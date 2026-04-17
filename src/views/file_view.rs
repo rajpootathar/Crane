@@ -240,8 +240,12 @@ fn draw_file_tab(
     );
 
     let t = theme::current();
+    let accent_tint = {
+        let a = t.accent;
+        Color32::from_rgba_unmultiplied(a.r, a.g, a.b, 55)
+    };
     let (bg, fg) = if is_active {
-        (t.accent.to_color32(), t.text_hover.to_color32())
+        (accent_tint, t.text.to_color32())
     } else if response.hovered() || close_response.hovered() {
         (t.row_hover.to_color32(), t.text.to_color32())
     } else {

@@ -33,7 +33,8 @@ pub fn row_hover() -> Color32 {
     crate::theme::current().row_hover.to_color32()
 }
 pub fn row_active() -> Color32 {
-    crate::theme::current().row_active.to_color32()
+    let a = crate::theme::current().accent;
+    Color32::from_rgba_unmultiplied(a.r, a.g, a.b, 55)
 }
 pub fn trailing_hover() -> Color32 {
     crate::theme::current().surface_alt.to_color32()
