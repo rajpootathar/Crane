@@ -32,19 +32,27 @@ pub enum PaneAction {
 fn dock_zone(rect: Rect, pos: Pos2) -> DockEdge {
     let rel_x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
     let rel_y = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
-    let edge = 0.25;
-    let from_left = rel_x;
-    let from_right = 1.0 - rel_x;
-    let from_top = rel_y;
-    let from_bottom = 1.0 - rel_y;
-    let min_edge = from_left.min(from_right).min(from_top).min(from_bottom);
-    if min_edge >= edge {
-        DockEdge::Center
-    } else if from_left <= min_edge {
-        DockEdge::Left
-    } else if from_right <= min_edge {
-        DockEdge::Right
-    } else if from_top <= min_edge {
+    // A small 30 %× 30 % center square means the outer 35 % on any side
+    // docks to that edge. This matches VS Code / Warp's feel — if the
+    // pointer is clearly closer to one edge, that edge wins.
+    let center_min = 0.35;
+    let center_max = 0.65;
+    if rel_x >= center_min
+        && rel_x <= center_max
+        && rel_y >= center_min
+        && rel_y <= center_max
+    {
+        return DockEdge::Center;
+    }
+    let dx = rel_x - 0.5;
+    let dy = rel_y - 0.5;
+    if dx.abs() >= dy.abs() {
+        if dx < 0.0 {
+            DockEdge::Left
+        } else {
+            DockEdge::Right
+        }
+    } else if dy < 0.0 {
         DockEdge::Top
     } else {
         DockEdge::Bottom
