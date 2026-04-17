@@ -1,10 +1,47 @@
 use crate::terminal::Terminal;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 use egui::{Color32, FontFamily, FontId, Pos2, Rect, Sense, Vec2};
 
 const BG: Color32 = Color32::from_rgb(14, 16, 24);
 const FG: Color32 = Color32::from_rgb(176, 180, 192);
+const SELECTION_BG: Color32 = Color32::from_rgba_premultiplied(60, 110, 180, 120);
+
+fn point_in_selection(point: Point, range: &alacritty_terminal::selection::SelectionRange) -> bool {
+    if range.is_block {
+        point.line >= range.start.line
+            && point.line <= range.end.line
+            && point.column >= range.start.column
+            && point.column <= range.end.column
+    } else if point.line < range.start.line || point.line > range.end.line {
+        false
+    } else if range.start.line == range.end.line {
+        point.column >= range.start.column && point.column <= range.end.column
+    } else if point.line == range.start.line {
+        point.column >= range.start.column
+    } else if point.line == range.end.line {
+        point.column <= range.end.column
+    } else {
+        true
+    }
+}
+
+fn pixel_to_point(pos: Pos2, origin: Pos2, cell_w: f32, cell_h: f32, cols: usize, rows: usize) -> (Point, Side) {
+    let rel_x = (pos.x - origin.x).max(0.0);
+    let rel_y = (pos.y - origin.y).max(0.0);
+    let col_f = rel_x / cell_w;
+    let line_f = rel_y / cell_h;
+    let col = (col_f.floor() as usize).min(cols.saturating_sub(1));
+    let line = (line_f.floor() as usize).min(rows.saturating_sub(1));
+    let side = if col_f - col_f.floor() < 0.5 {
+        Side::Left
+    } else {
+        Side::Right
+    };
+    (Point::new(Line(line as i32), Column(col)), side)
+}
 
 pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f32, has_focus: bool) {
     let font_id = FontId::new(font_size, FontFamily::Monospace);
@@ -24,17 +61,47 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
 
     painter.rect_filled(response.rect, 0.0, BG);
 
+    // Mouse selection: drag to select, click to clear.
+    if response.drag_started() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
+            let mut guard = terminal.term.lock();
+            guard.selection = Some(Selection::new(SelectionType::Simple, point, side));
+        }
+    }
+    if response.dragged() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
+            let mut guard = terminal.term.lock();
+            if let Some(sel) = guard.selection.as_mut() {
+                sel.update(point, side);
+            }
+        }
+    }
+    if response.clicked() {
+        let mut guard = terminal.term.lock();
+        if guard
+            .selection
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+        {
+            guard.selection = None;
+        }
+    }
+
     let snapshot = {
         let guard = terminal.term.lock();
         let content = guard.renderable_content();
         let cursor = (content.cursor.point.column.0, content.cursor.point.line.0);
+        let selection = content.selection;
         let cells: Vec<_> = content
             .display_iter
             .map(|item| (item.point, item.cell.clone()))
             .collect();
-        (cells, cursor)
+        (cells, cursor, selection)
     };
-    let (cells, (cursor_col, cursor_line)) = snapshot;
+    let (cells, (cursor_col, cursor_line), selection) = snapshot;
 
     for (point, cell) in cells {
         let col = point.column.0;
@@ -51,6 +118,13 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         let bg = color_to_egui(cell.bg, false);
         if bg != BG {
             painter.rect_filled(rect, 0.0, bg);
+        }
+
+        let in_selection = selection
+            .map(|sel| point_in_selection(point, &sel))
+            .unwrap_or(false);
+        if in_selection {
+            painter.rect_filled(rect, 0.0, SELECTION_BG);
         }
 
         if cell.c != ' ' && cell.c != '\0' {
@@ -86,9 +160,24 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         return;
     }
 
+    let mut copy_text: Option<String> = None;
+    let mut paste_text: Option<String> = None;
     ui.input(|i| {
         for event in &i.events {
             match event {
+                egui::Event::Copy => {
+                    let guard = terminal.term.lock();
+                    if let Some(t) = guard.selection_to_string() {
+                        if !t.is_empty() {
+                            copy_text = Some(t);
+                        }
+                    }
+                }
+                egui::Event::Paste(text) => {
+                    if !text.is_empty() {
+                        paste_text = Some(text.clone());
+                    }
+                }
                 egui::Event::Key {
                     key,
                     pressed: true,
@@ -115,6 +204,12 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             }
         }
     });
+    if let Some(t) = copy_text {
+        ui.ctx().copy_text(t);
+    }
+    if let Some(t) = paste_text {
+        terminal.write_input(t.as_bytes());
+    }
 }
 
 fn color_to_egui(color: TermColor, is_fg: bool) -> Color32 {
