@@ -102,6 +102,14 @@ fn apply_style(ctx: &egui::Context) {
     style.visuals.window_stroke = egui::Stroke::new(1.0, border_subtle);
     style.visuals.menu_corner_radius = egui::CornerRadius::same(8);
 
+    // These are the colours TextEdit, ScrollArea and inline code rely on.
+    // Without them, the Files Pane's editor background ignored the theme.
+    style.visuals.panel_fill = t.bg.to_color32();
+    style.visuals.extreme_bg_color = t.bg.to_color32();
+    style.visuals.code_bg_color = t.surface.to_color32();
+    style.visuals.faint_bg_color = t.row_hover.to_color32();
+    style.visuals.override_text_color = Some(text_primary);
+
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
     style.spacing.item_spacing = egui::vec2(8.0, 5.0);
     style.spacing.menu_margin = egui::Margin::symmetric(6, 6);
@@ -187,18 +195,35 @@ impl CraneApp {
         if self.last_save_at.elapsed() < session::SAVE_DEBOUNCE {
             return;
         }
-        let snapshot = match serde_json::to_string(&session::Session::from_app(&self.app)) {
-            Ok(s) => s,
+        // Serialise on the render thread (fast — bytes for a modest
+        // session ≈ tens of KB), diff against the last snapshot, then
+        // hand the bytes to a background thread to write. The UI never
+        // blocks on fsync.
+        let session_value = session::Session::from_app(&self.app);
+        let bytes = match serde_json::to_vec_pretty(&session_value) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let snapshot = match std::str::from_utf8(&bytes) {
+            Ok(s) => s.to_string(),
             Err(_) => return,
         };
         if snapshot == self.last_saved_snapshot {
             self.last_save_at = std::time::Instant::now();
             return;
         }
-        if session::save(&self.app).is_ok() {
-            self.last_saved_snapshot = snapshot;
-            self.last_save_at = std::time::Instant::now();
-        }
+        let path = session::session_file();
+        std::thread::spawn(move || {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        });
+        self.last_saved_snapshot = snapshot;
+        self.last_save_at = std::time::Instant::now();
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
