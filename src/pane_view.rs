@@ -212,18 +212,6 @@ fn render_pane(
         None
     };
 
-    if let Some(edge) = drop_edge {
-        let zone = zone_rect(rect, edge);
-        ui.painter()
-            .rect_filled(zone, 4.0, Color32::from_rgba_unmultiplied(96, 140, 220, 60));
-        ui.painter().rect_stroke(
-            zone,
-            4.0,
-            Stroke::new(2.0, Color32::from_rgb(96, 140, 220)),
-            StrokeKind::Inside,
-        );
-    }
-
     if is_drop_target && released
         && let Some(payload) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx())
             && payload.0 != id
@@ -236,16 +224,10 @@ fn render_pane(
         };
     }
 
-    let border = if is_drop_target {
-        Color32::from_rgb(96, 140, 220)
-    } else {
-        border_color
-    };
-    let border_w = if is_drop_target { 2.0 } else { BORDER_W };
     ui.painter().rect_stroke(
         rect,
         4.0,
-        Stroke::new(border_w, border),
+        Stroke::new(BORDER_W, border_color),
         StrokeKind::Inside,
     );
 
@@ -292,6 +274,23 @@ fn render_pane(
         PaneContent::Browser(browser) => {
             browser_view::render(&mut child, browser, &mut pane.title);
         }
+    }
+
+    // Drop-zone overlay is painted LAST so it sits above pane content and
+    // only covers the actual target area (left/right/top/bottom half or the
+    // middle square). Previously the body background was painted after the
+    // zone, so the overlay was invisible on content panes and looked like
+    // the whole pane was highlighted.
+    if let Some(edge) = drop_edge {
+        let zone = zone_rect(rect, edge);
+        let painter = ui.painter();
+        painter.rect_filled(zone, 4.0, Color32::from_rgba_unmultiplied(96, 140, 220, 90));
+        painter.rect_stroke(
+            zone,
+            4.0,
+            Stroke::new(2.0, Color32::from_rgb(96, 140, 220)),
+            StrokeKind::Inside,
+        );
     }
 }
 
