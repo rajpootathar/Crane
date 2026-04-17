@@ -296,7 +296,7 @@ pub fn current() -> Theme {
 
 pub fn themes_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(format!("{home}/.config/crane/themes"))
+    PathBuf::from(format!("{home}/.crane/themes"))
 }
 
 /// Scan `~/.config/crane/themes/*.toml` and return all successfully parsed

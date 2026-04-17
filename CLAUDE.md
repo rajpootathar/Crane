@@ -107,14 +107,14 @@ Agent memory lives at `~/.claude/projects/-Users-rajpootathar-ideaProjects-super
 - `project_crane_naming.md` — canonical glossary (above)
 - `project_crane_config_persistence.md` — font size / themes via `crane.yaml`
 
-User-facing persistence: `~/.config/crane/` (planned for config, sessions, themes). Not yet implemented.
+User-facing persistence: `~/.crane/` (planned for config, sessions, themes). Not yet implemented.
 
 ## Pending major work
 
 - Rename `Workspace` → `Layout`, `Worktree` → `Workspace` throughout the code
 - Drag-drop Pane rearrange in Layout tree
 - `wry`-backed embedded browser Pane (currently a placeholder)
-- Session save/restore (`~/.config/crane/sessions/`)
+- Session save/restore (`~/.crane/sessions/`)
 - Config + theme loading (`crane.yaml`, hot-reload)
 - Mouse selection + copy/paste in Terminal Panes
 

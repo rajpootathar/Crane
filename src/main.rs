@@ -109,6 +109,21 @@ fn apply_style(ctx: &egui::Context) {
     ctx.set_global_style(style);
 }
 
+/// One-shot migration: if the old `~/.config/crane/` dir exists and the new
+/// `~/.crane/` doesn't, move it over so users on earlier builds don't lose
+/// their session or custom themes.
+fn migrate_config_dir() {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let old_dir = std::path::PathBuf::from(format!("{home}/.config/crane"));
+    let new_dir = std::path::PathBuf::from(format!("{home}/.crane"));
+    if old_dir.is_dir() && !new_dir.exists() {
+        let _ = std::fs::rename(&old_dir, &new_dir);
+    }
+}
+
 fn open_in_file_manager(path: &std::path::Path) {
     #[cfg(target_os = "macos")]
     {
@@ -154,6 +169,7 @@ impl CraneApp {
             Some(s) => s.restore(&cc.egui_ctx),
             None => App::new(),
         };
+        migrate_config_dir();
         theme::ensure_builtin_tomls_on_disk();
         let initial = theme::find_by_name(&app.selected_theme)
             .unwrap_or_else(theme::Theme::dark);

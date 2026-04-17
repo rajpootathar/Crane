@@ -113,7 +113,7 @@ pub struct SFile {
 
 pub fn session_file() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(format!("{home}/.config/crane/session.json"))
+    PathBuf::from(format!("{home}/.crane/session.json"))
 }
 
 pub fn save(app: &App) -> std::io::Result<()> {

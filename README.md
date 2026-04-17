@@ -26,7 +26,7 @@ Grab the latest build for your platform from the [Releases](https://github.com/r
 - **Pane types** — Terminal, Files (editable, tabbed, syntax-highlighted via syntect), Markdown, Diff, Browser (placeholder — native webview pending).
 - **Left Panel** — Projects → Workspaces (git worktrees) → Tabs tree with diff-stat badges.
 - **Right Panel** — Git Changes (stage / unstage / commit / push / pull) + Files browser.
-- **Session restore** — projects, workspaces, tabs, layouts, open files, panel state all persist to `~/.config/crane/session.json` and restore on launch.
+- **Session restore** — projects, workspaces, tabs, layouts, open files, panel state all persist to `~/.crane/session.json` and restore on launch.
 - **Git worktree management** — create a new workspace by picking a branch + location; removal cleans up.
 
 ## Keyboard shortcuts
@@ -131,7 +131,7 @@ src/
 ├── ui_top.rs        Main Panel top bar (breadcrumb, action buttons, panel toggles)
 ├── ui_util.rs       Shared widget primitives + tree row + design tokens
 ├── git.rs           Shell-out git: status · stage · unstage · commit · push · pull · worktree
-├── session.rs       Session save/restore (~/.config/crane/session.json)
+├── session.rs       Session save/restore (~/.crane/session.json)
 └── views/           Pane-content renderers: files · markdown · diff · browser
 ```
 
