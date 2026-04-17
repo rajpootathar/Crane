@@ -1,6 +1,6 @@
 use crate::state::App;
 use crate::ui_util::{
-    draw_row, draw_trailing, full_width_primary_button, RowConfig, ACCENT, MUTED,
+    draw_row, draw_trailing, full_width_primary_button, RowConfig, ACCENT,
 };
 use egui::{Color32, Pos2, Rect, RichText, Stroke};
 use egui_phosphor::regular as icons;

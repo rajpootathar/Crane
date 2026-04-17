@@ -1,10 +1,9 @@
 use crate::git::{self, FileChange};
 use crate::state::{App, RightTab};
 use crate::ui_util::{
-    draw_row, draw_trailing, full_width_primary_button, ghost_button, section_header,
+    draw_row, draw_trailing, section_header,
     RowConfig, ACCENT, MUTED, TEXT,
 };
-use crate::layout::{DiffPane, Dir, PaneContent};
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
 use std::collections::BTreeMap;

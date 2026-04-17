@@ -1,6 +1,7 @@
 use crate::state::{
     App, Project, RightTab, Tab, Workspace, WorkspaceId, TabId, ProjectId,
 };
+use crate::update_check::{PromptState, UpdateCheck};
 use crate::layout::{
     BrowserPane, DiffPane, Dir, FileTab, FilesPane, Layout, MarkdownPane, Node, Pane,
     PaneContent, PaneId,
@@ -25,6 +26,8 @@ pub struct Session {
     pub next_project: ProjectId,
     pub next_workspace: WorkspaceId,
     pub next_tab: TabId,
+    #[serde(default)]
+    pub update_prompts: std::collections::HashMap<String, PromptState>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -175,6 +178,7 @@ impl Session {
             next_project: app.next_project_id(),
             next_workspace: app.next_workspace_id(),
             next_tab: app.next_tab_id(),
+            update_prompts: app.update_check.prompts.clone(),
         }
     }
 
@@ -222,6 +226,7 @@ impl Session {
         app.active = self.active;
         app.last_workspace = self.last_workspace;
         app.set_id_counters(self.next_project, self.next_workspace, self.next_tab);
+        app.update_check = UpdateCheck::new(self.update_prompts);
         app
     }
 }

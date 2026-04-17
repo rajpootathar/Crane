@@ -52,7 +52,7 @@ fn render_md(ui: &mut egui::Ui, src: &str, font_size: f32) {
 
     let mut bold = false;
     let mut italic = false;
-    let mut code = false;
+    let code = false;
     let mut heading: Option<HeadingLevel> = None;
     let mut in_list = false;
     let mut in_code_block = false;

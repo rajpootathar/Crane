@@ -1,5 +1,6 @@
 use crate::git::{self, GitStatus};
 use crate::layout::Layout;
+use crate::update_check::UpdateCheck;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -93,6 +94,7 @@ pub struct App {
     pub expanded_dirs: HashSet<PathBuf>,
     pub collapsed_change_dirs: HashSet<String>,
     pub new_workspace_modal: Option<NewWorkspaceModal>,
+    pub update_check: UpdateCheck,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -115,6 +117,7 @@ impl App {
             expanded_dirs: HashSet::new(),
             collapsed_change_dirs: HashSet::new(),
             new_workspace_modal: None,
+            update_check: UpdateCheck::new(Default::default()),
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,
