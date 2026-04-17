@@ -109,6 +109,21 @@ fn apply_style(ctx: &egui::Context) {
     ctx.set_global_style(style);
 }
 
+fn open_in_file_manager(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(path).spawn();
+    }
+}
+
 fn load_app_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../crane.png");
     let image = image::load_from_memory(bytes).ok()?;
@@ -390,7 +405,7 @@ fn render_settings_modal(ctx: &egui::Context, app: &mut state::App) {
             if ui.small_button("Open themes folder").clicked() {
                 let dir = theme::themes_dir();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = webbrowser::open(&format!("file://{}", dir.display()));
+                open_in_file_manager(&dir);
             }
         });
     if !open {

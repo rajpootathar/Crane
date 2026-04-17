@@ -1,6 +1,7 @@
 use crate::terminal_view;
 use crate::views::{browser_view, diff_view, file_view, markdown_view};
 use crate::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
+use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
 use egui_phosphor::regular as icons;
 
@@ -8,14 +9,33 @@ pub const HEADER_H: f32 = 26.0;
 const BORDER_W: f32 = 1.0;
 const SPLITTER_W: f32 = 4.0;
 
-const FOCUS_BORDER: Color32 = Color32::from_rgb(100, 140, 220);
-const INACTIVE_BORDER: Color32 = Color32::from_rgb(36, 40, 52);
-const HEADER_BG_ACTIVE: Color32 = Color32::from_rgb(30, 34, 48);
-const HEADER_BG_INACTIVE: Color32 = Color32::from_rgb(22, 25, 36);
-const HEADER_FG: Color32 = Color32::from_rgb(200, 204, 220);
-const HEADER_FG_DIM: Color32 = Color32::from_rgb(130, 136, 150);
-const CLOSE_HOVER_BG: Color32 = Color32::from_rgb(180, 60, 60);
-const SPLITTER_COLOR: Color32 = Color32::from_rgb(22, 25, 36);
+fn focus_border() -> Color32 {
+    theme::current().focus_border.to_color32()
+}
+fn inactive_border() -> Color32 {
+    theme::current().inactive_border.to_color32()
+}
+fn header_bg_active() -> Color32 {
+    theme::current().surface.to_color32()
+}
+fn header_bg_inactive() -> Color32 {
+    theme::current().topbar_bg.to_color32()
+}
+fn header_fg() -> Color32 {
+    theme::current().text.to_color32()
+}
+fn header_fg_dim() -> Color32 {
+    theme::current().text_muted.to_color32()
+}
+fn close_hover_bg() -> Color32 {
+    theme::current().error.to_color32()
+}
+fn splitter_color() -> Color32 {
+    theme::current().divider.to_color32()
+}
+fn pane_body_bg() -> Color32 {
+    theme::current().bg.to_color32()
+}
 
 #[derive(Clone, Copy)]
 struct DragPayload(PaneId);
@@ -160,7 +180,7 @@ fn render_splitter(
     parent: Rect,
     action: &mut PaneAction,
 ) {
-    ui.painter().rect_filled(rect, 0.0, SPLITTER_COLOR);
+    ui.painter().rect_filled(rect, 0.0, splitter_color());
     let id = egui::Id::new(("splitter", path.to_vec()));
     let response = ui.interact(rect, id, Sense::click_and_drag());
     if response.hovered() || response.dragged() {
@@ -192,9 +212,9 @@ fn render_pane(
 ) {
     let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
-        FOCUS_BORDER
+        focus_border()
     } else {
-        INACTIVE_BORDER
+        inactive_border()
     };
 
     let drag_payload = egui::DragAndDrop::payload::<DragPayload>(ui.ctx());
@@ -254,7 +274,7 @@ fn render_pane(
     }
 
     ui.painter()
-        .rect_filled(body_outer, 0.0, Color32::from_rgb(14, 16, 24));
+        .rect_filled(body_outer, 0.0, pane_body_bg());
     let mut child = ui.new_child(UiBuilder::new().max_rect(body_rect));
     child.set_clip_rect(body_rect);
 
@@ -303,9 +323,9 @@ fn render_header(
     action: &mut PaneAction,
 ) {
     let bg = if is_focus {
-        HEADER_BG_ACTIVE
+        header_bg_active()
     } else {
-        HEADER_BG_INACTIVE
+        header_bg_inactive()
     };
     ui.painter().rect_filled(rect, 0.0, bg);
 
@@ -321,14 +341,14 @@ fn render_header(
     );
     let close_response = ui.interact(close_rect, egui::Id::new(("close", id)), Sense::click());
     if close_response.hovered() {
-        ui.painter().rect_filled(close_rect, 0.0, CLOSE_HOVER_BG);
+        ui.painter().rect_filled(close_rect, 0.0, close_hover_bg());
     }
     ui.painter().text(
         close_rect.center(),
         egui::Align2::CENTER_CENTER,
         icons::X,
         egui::FontId::new(13.0, egui::FontFamily::Proportional),
-        HEADER_FG,
+        header_fg(),
     );
     if close_response.clicked() {
         *action = PaneAction::Close(id);
@@ -356,7 +376,7 @@ fn render_header(
         *action = PaneAction::Focus(id);
     }
     let label = format!("{}  ·  {}", pane.title, pane.content.kind_label());
-    let fg = if is_focus { HEADER_FG } else { HEADER_FG_DIM };
+    let fg = if is_focus { header_fg() } else { header_fg_dim() };
     ui.painter().text(
         Pos2::new(title_rect.min.x, rect.center().y),
         egui::Align2::LEFT_CENTER,

@@ -5,10 +5,18 @@ use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
 
 const TOPBAR_H: f32 = 34.0;
-const TOPBAR_BG: Color32 = Color32::from_rgb(20, 22, 32);
-const DIVIDER: Color32 = Color32::from_rgb(36, 40, 52);
-const DIM: Color32 = Color32::from_rgb(130, 136, 150);
-const PRIMARY: Color32 = Color32::from_rgb(210, 214, 224);
+fn topbar_bg() -> Color32 {
+    crate::theme::current().topbar_bg.to_color32()
+}
+fn divider() -> Color32 {
+    crate::theme::current().divider.to_color32()
+}
+fn dim() -> Color32 {
+    crate::theme::current().text_muted.to_color32()
+}
+fn primary() -> Color32 {
+    crate::theme::current().text.to_color32()
+}
 
 pub const TOTAL_H: f32 = TOPBAR_H;
 
@@ -16,13 +24,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let rect = ui.available_rect_before_wrap();
     let bar_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TOPBAR_H));
 
-    ui.painter().rect_filled(bar_rect, 0.0, TOPBAR_BG);
+    ui.painter().rect_filled(bar_rect, 0.0, topbar_bg());
     ui.painter().line_segment(
         [
             egui::pos2(bar_rect.min.x, bar_rect.max.y),
             egui::pos2(bar_rect.max.x, bar_rect.max.y),
         ],
-        egui::Stroke::new(1.0, DIVIDER),
+        egui::Stroke::new(1.0, divider()),
     );
 
     let mut bar_ui = ui.new_child(
@@ -43,7 +51,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     bar_ui.label(
         RichText::new(app.breadcrumb())
             .size(12.5)
-            .color(PRIMARY),
+            .color(primary()),
     );
 
     bar_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
