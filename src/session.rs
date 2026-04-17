@@ -116,20 +116,6 @@ pub fn session_file() -> PathBuf {
     PathBuf::from(format!("{home}/.crane/session.json"))
 }
 
-pub fn save(app: &App) -> std::io::Result<()> {
-    let s = Session::from_app(app);
-    let bytes = serde_json::to_vec_pretty(&s)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let path = session_file();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 pub fn load() -> Option<Session> {
     let bytes = std::fs::read(session_file()).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -493,6 +479,7 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+#[allow(dead_code)] // paired with base64_encode; staged for scrollback replay
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     let mut lookup = [255u8; 256];
     for (i, &b) in B64.iter().enumerate() {

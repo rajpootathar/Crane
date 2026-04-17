@@ -52,6 +52,10 @@ install-cargo-bundle:
 
 bundle: icns install-cargo-bundle
 	cargo bundle --release
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		codesign --force --deep --sign - "$(APP)" && \
+		echo "ad-hoc signed: $(APP)"; \
+	fi
 	@echo "bundle ready: $(APP)"
 
 dmg: bundle
@@ -83,6 +87,8 @@ bundle-universal: icns install-cargo-bundle
 		"target/aarch64-apple-darwin/release/$(BIN_NAME)" \
 		"target/x86_64-apple-darwin/release/$(BIN_NAME)" \
 		-output "$(UNIVERSAL_APP)/Contents/MacOS/$(BIN_NAME)"
+	@codesign --force --deep --sign - "$(UNIVERSAL_APP)" && \
+		echo "ad-hoc signed: $(UNIVERSAL_APP)"
 	@echo "universal bundle ready: $(UNIVERSAL_APP)"
 
 dmg-universal: bundle-universal

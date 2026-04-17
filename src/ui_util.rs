@@ -64,23 +64,6 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, tooltip: &str) -> Respon
     }
 }
 
-/// Primary filled button with optional leading icon.
-pub fn primary_button(ui: &mut Ui, icon: Option<&str>, label: &str, tooltip: &str) -> Response {
-    let text = match icon {
-        Some(g) => format!("{g}  {label}"),
-        None => label.to_string(),
-    };
-    let resp = ui.add(
-        egui::Button::new(RichText::new(text).size(BTN_TEXT_SIZE))
-            .min_size(Vec2::new(0.0, TEXT_BTN_H)),
-    );
-    if tooltip.is_empty() {
-        resp
-    } else {
-        resp.on_hover_text(tooltip)
-    }
-}
-
 /// Full-width filled button — spans remaining horizontal space.
 pub fn full_width_primary_button(
     ui: &mut Ui,
@@ -97,33 +80,6 @@ pub fn full_width_primary_button(
         egui::Button::new(RichText::new(text).size(BTN_TEXT_SIZE))
             .min_size(Vec2::new(width, TEXT_BTN_H)),
     );
-    if tooltip.is_empty() {
-        resp
-    } else {
-        resp.on_hover_text(tooltip)
-    }
-}
-
-/// Secondary borderless text button.
-pub fn ghost_button(ui: &mut Ui, icon: Option<&str>, label: &str, tooltip: &str) -> Response {
-    let text = match icon {
-        Some(g) => format!("{g}  {label}"),
-        None => label.to_string(),
-    };
-    let resp = ui
-        .scope(|ui| {
-            let v = ui.visuals_mut();
-            v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-            v.widgets.inactive.bg_fill = Color32::TRANSPARENT;
-            v.widgets.inactive.bg_stroke = Stroke::NONE;
-            v.widgets.hovered.bg_stroke = Stroke::NONE;
-            v.widgets.active.bg_stroke = Stroke::NONE;
-            ui.add(
-                egui::Button::new(RichText::new(text).size(BTN_TEXT_SIZE).color(muted()))
-                    .min_size(Vec2::new(0.0, TEXT_BTN_H)),
-            )
-        })
-        .inner;
     if tooltip.is_empty() {
         resp
     } else {

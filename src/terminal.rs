@@ -49,6 +49,7 @@ pub struct Terminal {
     pub last_click: Option<(std::time::Instant, i32, usize)>,
     pub click_count: u8,
     master: Box<dyn MasterPty + Send>,
+    shell_pid: Option<u32>,
 }
 
 impl Terminal {
@@ -76,10 +77,11 @@ impl Terminal {
         } else if let Ok(home) = std::env::var("HOME") {
             cmd.cwd(home);
         }
-        let _child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let shell_pid = child.process_id();
         drop(pair.slave);
 
         let listener = WakeListener { ctx: ctx.clone() };
@@ -140,12 +142,37 @@ impl Terminal {
             last_click: None,
             click_count: 0,
             master: pair.master,
+            shell_pid,
         })
+    }
+
+    /// True if the PTY's foreground process group is not the shell itself —
+    /// i.e. something is actively running (vim, a build, a long-running test).
+    /// Unix-only; other platforms always return false.
+    #[cfg(unix)]
+    pub fn has_foreground_process(&self) -> bool {
+        let Some(shell) = self.shell_pid else {
+            return false;
+        };
+        let Some(fd) = self.master.as_raw_fd() else {
+            return false;
+        };
+        let fg = unsafe { libc::tcgetpgrp(fd) };
+        if fg < 0 {
+            return false;
+        }
+        (fg as u32) != shell
+    }
+
+    #[cfg(not(unix))]
+    pub fn has_foreground_process(&self) -> bool {
+        false
     }
 
     /// Restore a terminal from saved scrollback bytes. Spawns a live shell in
     /// the given cwd; then replays the saved bytes through the VT processor so
     /// the grid shows the prior visual state. New input/output starts fresh.
+    #[allow(dead_code)] // staged for session scrollback replay
     pub fn spawn_with_history(
         ctx: egui::Context,
         cols: usize,

@@ -7,23 +7,6 @@ pub struct WorkspaceInfo {
     pub branch: String,
 }
 
-pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(start)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(s))
-    }
-}
-
 pub fn list_workspaces(repo: &Path) -> Vec<WorkspaceInfo> {
     let out = match Command::new("git")
         .args(["worktree", "list", "--porcelain"])
@@ -65,18 +48,6 @@ pub enum ChangeStatus {
     Deleted,
     Renamed,
     Untracked,
-}
-
-impl ChangeStatus {
-    pub fn glyph(self) -> &'static str {
-        match self {
-            ChangeStatus::Added => "A",
-            ChangeStatus::Modified => "M",
-            ChangeStatus::Deleted => "D",
-            ChangeStatus::Renamed => "R",
-            ChangeStatus::Untracked => "?",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +188,7 @@ pub fn workspace_add(repo: &Path, path: &Path, branch: &str, create_new: bool) -
     run(repo, &args)
 }
 
+#[allow(dead_code)] // staged for #45 branch-switch UI
 pub fn list_local_branches(repo: &Path) -> Vec<String> {
     let out = match Command::new("git")
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])

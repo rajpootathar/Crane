@@ -68,7 +68,6 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let origin = response.rect.min;
 
     let bg_theme = term_bg();
-    let fg_theme = term_fg();
     painter.rect_filled(response.rect, 0.0, bg_theme);
 
     // I-beam over the terminal so it feels like selectable text.

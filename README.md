@@ -12,7 +12,12 @@ Grab the latest build for your platform from the [Releases](https://github.com/r
 
 - **macOS** (Apple Silicon + Intel, universal) — `Crane-<version>-universal.dmg`
   - Double-click to mount, drag **Crane.app** into `/Applications`.
-  - First launch: right-click the app → **Open** (unsigned build, macOS asks once).
+  - First launch: right-click the app → **Open** (ad-hoc signed, macOS asks once).
+  - If macOS says **"Crane is damaged and can't be opened"**, strip the download-quarantine bit:
+    ```bash
+    xattr -dr com.apple.quarantine /Applications/Crane.app
+    ```
+    Then open normally. (This happens on unsigned/unnotarized builds; a paid Apple Developer ID would fix it at the source.)
 - **Linux** (x86_64, Debian/Ubuntu) — `crane_<version>_amd64.deb`
   - `sudo dpkg -i crane_<version>_amd64.deb`
 - **Windows** (x86_64) — `Crane-<version>-windows-x86_64.zip`

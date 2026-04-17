@@ -88,7 +88,6 @@ pub struct App {
     pub right_tab: RightTab,
     pub commit_message: String,
     pub git_error: Option<String>,
-    pub add_project_buf: String,
     pub font_size: f32,
     pub expanded_dirs: HashSet<PathBuf>,
     pub collapsed_change_dirs: HashSet<String>,
@@ -113,7 +112,6 @@ impl App {
             right_tab: RightTab::Changes,
             commit_message: String::new(),
             git_error: None,
-            add_project_buf: String::new(),
             font_size: 14.0,
             expanded_dirs: HashSet::new(),
             collapsed_change_dirs: HashSet::new(),
@@ -221,6 +219,14 @@ impl App {
         Some(&wt.path)
     }
 
+    pub fn active_layout_ref(&self) -> Option<&Layout> {
+        let (pid, wid, tid) = self.active?;
+        let project = self.projects.iter().find(|p| p.id == pid)?;
+        let workspace = project.workspaces.iter().find(|w| w.id == wid)?;
+        let tab = workspace.tabs.iter().find(|t| t.id == tid)?;
+        Some(&tab.layout)
+    }
+
     pub fn active_layout(&mut self) -> Option<&mut Layout> {
         let (pid, wid, tid) = self.active?;
         let project = self.projects.iter_mut().find(|p| p.id == pid)?;
@@ -246,15 +252,6 @@ impl App {
 
     pub fn new_tab_in_active_workspace(&mut self, ctx: &egui::Context) {
         self.push_tab(ctx, None, None);
-    }
-
-    pub fn new_content_tab(
-        &mut self,
-        ctx: &egui::Context,
-        content: crate::layout::PaneContent,
-        name: String,
-    ) {
-        self.push_tab(ctx, Some(content), Some(name));
     }
 
     fn push_tab(

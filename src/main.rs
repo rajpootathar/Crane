@@ -1,7 +1,6 @@
-#![allow(dead_code)] // WIP: some helpers are staged for upcoming features (branch switch, wry browser)
-
 mod git;
 mod layout;
+mod modals;
 mod pane_view;
 mod session;
 mod state;
@@ -14,6 +13,11 @@ mod ui_top;
 mod ui_util;
 mod update_check;
 mod views;
+
+use modals::{
+    render_empty_state, render_help_modal, render_new_workspace_modal, render_settings_modal,
+    render_update_toast,
+};
 
 use eframe::egui;
 use layout::Dir;
@@ -132,21 +136,6 @@ fn migrate_config_dir() {
     }
 }
 
-fn open_in_file_manager(path: &std::path::Path) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(path).spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("explorer").arg(path).spawn();
-    }
-}
-
 fn load_app_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../crane.png");
     let image = image::load_from_memory(bytes).ok()?;
@@ -164,6 +153,20 @@ struct CraneApp {
     app: App,
     last_saved_snapshot: String,
     last_save_at: std::time::Instant,
+    pending_close: Option<layout::PaneId>,
+}
+
+fn terminal_is_running(app: &App, id: layout::PaneId) -> bool {
+    let Some(layout) = app.active_layout_ref() else {
+        return false;
+    };
+    let Some(pane) = layout.panes.get(&id) else {
+        return false;
+    };
+    match &pane.content {
+        layout::PaneContent::Terminal(t) => t.has_foreground_process(),
+        _ => false,
+    }
 }
 
 impl CraneApp {
@@ -188,6 +191,45 @@ impl CraneApp {
             app,
             last_saved_snapshot: String::new(),
             last_save_at: std::time::Instant::now(),
+            pending_close: None,
+        }
+    }
+
+    fn render_confirm_close(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.pending_close else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Terminal is still running")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.add_space(4.0);
+                ui.label("A process is running in this terminal. Closing it will kill the process.");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Close terminal").clicked() {
+                        confirm = true;
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if cancel {
+            self.pending_close = None;
+        } else if confirm {
+            if let Some(ws) = self.app.active_layout() {
+                ws.focus = Some(id);
+                ws.close_focused();
+            }
+            self.pending_close = None;
         }
     }
 
@@ -264,10 +306,19 @@ impl CraneApp {
             && let Some(ws) = self.app.active_layout() {
                 ws.split_focused_with_terminal(ctx, Dir::Vertical);
             }
-        if close_pane
-            && let Some(ws) = self.app.active_layout() {
-                ws.close_focused();
+        if close_pane {
+            let focus = self
+                .app
+                .active_layout_ref()
+                .and_then(|l| l.focus);
+            if let Some(id) = focus {
+                if terminal_is_running(&self.app, id) {
+                    self.pending_close = Some(id);
+                } else if let Some(ws) = self.app.active_layout() {
+                    ws.close_focused();
+                }
             }
+        }
         if close_tab {
             self.app.close_active_tab();
         }
@@ -369,8 +420,16 @@ impl eframe::App for CraneApp {
                     PaneAction::None => {}
                     PaneAction::Focus(id) => ws.focus = Some(id),
                     PaneAction::Close(id) => {
-                        ws.focus = Some(id);
-                        ws.close_focused();
+                        let running = matches!(
+                            ws.panes.get(&id).map(|p| &p.content),
+                            Some(layout::PaneContent::Terminal(t)) if t.has_foreground_process()
+                        );
+                        if running {
+                            self.pending_close = Some(id);
+                        } else {
+                            ws.focus = Some(id);
+                            ws.close_focused();
+                        }
                     }
                     PaneAction::ResizeSplit { path, ratio } => {
                         ws.set_split_ratio(&path, ratio);
@@ -389,392 +448,11 @@ impl eframe::App for CraneApp {
 
         render_new_workspace_modal(&ctx, &mut self.app);
         render_help_modal(&ctx, &mut self.app);
-        render_settings_modal(&ctx, &mut self.app);
+        render_settings_modal(&ctx, &mut self.app, apply_style);
+        self.render_confirm_close(&ctx);
         self.app.update_check.drain();
         render_update_toast(&ctx, &mut self.app);
         self.maybe_save();
     }
 }
 
-fn render_settings_modal(ctx: &egui::Context, app: &mut state::App) {
-    if !app.show_settings {
-        return;
-    }
-    let mut open = true;
-    let mut selected_now: Option<String> = None;
-    egui::Window::new("Settings")
-        .collapsible(false)
-        .resizable(false)
-        .fixed_size(egui::vec2(420.0, 380.0))
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.set_width(400.0);
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("Theme").strong());
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical()
-                .max_height(260.0)
-                .show(ui, |ui| {
-                    for theme in theme::load_all() {
-                        let is_active = app.selected_theme == theme.name;
-                        let label = format!(
-                            "{}{}",
-                            if is_active { "● " } else { "  " },
-                            theme.name
-                        );
-                        let resp = ui.add(
-                            egui::Button::new(
-                                egui::RichText::new(label).size(13.0),
-                            )
-                            .min_size(egui::vec2(ui.available_width(), 28.0)),
-                        );
-                        if resp.clicked() && !is_active {
-                            selected_now = Some(theme.name.clone());
-                        }
-                    }
-                });
-            ui.add_space(8.0);
-            ui.separator();
-            ui.label(
-                egui::RichText::new(format!(
-                    "Drop custom themes (*.toml) at: {}",
-                    theme::themes_dir().display()
-                ))
-                .size(10.5)
-                .color(theme::current().text_muted.to_color32()),
-            );
-            if ui.small_button("Open themes folder").clicked() {
-                let dir = theme::themes_dir();
-                let _ = std::fs::create_dir_all(&dir);
-                open_in_file_manager(&dir);
-            }
-        });
-    if !open {
-        app.show_settings = false;
-    }
-    if let Some(name) = selected_now
-        && let Some(t) = theme::find_by_name(&name)
-    {
-        theme::set(t);
-        app.selected_theme = name;
-        apply_style(ctx);
-        ctx.request_repaint();
-    }
-}
-
-fn render_update_toast(ctx: &egui::Context, app: &mut state::App) {
-    if !app.update_check.should_show() {
-        return;
-    }
-    let version = app
-        .update_check
-        .available
-        .as_ref()
-        .map(|u| u.version.clone())
-        .unwrap_or_default();
-    let url = app
-        .update_check
-        .available
-        .as_ref()
-        .map(|u| u.url.clone())
-        .unwrap_or_default();
-
-    let screen = ctx.content_rect();
-    let toast_w = 440.0_f32.min(screen.width() - 40.0);
-    egui::Area::new(egui::Id::new("update_toast"))
-        .order(egui::Order::Tooltip)
-        .fixed_pos(egui::pos2(
-            screen.max.x - toast_w - 20.0,
-            screen.max.y - 140.0,
-        ))
-        .show(ctx, |ui| {
-            egui::Frame::default()
-                .fill(egui::Color32::from_rgb(28, 32, 44))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 86)))
-                .corner_radius(egui::CornerRadius::same(10))
-                .inner_margin(egui::Margin::same(14))
-                .show(ui, |ui| {
-                    ui.set_width(toast_w - 28.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(egui_phosphor::regular::ARROW_CIRCLE_UP)
-                                .size(18.0)
-                                .color(egui::Color32::from_rgb(96, 140, 220)),
-                        );
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("Crane v{version} is available"))
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(212, 216, 228))
-                                    .strong(),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "You're on v{}. Grab the new build?",
-                                    env!("CARGO_PKG_VERSION")
-                                ))
-                                .size(11.5)
-                                .color(egui::Color32::from_rgb(150, 156, 172)),
-                            );
-                        });
-                    });
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(
-                                egui::RichText::new(format!(
-                                    "{}  Download",
-                                    egui_phosphor::regular::DOWNLOAD_SIMPLE
-                                ))
-                                .size(12.0)
-                                .strong(),
-                            )
-                            .clicked()
-                        {
-                            let _ = webbrowser::open(&url);
-                            app.update_check.dismiss_forever();
-                        }
-                        if ui
-                            .button(egui::RichText::new("Not now").size(12.0))
-                            .clicked()
-                        {
-                            app.update_check.dismiss_session();
-                        }
-                        if ui
-                            .button(egui::RichText::new("Remind in 7 days").size(12.0))
-                            .clicked()
-                        {
-                            app.update_check.remind_later();
-                        }
-                    });
-                });
-        });
-}
-
-fn render_help_modal(ctx: &egui::Context, app: &mut state::App) {
-    if !app.show_help {
-        return;
-    }
-    let mut open = true;
-    egui::Window::new("Keyboard Shortcuts")
-        .collapsible(false)
-        .resizable(false)
-        .default_width(420.0)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .open(&mut open)
-        .show(ctx, |ui| {
-            let rows: &[(&str, &str)] = &[
-                ("Cmd+T", "Split active Pane with new terminal"),
-                ("Cmd+Shift+T", "New Tab in active Workspace"),
-                ("Cmd+D", "Split Pane horizontally (side-by-side)"),
-                ("Cmd+Shift+D", "Split Pane vertically (stacked)"),
-                ("Cmd+W", "Close focused Pane"),
-                ("Cmd+Shift+W", "Close active Tab"),
-                ("Cmd+[ / Cmd+]", "Focus prev / next Pane"),
-                ("Cmd+B", "Toggle Left Panel"),
-                ("Cmd+/", "Toggle Right Panel"),
-                ("Cmd+= / Cmd+-", "Increase / decrease font size"),
-                ("Cmd+0", "Reset font size"),
-                ("Ctrl+C / Ctrl+D", "Terminal: interrupt / EOF"),
-            ];
-            egui::Grid::new("shortcuts_grid")
-                .num_columns(2)
-                .spacing([18.0, 6.0])
-                .show(ui, |ui| {
-                    for (key, desc) in rows {
-                        ui.label(egui::RichText::new(*key).monospace().strong());
-                        ui.label(*desc);
-                        ui.end_row();
-                    }
-                });
-        });
-    if !open {
-        app.show_help = false;
-    }
-}
-
-fn render_new_workspace_modal(ctx: &egui::Context, app: &mut state::App) {
-    let mut open = app.new_workspace_modal.is_some();
-    if !open {
-        return;
-    }
-    let mut create = false;
-    let mut cancel = false;
-    let mut browse: Option<String> = None;
-    let modal_width = 480.0;
-    let project_info = app.new_workspace_modal.as_ref().and_then(|m| {
-        app.projects
-            .iter()
-            .find(|p| p.id == m.project_id)
-            .map(|p| (p.path.clone(), p.name.clone()))
-    });
-
-    egui::Window::new("New Worktree")
-        .collapsible(false)
-        .resizable(false)
-        .fixed_size(egui::vec2(modal_width, 280.0))
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.set_width(modal_width - 20.0);
-            let input_width = modal_width - 40.0;
-            if let Some(modal) = app.new_workspace_modal.as_mut() {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("Branch").strong());
-                ui.add(
-                    egui::TextEdit::singleline(&mut modal.branch)
-                        .hint_text("feature/my-branch")
-                        .desired_width(input_width),
-                );
-                ui.checkbox(&mut modal.create_new_branch, "Create new branch");
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Location").strong());
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut modal.mode,
-                        state::LocationMode::Global,
-                        "Global",
-                    )
-                    .on_hover_text("~/.crane-worktrees/<project>/<branch>");
-                    ui.selectable_value(
-                        &mut modal.mode,
-                        state::LocationMode::ProjectLocal,
-                        "Project-local",
-                    )
-                    .on_hover_text("<project>/.crane-worktrees/<branch>");
-                    ui.selectable_value(
-                        &mut modal.mode,
-                        state::LocationMode::Custom,
-                        "Custom",
-                    )
-                    .on_hover_text("Pick any folder");
-                });
-                if modal.mode == state::LocationMode::Custom {
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut modal.custom_path)
-                                .hint_text("/path/to/parent")
-                                .desired_width(input_width - 88.0),
-                        );
-                        if ui.button("Browse…").clicked() {
-                            browse = Some(modal.custom_path.clone());
-                        }
-                    });
-                }
-                let preview = project_info
-                    .as_ref()
-                    .map(|(p, n)| modal.resolved_parent(p, n))
-                    .unwrap_or_default();
-                let preview_str = format!(
-                    "→ {}/{}",
-                    preview.display().to_string().trim_end_matches('/'),
-                    if modal.branch.is_empty() {
-                        "<branch>"
-                    } else {
-                        &modal.branch
-                    }
-                );
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(preview_str)
-                            .size(10.5)
-                            .color(egui::Color32::from_rgb(130, 136, 150)),
-                    )
-                    .truncate(),
-                );
-                if let Some(err) = &modal.error {
-                    ui.add_space(4.0);
-                    ui.colored_label(egui::Color32::from_rgb(220, 100, 100), err);
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button(egui::RichText::new("Create").strong()).clicked() {
-                        create = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            }
-        });
-    if !open || cancel {
-        app.new_workspace_modal = None;
-    } else if let Some(current) = browse {
-        let start = std::path::PathBuf::from(if current.is_empty() {
-            std::env::var("HOME").unwrap_or_default()
-        } else {
-            current
-        });
-        if let Some(p) = rfd::FileDialog::new()
-            .set_title("Choose worktree parent folder")
-            .set_directory(start)
-            .pick_folder()
-            && let Some(modal) = app.new_workspace_modal.as_mut() {
-                modal.custom_path = p.to_string_lossy().to_string();
-                modal.mode = state::LocationMode::Custom;
-            }
-    } else if create {
-        app.create_workspace_from_modal(ctx);
-    }
-}
-
-fn render_empty_state(
-    ui: &mut egui::Ui,
-    app: &mut state::App,
-    ctx: &egui::Context,
-    rect: egui::Rect,
-) {
-    let mut empty_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect)
-            .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)),
-    );
-    empty_ui.set_clip_rect(rect);
-    empty_ui.vertical_centered(|ui| {
-        ui.add_space(rect.height() * 0.25);
-        let has_project = !app.projects.is_empty();
-        let (title, hint) = if has_project {
-            ("No tabs open", "Cmd+T to create a new terminal tab")
-        } else {
-            ("Welcome to Crane", "Add a project from the Left Panel to get started")
-        };
-        ui.label(
-            egui::RichText::new(title)
-                .size(18.0)
-                .color(egui::Color32::from_rgb(200, 204, 220)),
-        );
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(hint)
-                .size(12.0)
-                .color(egui::Color32::from_rgb(130, 136, 150)),
-        );
-        ui.add_space(20.0);
-        if has_project {
-            if ui
-                .add_sized(
-                    [180.0, 32.0],
-                    egui::Button::new(egui::RichText::new("+ New Terminal Tab").size(13.0)),
-                )
-                .clicked()
-            {
-                app.new_tab_in_active_workspace(ctx);
-            }
-        } else if ui
-            .add_sized(
-                [180.0, 32.0],
-                egui::Button::new(
-                    egui::RichText::new(format!("{}  Add Project…", egui_phosphor::regular::FOLDER_PLUS))
-                        .size(13.0),
-                ),
-            )
-            .clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .set_title("Choose project folder")
-                .pick_folder()
-            {
-                app.add_project_from_path(path, ctx);
-            }
-    });
-}

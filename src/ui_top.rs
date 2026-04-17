@@ -11,9 +11,6 @@ fn topbar_bg() -> Color32 {
 fn divider() -> Color32 {
     crate::theme::current().divider.to_color32()
 }
-fn dim() -> Color32 {
-    crate::theme::current().text_muted.to_color32()
-}
 fn primary() -> Color32 {
     crate::theme::current().text.to_color32()
 }

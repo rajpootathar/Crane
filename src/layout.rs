@@ -1,6 +1,6 @@
 use crate::terminal::Terminal;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub type PaneId = u64;
 
@@ -37,7 +37,9 @@ impl FileTab {
 pub struct FilesPane {
     pub tabs: Vec<FileTab>,
     pub active: usize,
+    #[allow(dead_code)] // kept for session schema compat
     pub input_buf: String,
+    #[allow(dead_code)] // kept for session schema compat
     pub error: Option<String>,
 }
 
@@ -89,7 +91,9 @@ pub struct DiffPane {
     pub right_path: String,
     pub left_text: String,
     pub right_text: String,
+    #[allow(dead_code)] // kept for session schema compat
     pub left_buf: String,
+    #[allow(dead_code)] // kept for session schema compat
     pub right_buf: String,
     pub error: Option<String>,
 }
@@ -120,6 +124,7 @@ impl PaneContent {
 }
 
 pub struct Pane {
+    #[allow(dead_code)] // redundant with HashMap key, kept for session round-trip
     pub id: PaneId,
     pub title: String,
     pub content: PaneContent,
@@ -204,14 +209,6 @@ impl Layout {
         if let Ok(term) = Terminal::spawn(ctx.clone(), 80, 24, Some(&cwd)) {
             self.add_pane(PaneContent::Terminal(term), Some(dir));
         }
-    }
-
-    pub fn set_cwd(&mut self, cwd: PathBuf) {
-        self.cwd = cwd;
-    }
-
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
     }
 
     pub fn next_pane_id(&self) -> PaneId {
