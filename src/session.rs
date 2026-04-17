@@ -3,7 +3,7 @@ use crate::state::{
 };
 use crate::update_check::{PromptState, UpdateCheck};
 use crate::layout::{
-    BrowserPane, DiffPane, Dir, FileTab, FilesPane, Layout, MarkdownPane, Node, Pane,
+    self, BrowserPane, DiffPane, Dir, FileTab, FilesPane, Layout, MarkdownPane, Node, Pane,
     PaneContent, PaneId,
 };
 use serde::{Deserialize, Serialize};
@@ -233,17 +233,39 @@ impl Session {
 
 impl STab {
     fn from_tab(t: &Tab) -> Self {
+        // Diff panes are transient by design — never persist them. Prune their
+        // IDs from both the pane map and the layout tree so we never restore
+        // with an empty Diff pane hanging around.
+        let diff_ids: Vec<PaneId> = t
+            .layout
+            .panes
+            .iter()
+            .filter(|(_, p)| matches!(p.content, PaneContent::Diff(_)))
+            .map(|(id, _)| *id)
+            .collect();
+
         let panes: Vec<SPane> = t
             .layout
             .panes
             .iter()
+            .filter(|(id, _)| !diff_ids.contains(id))
             .map(|(id, p)| SPane::from_pane(*id, p))
             .collect();
+
+        let mut pruned_root = t.layout.root.clone();
+        for id in &diff_ids {
+            if let Some(root) = pruned_root.take() {
+                let (new_root, _) = layout::prune_leaf(root, *id);
+                pruned_root = new_root;
+            }
+        }
+        let pruned_focus = t.layout.focus.filter(|f| !diff_ids.contains(f));
+
         STab {
             id: t.id,
             name: t.name.clone(),
-            layout: t.layout.root.as_ref().map(SNode::from_node),
-            focus: t.layout.focus,
+            layout: pruned_root.as_ref().map(SNode::from_node),
+            focus: pruned_focus,
             next_pane_id: t.layout.next_pane_id(),
             panes,
         }

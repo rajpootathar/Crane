@@ -56,7 +56,10 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
     let diff = TextDiff::from_lines(&pane.left_text, &pane.right_text);
     let font = FontId::new(font_size, FontFamily::Monospace);
 
-    ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
+    ScrollArea::both()
+        .auto_shrink([false; 2])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .show(ui, |ui| {
         for change in diff.iter_all_changes() {
             let (sign, fg, bg) = match change.tag() {
                 ChangeTag::Delete => ("-", DEL_FG, Some(DEL_BG)),

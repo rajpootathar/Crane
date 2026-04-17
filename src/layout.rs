@@ -10,6 +10,7 @@ pub enum Dir {
     Vertical,
 }
 
+#[derive(Clone)]
 pub enum Node {
     Leaf(PaneId),
     Split {
@@ -340,6 +341,31 @@ impl Layout {
             set_ratio(root, path, ratio.clamp(0.05, 0.95));
         }
     }
+
+    pub fn swap_panes(&mut self, a: PaneId, b: PaneId) {
+        if a == b {
+            return;
+        }
+        if let Some(root) = self.root.as_mut() {
+            swap_leaves(root, a, b);
+        }
+    }
+}
+
+fn swap_leaves(node: &mut Node, a: PaneId, b: PaneId) {
+    match node {
+        Node::Leaf(id) => {
+            if *id == a {
+                *id = b;
+            } else if *id == b {
+                *id = a;
+            }
+        }
+        Node::Split { first, second, .. } => {
+            swap_leaves(first, a, b);
+            swap_leaves(second, a, b);
+        }
+    }
 }
 
 fn split_at(node: Node, target: PaneId, new_pane: PaneId, dir: Dir) -> Node {
@@ -363,6 +389,10 @@ fn split_at(node: Node, target: PaneId, new_pane: PaneId, dir: Dir) -> Node {
             ratio,
         },
     }
+}
+
+pub fn prune_leaf(node: Node, target: PaneId) -> (Option<Node>, Option<PaneId>) {
+    remove_node(node, target)
 }
 
 fn remove_node(node: Node, target: PaneId) -> (Option<Node>, Option<PaneId>) {

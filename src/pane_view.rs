@@ -17,11 +17,15 @@ const HEADER_FG_DIM: Color32 = Color32::from_rgb(130, 136, 150);
 const CLOSE_HOVER_BG: Color32 = Color32::from_rgb(180, 60, 60);
 const SPLITTER_COLOR: Color32 = Color32::from_rgb(22, 25, 36);
 
+#[derive(Clone, Copy)]
+struct DragPayload(PaneId);
+
 pub enum PaneAction {
     None,
     Focus(PaneId),
     Close(PaneId),
     ResizeSplit { path: Vec<usize>, ratio: f32 },
+    SwapPanes { a: PaneId, b: PaneId },
 }
 
 pub fn render_layout(
@@ -143,10 +147,45 @@ fn render_pane(
         INACTIVE_BORDER
     };
 
+    let drag_payload = egui::DragAndDrop::payload::<DragPayload>(ui.ctx());
+    let pointer_in = ui.input(|i| {
+        i.pointer
+            .hover_pos()
+            .map(|p| rect.contains(p))
+            .unwrap_or(false)
+    });
+    let is_drop_target = drag_payload
+        .as_ref()
+        .map(|p| p.0 != id && pointer_in)
+        .unwrap_or(false);
+    let released = ui.input(|i| i.pointer.any_released());
+
+    if is_drop_target {
+        ui.painter().rect_filled(
+            rect,
+            4.0,
+            Color32::from_rgba_unmultiplied(96, 140, 220, 40),
+        );
+    }
+
+    if is_drop_target && released {
+        if let Some(payload) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx()) {
+            if payload.0 != id {
+                *action = PaneAction::SwapPanes { a: payload.0, b: id };
+            }
+        }
+    }
+
+    let border = if is_drop_target {
+        Color32::from_rgb(96, 140, 220)
+    } else {
+        border_color
+    };
+    let border_w = if is_drop_target { 2.0 } else { BORDER_W };
     ui.painter().rect_stroke(
         rect,
         4.0,
-        Stroke::new(BORDER_W, border_color),
+        Stroke::new(border_w, border),
         StrokeKind::Inside,
     );
 
@@ -240,7 +279,20 @@ fn render_header(
         Pos2::new(rect.min.x + 10.0, rect.min.y),
         Pos2::new(close_rect.min.x - 6.0, rect.max.y),
     );
-    let title_response = ui.interact(title_rect, egui::Id::new(("header", id)), Sense::click());
+    let title_response = ui.interact(
+        title_rect,
+        egui::Id::new(("header", id)),
+        Sense::click_and_drag(),
+    );
+    if title_response.drag_started() {
+        egui::DragAndDrop::set_payload(ui.ctx(), DragPayload(id));
+    }
+    if title_response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    if title_response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
     if title_response.clicked() {
         *action = PaneAction::Focus(id);
     }

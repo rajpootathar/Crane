@@ -314,6 +314,9 @@ impl eframe::App for CraneApp {
                     PaneAction::ResizeSplit { path, ratio } => {
                         ws.set_split_ratio(&path, ratio);
                     }
+                    PaneAction::SwapPanes { a, b } => {
+                        ws.swap_panes(a, b);
+                    }
                 }
             }
         } else {
