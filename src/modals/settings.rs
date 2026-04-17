@@ -6,12 +6,22 @@ const SIDEBAR_W: f32 = 200.0;
 const WIN_W: f32 = 780.0;
 const WIN_H: f32 = 520.0;
 
-pub fn render(ctx: &egui::Context, app: &mut App, apply_style: impl FnOnce(&egui::Context)) {
+pub enum SettingsEffect {
+    None,
+    ReloadFonts,
+}
+
+pub fn render(
+    ctx: &egui::Context,
+    app: &mut App,
+    apply_style: impl FnOnce(&egui::Context),
+) -> SettingsEffect {
     if !app.show_settings {
-        return;
+        return SettingsEffect::None;
     }
     let mut open = true;
     let mut theme_change: Option<String> = None;
+    let mut effect = SettingsEffect::None;
 
     egui::Window::new("Settings")
         .collapsible(false)
@@ -20,19 +30,23 @@ pub fn render(ctx: &egui::Context, app: &mut App, apply_style: impl FnOnce(&egui
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .open(&mut open)
         .show(ctx, |ui| {
+            let content_h = ui.available_height();
             ui.horizontal_top(|ui| {
-                render_sidebar(ui, app);
+                render_sidebar(ui, app, content_h);
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    ui.set_min_height(WIN_H - 48.0);
+                    ui.set_min_height(content_h);
+                    ui.set_max_height(content_h);
                     match app.settings_section {
                         SettingsSection::Appearance => {
-                            render_appearance(ui, app, &mut theme_change)
+                            if render_appearance(ui, app, &mut theme_change) {
+                                effect = SettingsEffect::ReloadFonts;
+                            }
                         }
-                        SettingsSection::Editor => render_editor(ui, app),
-                        SettingsSection::Terminal => render_terminal(ui, app),
+                        SettingsSection::Editor => render_editor(ui),
+                        SettingsSection::Terminal => render_terminal(ui),
                         SettingsSection::Shortcuts => render_shortcuts(ui),
                         SettingsSection::About => render_about(ui, app),
                     }
@@ -51,12 +65,13 @@ pub fn render(ctx: &egui::Context, app: &mut App, apply_style: impl FnOnce(&egui
         apply_style(ctx);
         ctx.request_repaint();
     }
+    effect
 }
 
-fn render_sidebar(ui: &mut egui::Ui, app: &mut App) {
+fn render_sidebar(ui: &mut egui::Ui, app: &mut App, content_h: f32) {
     ui.vertical(|ui| {
         ui.set_width(SIDEBAR_W);
-        ui.set_min_height(WIN_H - 48.0);
+        ui.set_min_height(content_h);
         ui.add_space(4.0);
         for section in SettingsSection::ALL {
             let selected = app.settings_section == *section;
@@ -111,11 +126,89 @@ fn render_sidebar(ui: &mut egui::Ui, app: &mut App) {
 
 fn render_appearance(
     ui: &mut egui::Ui,
-    app: &App,
+    app: &mut App,
     theme_change: &mut Option<String>,
-) {
+) -> bool {
     section_title(ui, "Appearance");
+    let mut reload_fonts = false;
+    ui.add_space(6.0);
+
+    // --- Fonts & scale section (compact rows) ---
+    setting_row(ui, "UI scale", |ui| {
+        ui.scope(|ui| {
+            let v = ui.visuals_mut();
+            v.widgets.inactive.bg_fill = theme::current().surface_alt.to_color32();
+            v.widgets.hovered.bg_fill = theme::current().surface_hi.to_color32();
+            v.widgets.active.bg_fill = theme::current().accent.to_color32();
+            let mut s = app.ui_scale;
+            let resp = ui.add(
+                egui::Slider::new(&mut s, 0.85..=1.3)
+                    .step_by(0.05)
+                    .trailing_fill(true)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                    .custom_parser(|s| s.trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)),
+            );
+            if resp.changed() {
+                app.ui_scale = s;
+                ui.ctx().set_zoom_factor(s);
+            }
+        });
+        if ui.small_button("Reset").clicked() {
+            app.ui_scale = 1.0;
+            ui.ctx().set_zoom_factor(1.0);
+        }
+    });
     ui.add_space(4.0);
+    setting_row(ui, "Editor / Terminal font size", |ui| {
+        ui.scope(|ui| {
+            let v = ui.visuals_mut();
+            v.widgets.inactive.bg_fill = theme::current().surface_alt.to_color32();
+            v.widgets.hovered.bg_fill = theme::current().surface_hi.to_color32();
+            v.widgets.active.bg_fill = theme::current().accent.to_color32();
+            ui.add(
+                egui::Slider::new(&mut app.font_size, 9.0..=28.0)
+                    .step_by(1.0)
+                    .trailing_fill(true),
+            );
+        });
+        if ui.small_button("Reset").clicked() {
+            app.font_size = 14.0;
+        }
+    });
+    ui.add_space(4.0);
+    setting_row(ui, "Monospace font", |ui| {
+        let name = app
+            .custom_mono_font
+            .as_deref()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(p)
+                    .to_string()
+            })
+            .unwrap_or_else(|| "Default".to_string());
+        ui.label(
+            RichText::new(name)
+                .size(12.0)
+                .color(theme::current().text_muted.to_color32()),
+        );
+        if ui.small_button("Choose…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Choose monospace .ttf / .otf")
+                .add_filter("Font", &["ttf", "otf", "TTF", "OTF"])
+                .pick_file()
+        {
+            app.custom_mono_font = Some(path.to_string_lossy().to_string());
+            reload_fonts = true;
+        }
+        if app.custom_mono_font.is_some() && ui.small_button("Reset").clicked() {
+            app.custom_mono_font = None;
+            reload_fonts = true;
+        }
+    });
+
+    ui.add_space(12.0);
     ui.label(
         RichText::new("Theme")
             .size(12.5)
@@ -123,9 +216,12 @@ fn render_appearance(
             .strong(),
     );
     ui.add_space(4.0);
+    let footer_h = 62.0;
+    let avail = ui.available_height() - footer_h;
     egui::ScrollArea::vertical()
         .id_salt("settings_themes")
-        .max_height(WIN_H - 220.0)
+        .max_height(avail.max(120.0))
+        .auto_shrink([false; 2])
         .show(ui, |ui| {
             for t in theme::load_all() {
                 let is_active = app.selected_theme == t.name;
@@ -197,30 +293,45 @@ fn render_appearance(
         let _ = std::fs::create_dir_all(&dir);
         super::open_in_file_manager(&dir);
     }
+    reload_fonts
 }
 
-fn render_editor(ui: &mut egui::Ui, app: &mut App) {
+fn render_editor(ui: &mut egui::Ui) {
     section_title(ui, "Editor");
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("Font size")
-                .size(12.5)
-                .color(theme::current().text.to_color32()),
-        );
-        ui.add(egui::Slider::new(&mut app.font_size, 9.0..=28.0).step_by(1.0));
-        if ui.small_button("Reset").clicked() {
-            app.font_size = 14.0;
-        }
-    });
-    ui.add_space(12.0);
+    ui.add_space(10.0);
     placeholder(
         ui,
-        "Syntax colour overrides, tab width, and cursor style will land here.",
+        "Syntax colour overrides, tab width, word-wrap, and cursor style will land here.",
     );
 }
 
-fn render_terminal(ui: &mut egui::Ui, _app: &mut App) {
+fn setting_row(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::default()
+        .fill(theme::current().surface.to_color32())
+        .stroke(egui::Stroke::new(
+            1.0,
+            theme::current().border.to_color32(),
+        ))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(
+                    RichText::new(label)
+                        .size(12.5)
+                        .color(theme::current().text.to_color32())
+                        .strong(),
+                );
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    content,
+                );
+            });
+        });
+}
+
+fn render_terminal(ui: &mut egui::Ui) {
     section_title(ui, "Terminal");
     ui.add_space(8.0);
     placeholder(

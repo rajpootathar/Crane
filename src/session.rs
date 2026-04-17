@@ -30,6 +30,14 @@ pub struct Session {
     pub update_prompts: std::collections::HashMap<String, PromptState>,
     #[serde(default = "default_theme_name")]
     pub selected_theme: String,
+    #[serde(default)]
+    pub custom_mono_font: Option<String>,
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+}
+
+fn default_ui_scale() -> f32 {
+    1.0
 }
 
 fn default_theme_name() -> String {
@@ -172,6 +180,8 @@ impl Session {
             next_tab: app.next_tab_id(),
             update_prompts: app.update_check.prompts.clone(),
             selected_theme: app.selected_theme.clone(),
+            custom_mono_font: app.custom_mono_font.clone(),
+            ui_scale: app.ui_scale,
         }
     }
 
@@ -221,6 +231,8 @@ impl Session {
         app.set_id_counters(self.next_project, self.next_workspace, self.next_tab);
         app.update_check = UpdateCheck::new(self.update_prompts);
         app.selected_theme = self.selected_theme;
+        app.custom_mono_font = self.custom_mono_font;
+        app.ui_scale = self.ui_scale.clamp(0.75, 1.5);
         app
     }
 }

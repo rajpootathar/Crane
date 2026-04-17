@@ -169,11 +169,25 @@ fn terminal_is_running(app: &App, id: layout::PaneId) -> bool {
     }
 }
 
+pub fn load_fonts(ctx: &egui::Context, custom_mono: Option<&str>) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    if let Some(path) = custom_mono
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        let name = "user_mono".to_string();
+        fonts
+            .font_data
+            .insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            mono.insert(0, name);
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
 impl CraneApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-        cc.egui_ctx.set_fonts(fonts);
         cc.egui_ctx
             .request_repaint_after(std::time::Duration::from_millis(1500));
         let mut app = match session::load() {
@@ -185,6 +199,8 @@ impl CraneApp {
         let initial = theme::find_by_name(&app.selected_theme)
             .unwrap_or_else(theme::Theme::dark);
         theme::init(initial);
+        load_fonts(&cc.egui_ctx, app.custom_mono_font.as_deref());
+        cc.egui_ctx.set_zoom_factor(app.ui_scale);
         apply_style(&cc.egui_ctx);
         app.update_check.spawn_check(cc.egui_ctx.clone());
         Self {
@@ -448,7 +464,10 @@ impl eframe::App for CraneApp {
 
         render_new_workspace_modal(&ctx, &mut self.app);
         render_help_modal(&ctx, &mut self.app);
-        render_settings_modal(&ctx, &mut self.app, apply_style);
+        let settings_effect = render_settings_modal(&ctx, &mut self.app, apply_style);
+        if matches!(settings_effect, modals::settings::SettingsEffect::ReloadFonts) {
+            load_fonts(&ctx, self.app.custom_mono_font.as_deref());
+        }
         self.render_confirm_close(&ctx);
         self.app.update_check.drain();
         render_update_toast(&ctx, &mut self.app);
