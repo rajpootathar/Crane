@@ -14,10 +14,42 @@ static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
 static THEMES: OnceLock<ThemeSet> = OnceLock::new();
 
 fn syntaxes() -> &'static SyntaxSet {
-    SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines)
+    SYNTAXES.get_or_init(|| {
+        let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+        // User-dropped `.sublime-syntax` / `.tmLanguage` packages in
+        // ~/.crane/syntaxes/ get folded in so Babel/TSX/custom grammars
+        // work without recompiling.
+        if let Ok(home) = std::env::var("HOME") {
+            let dir = std::path::PathBuf::from(format!("{home}/.crane/syntaxes"));
+            if dir.is_dir() {
+                let _ = builder.add_from_folder(&dir, true);
+            }
+        }
+        builder.build()
+    })
 }
 fn themes() -> &'static ThemeSet {
     THEMES.get_or_init(ThemeSet::load_defaults)
+}
+
+/// Map file extension to a syntax name, with sensible fallbacks for flavours
+/// (TSX→TypeScript, JSX→JavaScript, etc.) when a dedicated syntax isn't loaded.
+fn find_syntax_for_ext(ext: &str) -> &'static syntect::parsing::SyntaxReference {
+    let ss = syntaxes();
+    if let Some(syn) = ss.find_syntax_by_extension(ext) {
+        return syn;
+    }
+    let fallback = match ext {
+        "tsx" | "mts" | "cts" => "TypeScript",
+        "jsx" | "mjs" | "cjs" => "JavaScript",
+        "vue" | "svelte" | "astro" => "HTML",
+        "zsh" | "fish" | "bash" => "Bourne Again Shell (bash)",
+        "h" => "C",
+        "hpp" | "hh" | "hxx" | "cc" | "cxx" => "C++",
+        _ => "Plain Text",
+    };
+    ss.find_syntax_by_name(fallback)
+        .unwrap_or_else(|| ss.find_syntax_plain_text())
 }
 
 pub fn render(
@@ -138,9 +170,7 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        let syntax: &'static syntect::parsing::SyntaxReference = syntaxes()
-            .find_syntax_by_extension(ext)
-            .unwrap_or_else(|| syntaxes().find_syntax_plain_text());
+        let syntax: &'static syntect::parsing::SyntaxReference = find_syntax_for_ext(ext);
         let bg = theme::current().bg;
         let is_light = bg.r as u32 + bg.g as u32 + bg.b as u32 > 128 * 3;
         let st_theme: &'static syntect::highlighting::Theme = if is_light {
