@@ -23,7 +23,14 @@ pub enum Node {
 pub struct FileTab {
     pub path: String,
     pub content: String,
+    pub original_content: String,
     pub name: String,
+}
+
+impl FileTab {
+    pub fn dirty(&self) -> bool {
+        self.content != self.original_content
+    }
 }
 
 pub struct FilesPane {
@@ -48,7 +55,12 @@ impl FilesPane {
             self.active = idx;
             return;
         }
-        self.tabs.push(FileTab { path, content, name });
+        self.tabs.push(FileTab {
+            path,
+            original_content: content.clone(),
+            content,
+            name,
+        });
         self.active = self.tabs.len() - 1;
     }
 
@@ -199,6 +211,63 @@ impl Workspace {
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    pub fn next_pane_id(&self) -> PaneId {
+        self.next_id
+    }
+
+    pub fn set_next_pane_id(&mut self, id: PaneId) {
+        self.next_id = id.max(self.next_id);
+    }
+
+    pub fn open_or_replace_diff(
+        &mut self,
+        left_path: String,
+        right_path: String,
+        left_text: String,
+        right_text: String,
+        title: String,
+    ) {
+        let existing = self
+            .panes
+            .iter()
+            .find(|(_, p)| matches!(p.content, PaneContent::Diff(_)))
+            .map(|(id, _)| *id);
+        match existing {
+            Some(pid) => {
+                if let Some(pane) = self.panes.get_mut(&pid) {
+                    pane.title = title;
+                    if let PaneContent::Diff(diff) = &mut pane.content {
+                        diff.left_path = left_path;
+                        diff.right_path = right_path;
+                        diff.left_text = left_text;
+                        diff.right_text = right_text;
+                        diff.error = None;
+                    }
+                }
+                self.focus = Some(pid);
+            }
+            None => {
+                self.add_pane(
+                    PaneContent::Diff(DiffPane {
+                        left_path,
+                        right_path,
+                        left_text,
+                        right_text,
+                        left_buf: String::new(),
+                        right_buf: String::new(),
+                        error: None,
+                    }),
+                    Some(Dir::Horizontal),
+                );
+                if let Some(focus) = self.focus {
+                    if let Some(pane) = self.panes.get_mut(&focus) {
+                        pane.title = title;
+                    }
+                }
+            }
+        }
     }
 
     pub fn open_file_in_files_pane(&mut self, path: String, name: String, content: String) {

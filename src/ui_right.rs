@@ -108,6 +108,8 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     let mut stage_path: Option<String> = None;
     let mut unstage_path: Option<String> = None;
     let mut open_diff: Option<String> = None;
+    let mut toggle_dir: Option<String> = None;
+    let collapsed = app.collapsed_change_dirs.clone();
 
     egui::ScrollArea::vertical()
         .id_salt("right_changes")
@@ -130,33 +132,42 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                 section_header(ui, "STAGED");
                 render_change_tree(
                     ui,
+                    "stg",
                     &staged,
                     true,
+                    &collapsed,
                     &mut unstage_path,
                     &mut stage_path,
                     &mut open_diff,
+                    &mut toggle_dir,
                 );
             }
             if !unstaged.is_empty() {
                 section_header(ui, "UNSTAGED");
                 render_change_tree(
                     ui,
+                    "unstg",
                     &unstaged,
                     false,
+                    &collapsed,
                     &mut unstage_path,
                     &mut stage_path,
                     &mut open_diff,
+                    &mut toggle_dir,
                 );
             }
             if !untracked.is_empty() {
                 section_header(ui, "UNTRACKED");
                 render_change_tree(
                     ui,
+                    "untr",
                     &untracked,
                     false,
+                    &collapsed,
                     &mut unstage_path,
                     &mut stage_path,
                     &mut open_diff,
+                    &mut toggle_dir,
                 );
             }
 
@@ -173,50 +184,114 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
         ],
         egui::Stroke::new(1.0, Color32::from_rgb(36, 40, 52)),
     );
-    ui.add_space(6.0);
-    section_header(ui, "COMMIT");
-    ui.add_space(2.0);
+    ui.add_space(8.0);
+
+    let staged_count = status.changes.iter().filter(|c| c.staged).count();
+    let has_staged = staged_count > 0;
+    let has_message = !app.commit_message.trim().is_empty();
+    let can_commit = has_staged && has_message;
+
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        ui.add(
+        let text_resp = ui.add(
             egui::TextEdit::multiline(&mut app.commit_message)
-                .hint_text("message")
+                .hint_text("Commit message")
                 .desired_rows(2)
-                .desired_width(WIDTH - 24.0),
+                .desired_width(WIDTH - 28.0)
+                .font(egui::FontId::new(12.0, egui::FontFamily::Proportional)),
         );
+        if text_resp.has_focus() {
+            let submit = ui.input(|i| {
+                i.key_pressed(egui::Key::Enter)
+                    && (i.modifiers.command || i.modifiers.mac_cmd)
+            });
+            if submit && can_commit {
+                do_commit(app, &repo_path, false);
+            }
+        }
     });
-    ui.add_space(4.0);
-    let mut commit_clicked = false;
-    let mut push_clicked = false;
+
+    ui.add_space(6.0);
+
+    let mut action_commit = false;
+    let mut action_commit_push = false;
+    let mut action_push = false;
+    let mut action_pull = false;
+
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        commit_clicked = full_width_primary_button(
-            ui,
-            Some(icons::CHECK),
-            "Commit",
-            "Commit staged changes",
-        )
-        .clicked();
+        ui.spacing_mut().item_spacing.x = 1.0;
+
+        let width = ui.available_width() - 20.0;
+        let primary_w = width - 30.0;
+
+        ui.scope(|ui| {
+            ui.add_enabled_ui(can_commit, |ui| {
+                let r = ui.add(
+                    egui::Button::new(
+                        RichText::new(format!("{}  Commit", icons::CHECK)).size(12.5),
+                    )
+                    .min_size(egui::vec2(primary_w, 28.0)),
+                );
+                if r.clicked() {
+                    action_commit = true;
+                }
+            });
+        });
+
+        let menu_resp = ui.add(
+            egui::Button::new(RichText::new(icons::CARET_DOWN).size(12.0))
+                .min_size(egui::vec2(30.0, 28.0)),
+        );
+        egui::Popup::menu(&menu_resp).show(|ui| {
+            ui.set_min_width(180.0);
+            let commit_btn = egui::Button::new(
+                RichText::new(format!("{}  Commit", icons::CHECK)).size(12.0),
+            )
+            .min_size(egui::vec2(ui.available_width(), 24.0));
+            if ui.add_enabled(can_commit, commit_btn).clicked() {
+                action_commit = true;
+            }
+            let commit_push = egui::Button::new(
+                RichText::new(format!("{}  Commit & Push", icons::ARROW_UP))
+                    .size(12.0),
+            )
+            .min_size(egui::vec2(ui.available_width(), 24.0));
+            if ui.add_enabled(can_commit, commit_push).clicked() {
+                action_commit_push = true;
+            }
+            ui.separator();
+            let push_btn = egui::Button::new(
+                RichText::new(format!("{}  Push", icons::ARROW_UP)).size(12.0),
+            )
+            .min_size(egui::vec2(ui.available_width(), 24.0));
+            if ui.add(push_btn).clicked() {
+                action_push = true;
+            }
+            let pull_btn = egui::Button::new(
+                RichText::new(format!("{}  Pull", icons::ARROW_DOWN)).size(12.0),
+            )
+            .min_size(egui::vec2(ui.available_width(), 24.0));
+            if ui.add(pull_btn).clicked() {
+                action_pull = true;
+            }
+        });
     });
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        push_clicked = ghost_button(
-            ui,
-            Some(icons::ARROW_UP),
-            "Push",
-            "Push to origin",
-        )
-        .clicked();
-    });
+
     if let Some(err) = &app.git_error {
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.add_space(10.0);
             ui.label(RichText::new(err).color(DEL).size(11.0));
         });
     }
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 
+    if let Some(dir) = toggle_dir {
+        if !app.collapsed_change_dirs.remove(&dir) {
+            app.collapsed_change_dirs.insert(dir);
+        }
+    }
     if let Some(path) = stage_path {
         match git::stage(&repo_path, &path) {
             Ok(()) => {
@@ -238,26 +313,49 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     if let Some(path) = open_diff {
         open_file_diff(app, &repo_path, &path);
     }
-    if commit_clicked {
-        let msg = app.commit_message.trim().to_string();
-        if msg.is_empty() {
-            app.git_error = Some("Commit message is empty".into());
-        } else {
-            match git::commit(&repo_path, &msg) {
-                Ok(()) => {
-                    app.commit_message.clear();
-                    app.git_error = None;
-                    force_status_refresh(app);
-                }
-                Err(e) => app.git_error = Some(e),
+    if action_commit {
+        do_commit(app, &repo_path, false);
+    } else if action_commit_push {
+        do_commit(app, &repo_path, true);
+    } else if action_push {
+        do_push(app, &repo_path);
+    } else if action_pull {
+        match git::pull(&repo_path) {
+            Ok(()) => {
+                app.git_error = None;
+                force_status_refresh(app);
             }
-        }
-    }
-    if push_clicked {
-        match git::push(&repo_path) {
-            Ok(()) => app.git_error = None,
             Err(e) => app.git_error = Some(e),
         }
+    }
+}
+
+fn do_commit(app: &mut App, repo: &std::path::Path, then_push: bool) {
+    let msg = app.commit_message.trim().to_string();
+    if msg.is_empty() {
+        app.git_error = Some("Commit message is empty".into());
+        return;
+    }
+    match git::commit(repo, &msg) {
+        Ok(()) => {
+            app.commit_message.clear();
+            app.git_error = None;
+            force_status_refresh(app);
+            if then_push {
+                do_push(app, repo);
+            }
+        }
+        Err(e) => app.git_error = Some(e),
+    }
+}
+
+fn do_push(app: &mut App, repo: &std::path::Path) {
+    match git::push(repo) {
+        Ok(()) => {
+            app.git_error = None;
+            force_status_refresh(app);
+        }
+        Err(e) => app.git_error = Some(e),
     }
 }
 
@@ -271,30 +369,21 @@ fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
     let full = repo.join(rel_path);
     let right_text = std::fs::read_to_string(&full).unwrap_or_default();
     let left_text = git::head_content(repo, rel_path);
+    let title = format!(
+        "diff: {}",
+        std::path::Path::new(rel_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(rel_path)
+    );
     if let Some(ws) = app.active_workspace() {
-        ws.add_pane(
-            PaneContent::Diff(DiffPane {
-                left_path: format!("HEAD:{rel_path}"),
-                right_path: rel_path.to_string(),
-                left_text,
-                right_text,
-                left_buf: String::new(),
-                right_buf: String::new(),
-                error: None,
-            }),
-            Some(Dir::Horizontal),
+        ws.open_or_replace_diff(
+            format!("HEAD:{rel_path}"),
+            rel_path.to_string(),
+            left_text,
+            right_text,
+            title,
         );
-        if let Some(focus) = ws.focus {
-            if let Some(p) = ws.panes.get_mut(&focus) {
-                p.title = format!(
-                    "diff: {}",
-                    std::path::Path::new(rel_path)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(rel_path)
-                );
-            }
-        }
     }
 }
 
@@ -326,36 +415,47 @@ fn build_tree(changes: &[&FileChange]) -> DirNode {
     root
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_change_tree(
     ui: &mut egui::Ui,
+    section: &str,
     changes: &[&FileChange],
     staged: bool,
+    collapsed: &std::collections::HashSet<String>,
     unstage_path: &mut Option<String>,
     stage_path: &mut Option<String>,
     open_diff: &mut Option<String>,
+    toggle_dir: &mut Option<String>,
 ) {
     let tree = build_tree(changes);
     render_change_node(
         ui,
+        section,
         &tree,
         "",
         0,
         staged,
+        collapsed,
         unstage_path,
         stage_path,
         open_diff,
+        toggle_dir,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_change_node(
     ui: &mut egui::Ui,
+    section: &str,
     node: &DirNode,
     prefix: &str,
     depth: usize,
     staged: bool,
+    collapsed: &std::collections::HashSet<String>,
     unstage_path: &mut Option<String>,
     stage_path: &mut Option<String>,
     open_diff: &mut Option<String>,
+    toggle_dir: &mut Option<String>,
 ) {
     for (dir_name, child) in &node.dirs {
         let child_prefix = if prefix.is_empty() {
@@ -366,21 +466,26 @@ fn render_change_node(
         if node.dirs.len() == 1 && child.files.is_empty() && !child.dirs.is_empty() {
             render_change_node(
                 ui,
+                section,
                 child,
                 &child_prefix,
                 depth,
                 staged,
+                collapsed,
                 unstage_path,
                 stage_path,
                 open_diff,
+                toggle_dir,
             );
             continue;
         }
-        draw_row(
+        let key = format!("{section}:{child_prefix}");
+        let is_collapsed = collapsed.contains(&key);
+        let row = draw_row(
             ui,
             RowConfig {
                 depth,
-                expanded: Some(true),
+                expanded: Some(!is_collapsed),
                 leading: Some(icons::FOLDER),
                 leading_color: Some(MUTED),
                 label: dir_name,
@@ -391,16 +496,24 @@ fn render_change_node(
                 trailing_count: 0,
             },
         );
-        render_change_node(
-            ui,
-            child,
-            &child_prefix,
-            depth + 1,
-            staged,
-            unstage_path,
-            stage_path,
-            open_diff,
-        );
+        if row.main_clicked {
+            *toggle_dir = Some(key.clone());
+        }
+        if !is_collapsed {
+            render_change_node(
+                ui,
+                section,
+                child,
+                &child_prefix,
+                depth + 1,
+                staged,
+                collapsed,
+                unstage_path,
+                stage_path,
+                open_diff,
+                toggle_dir,
+            );
+        }
     }
     for (file_name, change) in &node.files {
         let (glyph, glyph_color) = match change.status {
@@ -433,15 +546,14 @@ fn render_change_node(
             row.hovered,
             &[(trailing_icon, trailing_tip, 0)],
         );
-        if row.main_clicked {
-            *open_diff = Some(change.path.clone());
-        }
         if flags[0] {
             if staged {
                 *unstage_path = Some(change.path.clone());
             } else {
                 *stage_path = Some(change.path.clone());
             }
+        } else if row.main_clicked {
+            *open_diff = Some(change.path.clone());
         }
     }
 }

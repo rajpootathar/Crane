@@ -91,6 +91,7 @@ pub struct App {
     pub add_project_buf: String,
     pub font_size: f32,
     pub expanded_dirs: HashSet<PathBuf>,
+    pub collapsed_change_dirs: HashSet<String>,
     pub new_workspace_modal: Option<NewWorkspaceModal>,
     next_project: ProjectId,
     next_worktree: WorktreeId,
@@ -112,6 +113,7 @@ impl App {
             add_project_buf: String::new(),
             font_size: 14.0,
             expanded_dirs: HashSet::new(),
+            collapsed_change_dirs: HashSet::new(),
             new_workspace_modal: None,
             next_project: 1,
             next_worktree: 1,
@@ -126,6 +128,21 @@ impl App {
                 self.add_project_from_path(root, ctx);
             }
         }
+    }
+
+    pub fn next_project_id(&self) -> ProjectId {
+        self.next_project
+    }
+    pub fn next_worktree_id(&self) -> WorktreeId {
+        self.next_worktree
+    }
+    pub fn next_tab_id(&self) -> TabId {
+        self.next_tab
+    }
+    pub fn set_id_counters(&mut self, p: ProjectId, w: WorktreeId, t: TabId) {
+        self.next_project = p.max(self.next_project);
+        self.next_worktree = w.max(self.next_worktree);
+        self.next_tab = t.max(self.next_tab);
     }
 
     pub fn add_project_from_path(&mut self, path: PathBuf, ctx: &egui::Context) -> Option<ProjectId> {

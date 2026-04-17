@@ -1,5 +1,6 @@
 mod git;
 mod pane_view;
+mod session;
 mod state;
 mod terminal;
 mod terminal_view;
@@ -116,6 +117,8 @@ fn load_app_icon() -> Option<egui::IconData> {
 
 struct CraneApp {
     app: App,
+    last_saved_snapshot: String,
+    last_save_at: std::time::Instant,
 }
 
 impl CraneApp {
@@ -127,7 +130,33 @@ impl CraneApp {
         apply_style(&cc.egui_ctx);
         cc.egui_ctx
             .request_repaint_after(std::time::Duration::from_millis(1500));
-        Self { app: App::new() }
+        let app = match session::load() {
+            Some(s) => s.restore(&cc.egui_ctx),
+            None => App::new(),
+        };
+        Self {
+            app,
+            last_saved_snapshot: String::new(),
+            last_save_at: std::time::Instant::now(),
+        }
+    }
+
+    fn maybe_save(&mut self) {
+        if self.last_save_at.elapsed() < session::SAVE_DEBOUNCE {
+            return;
+        }
+        let snapshot = match serde_json::to_string(&session::Session::from_app(&self.app)) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if snapshot == self.last_saved_snapshot {
+            self.last_save_at = std::time::Instant::now();
+            return;
+        }
+        if session::save(&self.app).is_ok() {
+            self.last_saved_snapshot = snapshot;
+            self.last_save_at = std::time::Instant::now();
+        }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -289,6 +318,7 @@ impl eframe::App for CraneApp {
 
         render_new_workspace_modal(&ctx, &mut self.app);
         render_help_modal(&ctx, &mut self.app);
+        self.maybe_save();
     }
 }
 

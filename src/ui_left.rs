@@ -87,8 +87,8 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                     RowConfig {
                         depth: 0,
                         expanded: Some(project.expanded),
-                        leading: None,
-                        leading_color: None,
+                        leading: Some(icons::CUBE),
+                        leading_color: Some(ACCENT),
                         label: &project.name,
                         label_color: None,
                         is_active: false,
@@ -106,14 +106,12 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         (icons::X, "Remove project", 1),
                     ],
                 );
-                if row.main_clicked {
-                    toggle_project = Some(project.id);
-                }
                 if project_trailing[0] {
                     new_workspace_for_project = Some(project.id);
-                }
-                if project_trailing[1] {
+                } else if project_trailing[1] {
                     remove_project = Some(project.id);
+                } else if row.main_clicked {
+                    toggle_project = Some(project.id);
                 }
 
                 if project.expanded {
@@ -147,11 +145,10 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             wt_row.hovered,
                             &[(icons::PLUS, "New tab", 0)],
                         );
-                        if wt_row.main_clicked {
-                            toggle_worktree = Some((project.id, wt.id));
-                        }
                         if wt_trailing[0] {
                             new_tab_for_worktree = Some((project.id, wt.id));
+                        } else if wt_row.main_clicked {
+                            toggle_worktree = Some((project.id, wt.id));
                         }
 
                         if wt.expanded {
@@ -181,11 +178,10 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                     tab_row.hovered,
                                     &[(icons::X, "Close tab", 0)],
                                 );
-                                if tab_row.main_clicked {
-                                    set_active = Some((project.id, wt.id, tab.id));
-                                }
                                 if tab_trailing[0] {
                                     close_tab = Some((project.id, wt.id, tab.id));
+                                } else if tab_row.main_clicked {
+                                    set_active = Some((project.id, wt.id, tab.id));
                                 }
                             }
                         }

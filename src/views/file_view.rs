@@ -1,22 +1,6 @@
 use crate::workspace::FilesPane;
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
 use egui_phosphor::regular as icons;
-use std::path::Path;
-use std::sync::OnceLock;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Style, ThemeSet};
-use syntect::parsing::SyntaxSet;
-use syntect::util::LinesWithEndings;
-
-static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
-
-fn syntaxes() -> &'static SyntaxSet {
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-fn themes() -> &'static ThemeSet {
-    THEME_SET.get_or_init(ThemeSet::load_defaults)
-}
 
 pub fn render(
     ui: &mut egui::Ui,
@@ -50,6 +34,7 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
         return;
     }
 
+    // Tab bar
     let mut close_idx: Option<usize> = None;
     let mut activate_idx: Option<usize> = None;
     ui.horizontal(|ui| {
@@ -57,7 +42,12 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
         ui.add_space(4.0);
         for (idx, tab) in pane.tabs.iter().enumerate() {
             let is_active = idx == pane.active;
-            let (clicked, close_clicked) = draw_file_tab(ui, &tab.name, is_active, idx);
+            let label = if tab.dirty() {
+                format!("● {}", tab.name)
+            } else {
+                tab.name.clone()
+            };
+            let (clicked, close_clicked) = draw_file_tab(ui, &label, is_active, idx);
             if clicked {
                 activate_idx = Some(idx);
             }
@@ -71,30 +61,72 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
     }
     if let Some(idx) = close_idx {
         pane.close(idx);
+        if pane.tabs.is_empty() {
+            return;
+        }
     }
     ui.add_space(2.0);
 
-    if pane.tabs.is_empty() {
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("Click a file in the Files sidebar to open it here")
-                .color(Color32::from_rgb(130, 136, 150))
-                .size(11.5),
-        );
-        return;
-    }
-
     let active_idx = pane.active.min(pane.tabs.len() - 1);
     pane.active = active_idx;
-    let active = &pane.tabs[active_idx];
-    *title = format!("Files · {}", active.name);
 
-    ScrollArea::both()
-        .id_salt(("file_scroll", active_idx))
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            render_highlighted(ui, &active.content, &active.path, font_size)
+    // Save shortcut
+    let save_pressed = ui.input(|i| {
+        (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::S)
+    });
+
+    {
+        let tab = &mut pane.tabs[active_idx];
+        let name_label = if tab.dirty() {
+            format!("● {}", tab.name)
+        } else {
+            tab.name.clone()
+        };
+        *title = format!("Files · {name_label}");
+
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(&tab.path)
+                    .size(10.5)
+                    .color(Color32::from_rgb(130, 136, 150)),
+            );
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let save_btn = ui.add_enabled(
+                        tab.dirty(),
+                        egui::Button::new(
+                            RichText::new(format!("{}  Save", icons::FLOPPY_DISK))
+                                .size(11.5),
+                        )
+                        .min_size(egui::vec2(0.0, 24.0)),
+                    );
+                    if save_btn.clicked() || (save_pressed && tab.dirty()) {
+                        if let Err(e) = std::fs::write(&tab.path, &tab.content) {
+                            eprintln!("save failed: {e}");
+                        } else {
+                            tab.original_content = tab.content.clone();
+                        }
+                    }
+                },
+            );
         });
+        ui.add_space(2.0);
+
+        let font = FontId::new(font_size, FontFamily::Monospace);
+        ScrollArea::both()
+            .id_salt(("file_scroll", active_idx))
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                let editor = egui::TextEdit::multiline(&mut tab.content)
+                    .code_editor()
+                    .font(font)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(30);
+                ui.add(editor);
+            });
+    }
 }
 
 fn draw_file_tab(
@@ -172,41 +204,8 @@ fn draw_file_tab(
     if response.hovered() || close_response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    (response.clicked() && !close_response.hovered(), close_response.clicked())
-}
-
-fn render_highlighted(ui: &mut egui::Ui, content: &str, path: &str, font_size: f32) {
-    let syntaxes = syntaxes();
-    let themes = themes();
-    let theme = &themes.themes["base16-ocean.dark"];
-    let syntax = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .and_then(|e| syntaxes.find_syntax_by_extension(e))
-        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
-
-    let mut h = HighlightLines::new(syntax, theme);
-    let font = FontId::new(font_size, FontFamily::Monospace);
-
-    for line in LinesWithEndings::from(content) {
-        let ranges: Vec<(Style, &str)> = match h.highlight_line(line, syntaxes) {
-            Ok(r) => r,
-            Err(_) => vec![(Style::default(), line)],
-        };
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            for (style, text) in ranges {
-                let color = Color32::from_rgb(
-                    style.foreground.r,
-                    style.foreground.g,
-                    style.foreground.b,
-                );
-                ui.label(
-                    RichText::new(text.trim_end_matches('\n'))
-                        .color(color)
-                        .font(font.clone()),
-                );
-            }
-        });
-    }
+    (
+        response.clicked() && !close_response.hovered(),
+        close_response.clicked(),
+    )
 }

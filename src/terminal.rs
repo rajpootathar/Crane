@@ -37,11 +37,15 @@ impl EventListener for WakeListener {
     }
 }
 
+const HISTORY_MAX: usize = 256 * 1024;
+
 pub struct Terminal {
     pub term: Arc<Mutex<Term<WakeListener>>>,
     writer: Box<dyn Write + Send>,
     pub cols: usize,
     pub rows: usize,
+    pub cwd: std::path::PathBuf,
+    pub history: Arc<Mutex<Vec<u8>>>,
     master: Box<dyn MasterPty + Send>,
 }
 
@@ -95,7 +99,9 @@ impl Terminal {
             .take_writer()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+        let history = Arc::new(Mutex::new(Vec::<u8>::with_capacity(HISTORY_MAX / 2)));
         let term_clone = term.clone();
+        let history_clone = history.clone();
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let mut reader = reader;
@@ -108,6 +114,13 @@ impl Terminal {
                         let mut t = term_clone.lock();
                         processor.advance(&mut *t, &buf[..n]);
                         drop(t);
+                        let mut h = history_clone.lock();
+                        h.extend_from_slice(&buf[..n]);
+                        if h.len() > HISTORY_MAX {
+                            let drop_n = h.len() - HISTORY_MAX;
+                            h.drain(0..drop_n);
+                        }
+                        drop(h);
                         ctx_clone.request_repaint();
                     }
                     Err(_) => break,
@@ -120,8 +133,40 @@ impl Terminal {
             writer,
             cols,
             rows,
+            cwd: cwd.map(|p| p.to_path_buf()).unwrap_or_default(),
+            history,
             master: pair.master,
         })
+    }
+
+    /// Restore a terminal from saved scrollback bytes. Spawns a live shell in
+    /// the given cwd; then replays the saved bytes through the VT processor so
+    /// the grid shows the prior visual state. New input/output starts fresh.
+    pub fn spawn_with_history(
+        ctx: egui::Context,
+        cols: usize,
+        rows: usize,
+        cwd: Option<&Path>,
+        saved_history: &[u8],
+    ) -> std::io::Result<Self> {
+        let term = Self::spawn(ctx, cols, rows, cwd)?;
+        if !saved_history.is_empty() {
+            let mut processor: Processor<StdSyncHandler> = Processor::new();
+            let mut guard = term.term.lock();
+            processor.advance(&mut *guard, saved_history);
+            drop(guard);
+            let mut h = term.history.lock();
+            h.extend_from_slice(saved_history);
+            if h.len() > HISTORY_MAX {
+                let drop_n = h.len() - HISTORY_MAX;
+                h.drain(0..drop_n);
+            }
+        }
+        Ok(term)
+    }
+
+    pub fn history_snapshot(&self) -> Vec<u8> {
+        self.history.lock().clone()
     }
 
     pub fn write_input(&mut self, data: &[u8]) {

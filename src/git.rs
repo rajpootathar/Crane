@@ -200,6 +200,10 @@ pub fn push(repo: &Path) -> Result<(), String> {
     run(repo, &["push"])
 }
 
+pub fn pull(repo: &Path) -> Result<(), String> {
+    run(repo, &["pull", "--ff-only"])
+}
+
 pub fn worktree_add(repo: &Path, path: &Path, branch: &str, create_new: bool) -> Result<(), String> {
     let path_str = path.to_string_lossy();
     let mut args: Vec<&str> = vec!["worktree", "add"];

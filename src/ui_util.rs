@@ -260,7 +260,8 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
 }
 
 /// Draw up to N trailing icon buttons on the right edge of a row.
-/// Only visible when the row is hovered. Returns click flags in slot order.
+/// Always registers the hitbox so clicks work on the first hover frame;
+/// paints only when the row (or the button itself) is hovered.
 pub fn draw_trailing(
     ui: &mut Ui,
     rect: Rect,
@@ -268,9 +269,6 @@ pub fn draw_trailing(
     actions: &[(&str, &str, usize)],
 ) -> [bool; 4] {
     let mut out = [false; 4];
-    if !row_hovered {
-        return out;
-    }
     let size = 20.0;
     let mut x = rect.max.x - 8.0;
     for (icon, tip, slot) in actions.iter().rev() {
@@ -283,18 +281,20 @@ pub fn draw_trailing(
             .id()
             .with(("trailing", rect.min.x as i32, rect.min.y as i32, *slot));
         let resp = ui.interact(btn_rect, id, Sense::click()).on_hover_text(*tip);
-        let painter = ui.painter_at(btn_rect);
-        if resp.hovered() {
-            painter.rect_filled(btn_rect, 4.0, TRAILING_HOVER);
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        if row_hovered || resp.hovered() {
+            let painter = ui.painter_at(btn_rect);
+            if resp.hovered() {
+                painter.rect_filled(btn_rect, 4.0, TRAILING_HOVER);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            painter.text(
+                btn_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                *icon,
+                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                TEXT,
+            );
         }
-        painter.text(
-            btn_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            *icon,
-            egui::FontId::new(13.0, egui::FontFamily::Proportional),
-            TEXT,
-        );
         if resp.clicked() && *slot < 4 {
             out[*slot] = true;
         }
