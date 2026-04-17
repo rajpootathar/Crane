@@ -56,6 +56,9 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             app.show_right = !app.show_right;
         }
         ui.separator();
+        if icon_button(ui, icons::GEAR, 16.0, "Settings").clicked() {
+            app.show_settings = !app.show_settings;
+        }
         if icon_button(ui, icons::QUESTION, 16.0, "Keyboard shortcuts").clicked() {
             app.show_help = !app.show_help;
         }

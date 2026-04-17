@@ -14,13 +14,30 @@ pub const ROW_H: f32 = 26.0;
 pub const INDENT_W: f32 = 14.0;
 pub const CHEVRON_W: f32 = 14.0;
 
-pub const TEXT: Color32 = Color32::from_rgb(210, 214, 226);
-pub const MUTED: Color32 = Color32::from_rgb(150, 156, 172);
-pub const HEADER_FG: Color32 = Color32::from_rgb(140, 146, 162);
-pub const ACCENT: Color32 = Color32::from_rgb(96, 140, 220);
-pub const ROW_HOVER: Color32 = Color32::from_rgb(30, 34, 46);
-pub const ROW_ACTIVE: Color32 = Color32::from_rgb(48, 56, 80);
-pub const TRAILING_HOVER: Color32 = Color32::from_rgb(56, 62, 82);
+// Colour accessors — read from the active theme every call.
+// Previously these were const Color32 for the dark theme which stranded
+// light themes with white-on-white text.
+pub fn text() -> Color32 {
+    crate::theme::current().text.to_color32()
+}
+pub fn muted() -> Color32 {
+    crate::theme::current().text_muted.to_color32()
+}
+pub fn header_fg() -> Color32 {
+    crate::theme::current().text_header.to_color32()
+}
+pub fn accent() -> Color32 {
+    crate::theme::current().accent.to_color32()
+}
+pub fn row_hover() -> Color32 {
+    crate::theme::current().row_hover.to_color32()
+}
+pub fn row_active() -> Color32 {
+    crate::theme::current().row_active.to_color32()
+}
+pub fn trailing_hover() -> Color32 {
+    crate::theme::current().surface_alt.to_color32()
+}
 
 // --- Buttons ---
 
@@ -101,7 +118,7 @@ pub fn ghost_button(ui: &mut Ui, icon: Option<&str>, label: &str, tooltip: &str)
             v.widgets.hovered.bg_stroke = Stroke::NONE;
             v.widgets.active.bg_stroke = Stroke::NONE;
             ui.add(
-                egui::Button::new(RichText::new(text).size(BTN_TEXT_SIZE).color(MUTED))
+                egui::Button::new(RichText::new(text).size(BTN_TEXT_SIZE).color(muted()))
                     .min_size(Vec2::new(0.0, TEXT_BTN_H)),
             )
         })
@@ -120,7 +137,7 @@ pub fn section_header(ui: &mut Ui, label: &str) {
         ui.label(
             RichText::new(label)
                 .size(10.5)
-                .color(HEADER_FG)
+                .color(header_fg())
                 .strong(),
         );
     });
@@ -156,9 +173,9 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     let hovered = response.hovered();
 
     let bg = if cfg.is_active {
-        ROW_ACTIVE
+        row_active()
     } else if hovered {
-        ROW_HOVER
+        row_hover()
     } else {
         Color32::TRANSPARENT
     };
@@ -172,7 +189,7 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
                 Vec2::new(2.0, rect.height() - 6.0),
             ),
             1.0,
-            ACCENT,
+            accent(),
         );
     }
 
@@ -189,13 +206,13 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
             egui::Align2::CENTER_CENTER,
             glyph,
             egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            if cfg.is_active { TEXT } else { MUTED },
+            if cfg.is_active { text() } else { muted() },
         );
     }
     cursor_x += CHEVRON_W + 2.0;
 
     if let Some(leading) = cfg.leading {
-        let color = cfg.leading_color.unwrap_or(MUTED);
+        let color = cfg.leading_color.unwrap_or(muted());
         painter.text(
             Pos2::new(cursor_x + 8.0, rect.center().y),
             egui::Align2::CENTER_CENTER,
@@ -206,7 +223,7 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
         cursor_x += 18.0;
     }
 
-    let text_color = cfg.label_color.unwrap_or(TEXT);
+    let text_color = cfg.label_color.unwrap_or(text());
     painter.text(
         Pos2::new(cursor_x, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -284,7 +301,7 @@ pub fn draw_trailing(
         if row_hovered || resp.hovered() {
             let painter = ui.painter_at(btn_rect);
             if resp.hovered() {
-                painter.rect_filled(btn_rect, 4.0, TRAILING_HOVER);
+                painter.rect_filled(btn_rect, 4.0, trailing_hover());
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             painter.text(
@@ -292,7 +309,7 @@ pub fn draw_trailing(
                 egui::Align2::CENTER_CENTER,
                 *icon,
                 egui::FontId::new(13.0, egui::FontFamily::Proportional),
-                TEXT,
+                text(),
             );
         }
         if resp.clicked() && *slot < 4 {

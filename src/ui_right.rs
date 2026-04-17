@@ -2,7 +2,7 @@ use crate::git::{self, FileChange};
 use crate::state::{App, RightTab};
 use crate::ui_util::{
     draw_row, draw_trailing, section_header,
-    RowConfig, ACCENT, MUTED, TEXT,
+    RowConfig, accent, muted, text,
 };
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
@@ -44,7 +44,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut App) {
 }
 
 fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, mut on_click: impl FnMut()) {
-    let color = if active { TEXT } else { MUTED };
+    let color = if active { text() } else { muted() };
     let resp = ui
         .scope(|ui| {
             let v = ui.visuals_mut();
@@ -66,7 +66,7 @@ fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, mut on_click: impl FnM
                         egui::pos2(rect.min.x + 6.0, rect.max.y),
                         egui::pos2(rect.max.x - 6.0, rect.max.y),
                     ],
-                    egui::Stroke::new(2.0, ACCENT),
+                    egui::Stroke::new(2.0, accent()),
                 );
             }
             r
@@ -98,7 +98,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
         ui.add_space(12.0);
         ui.label(
             RichText::new(format!("{}  {}", icons::GIT_BRANCH, status.branch))
-                .color(MUTED)
+                .color(muted())
                 .size(11.5),
         );
     });
@@ -389,7 +389,7 @@ fn dim_row(ui: &mut egui::Ui, text: &str) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(12.0);
-        ui.label(RichText::new(text).color(MUTED).size(11.5));
+        ui.label(RichText::new(text).color(muted()).size(11.5));
     });
 }
 
@@ -485,9 +485,9 @@ fn render_change_node(
                 depth,
                 expanded: Some(!is_collapsed),
                 leading: Some(icons::FOLDER),
-                leading_color: Some(MUTED),
+                leading_color: Some(muted()),
                 label: dir_name,
-                label_color: Some(MUTED),
+                label_color: Some(muted()),
                 is_active: false,
                 active_bar: false,
                 badge: None,
@@ -516,9 +516,9 @@ fn render_change_node(
     for (file_name, change) in &node.files {
         let (glyph, glyph_color) = match change.status {
             git::ChangeStatus::Added => ("A", ADD),
-            git::ChangeStatus::Modified => ("M", ACCENT),
+            git::ChangeStatus::Modified => ("M", accent()),
             git::ChangeStatus::Deleted => ("D", DEL),
-            git::ChangeStatus::Renamed => ("R", ACCENT),
+            git::ChangeStatus::Renamed => ("R", accent()),
             git::ChangeStatus::Untracked => ("?", WARN),
         };
         let row = draw_row(
@@ -636,7 +636,7 @@ fn render_fs_dir(
                 depth,
                 expanded: if is_dir { Some(is_expanded) } else { None },
                 leading: Some(if is_dir { icons::FOLDER } else { icons::FILE }),
-                leading_color: Some(MUTED),
+                leading_color: Some(muted()),
                 label: &name,
                 label_color: None,
                 is_active: false,

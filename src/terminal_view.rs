@@ -1,13 +1,21 @@
 use crate::terminal::Terminal;
+use crate::theme;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 use egui::{Color32, FontFamily, FontId, Pos2, Rect, Sense, Vec2};
 
-const BG: Color32 = Color32::from_rgb(14, 16, 24);
-const FG: Color32 = Color32::from_rgb(176, 180, 192);
-const SELECTION_BG: Color32 = Color32::from_rgba_premultiplied(60, 110, 180, 120);
+fn term_bg() -> Color32 {
+    theme::current().terminal_bg.to_color32()
+}
+fn term_fg() -> Color32 {
+    theme::current().terminal_fg.to_color32()
+}
+fn selection_bg() -> Color32 {
+    let a = theme::current().accent;
+    Color32::from_rgba_premultiplied(a.r, a.g, a.b, 100)
+}
 
 fn point_in_selection(point: Point, range: &alacritty_terminal::selection::SelectionRange) -> bool {
     if range.is_block {
@@ -59,7 +67,9 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     );
     let origin = response.rect.min;
 
-    painter.rect_filled(response.rect, 0.0, BG);
+    let bg_theme = term_bg();
+    let fg_theme = term_fg();
+    painter.rect_filled(response.rect, 0.0, bg_theme);
 
     // I-beam over the terminal so it feels like selectable text.
     if response.hovered() {
@@ -143,12 +153,12 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         }
         let line = line as usize;
 
-        let x = origin.x + col as f32 * cell_w;
-        let y = origin.y + line as f32 * cell_h;
-        let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
+        let x = (origin.x + col as f32 * cell_w).round();
+        let y = (origin.y + line as f32 * cell_h).round();
+        let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w.round(), cell_h.round()));
 
         let bg = color_to_egui(cell.bg, false);
-        if bg != BG {
+        if bg != bg_theme {
             painter.rect_filled(rect, 0.0, bg);
         }
 
@@ -156,7 +166,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             .map(|sel| point_in_selection(point, &sel))
             .unwrap_or(false);
         if in_selection {
-            painter.rect_filled(rect, 0.0, SELECTION_BG);
+            painter.rect_filled(rect, 0.0, selection_bg());
         }
 
         if cell.c != ' ' && cell.c != '\0' {
@@ -180,12 +190,21 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         }
     }
 
-    let cx = origin.x + cursor_col as f32 * cell_w;
-    let cy = origin.y + cursor_line as f32 * cell_h;
+    // Snap cursor to integer pixels so it aligns with char cells. Subpixel
+    // drift accumulates on long lines and makes the cursor look "off by
+    // one" vs where the next character will print.
+    let cx = (origin.x + cursor_col as f32 * cell_w).round();
+    let cy = (origin.y + cursor_line as f32 * cell_h).round();
+    let cw = cell_w.round();
+    let ch = cell_h.round();
+    let cursor_color = {
+        let c = theme::current().terminal_fg;
+        Color32::from_rgba_unmultiplied(c.r, c.g, c.b, 130)
+    };
     painter.rect_filled(
-        Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(cell_w, cell_h)),
+        Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(cw, ch)),
         0.0,
-        Color32::from_rgba_unmultiplied(176, 180, 192, 120),
+        cursor_color,
     );
 
     if !has_focus {
@@ -266,18 +285,18 @@ fn color_to_egui(color: TermColor, is_fg: bool) -> Color32 {
             Color32::from_rgb(r, g, b)
         }
         TermColor::Named(named) => match named {
-            NamedColor::Foreground => FG,
-            NamedColor::Background => BG,
-            NamedColor::Cursor => FG,
+            NamedColor::Foreground => term_fg(),
+            NamedColor::Background => term_bg(),
+            NamedColor::Cursor => term_fg(),
             other => {
                 let idx = other as u16;
                 if idx < 16 {
                     let (r, g, b) = palette(idx as u8);
                     Color32::from_rgb(r, g, b)
                 } else if is_fg {
-                    FG
+                    term_fg()
                 } else {
-                    BG
+                    term_bg()
                 }
             }
         },

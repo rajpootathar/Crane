@@ -7,6 +7,7 @@ mod session;
 mod state;
 mod terminal;
 mod terminal_view;
+mod theme;
 mod ui_left;
 mod ui_right;
 mod ui_top;
@@ -18,10 +19,6 @@ use eframe::egui;
 use layout::Dir;
 use pane_view::PaneAction;
 use state::App;
-
-const BG: egui::Color32 = egui::Color32::from_rgb(14, 16, 24);
-const SIDEBAR_BG: egui::Color32 = egui::Color32::from_rgb(18, 20, 28);
-const DIVIDER: egui::Color32 = egui::Color32::from_rgb(36, 40, 52);
 
 fn main() -> eframe::Result {
     env_logger::init();
@@ -46,16 +43,23 @@ fn main() -> eframe::Result {
 }
 
 fn apply_style(ctx: &egui::Context) {
-    let mut style = (*ctx.global_style()).clone();
+    let t = theme::current();
+    let light = t.bg.r as u32 + t.bg.g as u32 + t.bg.b as u32 > 128 * 3;
+    ctx.set_visuals(if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    });
 
-    let surface_1 = egui::Color32::from_rgb(40, 45, 60);
-    let surface_2 = egui::Color32::from_rgb(56, 62, 82);
-    let surface_3 = egui::Color32::from_rgb(72, 80, 104);
-    let border_subtle = egui::Color32::from_rgb(60, 66, 86);
-    let border_strong = egui::Color32::from_rgb(96, 106, 132);
-    let text_primary = egui::Color32::from_rgb(212, 216, 228);
-    let text_hover = egui::Color32::from_rgb(234, 238, 248);
-    let accent = egui::Color32::from_rgb(90, 135, 220);
+    let mut style = (*ctx.global_style()).clone();
+    let surface_1 = t.surface.to_color32();
+    let surface_2 = t.surface_alt.to_color32();
+    let surface_3 = t.surface_hi.to_color32();
+    let border_subtle = t.border.to_color32();
+    let border_strong = t.border_strong.to_color32();
+    let text_primary = t.text.to_color32();
+    let text_hover = t.text_hover.to_color32();
+    let accent = t.accent.to_color32();
 
     let corner = egui::CornerRadius::same(6);
     for w in [
@@ -90,11 +94,11 @@ fn apply_style(ctx: &egui::Context) {
         egui::Stroke::new(1.0, text_hover);
 
     style.visuals.selection.bg_fill =
-        egui::Color32::from_rgba_unmultiplied(90, 135, 220, 70);
+        egui::Color32::from_rgba_unmultiplied(t.accent.r, t.accent.g, t.accent.b, 70);
     style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
 
     style.visuals.window_corner_radius = egui::CornerRadius::same(10);
-    style.visuals.window_fill = egui::Color32::from_rgb(22, 25, 36);
+    style.visuals.window_fill = t.surface.to_color32();
     style.visuals.window_stroke = egui::Stroke::new(1.0, border_subtle);
     style.visuals.menu_corner_radius = egui::CornerRadius::same(8);
 
@@ -126,17 +130,19 @@ struct CraneApp {
 
 impl CraneApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         cc.egui_ctx.set_fonts(fonts);
-        apply_style(&cc.egui_ctx);
         cc.egui_ctx
             .request_repaint_after(std::time::Duration::from_millis(1500));
         let mut app = match session::load() {
             Some(s) => s.restore(&cc.egui_ctx),
             None => App::new(),
         };
+        let initial = theme::find_by_name(&app.selected_theme)
+            .unwrap_or_else(theme::Theme::dark);
+        theme::init(initial);
+        apply_style(&cc.egui_ctx);
         app.update_check.spawn_check(cc.egui_ctx.clone());
         Self {
             app,
@@ -242,7 +248,11 @@ impl eframe::App for CraneApp {
         self.app.refresh_active_git_status(&ctx);
 
         let full = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(full, 0.0, BG);
+        let t = theme::current();
+        let bg = t.bg.to_color32();
+        let sidebar_bg = t.sidebar_bg.to_color32();
+        let divider = t.divider.to_color32();
+        ui.painter().rect_filled(full, 0.0, bg);
 
         let left_w = if self.app.show_left { ui_left::WIDTH } else { 0.0 };
         let right_w = if self.app.show_right { ui_right::WIDTH } else { 0.0 };
@@ -258,13 +268,13 @@ impl eframe::App for CraneApp {
         );
 
         if self.app.show_left {
-            ui.painter().rect_filled(left_rect, 0.0, SIDEBAR_BG);
+            ui.painter().rect_filled(left_rect, 0.0, sidebar_bg);
             ui.painter().line_segment(
                 [
                     egui::pos2(left_rect.max.x, left_rect.min.y),
                     egui::pos2(left_rect.max.x, left_rect.max.y),
                 ],
-                egui::Stroke::new(1.0, DIVIDER),
+                egui::Stroke::new(1.0, divider),
             );
             let mut left_ui = ui.new_child(egui::UiBuilder::new().max_rect(left_rect));
             left_ui.set_clip_rect(left_rect);
@@ -272,13 +282,13 @@ impl eframe::App for CraneApp {
         }
 
         if self.app.show_right {
-            ui.painter().rect_filled(right_rect, 0.0, SIDEBAR_BG);
+            ui.painter().rect_filled(right_rect, 0.0, sidebar_bg);
             ui.painter().line_segment(
                 [
                     egui::pos2(right_rect.min.x, right_rect.min.y),
                     egui::pos2(right_rect.min.x, right_rect.max.y),
                 ],
-                egui::Stroke::new(1.0, DIVIDER),
+                egui::Stroke::new(1.0, divider),
             );
             let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(right_rect));
             right_ui.set_clip_rect(right_rect);
@@ -322,9 +332,77 @@ impl eframe::App for CraneApp {
 
         render_new_workspace_modal(&ctx, &mut self.app);
         render_help_modal(&ctx, &mut self.app);
+        render_settings_modal(&ctx, &mut self.app);
         self.app.update_check.drain();
         render_update_toast(&ctx, &mut self.app);
         self.maybe_save();
+    }
+}
+
+fn render_settings_modal(ctx: &egui::Context, app: &mut state::App) {
+    if !app.show_settings {
+        return;
+    }
+    let mut open = true;
+    let mut selected_now: Option<String> = None;
+    egui::Window::new("Settings")
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size(egui::vec2(420.0, 380.0))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Theme").strong());
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    for theme in theme::load_all() {
+                        let is_active = app.selected_theme == theme.name;
+                        let label = format!(
+                            "{}{}",
+                            if is_active { "● " } else { "  " },
+                            theme.name
+                        );
+                        let resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new(label).size(13.0),
+                            )
+                            .min_size(egui::vec2(ui.available_width(), 28.0)),
+                        );
+                        if resp.clicked() && !is_active {
+                            selected_now = Some(theme.name.clone());
+                        }
+                    }
+                });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Drop custom themes (*.toml) at: {}",
+                    theme::themes_dir().display()
+                ))
+                .size(10.5)
+                .color(theme::current().text_muted.to_color32()),
+            );
+            if ui.small_button("Open themes folder").clicked() {
+                let dir = theme::themes_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = webbrowser::open(&format!("file://{}", dir.display()));
+            }
+        });
+    if !open {
+        app.show_settings = false;
+    }
+    if let Some(name) = selected_now
+        && let Some(t) = theme::find_by_name(&name)
+    {
+        theme::set(t);
+        app.selected_theme = name;
+        apply_style(ctx);
+        ctx.request_repaint();
     }
 }
 

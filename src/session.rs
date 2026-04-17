@@ -28,6 +28,12 @@ pub struct Session {
     pub next_tab: TabId,
     #[serde(default)]
     pub update_prompts: std::collections::HashMap<String, PromptState>,
+    #[serde(default = "default_theme_name")]
+    pub selected_theme: String,
+}
+
+fn default_theme_name() -> String {
+    "crane-dark".into()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -179,6 +185,7 @@ impl Session {
             next_workspace: app.next_workspace_id(),
             next_tab: app.next_tab_id(),
             update_prompts: app.update_check.prompts.clone(),
+            selected_theme: app.selected_theme.clone(),
         }
     }
 
@@ -227,6 +234,7 @@ impl Session {
         app.last_workspace = self.last_workspace;
         app.set_id_counters(self.next_project, self.next_workspace, self.next_tab);
         app.update_check = UpdateCheck::new(self.update_prompts);
+        app.selected_theme = self.selected_theme;
         app
     }
 }

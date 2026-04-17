@@ -1,6 +1,6 @@
 use crate::state::App;
 use crate::ui_util::{
-    draw_row, draw_trailing, full_width_primary_button, RowConfig, ACCENT,
+    accent, draw_row, draw_trailing, full_width_primary_button, RowConfig,
 };
 use egui::{Color32, Pos2, Rect, RichText, Stroke};
 use egui_phosphor::regular as icons;
@@ -86,7 +86,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         depth: 0,
                         expanded: Some(project.expanded),
                         leading: Some(icons::CUBE),
-                        leading_color: Some(ACCENT),
+                        leading_color: Some(accent()),
                         label: &project.name,
                         label_color: None,
                         is_active: false,
@@ -128,7 +128,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 depth: 1,
                                 expanded: Some(wt.expanded),
                                 leading: Some(icons::GIT_BRANCH),
-                                leading_color: if active_wt { Some(ACCENT) } else { None },
+                                leading_color: if active_wt { Some(accent()) } else { None },
                                 label: &wt.name,
                                 label_color: None,
                                 is_active: active_wt,
@@ -161,7 +161,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                         depth: 2,
                                         expanded: None,
                                         leading: Some(icons::TERMINAL_WINDOW),
-                                        leading_color: if is_active { Some(ACCENT) } else { None },
+                                        leading_color: if is_active { Some(accent()) } else { None },
                                         label: &tab.name,
                                         label_color: None,
                                         is_active,
