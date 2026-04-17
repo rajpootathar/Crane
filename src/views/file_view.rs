@@ -1,7 +1,24 @@
 use crate::layout::FilesPane;
 use crate::theme;
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
+use egui::text::{LayoutJob, TextFormat};
 use egui_phosphor::regular as icons;
+use std::path::Path;
+use std::sync::OnceLock;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::LinesWithEndings;
+
+static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
+static THEMES: OnceLock<ThemeSet> = OnceLock::new();
+
+fn syntaxes() -> &'static SyntaxSet {
+    SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+fn themes() -> &'static ThemeSet {
+    THEMES.get_or_init(ThemeSet::load_defaults)
+}
 
 pub fn render(
     ui: &mut egui::Ui,
@@ -117,15 +134,74 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
         ui.add_space(2.0);
 
         let font = FontId::new(font_size, FontFamily::Monospace);
+        let ext = Path::new(&tab.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let syntax: &'static syntect::parsing::SyntaxReference = syntaxes()
+            .find_syntax_by_extension(ext)
+            .unwrap_or_else(|| syntaxes().find_syntax_plain_text());
+        let bg = theme::current().bg;
+        let is_light = bg.r as u32 + bg.g as u32 + bg.b as u32 > 128 * 3;
+        let st_theme: &'static syntect::highlighting::Theme = if is_light {
+            themes()
+                .themes
+                .get("InspiredGitHub")
+                .unwrap_or_else(|| &themes().themes["base16-ocean.light"])
+        } else {
+            &themes().themes["base16-ocean.dark"]
+        };
+        let fallback_fg = theme::current().text.to_color32();
+
+        let mut layouter = move |ui: &egui::Ui,
+                                  buffer: &dyn egui::TextBuffer,
+                                  _wrap_width: f32|
+              -> std::sync::Arc<egui::Galley> {
+            let text = buffer.as_str();
+            let mut job = LayoutJob::default();
+            let mut hl = HighlightLines::new(syntax, st_theme);
+            for line in LinesWithEndings::from(text) {
+                let segments: Vec<(Style, &str)> = hl
+                    .highlight_line(line, syntaxes())
+                    .unwrap_or_else(|_| vec![(Style::default(), line)]);
+                for (style, segment) in segments {
+                    let color = if style.foreground.r == 0
+                        && style.foreground.g == 0
+                        && style.foreground.b == 0
+                        && style.foreground.a == 0
+                    {
+                        fallback_fg
+                    } else {
+                        Color32::from_rgb(
+                            style.foreground.r,
+                            style.foreground.g,
+                            style.foreground.b,
+                        )
+                    };
+                    job.append(
+                        segment,
+                        0.0,
+                        TextFormat {
+                            font_id: font.clone(),
+                            color,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            ui.fonts_mut(|f| f.layout_job(job))
+        };
+
         ScrollArea::both()
             .id_salt(("file_scroll", active_idx))
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 let editor = egui::TextEdit::multiline(&mut tab.content)
                     .code_editor()
-                    .font(font)
+                    .frame(egui::Frame::NONE)
                     .desired_width(f32::INFINITY)
-                    .desired_rows(30);
+                    .desired_rows(30)
+                    .layouter(&mut layouter);
                 ui.add(editor);
             });
     }

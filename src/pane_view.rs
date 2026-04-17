@@ -244,13 +244,9 @@ fn render_pane(
         };
     }
 
-    ui.painter().rect_stroke(
-        rect,
-        4.0,
-        Stroke::new(BORDER_W, border_color),
-        StrokeKind::Inside,
-    );
-
+    // No visible border on panes (Warp-style). Active/inactive is shown by
+    // a subtle dim overlay painted after content renders, below.
+    let _ = border_color;
     let inner = rect.shrink(BORDER_W);
     let header_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), HEADER_H));
     let body_outer = Rect::from_min_max(Pos2::new(inner.min.x, inner.min.y + HEADER_H), inner.max);
@@ -296,11 +292,20 @@ fn render_pane(
         }
     }
 
+    // Warp-style active/inactive: dim inactive panes with a translucent
+    // black overlay. No border, no highlight ring — just a subtle value
+    // shift so your eye goes to the one you're working in.
+    if !is_focus && drop_edge.is_none() {
+        ui.painter().rect_filled(
+            rect,
+            4.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 45),
+        );
+    }
+
     // Drop-zone overlay is painted LAST so it sits above pane content and
     // only covers the actual target area (left/right/top/bottom half or the
-    // middle square). Previously the body background was painted after the
-    // zone, so the overlay was invisible on content panes and looked like
-    // the whole pane was highlighted.
+    // middle square).
     if let Some(edge) = drop_edge {
         let zone = zone_rect(rect, edge);
         let painter = ui.painter();
