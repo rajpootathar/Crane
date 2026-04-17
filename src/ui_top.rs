@@ -54,13 +54,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             app.show_right = !app.show_right;
         }
         ui.separator();
-        ui.label(
-            RichText::new(
-                "Cmd+T split  ·  Cmd+Shift+T new tab  ·  Cmd+D split  ·  Cmd+W close",
-            )
-            .size(10.5)
-            .color(DIM),
-        );
+        if ui
+            .small_button(RichText::new("?").size(13.0).strong())
+            .on_hover_text("Keyboard shortcuts")
+            .clicked()
+        {
+            app.show_help = !app.show_help;
+        }
         ui.separator();
         let mut split_content: Option<PaneContent> = None;
         if ui

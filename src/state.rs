@@ -32,6 +32,7 @@ pub struct Worktree {
     pub expanded: bool,
     pub git_status: Option<GitStatus>,
     pub last_status_refresh: Option<Instant>,
+    pub git_rx: Option<std::sync::mpsc::Receiver<Option<GitStatus>>>,
 }
 
 pub struct Project {
@@ -62,6 +63,7 @@ pub struct App {
     pub last_worktree: Option<(ProjectId, WorktreeId)>,
     pub show_left: bool,
     pub show_right: bool,
+    pub show_help: bool,
     pub right_tab: RightTab,
     pub commit_message: String,
     pub git_error: Option<String>,
@@ -82,6 +84,7 @@ impl App {
             last_worktree: None,
             show_left: true,
             show_right: true,
+            show_help: false,
             right_tab: RightTab::Changes,
             commit_message: String::new(),
             git_error: None,
@@ -152,6 +155,7 @@ impl App {
                 expanded: true,
                 git_status: None,
                 last_status_refresh: None,
+                git_rx: None,
             });
         }
 
@@ -275,18 +279,41 @@ impl App {
         self.last_worktree = Some((pid, wid));
     }
 
-    pub fn refresh_active_git_status(&mut self) {
+    pub fn refresh_active_git_status(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
-        if let Some(wt) = self.active_worktree_mut() {
-            let should = wt
-                .last_status_refresh
-                .map(|t| now.duration_since(t) > Duration::from_millis(1500))
-                .unwrap_or(true);
-            if should {
-                wt.git_status = git::status(&wt.path);
+        let wt = match self.active_worktree_mut() {
+            Some(w) => w,
+            None => return,
+        };
+
+        if let Some(rx) = wt.git_rx.as_ref() {
+            if let Ok(status) = rx.try_recv() {
+                wt.git_status = status;
                 wt.last_status_refresh = Some(now);
+                wt.git_rx = None;
             }
         }
+
+        if wt.git_rx.is_some() {
+            return;
+        }
+        let due = wt
+            .last_status_refresh
+            .map(|t| now.duration_since(t) > Duration::from_millis(2000))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = wt.path.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let status = git::status(&path);
+            let _ = tx.send(status);
+            ctx.request_repaint();
+        });
+        wt.git_rx = Some(rx);
     }
 
     pub fn open_new_workspace_modal(&mut self, pid: ProjectId) {
@@ -354,6 +381,7 @@ impl App {
                     expanded: true,
                     git_status: None,
                     last_status_refresh: None,
+                    git_rx: None,
                 });
                 self.active = Some((modal.project_id, wt_id, tab_id));
                 self.last_worktree = Some((modal.project_id, wt_id));
