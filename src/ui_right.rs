@@ -1,42 +1,42 @@
 use crate::git::{self, FileChange};
 use crate::state::{App, RightTab};
+use crate::ui_util::{
+    draw_row, draw_trailing, full_width_primary_button, ghost_button, section_header,
+    RowConfig, ACCENT, MUTED, TEXT,
+};
 use crate::workspace::{DiffPane, Dir, PaneContent};
 use egui::{Color32, RichText};
+use egui_phosphor::regular as icons;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const WIDTH: f32 = 280.0;
+pub const WIDTH: f32 = 300.0;
 
-const HEADER: Color32 = Color32::from_rgb(180, 184, 196);
-const DIM: Color32 = Color32::from_rgb(130, 136, 150);
-const TEXT: Color32 = Color32::from_rgb(200, 204, 220);
-const ADD: Color32 = Color32::from_rgb(110, 200, 130);
+const ADD: Color32 = Color32::from_rgb(120, 210, 140);
 const DEL: Color32 = Color32::from_rgb(220, 110, 110);
-const UNTRACKED: Color32 = Color32::from_rgb(220, 180, 110);
-const HOVER_BG: Color32 = Color32::from_rgb(30, 34, 48);
+const WARN: Color32 = Color32::from_rgb(220, 180, 110);
 
 pub fn render(ui: &mut egui::Ui, app: &mut App) {
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        let is_changes = app.right_tab == RightTab::Changes;
-        let is_files = app.right_tab == RightTab::Files;
-        if ui
-            .selectable_label(is_changes, RichText::new("Changes").size(12.5))
-            .clicked()
-        {
+        tab_chip(ui, "Changes", app.right_tab == RightTab::Changes, || {
             app.right_tab = RightTab::Changes;
-        }
+        });
         ui.add_space(4.0);
-        if ui
-            .selectable_label(is_files, RichText::new("Files").size(12.5))
-            .clicked()
-        {
+        tab_chip(ui, "Files", app.right_tab == RightTab::Files, || {
             app.right_tab = RightTab::Files;
-        }
+        });
     });
-    ui.add_space(4.0);
-    ui.separator();
+    ui.add_space(6.0);
+    ui.painter().line_segment(
+        [
+            egui::pos2(ui.min_rect().min.x, ui.cursor().min.y),
+            egui::pos2(ui.min_rect().max.x, ui.cursor().min.y),
+        ],
+        egui::Stroke::new(1.0, Color32::from_rgb(36, 40, 52)),
+    );
+    ui.add_space(2.0);
 
     match app.right_tab {
         RightTab::Changes => render_changes(ui, app),
@@ -44,28 +44,62 @@ pub fn render(ui: &mut egui::Ui, app: &mut App) {
     }
 }
 
+fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, mut on_click: impl FnMut()) {
+    let color = if active { TEXT } else { MUTED };
+    let resp = ui
+        .scope(|ui| {
+            let v = ui.visuals_mut();
+            v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            v.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+            v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+            v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+            v.widgets.active.bg_stroke = egui::Stroke::NONE;
+            let r = ui.add(
+                egui::Button::new(
+                    RichText::new(label).size(12.5).color(color),
+                )
+                .min_size(egui::vec2(0.0, 26.0)),
+            );
+            if active {
+                let rect = r.rect;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.min.x + 6.0, rect.max.y),
+                        egui::pos2(rect.max.x - 6.0, rect.max.y),
+                    ],
+                    egui::Stroke::new(2.0, ACCENT),
+                );
+            }
+            r
+        })
+        .inner;
+    if resp.clicked() {
+        on_click();
+    }
+}
+
 fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     let repo_path = match app.active_worktree_path() {
         Some(p) => p.to_path_buf(),
         None => {
-            dim_label(ui, "No active worktree");
+            dim_row(ui, "No active worktree");
             return;
         }
     };
     let status = match app.active_worktree_mut().and_then(|w| w.git_status.clone()) {
         Some(s) => s,
         None => {
-            dim_label(ui, "(not a git repo)");
+            dim_row(ui, "(not a git repo)");
             return;
         }
     };
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.add_space(10.0);
+        ui.add_space(12.0);
         ui.label(
-            RichText::new(format!("⎇ {}", status.branch))
-                .color(DIM)
+            RichText::new(format!("{}  {}", icons::GIT_BRANCH, status.branch))
+                .color(MUTED)
                 .size(11.5),
         );
     });
@@ -94,9 +128,8 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
 
             if !staged.is_empty() {
                 section_header(ui, "STAGED");
-                render_tree(
+                render_change_tree(
                     ui,
-                    "stg",
                     &staged,
                     true,
                     &mut unstage_path,
@@ -106,9 +139,8 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
             }
             if !unstaged.is_empty() {
                 section_header(ui, "UNSTAGED");
-                render_tree(
+                render_change_tree(
                     ui,
-                    "unstg",
                     &unstaged,
                     false,
                     &mut unstage_path,
@@ -118,9 +150,8 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
             }
             if !untracked.is_empty() {
                 section_header(ui, "UNTRACKED");
-                render_tree(
+                render_change_tree(
                     ui,
-                    "untr",
                     &untracked,
                     false,
                     &mut unstage_path,
@@ -130,21 +161,21 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
             }
 
             if status.changes.is_empty() {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("working tree clean").color(DIM).size(11.5));
-                });
+                dim_row(ui, "working tree clean");
             }
         });
 
     ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        ui.label(RichText::new("COMMIT").size(10.5).color(HEADER).strong());
-    });
+    ui.painter().line_segment(
+        [
+            egui::pos2(ui.min_rect().min.x, ui.cursor().min.y),
+            egui::pos2(ui.min_rect().max.x, ui.cursor().min.y),
+        ],
+        egui::Stroke::new(1.0, Color32::from_rgb(36, 40, 52)),
+    );
+    ui.add_space(6.0);
+    section_header(ui, "COMMIT");
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.add_space(10.0);
         ui.add(
@@ -154,15 +185,29 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                 .desired_width(WIDTH - 24.0),
         );
     });
-    ui.add_space(2.0);
+    ui.add_space(4.0);
     let mut commit_clicked = false;
     let mut push_clicked = false;
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        commit_clicked = ui
-            .add(egui::Button::new(RichText::new("Commit").strong()))
-            .clicked();
-        push_clicked = ui.button("Push").clicked();
+        commit_clicked = full_width_primary_button(
+            ui,
+            Some(icons::CHECK),
+            "Commit",
+            "Commit staged changes",
+        )
+        .clicked();
+    });
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        push_clicked = ghost_button(
+            ui,
+            Some(icons::ARROW_UP),
+            "Push",
+            "Push to origin",
+        )
+        .clicked();
     });
     if let Some(err) = &app.git_error {
         ui.horizontal_wrapped(|ui| {
@@ -253,19 +298,11 @@ fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
     }
 }
 
-fn section_header(ui: &mut egui::Ui, label: &str) {
+fn dim_row(ui: &mut egui::Ui, text: &str) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        ui.label(RichText::new(label).size(10.5).color(HEADER).strong());
-    });
-}
-
-fn dim_label(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        ui.label(RichText::new(text).color(DIM).size(11.5));
+        ui.add_space(12.0);
+        ui.label(RichText::new(text).color(MUTED).size(11.5));
     });
 }
 
@@ -289,9 +326,8 @@ fn build_tree(changes: &[&FileChange]) -> DirNode {
     root
 }
 
-fn render_tree(
+fn render_change_tree(
     ui: &mut egui::Ui,
-    salt: &str,
     changes: &[&FileChange],
     staged: bool,
     unstage_path: &mut Option<String>,
@@ -299,13 +335,20 @@ fn render_tree(
     open_diff: &mut Option<String>,
 ) {
     let tree = build_tree(changes);
-    render_dir_node(ui, salt, &tree, "", 0, staged, unstage_path, stage_path, open_diff);
+    render_change_node(
+        ui,
+        &tree,
+        "",
+        0,
+        staged,
+        unstage_path,
+        stage_path,
+        open_diff,
+    );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_dir_node(
+fn render_change_node(
     ui: &mut egui::Ui,
-    salt: &str,
     node: &DirNode,
     prefix: &str,
     depth: usize,
@@ -321,9 +364,8 @@ fn render_dir_node(
             format!("{prefix}/{dir_name}")
         };
         if node.dirs.len() == 1 && child.files.is_empty() && !child.dirs.is_empty() {
-            render_dir_node(
+            render_change_node(
                 ui,
-                salt,
                 child,
                 &child_prefix,
                 depth,
@@ -334,17 +376,23 @@ fn render_dir_node(
             );
             continue;
         }
-        ui.horizontal(|ui| {
-            ui.add_space(10.0 + depth as f32 * 12.0);
-            ui.label(
-                RichText::new(format!("▾ {}", dir_name))
-                    .size(11.5)
-                    .color(DIM),
-            );
-        });
-        render_dir_node(
+        draw_row(
             ui,
-            salt,
+            RowConfig {
+                depth,
+                expanded: Some(true),
+                leading: Some(icons::FOLDER),
+                leading_color: Some(MUTED),
+                label: dir_name,
+                label_color: Some(MUTED),
+                is_active: false,
+                active_bar: false,
+                badge: None,
+                trailing_count: 0,
+            },
+        );
+        render_change_node(
+            ui,
             child,
             &child_prefix,
             depth + 1,
@@ -355,55 +403,46 @@ fn render_dir_node(
         );
     }
     for (file_name, change) in &node.files {
-        ui.push_id((salt, &change.path), |ui| {
-            let row = ui
-                .horizontal(|ui| {
-                    ui.add_space(10.0 + depth as f32 * 12.0);
-                    if staged {
-                        if ui
-                            .small_button(RichText::new("−").color(DIM))
-                            .on_hover_text("Unstage")
-                            .clicked()
-                        {
-                            *unstage_path = Some(change.path.clone());
-                        }
-                    } else if ui
-                        .small_button(RichText::new("+").color(DIM))
-                        .on_hover_text("Stage")
-                        .clicked()
-                    {
-                        *stage_path = Some(change.path.clone());
-                    }
-                    let glyph_color = match change.status {
-                        git::ChangeStatus::Added => ADD,
-                        git::ChangeStatus::Deleted => DEL,
-                        git::ChangeStatus::Untracked => UNTRACKED,
-                        _ => TEXT,
-                    };
-                    ui.label(
-                        RichText::new(change.status.glyph())
-                            .color(glyph_color)
-                            .size(11.0)
-                            .monospace(),
-                    );
-                    let name_response = ui.add(
-                        egui::Label::new(RichText::new(file_name).size(11.5).color(TEXT))
-                            .sense(egui::Sense::click()),
-                    );
-                    if name_response.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    if name_response.clicked() {
-                        *open_diff = Some(change.path.clone());
-                    }
-                    name_response
-                })
-                .inner;
-            if row.hovered() {
-                let painter = ui.painter();
-                painter.rect_filled(row.rect.expand2(egui::vec2(0.0, 1.0)), 0.0, HOVER_BG);
+        let (glyph, glyph_color) = match change.status {
+            git::ChangeStatus::Added => ("A", ADD),
+            git::ChangeStatus::Modified => ("M", ACCENT),
+            git::ChangeStatus::Deleted => ("D", DEL),
+            git::ChangeStatus::Renamed => ("R", ACCENT),
+            git::ChangeStatus::Untracked => ("?", WARN),
+        };
+        let row = draw_row(
+            ui,
+            RowConfig {
+                depth,
+                expanded: None,
+                leading: Some(glyph),
+                leading_color: Some(glyph_color),
+                label: file_name,
+                label_color: None,
+                is_active: false,
+                active_bar: false,
+                badge: None,
+                trailing_count: 1,
+            },
+        );
+        let trailing_icon = if staged { icons::MINUS } else { icons::PLUS };
+        let trailing_tip = if staged { "Unstage" } else { "Stage" };
+        let flags = draw_trailing(
+            ui,
+            row.rect,
+            row.hovered,
+            &[(trailing_icon, trailing_tip, 0)],
+        );
+        if row.main_clicked {
+            *open_diff = Some(change.path.clone());
+        }
+        if flags[0] {
+            if staged {
+                *unstage_path = Some(change.path.clone());
+            } else {
+                *stage_path = Some(change.path.clone());
             }
-        });
+        }
     }
 }
 
@@ -411,7 +450,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
     let path = match app.active_worktree_path() {
         Some(p) => p.to_path_buf(),
         None => {
-            dim_label(ui, "No active worktree");
+            dim_row(ui, "No active worktree");
             return;
         }
     };
@@ -482,29 +521,22 @@ fn render_fs_dir(
         let entry_path = e.path();
         let is_dir = entry_path.is_dir();
         let is_expanded = is_dir && expanded.contains(&entry_path);
-        let glyph = if is_dir {
-            if is_expanded { "▾" } else { "▸" }
-        } else {
-            "·"
-        };
-        let color = if is_dir { TEXT } else { Color32::from_rgb(170, 176, 190) };
-        let response = ui
-            .horizontal(|ui| {
-                ui.add_space(10.0 + depth as f32 * 12.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("{glyph}  {}", name))
-                            .color(color)
-                            .size(11.5),
-                    )
-                    .sense(egui::Sense::click()),
-                )
-            })
-            .inner;
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        if response.clicked() {
+        let row = draw_row(
+            ui,
+            RowConfig {
+                depth,
+                expanded: if is_dir { Some(is_expanded) } else { None },
+                leading: Some(if is_dir { icons::FOLDER } else { icons::FILE }),
+                leading_color: Some(MUTED),
+                label: &name,
+                label_color: None,
+                is_active: false,
+                active_bar: false,
+                badge: None,
+                trailing_count: 0,
+            },
+        );
+        if row.main_clicked {
             if is_dir {
                 *toggle_dir = Some(entry_path.clone());
             } else {
