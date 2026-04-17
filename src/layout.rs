@@ -262,11 +262,10 @@ impl Layout {
                     }),
                     Some(Dir::Horizontal),
                 );
-                if let Some(focus) = self.focus {
-                    if let Some(pane) = self.panes.get_mut(&focus) {
+                if let Some(focus) = self.focus
+                    && let Some(pane) = self.panes.get_mut(&focus) {
                         pane.title = title;
                     }
-                }
             }
         }
     }
@@ -279,11 +278,10 @@ impl Layout {
             .map(|(id, _)| *id);
         match existing {
             Some(pid) => {
-                if let Some(pane) = self.panes.get_mut(&pid) {
-                    if let PaneContent::Files(files) = &mut pane.content {
+                if let Some(pane) = self.panes.get_mut(&pid)
+                    && let PaneContent::Files(files) = &mut pane.content {
                         files.open(path, content, name);
                     }
-                }
                 self.focus = Some(pid);
             }
             None => {
@@ -349,6 +347,71 @@ impl Layout {
         if let Some(root) = self.root.as_mut() {
             swap_leaves(root, a, b);
         }
+    }
+
+    /// Remove `src` from its current position and re-insert it adjacent to
+    /// `target` on the given edge. No-op if src == target.
+    pub fn dock_pane(&mut self, src: PaneId, target: PaneId, edge: DockEdge) {
+        if src == target {
+            return;
+        }
+        let root = match self.root.take() {
+            Some(r) => r,
+            None => return,
+        };
+        let (root_without_src, _) = remove_node(root, src);
+        let Some(root_without_src) = root_without_src else {
+            self.root = None;
+            return;
+        };
+        self.root = Some(wrap_target(root_without_src, target, src, edge));
+        self.focus = Some(src);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Center,
+}
+
+fn wrap_target(node: Node, target: PaneId, src: PaneId, edge: DockEdge) -> Node {
+    match node {
+        Node::Leaf(id) if id == target => {
+            let (direction, src_first) = match edge {
+                DockEdge::Left => (Dir::Horizontal, true),
+                DockEdge::Right => (Dir::Horizontal, false),
+                DockEdge::Top => (Dir::Vertical, true),
+                DockEdge::Bottom => (Dir::Vertical, false),
+                DockEdge::Center => return Node::Leaf(id),
+            };
+            let (first, second) = if src_first {
+                (Node::Leaf(src), Node::Leaf(target))
+            } else {
+                (Node::Leaf(target), Node::Leaf(src))
+            };
+            Node::Split {
+                direction,
+                first: Box::new(first),
+                second: Box::new(second),
+                ratio: 0.5,
+            }
+        }
+        Node::Leaf(_) => node,
+        Node::Split {
+            direction,
+            first,
+            second,
+            ratio,
+        } => Node::Split {
+            direction,
+            first: Box::new(wrap_target(*first, target, src, edge)),
+            second: Box::new(wrap_target(*second, target, src, edge)),
+            ratio,
+        },
     }
 }
 

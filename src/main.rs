@@ -186,42 +186,36 @@ impl CraneApp {
                 )
             });
 
-        if split_terminal {
-            if let Some(ws) = self.app.active_layout() {
+        if split_terminal
+            && let Some(ws) = self.app.active_layout() {
                 ws.split_focused_with_terminal(ctx, Dir::Horizontal);
             }
-        }
         if new_tab {
             self.app.new_tab_in_active_workspace(ctx);
         }
-        if split_h {
-            if let Some(ws) = self.app.active_layout() {
+        if split_h
+            && let Some(ws) = self.app.active_layout() {
                 ws.split_focused_with_terminal(ctx, Dir::Horizontal);
             }
-        }
-        if split_v {
-            if let Some(ws) = self.app.active_layout() {
+        if split_v
+            && let Some(ws) = self.app.active_layout() {
                 ws.split_focused_with_terminal(ctx, Dir::Vertical);
             }
-        }
-        if close_pane {
-            if let Some(ws) = self.app.active_layout() {
+        if close_pane
+            && let Some(ws) = self.app.active_layout() {
                 ws.close_focused();
             }
-        }
         if close_tab {
             self.app.close_active_tab();
         }
-        if next_pane {
-            if let Some(ws) = self.app.active_layout() {
+        if next_pane
+            && let Some(ws) = self.app.active_layout() {
                 ws.focus_next();
             }
-        }
-        if prev_pane {
-            if let Some(ws) = self.app.active_layout() {
+        if prev_pane
+            && let Some(ws) = self.app.active_layout() {
                 ws.focus_prev();
             }
-        }
         if zoom_in {
             self.app.font_size = (self.app.font_size + 1.0).min(40.0);
         }
@@ -316,6 +310,9 @@ impl eframe::App for CraneApp {
                     }
                     PaneAction::SwapPanes { a, b } => {
                         ws.swap_panes(a, b);
+                    }
+                    PaneAction::DockPane { src, target, edge } => {
+                        ws.dock_pane(src, target, edge);
                     }
                 }
             }
@@ -578,12 +575,10 @@ fn render_new_workspace_modal(ctx: &egui::Context, app: &mut state::App) {
             .set_title("Choose worktree parent folder")
             .set_directory(start)
             .pick_folder()
-        {
-            if let Some(modal) = app.new_workspace_modal.as_mut() {
+            && let Some(modal) = app.new_workspace_modal.as_mut() {
                 modal.custom_path = p.to_string_lossy().to_string();
                 modal.mode = state::LocationMode::Custom;
             }
-        }
     } else if create {
         app.create_workspace_from_modal(ctx);
     }
@@ -640,13 +635,11 @@ fn render_empty_state(
                 ),
             )
             .clicked()
-        {
-            if let Some(path) = rfd::FileDialog::new()
+            && let Some(path) = rfd::FileDialog::new()
                 .set_title("Choose project folder")
                 .pick_folder()
             {
                 app.add_project_from_path(path, ctx);
             }
-        }
     });
 }

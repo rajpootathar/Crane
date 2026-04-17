@@ -1,6 +1,6 @@
 use crate::terminal_view;
 use crate::views::{browser_view, diff_view, file_view, markdown_view};
-use crate::layout::{Dir, Node, PaneContent, PaneId, Layout};
+use crate::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
 use egui_phosphor::regular as icons;
 
@@ -26,6 +26,49 @@ pub enum PaneAction {
     Close(PaneId),
     ResizeSplit { path: Vec<usize>, ratio: f32 },
     SwapPanes { a: PaneId, b: PaneId },
+    DockPane { src: PaneId, target: PaneId, edge: DockEdge },
+}
+
+fn dock_zone(rect: Rect, pos: Pos2) -> DockEdge {
+    let rel_x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+    let rel_y = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+    let edge = 0.25;
+    let from_left = rel_x;
+    let from_right = 1.0 - rel_x;
+    let from_top = rel_y;
+    let from_bottom = 1.0 - rel_y;
+    let min_edge = from_left.min(from_right).min(from_top).min(from_bottom);
+    if min_edge >= edge {
+        DockEdge::Center
+    } else if from_left <= min_edge {
+        DockEdge::Left
+    } else if from_right <= min_edge {
+        DockEdge::Right
+    } else if from_top <= min_edge {
+        DockEdge::Top
+    } else {
+        DockEdge::Bottom
+    }
+}
+
+fn zone_rect(rect: Rect, edge: DockEdge) -> Rect {
+    match edge {
+        DockEdge::Center => rect,
+        DockEdge::Left => {
+            Rect::from_min_size(rect.min, Vec2::new(rect.width() * 0.5, rect.height()))
+        }
+        DockEdge::Right => Rect::from_min_max(
+            Pos2::new(rect.min.x + rect.width() * 0.5, rect.min.y),
+            rect.max,
+        ),
+        DockEdge::Top => {
+            Rect::from_min_size(rect.min, Vec2::new(rect.width(), rect.height() * 0.5))
+        }
+        DockEdge::Bottom => Rect::from_min_max(
+            Pos2::new(rect.min.x, rect.min.y + rect.height() * 0.5),
+            rect.max,
+        ),
+    }
 }
 
 pub fn render_layout(
@@ -118,8 +161,8 @@ fn render_splitter(
             Dir::Vertical => egui::CursorIcon::ResizeVertical,
         });
     }
-    if response.dragged() {
-        if let Some(pos) = response.interact_pointer_pos() {
+    if response.dragged()
+        && let Some(pos) = response.interact_pointer_pos() {
             let ratio = match dir {
                 Dir::Horizontal => (pos.x - parent.min.x) / parent.width(),
                 Dir::Vertical => (pos.y - parent.min.y) / parent.height(),
@@ -129,7 +172,6 @@ fn render_splitter(
                 ratio,
             };
         }
-    }
 }
 
 fn render_pane(
@@ -148,32 +190,42 @@ fn render_pane(
     };
 
     let drag_payload = egui::DragAndDrop::payload::<DragPayload>(ui.ctx());
-    let pointer_in = ui.input(|i| {
-        i.pointer
-            .hover_pos()
-            .map(|p| rect.contains(p))
-            .unwrap_or(false)
-    });
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    let pointer_in = pointer.map(|p| rect.contains(p)).unwrap_or(false);
     let is_drop_target = drag_payload
         .as_ref()
         .map(|p| p.0 != id && pointer_in)
         .unwrap_or(false);
     let released = ui.input(|i| i.pointer.any_released());
 
-    if is_drop_target {
-        ui.painter().rect_filled(
-            rect,
+    let drop_edge = if is_drop_target {
+        pointer.map(|p| dock_zone(rect, p))
+    } else {
+        None
+    };
+
+    if let Some(edge) = drop_edge {
+        let zone = zone_rect(rect, edge);
+        ui.painter()
+            .rect_filled(zone, 4.0, Color32::from_rgba_unmultiplied(96, 140, 220, 60));
+        ui.painter().rect_stroke(
+            zone,
             4.0,
-            Color32::from_rgba_unmultiplied(96, 140, 220, 40),
+            Stroke::new(2.0, Color32::from_rgb(96, 140, 220)),
+            StrokeKind::Inside,
         );
     }
 
-    if is_drop_target && released {
-        if let Some(payload) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx()) {
-            if payload.0 != id {
-                *action = PaneAction::SwapPanes { a: payload.0, b: id };
-            }
-        }
+    if is_drop_target && released
+        && let Some(payload) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx())
+            && payload.0 != id
+    {
+        let edge = drop_edge.unwrap_or(DockEdge::Center);
+        *action = if edge == DockEdge::Center {
+            PaneAction::SwapPanes { a: payload.0, b: id }
+        } else {
+            PaneAction::DockPane { src: payload.0, target: id, edge }
+        };
     }
 
     let border = if is_drop_target {

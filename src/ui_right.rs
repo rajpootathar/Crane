@@ -286,11 +286,10 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     }
     ui.add_space(8.0);
 
-    if let Some(dir) = toggle_dir {
-        if !app.collapsed_change_dirs.remove(&dir) {
+    if let Some(dir) = toggle_dir
+        && !app.collapsed_change_dirs.remove(&dir) {
             app.collapsed_change_dirs.insert(dir);
         }
-    }
     if let Some(path) = stage_path {
         match git::stage(&repo_path, &path) {
             Ok(()) => {
@@ -580,11 +579,10 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 &mut toggled,
             );
         });
-    if let Some(p) = toggled {
-        if !app.expanded_dirs.remove(&p) {
+    if let Some(p) = toggled
+        && !app.expanded_dirs.remove(&p) {
             app.expanded_dirs.insert(p);
         }
-    }
     if let Some(p) = opened {
         let path_str = p.to_string_lossy().to_string();
         let name = p

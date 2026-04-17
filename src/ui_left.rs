@@ -42,14 +42,12 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 "Choose a folder",
             )
             .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
+                && let Some(path) = rfd::FileDialog::new()
                     .set_title("Choose project folder")
                     .pick_folder()
                 {
                     app.add_project_from_path(path, ctx);
                 }
-            }
         });
         ui.add_space(8.0);
     });
@@ -191,21 +189,18 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         });
 
 
-    if let Some(pid) = toggle_project {
-        if let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
+    if let Some(pid) = toggle_project
+        && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
             p.expanded = !p.expanded;
         }
-    }
-    if let Some((pid, wid)) = toggle_worktree {
-        if let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
-            if let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
+    if let Some((pid, wid)) = toggle_worktree
+        && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
+            && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
                 w.expanded = !w.expanded;
                 if let Some(tid) = w.active_tab {
                     app.active = Some((pid, wid, tid));
                 }
             }
-        }
-    }
     if let Some((pid, wid, tid)) = set_active {
         app.set_active(pid, wid, tid);
     }
@@ -220,9 +215,9 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     if let Some(pid) = remove_project {
         app.remove_project(pid);
     }
-    if let Some((pid, wid, tid)) = close_tab {
-        if let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
-            if let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
+    if let Some((pid, wid, tid)) = close_tab
+        && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
+            && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
                 w.tabs.retain(|t| t.id != tid);
                 w.active_tab = w.tabs.first().map(|t| t.id);
                 if app.active.map(|(_, _, t)| t == tid).unwrap_or(false) {
@@ -230,7 +225,5 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 }
                 app.last_workspace = Some((pid, wid));
             }
-        }
-    }
 }
 

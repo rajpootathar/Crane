@@ -52,12 +52,11 @@ impl UpdateCheck {
     }
 
     pub fn drain(&mut self) {
-        if let Some(rx) = self.rx.as_ref() {
-            if let Ok(result) = rx.try_recv() {
+        if let Some(rx) = self.rx.as_ref()
+            && let Ok(result) = rx.try_recv() {
                 self.available = result;
                 self.rx = None;
             }
-        }
     }
 
     pub fn should_show(&self) -> bool {

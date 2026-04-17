@@ -78,16 +78,14 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             .on_hover_text("Split active pane with terminal (Cmd+T or Cmd+D)")
             .clicked();
 
-        if split_terminal {
-            if let Some(ws) = app.active_layout() {
+        if split_terminal
+            && let Some(ws) = app.active_layout() {
                 ws.split_focused_with_terminal(ctx, Dir::Horizontal);
             }
-        }
-        if let Some(content) = split_content {
-            if let Some(ws) = app.active_layout() {
+        if let Some(content) = split_content
+            && let Some(ws) = app.active_layout() {
                 ws.add_pane(content, Some(Dir::Horizontal));
             }
-        }
     });
 
     ui.advance_cursor_after_rect(bar_rect);

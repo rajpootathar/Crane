@@ -6,11 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn shellexpand_home(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME") {
             return format!("{home}/{rest}");
         }
-    }
     s.to_string()
 }
 
@@ -235,11 +234,10 @@ impl App {
     pub fn set_active(&mut self, pid: ProjectId, wid: WorkspaceId, tid: TabId) {
         self.active = Some((pid, wid, tid));
         self.last_workspace = Some((pid, wid));
-        if let Some(p) = self.projects.iter_mut().find(|p| p.id == pid) {
-            if let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
+        if let Some(p) = self.projects.iter_mut().find(|p| p.id == pid)
+            && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
                 w.active_tab = Some(tid);
             }
-        }
     }
 
     pub fn new_tab_in_active_workspace(&mut self, ctx: &egui::Context) {
@@ -324,13 +322,12 @@ impl App {
             None => return,
         };
 
-        if let Some(rx) = wt.git_rx.as_ref() {
-            if let Ok(status) = rx.try_recv() {
+        if let Some(rx) = wt.git_rx.as_ref()
+            && let Ok(status) = rx.try_recv() {
                 wt.git_status = status;
                 wt.last_status_refresh = Some(now);
                 wt.git_rx = None;
             }
-        }
 
         if wt.git_rx.is_some() {
             return;
@@ -433,17 +430,16 @@ impl App {
 
     pub fn remove_project(&mut self, pid: ProjectId) {
         self.projects.retain(|p| p.id != pid);
-        if let Some((p, _, _)) = self.active {
-            if p == pid {
+        if let Some((p, _, _)) = self.active
+            && p == pid {
                 self.active = self
                     .projects
                     .first()
                     .and_then(|p| p.workspaces.first().map(|w| (p.id, w)))
                     .and_then(|(pid, w)| w.active_tab.map(|t| (pid, w.id, t)));
             }
-        }
-        if let Some((p, _)) = self.last_workspace {
-            if p == pid {
+        if let Some((p, _)) = self.last_workspace
+            && p == pid {
                 self.last_workspace = self
                     .active
                     .map(|(pid, wid, _)| (pid, wid))
@@ -453,7 +449,6 @@ impl App {
                             .and_then(|p| p.workspaces.first().map(|w| (p.id, w.id)))
                     });
             }
-        }
     }
 
     pub fn breadcrumb(&self) -> String {

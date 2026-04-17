@@ -171,15 +171,14 @@ fn shortstat(repo: &Path) -> Option<(usize, usize)> {
     let mut deleted = 0usize;
     for part in s.split(',') {
         let part = part.trim();
-        if let Some(num) = part.split_whitespace().next() {
-            if let Ok(n) = num.parse::<usize>() {
+        if let Some(num) = part.split_whitespace().next()
+            && let Ok(n) = num.parse::<usize>() {
                 if part.contains("insertion") {
                     added = n;
                 } else if part.contains("deletion") {
                     deleted = n;
                 }
             }
-        }
     }
     Some((added, deleted))
 }

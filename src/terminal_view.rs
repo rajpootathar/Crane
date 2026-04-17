@@ -67,27 +67,25 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     }
 
     // Drag: plain range select.
-    if response.drag_started() {
-        if let Some(pos) = response.interact_pointer_pos() {
+    if response.drag_started()
+        && let Some(pos) = response.interact_pointer_pos() {
             let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
             let mut guard = terminal.term.lock();
             guard.selection = Some(Selection::new(SelectionType::Simple, point, side));
         }
-    }
-    if response.dragged() {
-        if let Some(pos) = response.interact_pointer_pos() {
+    if response.dragged()
+        && let Some(pos) = response.interact_pointer_pos() {
             let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
             let mut guard = terminal.term.lock();
             if let Some(sel) = guard.selection.as_mut() {
                 sel.update(point, side);
             }
         }
-    }
 
     // Clicks: 1 → clear, 2 → word (Semantic), 3 → line (Lines),
     // Shift+click → extend existing selection to click point.
-    if response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos() {
             let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
             let shift_held = ui.input(|i| i.modifiers.shift);
             let now = std::time::Instant::now();
@@ -123,7 +121,6 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                 }
             }
         }
-    }
 
     let snapshot = {
         let guard = terminal.term.lock();
@@ -202,11 +199,10 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             match event {
                 egui::Event::Copy => {
                     let guard = terminal.term.lock();
-                    if let Some(t) = guard.selection_to_string() {
-                        if !t.is_empty() {
+                    if let Some(t) = guard.selection_to_string()
+                        && !t.is_empty() {
                             copy_text = Some(t);
                         }
-                    }
                 }
                 egui::Event::Key {
                     key: egui::Key::A,
@@ -235,12 +231,11 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     modifiers,
                     ..
                 } => {
-                    if modifiers.ctrl {
-                        if let Some(letter) = key_letter(*key) {
+                    if modifiers.ctrl
+                        && let Some(letter) = key_letter(*key) {
                             terminal.write_input(&[letter - b'a' + 1]);
                             continue;
                         }
-                    }
                     if modifiers.mac_cmd || modifiers.command {
                         continue;
                     }
