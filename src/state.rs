@@ -121,13 +121,10 @@ impl App {
         }
     }
 
-    pub fn ensure_initial(&mut self, ctx: &egui::Context) {
-        if self.projects.is_empty() {
-            if let Ok(cwd) = std::env::current_dir() {
-                let root = git::find_repo_root(&cwd).unwrap_or(cwd);
-                self.add_project_from_path(root, ctx);
-            }
-        }
+    pub fn ensure_initial(&mut self, _ctx: &egui::Context) {
+        // Intentionally empty. First launch shows an empty state — the user
+        // picks a project via "Add Project…" in the Left Panel footer.
+        // Subsequent launches restore via session::load().
     }
 
     pub fn next_project_id(&self) -> ProjectId {

@@ -1,6 +1,6 @@
 [package]
 name = "crane"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Native GPU-rendered terminal + IDE environment"
 authors = ["rajpootathar"]
@@ -10,7 +10,6 @@ license = "MIT"
 name = "Crane"
 identifier = "sh.superset.crane"
 icon = ["icons/crane.icns", "crane.png"]
-version = "0.1.0"
 copyright = "Copyright © 2026 rajpootathar"
 category = "Developer Tool"
 short_description = "GPU-rendered terminal environment"
