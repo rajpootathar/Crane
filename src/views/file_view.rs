@@ -1,4 +1,4 @@
-use crate::workspace::FilesPane;
+use crate::layout::FilesPane;
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
 use egui_phosphor::regular as icons;
 

@@ -1,5 +1,5 @@
 use crate::git::{self, GitStatus};
-use crate::workspace::Workspace;
+use crate::layout::Layout;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -14,17 +14,17 @@ fn shellexpand_home(s: &str) -> String {
 }
 
 pub type ProjectId = u64;
-pub type WorktreeId = u64;
+pub type WorkspaceId = u64;
 pub type TabId = u64;
 
 pub struct Tab {
     pub id: TabId,
     pub name: String,
-    pub workspace: Workspace,
+    pub layout: Layout,
 }
 
-pub struct Worktree {
-    pub id: WorktreeId,
+pub struct Workspace {
+    pub id: WorkspaceId,
     pub name: String,
     pub path: PathBuf,
     pub tabs: Vec<Tab>,
@@ -39,7 +39,7 @@ pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub path: PathBuf,
-    pub worktrees: Vec<Worktree>,
+    pub workspaces: Vec<Workspace>,
     pub expanded: bool,
 }
 
@@ -80,8 +80,8 @@ impl NewWorkspaceModal {
 
 pub struct App {
     pub projects: Vec<Project>,
-    pub active: Option<(ProjectId, WorktreeId, TabId)>,
-    pub last_worktree: Option<(ProjectId, WorktreeId)>,
+    pub active: Option<(ProjectId, WorkspaceId, TabId)>,
+    pub last_workspace: Option<(ProjectId, WorkspaceId)>,
     pub show_left: bool,
     pub show_right: bool,
     pub show_help: bool,
@@ -94,7 +94,7 @@ pub struct App {
     pub collapsed_change_dirs: HashSet<String>,
     pub new_workspace_modal: Option<NewWorkspaceModal>,
     next_project: ProjectId,
-    next_worktree: WorktreeId,
+    next_workspace: WorkspaceId,
     next_tab: TabId,
 }
 
@@ -103,7 +103,7 @@ impl App {
         Self {
             projects: Vec::new(),
             active: None,
-            last_worktree: None,
+            last_workspace: None,
             show_left: true,
             show_right: true,
             show_help: false,
@@ -116,7 +116,7 @@ impl App {
             collapsed_change_dirs: HashSet::new(),
             new_workspace_modal: None,
             next_project: 1,
-            next_worktree: 1,
+            next_workspace: 1,
             next_tab: 1,
         }
     }
@@ -133,15 +133,15 @@ impl App {
     pub fn next_project_id(&self) -> ProjectId {
         self.next_project
     }
-    pub fn next_worktree_id(&self) -> WorktreeId {
-        self.next_worktree
+    pub fn next_workspace_id(&self) -> WorkspaceId {
+        self.next_workspace
     }
     pub fn next_tab_id(&self) -> TabId {
         self.next_tab
     }
-    pub fn set_id_counters(&mut self, p: ProjectId, w: WorktreeId, t: TabId) {
+    pub fn set_id_counters(&mut self, p: ProjectId, w: WorkspaceId, t: TabId) {
         self.next_project = p.max(self.next_project);
-        self.next_worktree = w.max(self.next_worktree);
+        self.next_workspace = w.max(self.next_workspace);
         self.next_tab = t.max(self.next_tab);
     }
 
@@ -157,9 +157,9 @@ impl App {
             .unwrap_or("project")
             .to_string();
 
-        let infos = git::list_worktrees(&path);
+        let infos = git::list_workspaces(&path);
         let infos = if infos.is_empty() {
-            vec![git::WorktreeInfo {
+            vec![git::WorkspaceInfo {
                 path: path.clone(),
                 branch: "(no git)".into(),
             }]
@@ -167,24 +167,24 @@ impl App {
             infos
         };
 
-        let mut worktrees = Vec::new();
-        let mut first_active: Option<(WorktreeId, TabId)> = None;
+        let mut workspaces = Vec::new();
+        let mut first_active: Option<(WorkspaceId, TabId)> = None;
         for info in infos {
-            let wt_id = self.next_worktree;
-            self.next_worktree += 1;
+            let wt_id = self.next_workspace;
+            self.next_workspace += 1;
             let tab_id = self.next_tab;
             self.next_tab += 1;
-            let mut workspace = Workspace::new(info.path.clone());
-            workspace.ensure_initial_terminal(ctx);
+            let mut layout = Layout::new(info.path.clone());
+            layout.ensure_initial_terminal(ctx);
             let tab = Tab {
                 id: tab_id,
                 name: "Terminal".into(),
-                workspace,
+                layout,
             };
             if first_active.is_none() {
                 first_active = Some((wt_id, tab_id));
             }
-            worktrees.push(Worktree {
+            workspaces.push(Workspace {
                 id: wt_id,
                 name: info.branch,
                 path: info.path,
@@ -201,55 +201,55 @@ impl App {
             id,
             name,
             path,
-            worktrees,
+            workspaces,
             expanded: true,
         });
         if let Some((wt, tab)) = first_active {
             self.active = Some((id, wt, tab));
-            self.last_worktree = Some((id, wt));
+            self.last_workspace = Some((id, wt));
         }
         Some(id)
     }
 
-    pub fn active_worktree_path(&self) -> Option<&Path> {
+    pub fn active_workspace_path(&self) -> Option<&Path> {
         let (pid, wid, _) = self.active?;
         let project = self.projects.iter().find(|p| p.id == pid)?;
-        let wt = project.worktrees.iter().find(|w| w.id == wid)?;
+        let wt = project.workspaces.iter().find(|w| w.id == wid)?;
         Some(&wt.path)
     }
 
-    pub fn active_workspace(&mut self) -> Option<&mut Workspace> {
+    pub fn active_layout(&mut self) -> Option<&mut Layout> {
         let (pid, wid, tid) = self.active?;
         let project = self.projects.iter_mut().find(|p| p.id == pid)?;
-        let worktree = project.worktrees.iter_mut().find(|w| w.id == wid)?;
-        let tab = worktree.tabs.iter_mut().find(|t| t.id == tid)?;
-        Some(&mut tab.workspace)
+        let workspace = project.workspaces.iter_mut().find(|w| w.id == wid)?;
+        let tab = workspace.tabs.iter_mut().find(|t| t.id == tid)?;
+        Some(&mut tab.layout)
     }
 
-    pub fn active_worktree_mut(&mut self) -> Option<&mut Worktree> {
+    pub fn active_workspace_mut(&mut self) -> Option<&mut Workspace> {
         let (pid, wid, _) = self.active?;
         let project = self.projects.iter_mut().find(|p| p.id == pid)?;
-        project.worktrees.iter_mut().find(|w| w.id == wid)
+        project.workspaces.iter_mut().find(|w| w.id == wid)
     }
 
-    pub fn set_active(&mut self, pid: ProjectId, wid: WorktreeId, tid: TabId) {
+    pub fn set_active(&mut self, pid: ProjectId, wid: WorkspaceId, tid: TabId) {
         self.active = Some((pid, wid, tid));
-        self.last_worktree = Some((pid, wid));
+        self.last_workspace = Some((pid, wid));
         if let Some(p) = self.projects.iter_mut().find(|p| p.id == pid) {
-            if let Some(w) = p.worktrees.iter_mut().find(|w| w.id == wid) {
+            if let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
                 w.active_tab = Some(tid);
             }
         }
     }
 
-    pub fn new_tab_in_active_worktree(&mut self, ctx: &egui::Context) {
+    pub fn new_tab_in_active_workspace(&mut self, ctx: &egui::Context) {
         self.push_tab(ctx, None, None);
     }
 
     pub fn new_content_tab(
         &mut self,
         ctx: &egui::Context,
-        content: crate::workspace::PaneContent,
+        content: crate::layout::PaneContent,
         name: String,
     ) {
         self.push_tab(ctx, Some(content), Some(name));
@@ -258,10 +258,10 @@ impl App {
     fn push_tab(
         &mut self,
         ctx: &egui::Context,
-        initial_content: Option<crate::workspace::PaneContent>,
+        initial_content: Option<crate::layout::PaneContent>,
         tab_name: Option<String>,
     ) {
-        let (pid, wid) = match self.active.map(|(p, w, _)| (p, w)).or(self.last_worktree) {
+        let (pid, wid) = match self.active.map(|(p, w, _)| (p, w)).or(self.last_workspace) {
             Some(a) => a,
             None => return,
         };
@@ -271,30 +271,30 @@ impl App {
             Some(p) => p,
             None => return,
         };
-        let wt = match project.worktrees.iter_mut().find(|w| w.id == wid) {
+        let wt = match project.workspaces.iter_mut().find(|w| w.id == wid) {
             Some(w) => w,
             None => return,
         };
-        let mut workspace = Workspace::new(wt.path.clone());
+        let mut layout = Layout::new(wt.path.clone());
         let name = match initial_content {
             None => {
-                workspace.ensure_initial_terminal(ctx);
+                layout.ensure_initial_terminal(ctx);
                 tab_name.unwrap_or_else(|| format!("Tab {}", wt.tabs.len() + 1))
             }
             Some(content) => {
                 let default = content.kind_label().to_string();
-                workspace.add_pane(content, None);
+                layout.add_pane(content, None);
                 tab_name.unwrap_or(default)
             }
         };
         wt.tabs.push(Tab {
             id: tab_id,
             name,
-            workspace,
+            layout,
         });
         wt.active_tab = Some(tab_id);
         self.active = Some((pid, wid, tab_id));
-        self.last_worktree = Some((pid, wid));
+        self.last_workspace = Some((pid, wid));
     }
 
     pub fn close_active_tab(&mut self) {
@@ -306,7 +306,7 @@ impl App {
             Some(p) => p,
             None => return,
         };
-        let wt = match project.worktrees.iter_mut().find(|w| w.id == wid) {
+        let wt = match project.workspaces.iter_mut().find(|w| w.id == wid) {
             Some(w) => w,
             None => return,
         };
@@ -314,12 +314,12 @@ impl App {
         let new_tab = wt.tabs.first().map(|t| t.id);
         wt.active_tab = new_tab;
         self.active = new_tab.map(|t| (pid, wid, t));
-        self.last_worktree = Some((pid, wid));
+        self.last_workspace = Some((pid, wid));
     }
 
     pub fn refresh_active_git_status(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
-        let wt = match self.active_worktree_mut() {
+        let wt = match self.active_workspace_mut() {
             Some(w) => w,
             None => return,
         };
@@ -390,25 +390,25 @@ impl App {
         let parent = modal.resolved_parent(&project_path, &project_name);
         let wt_path = parent.join(&branch);
         let _ = std::fs::create_dir_all(&parent);
-        match git::worktree_add(&project_path, &wt_path, &branch, modal.create_new_branch) {
+        match git::workspace_add(&project_path, &wt_path, &branch, modal.create_new_branch) {
             Ok(()) => {
                 let _ = project_name;
                 let project = match self.projects.iter_mut().find(|p| p.id == modal.project_id) {
                     Some(p) => p,
                     None => return,
                 };
-                let wt_id = self.next_worktree;
-                self.next_worktree += 1;
+                let wt_id = self.next_workspace;
+                self.next_workspace += 1;
                 let tab_id = self.next_tab;
                 self.next_tab += 1;
-                let mut workspace = Workspace::new(wt_path.clone());
-                workspace.ensure_initial_terminal(ctx);
+                let mut layout = Layout::new(wt_path.clone());
+                layout.ensure_initial_terminal(ctx);
                 let tab = Tab {
                     id: tab_id,
                     name: "Terminal".into(),
-                    workspace,
+                    layout,
                 };
-                project.worktrees.push(Worktree {
+                project.workspaces.push(Workspace {
                     id: wt_id,
                     name: branch,
                     path: wt_path,
@@ -420,7 +420,7 @@ impl App {
                     git_rx: None,
                 });
                 self.active = Some((modal.project_id, wt_id, tab_id));
-                self.last_worktree = Some((modal.project_id, wt_id));
+                self.last_workspace = Some((modal.project_id, wt_id));
             }
             Err(e) => {
                 self.new_workspace_modal = Some(NewWorkspaceModal {
@@ -438,19 +438,19 @@ impl App {
                 self.active = self
                     .projects
                     .first()
-                    .and_then(|p| p.worktrees.first().map(|w| (p.id, w)))
+                    .and_then(|p| p.workspaces.first().map(|w| (p.id, w)))
                     .and_then(|(pid, w)| w.active_tab.map(|t| (pid, w.id, t)));
             }
         }
-        if let Some((p, _)) = self.last_worktree {
+        if let Some((p, _)) = self.last_workspace {
             if p == pid {
-                self.last_worktree = self
+                self.last_workspace = self
                     .active
                     .map(|(pid, wid, _)| (pid, wid))
                     .or_else(|| {
                         self.projects
                             .first()
-                            .and_then(|p| p.worktrees.first().map(|w| (p.id, w.id)))
+                            .and_then(|p| p.workspaces.first().map(|w| (p.id, w.id)))
                     });
             }
         }
@@ -462,7 +462,7 @@ impl App {
             None => return String::from("Crane"),
         };
         let project = self.projects.iter().find(|p| p.id == pid);
-        let wt = project.and_then(|p| p.worktrees.iter().find(|w| w.id == wid));
+        let wt = project.and_then(|p| p.workspaces.iter().find(|w| w.id == wid));
         let tab = wt.and_then(|w| w.tabs.iter().find(|t| t.id == tid));
         format!(
             "{}  ›  {}  ›  {}",

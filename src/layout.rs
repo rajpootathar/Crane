@@ -124,7 +124,7 @@ pub struct Pane {
     pub content: PaneContent,
 }
 
-pub struct Workspace {
+pub struct Layout {
     pub root: Option<Node>,
     pub panes: HashMap<PaneId, Pane>,
     pub focus: Option<PaneId>,
@@ -132,7 +132,7 @@ pub struct Workspace {
     next_id: PaneId,
 }
 
-impl Workspace {
+impl Layout {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
             root: None,
@@ -458,6 +458,99 @@ fn set_ratio(node: &mut Node, path: &[usize], ratio: f32) {
             set_ratio(first, tail, ratio);
         } else {
             set_ratio(second, tail, ratio);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf(id: PaneId) -> Node {
+        Node::Leaf(id)
+    }
+
+    fn split(dir: Dir, first: Node, second: Node) -> Node {
+        Node::Split {
+            direction: dir,
+            first: Box::new(first),
+            second: Box::new(second),
+            ratio: 0.5,
+        }
+    }
+
+    #[test]
+    fn split_at_on_leaf_wraps_into_split() {
+        let tree = leaf(1);
+        let out = split_at(tree, 1, 2, Dir::Horizontal);
+        match out {
+            Node::Split { direction, first, second, ratio } => {
+                assert_eq!(direction, Dir::Horizontal);
+                assert!(matches!(*first, Node::Leaf(1)));
+                assert!(matches!(*second, Node::Leaf(2)));
+                assert_eq!(ratio, 0.5);
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn split_at_missing_target_noop() {
+        let tree = split(Dir::Horizontal, leaf(1), leaf(2));
+        let out = split_at(tree, 99, 3, Dir::Vertical);
+        assert_eq!(collect_leaves(Some(&out)), vec![1, 2]);
+    }
+
+    #[test]
+    fn remove_leaf_promotes_sibling() {
+        let tree = split(Dir::Horizontal, leaf(1), leaf(2));
+        let (new_tree, focus) = remove_node(tree, 1);
+        assert!(matches!(new_tree, Some(Node::Leaf(2))));
+        assert_eq!(focus, Some(2));
+    }
+
+    #[test]
+    fn remove_last_leaf_returns_none() {
+        let tree = leaf(1);
+        let (new_tree, focus) = remove_node(tree, 1);
+        assert!(new_tree.is_none());
+        assert_eq!(focus, None);
+    }
+
+    #[test]
+    fn first_leaf_finds_leftmost() {
+        let tree = split(Dir::Horizontal, split(Dir::Vertical, leaf(1), leaf(2)), leaf(3));
+        assert_eq!(first_leaf(Some(&tree)), Some(1));
+    }
+
+    #[test]
+    fn collect_leaves_in_order() {
+        let tree = split(Dir::Horizontal, split(Dir::Vertical, leaf(1), leaf(2)), leaf(3));
+        assert_eq!(collect_leaves(Some(&tree)), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn contains_walks_tree() {
+        let tree = split(Dir::Horizontal, leaf(1), split(Dir::Vertical, leaf(2), leaf(3)));
+        assert!(contains(&tree, 1));
+        assert!(contains(&tree, 2));
+        assert!(contains(&tree, 3));
+        assert!(!contains(&tree, 99));
+    }
+
+    #[test]
+    fn set_ratio_updates_target() {
+        let mut tree = split(Dir::Horizontal, leaf(1), split(Dir::Vertical, leaf(2), leaf(3)));
+        set_ratio(&mut tree, &[1], 0.75);
+        match &tree {
+            Node::Split { second, .. } => {
+                if let Node::Split { ratio, .. } = second.as_ref() {
+                    assert!((ratio - 0.75).abs() < f32::EPSILON);
+                } else {
+                    panic!("expected inner split");
+                }
+            }
+            _ => panic!("expected outer split"),
         }
     }
 }

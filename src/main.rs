@@ -1,4 +1,5 @@
 mod git;
+mod layout;
 mod pane_view;
 mod session;
 mod state;
@@ -9,12 +10,11 @@ mod ui_right;
 mod ui_top;
 mod ui_util;
 mod views;
-mod workspace;
 
 use eframe::egui;
+use layout::{Dir, FilesPane, PaneContent};
 use pane_view::PaneAction;
 use state::App;
-use workspace::{Dir, FilesPane, PaneContent};
 
 const BG: egui::Color32 = egui::Color32::from_rgb(14, 16, 24);
 const SIDEBAR_BG: egui::Color32 = egui::Color32::from_rgb(18, 20, 28);
@@ -183,25 +183,25 @@ impl CraneApp {
             });
 
         if split_terminal {
-            if let Some(ws) = self.app.active_workspace() {
+            if let Some(ws) = self.app.active_layout() {
                 ws.split_focused_with_terminal(ctx, Dir::Horizontal);
             }
         }
         if new_tab {
-            self.app.new_tab_in_active_worktree(ctx);
+            self.app.new_tab_in_active_workspace(ctx);
         }
         if split_h {
-            if let Some(ws) = self.app.active_workspace() {
+            if let Some(ws) = self.app.active_layout() {
                 ws.split_focused_with_terminal(ctx, Dir::Horizontal);
             }
         }
         if split_v {
-            if let Some(ws) = self.app.active_workspace() {
+            if let Some(ws) = self.app.active_layout() {
                 ws.split_focused_with_terminal(ctx, Dir::Vertical);
             }
         }
         if close_pane {
-            if let Some(ws) = self.app.active_workspace() {
+            if let Some(ws) = self.app.active_layout() {
                 ws.close_focused();
             }
         }
@@ -209,12 +209,12 @@ impl CraneApp {
             self.app.close_active_tab();
         }
         if next_pane {
-            if let Some(ws) = self.app.active_workspace() {
+            if let Some(ws) = self.app.active_layout() {
                 ws.focus_next();
             }
         }
         if prev_pane {
-            if let Some(ws) = self.app.active_workspace() {
+            if let Some(ws) = self.app.active_layout() {
                 ws.focus_prev();
             }
         }
@@ -297,9 +297,9 @@ impl eframe::App for CraneApp {
         );
         let font_size = self.app.font_size;
         let inset = canvas_rect.shrink(6.0);
-        if self.app.active_workspace().is_some() {
-            if let Some(ws) = self.app.active_workspace() {
-                let action = pane_view::render_workspace(&mut center_ui, ws, font_size, inset);
+        if self.app.active_layout().is_some() {
+            if let Some(ws) = self.app.active_layout() {
+                let action = pane_view::render_layout(&mut center_ui, ws, font_size, inset);
                 match action {
                     PaneAction::None => {}
                     PaneAction::Focus(id) => ws.focus = Some(id),
@@ -524,7 +524,7 @@ fn render_empty_state(
             )
             .clicked()
         {
-            app.new_tab_in_active_worktree(ctx);
+            app.new_tab_in_active_workspace(ctx);
         }
     });
 }

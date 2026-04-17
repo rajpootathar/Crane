@@ -115,7 +115,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 }
 
                 if project.expanded {
-                    for wt in &project.worktrees {
+                    for wt in &project.workspaces {
                         let active_wt = app.active.map(|(_, w, _)| w == wt.id).unwrap_or(false);
                         let badge = wt.git_status.as_ref().and_then(|s| {
                             if s.added > 0 || s.deleted > 0 {
@@ -198,7 +198,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     }
     if let Some((pid, wid)) = toggle_worktree {
         if let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
-            if let Some(w) = p.worktrees.iter_mut().find(|w| w.id == wid) {
+            if let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
                 w.expanded = !w.expanded;
                 if let Some(tid) = w.active_tab {
                     app.active = Some((pid, wid, tid));
@@ -211,8 +211,8 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     }
     if let Some((pid, wid)) = new_tab_for_worktree {
         app.active = app.active.map(|(_, _, t)| (pid, wid, t)).or(Some((pid, wid, 0)));
-        app.last_worktree = Some((pid, wid));
-        app.new_tab_in_active_worktree(ctx);
+        app.last_workspace = Some((pid, wid));
+        app.new_tab_in_active_workspace(ctx);
     }
     if let Some(pid) = new_workspace_for_project {
         app.open_new_workspace_modal(pid);
@@ -222,13 +222,13 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     }
     if let Some((pid, wid, tid)) = close_tab {
         if let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
-            if let Some(w) = p.worktrees.iter_mut().find(|w| w.id == wid) {
+            if let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
                 w.tabs.retain(|t| t.id != tid);
                 w.active_tab = w.tabs.first().map(|t| t.id);
                 if app.active.map(|(_, _, t)| t == tid).unwrap_or(false) {
                     app.active = w.active_tab.map(|nt| (pid, wid, nt));
                 }
-                app.last_worktree = Some((pid, wid));
+                app.last_workspace = Some((pid, wid));
             }
         }
     }

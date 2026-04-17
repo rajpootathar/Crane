@@ -1,4 +1,4 @@
-use crate::workspace::BrowserPane;
+use crate::layout::BrowserPane;
 use egui::{Color32, RichText};
 
 pub fn render(ui: &mut egui::Ui, pane: &mut BrowserPane, title: &mut String) {

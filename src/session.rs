@@ -1,9 +1,9 @@
 use crate::state::{
-    App, Project, RightTab, Tab, Worktree, WorktreeId, TabId, ProjectId,
+    App, Project, RightTab, Tab, Workspace, WorkspaceId, TabId, ProjectId,
 };
-use crate::workspace::{
-    BrowserPane, DiffPane, Dir, FileTab, FilesPane, MarkdownPane, Node, Pane, PaneContent,
-    PaneId, Workspace,
+use crate::layout::{
+    BrowserPane, DiffPane, Dir, FileTab, FilesPane, Layout, MarkdownPane, Node, Pane,
+    PaneContent, PaneId,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -13,8 +13,8 @@ use std::time::Duration;
 pub struct Session {
     pub version: u32,
     pub projects: Vec<SProject>,
-    pub active: Option<(ProjectId, WorktreeId, TabId)>,
-    pub last_worktree: Option<(ProjectId, WorktreeId)>,
+    pub active: Option<(ProjectId, WorkspaceId, TabId)>,
+    pub last_workspace: Option<(ProjectId, WorkspaceId)>,
     pub show_left: bool,
     pub show_right: bool,
     pub right_tab: String,
@@ -23,7 +23,7 @@ pub struct Session {
     pub expanded_dirs: Vec<PathBuf>,
     pub commit_message: String,
     pub next_project: ProjectId,
-    pub next_worktree: WorktreeId,
+    pub next_workspace: WorkspaceId,
     pub next_tab: TabId,
 }
 
@@ -33,12 +33,12 @@ pub struct SProject {
     pub name: String,
     pub path: PathBuf,
     pub expanded: bool,
-    pub worktrees: Vec<SWorktree>,
+    pub workspaces: Vec<SWorkspace>,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct SWorktree {
-    pub id: WorktreeId,
+pub struct SWorkspace {
+    pub id: WorkspaceId,
     pub name: String,
     pub path: PathBuf,
     pub expanded: bool,
@@ -130,13 +130,13 @@ impl Session {
     pub fn from_app(app: &App) -> Self {
         let mut projects = Vec::with_capacity(app.projects.len());
         for p in &app.projects {
-            let mut worktrees = Vec::with_capacity(p.worktrees.len());
-            for w in &p.worktrees {
+            let mut workspaces = Vec::with_capacity(p.workspaces.len());
+            for w in &p.workspaces {
                 let mut tabs = Vec::with_capacity(w.tabs.len());
                 for t in &w.tabs {
                     tabs.push(STab::from_tab(t));
                 }
-                worktrees.push(SWorktree {
+                workspaces.push(SWorkspace {
                     id: w.id,
                     name: w.name.clone(),
                     path: w.path.clone(),
@@ -150,7 +150,7 @@ impl Session {
                 name: p.name.clone(),
                 path: p.path.clone(),
                 expanded: p.expanded,
-                worktrees,
+                workspaces,
             });
         }
 
@@ -164,7 +164,7 @@ impl Session {
             version: 1,
             projects,
             active: app.active,
-            last_worktree: app.last_worktree,
+            last_workspace: app.last_workspace,
             show_left: app.show_left,
             show_right: app.show_right,
             right_tab,
@@ -173,7 +173,7 @@ impl Session {
             expanded_dirs: app.expanded_dirs.iter().cloned().collect(),
             commit_message: app.commit_message.clone(),
             next_project: app.next_project_id(),
-            next_worktree: app.next_worktree_id(),
+            next_workspace: app.next_workspace_id(),
             next_tab: app.next_tab_id(),
         }
     }
@@ -192,13 +192,13 @@ impl Session {
         app.expanded_dirs = self.expanded_dirs.into_iter().collect();
 
         for sp in self.projects {
-            let mut worktrees = Vec::with_capacity(sp.worktrees.len());
-            for sw in sp.worktrees {
+            let mut workspaces = Vec::with_capacity(sp.workspaces.len());
+            for sw in sp.workspaces {
                 let mut tabs = Vec::with_capacity(sw.tabs.len());
                 for st in sw.tabs {
                     tabs.push(st.into_tab(ctx, &sw.path));
                 }
-                worktrees.push(Worktree {
+                workspaces.push(Workspace {
                     id: sw.id,
                     name: sw.name,
                     path: sw.path,
@@ -215,13 +215,13 @@ impl Session {
                 name: sp.name,
                 path: sp.path,
                 expanded: sp.expanded,
-                worktrees,
+                workspaces,
             });
         }
 
         app.active = self.active;
-        app.last_worktree = self.last_worktree;
-        app.set_id_counters(self.next_project, self.next_worktree, self.next_tab);
+        app.last_workspace = self.last_workspace;
+        app.set_id_counters(self.next_project, self.next_workspace, self.next_tab);
         app
     }
 }
@@ -229,7 +229,7 @@ impl Session {
 impl STab {
     fn from_tab(t: &Tab) -> Self {
         let panes: Vec<SPane> = t
-            .workspace
+            .layout
             .panes
             .iter()
             .map(|(id, p)| SPane::from_pane(*id, p))
@@ -237,26 +237,26 @@ impl STab {
         STab {
             id: t.id,
             name: t.name.clone(),
-            layout: t.workspace.root.as_ref().map(SNode::from_node),
-            focus: t.workspace.focus,
-            next_pane_id: t.workspace.next_pane_id(),
+            layout: t.layout.root.as_ref().map(SNode::from_node),
+            focus: t.layout.focus,
+            next_pane_id: t.layout.next_pane_id(),
             panes,
         }
     }
 
     fn into_tab(self, ctx: &egui::Context, cwd: &Path) -> Tab {
-        let mut workspace = Workspace::new(cwd.to_path_buf());
+        let mut layout = Layout::new(cwd.to_path_buf());
         for sp in self.panes {
             let (id, pane) = sp.into_pane(ctx, cwd);
-            workspace.panes.insert(id, pane);
+            layout.panes.insert(id, pane);
         }
-        workspace.root = self.layout.map(|n| n.into_node());
-        workspace.focus = self.focus;
-        workspace.set_next_pane_id(self.next_pane_id);
+        layout.root = self.layout.map(|n| n.into_node());
+        layout.focus = self.focus;
+        layout.set_next_pane_id(self.next_pane_id);
         Tab {
             id: self.id,
             name: self.name,
-            workspace,
+            layout,
         }
     }
 }

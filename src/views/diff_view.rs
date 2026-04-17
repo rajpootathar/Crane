@@ -1,4 +1,4 @@
-use crate::workspace::DiffPane;
+use crate::layout::DiffPane;
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
 use similar::{ChangeTag, TextDiff};
 use std::path::Path;

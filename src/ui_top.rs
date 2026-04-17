@@ -1,6 +1,6 @@
 use crate::state::App;
 use crate::ui_util::icon_button;
-use crate::workspace::{BrowserPane, Dir, PaneContent};
+use crate::layout::{BrowserPane, Dir, PaneContent};
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
 
@@ -79,12 +79,12 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             .clicked();
 
         if split_terminal {
-            if let Some(ws) = app.active_workspace() {
+            if let Some(ws) = app.active_layout() {
                 ws.split_focused_with_terminal(ctx, Dir::Horizontal);
             }
         }
         if let Some(content) = split_content {
-            if let Some(ws) = app.active_workspace() {
+            if let Some(ws) = app.active_layout() {
                 ws.add_pane(content, Some(Dir::Horizontal));
             }
         }

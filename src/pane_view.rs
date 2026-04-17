@@ -1,6 +1,6 @@
 use crate::terminal_view;
 use crate::views::{browser_view, diff_view, file_view, markdown_view};
-use crate::workspace::{Dir, Node, PaneContent, PaneId, Workspace};
+use crate::layout::{Dir, Node, PaneContent, PaneId, Layout};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
 use egui_phosphor::regular as icons;
 
@@ -24,24 +24,24 @@ pub enum PaneAction {
     ResizeSplit { path: Vec<usize>, ratio: f32 },
 }
 
-pub fn render_workspace(
+pub fn render_layout(
     ui: &mut egui::Ui,
-    workspace: &mut Workspace,
+    layout: &mut Layout,
     font_size: f32,
     rect: Rect,
 ) -> PaneAction {
     let mut action = PaneAction::None;
-    let root = workspace.root.take();
+    let root = layout.root.take();
     if let Some(root) = root {
-        render_node(ui, workspace, &root, rect, font_size, &mut action, &[]);
-        workspace.root = Some(root);
+        render_node(ui, layout, &root, rect, font_size, &mut action, &[]);
+        layout.root = Some(root);
     }
     action
 }
 
 fn render_node(
     ui: &mut egui::Ui,
-    workspace: &mut Workspace,
+    layout: &mut Layout,
     node: &Node,
     rect: Rect,
     font_size: f32,
@@ -50,7 +50,7 @@ fn render_node(
 ) {
     match node {
         Node::Leaf(id) => {
-            render_pane(ui, workspace, *id, rect, font_size, action);
+            render_pane(ui, layout, *id, rect, font_size, action);
         }
         Node::Split {
             direction,
@@ -63,8 +63,8 @@ fn render_node(
             first_path.push(0);
             let mut second_path = path.to_vec();
             second_path.push(1);
-            render_node(ui, workspace, first, r1, font_size, action, &first_path);
-            render_node(ui, workspace, second, r2, font_size, action, &second_path);
+            render_node(ui, layout, first, r1, font_size, action, &first_path);
+            render_node(ui, layout, second, r2, font_size, action, &second_path);
             render_splitter(ui, splitter, *direction, path, rect, action);
         }
     }
@@ -130,13 +130,13 @@ fn render_splitter(
 
 fn render_pane(
     ui: &mut egui::Ui,
-    workspace: &mut Workspace,
+    layout: &mut Layout,
     id: PaneId,
     rect: Rect,
     font_size: f32,
     action: &mut PaneAction,
 ) {
-    let is_focus = workspace.focus == Some(id);
+    let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
         FOCUS_BORDER
     } else {
@@ -155,9 +155,9 @@ fn render_pane(
     let body_outer = Rect::from_min_max(Pos2::new(inner.min.x, inner.min.y + HEADER_H), inner.max);
     let body_rect = body_outer.shrink2(Vec2::new(5.0, 3.0));
 
-    render_header(ui, workspace, id, header_rect, is_focus, action);
+    render_header(ui, layout, id, header_rect, is_focus, action);
 
-    let pane = match workspace.panes.get_mut(&id) {
+    let pane = match layout.panes.get_mut(&id) {
         Some(p) => p,
         None => return,
     };
@@ -198,7 +198,7 @@ fn render_pane(
 
 fn render_header(
     ui: &mut egui::Ui,
-    workspace: &Workspace,
+    layout: &Layout,
     id: PaneId,
     rect: Rect,
     is_focus: bool,
@@ -211,7 +211,7 @@ fn render_header(
     };
     ui.painter().rect_filled(rect, 0.0, bg);
 
-    let pane = match workspace.panes.get(&id) {
+    let pane = match layout.panes.get(&id) {
         Some(p) => p,
         None => return,
     };

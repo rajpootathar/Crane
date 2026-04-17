@@ -4,7 +4,7 @@ use crate::ui_util::{
     draw_row, draw_trailing, full_width_primary_button, ghost_button, section_header,
     RowConfig, ACCENT, MUTED, TEXT,
 };
-use crate::workspace::{DiffPane, Dir, PaneContent};
+use crate::layout::{DiffPane, Dir, PaneContent};
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
 use std::collections::BTreeMap;
@@ -79,14 +79,14 @@ fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, mut on_click: impl FnM
 }
 
 fn render_changes(ui: &mut egui::Ui, app: &mut App) {
-    let repo_path = match app.active_worktree_path() {
+    let repo_path = match app.active_workspace_path() {
         Some(p) => p.to_path_buf(),
         None => {
             dim_row(ui, "No active worktree");
             return;
         }
     };
-    let status = match app.active_worktree_mut().and_then(|w| w.git_status.clone()) {
+    let status = match app.active_workspace_mut().and_then(|w| w.git_status.clone()) {
         Some(s) => s,
         None => {
             dim_row(ui, "(not a git repo)");
@@ -360,7 +360,7 @@ fn do_push(app: &mut App, repo: &std::path::Path) {
 }
 
 fn force_status_refresh(app: &mut App) {
-    if let Some(wt) = app.active_worktree_mut() {
+    if let Some(wt) = app.active_workspace_mut() {
         wt.last_status_refresh = None;
     }
 }
@@ -376,7 +376,7 @@ fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
             .and_then(|s| s.to_str())
             .unwrap_or(rel_path)
     );
-    if let Some(ws) = app.active_workspace() {
+    if let Some(ws) = app.active_layout() {
         ws.open_or_replace_diff(
             format!("HEAD:{rel_path}"),
             rel_path.to_string(),
@@ -559,7 +559,7 @@ fn render_change_node(
 }
 
 fn render_files(ui: &mut egui::Ui, app: &mut App) {
-    let path = match app.active_worktree_path() {
+    let path = match app.active_workspace_path() {
         Some(p) => p.to_path_buf(),
         None => {
             dim_row(ui, "No active worktree");
@@ -594,7 +594,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
             .unwrap_or(&path_str)
             .to_string();
         let content = std::fs::read_to_string(&p).unwrap_or_default();
-        if let Some(ws) = app.active_workspace() {
+        if let Some(ws) = app.active_layout() {
             ws.open_file_in_files_pane(path_str, name, content);
         }
     }

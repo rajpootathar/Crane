@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone)]
-pub struct WorktreeInfo {
+pub struct WorkspaceInfo {
     pub path: PathBuf,
     pub branch: String,
 }
@@ -24,7 +24,7 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-pub fn list_worktrees(repo: &Path) -> Vec<WorktreeInfo> {
+pub fn list_workspaces(repo: &Path) -> Vec<WorkspaceInfo> {
     let out = match Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo)
@@ -40,7 +40,7 @@ pub fn list_worktrees(repo: &Path) -> Vec<WorktreeInfo> {
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix("worktree ") {
             if let (Some(p), Some(b)) = (cur_path.take(), cur_branch.take()) {
-                result.push(WorktreeInfo { path: p, branch: b });
+                result.push(WorkspaceInfo { path: p, branch: b });
             }
             cur_path = Some(PathBuf::from(rest));
             cur_branch = Some("detached".into());
@@ -53,7 +53,7 @@ pub fn list_worktrees(repo: &Path) -> Vec<WorktreeInfo> {
         }
     }
     if let (Some(p), Some(b)) = (cur_path, cur_branch) {
-        result.push(WorktreeInfo { path: p, branch: b });
+        result.push(WorkspaceInfo { path: p, branch: b });
     }
     result
 }
@@ -204,7 +204,7 @@ pub fn pull(repo: &Path) -> Result<(), String> {
     run(repo, &["pull", "--ff-only"])
 }
 
-pub fn worktree_add(repo: &Path, path: &Path, branch: &str, create_new: bool) -> Result<(), String> {
+pub fn workspace_add(repo: &Path, path: &Path, branch: &str, create_new: bool) -> Result<(), String> {
     let path_str = path.to_string_lossy();
     let mut args: Vec<&str> = vec!["worktree", "add"];
     if create_new {
