@@ -49,12 +49,33 @@ pub enum RightTab {
     Files,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LocationMode {
+    Global,
+    ProjectLocal,
+    Custom,
+}
+
 pub struct NewWorkspaceModal {
     pub project_id: ProjectId,
     pub branch: String,
-    pub path: String,
+    pub custom_path: String,
+    pub mode: LocationMode,
     pub create_new_branch: bool,
     pub error: Option<String>,
+}
+
+impl NewWorkspaceModal {
+    pub fn resolved_parent(&self, project_path: &Path, project_name: &str) -> PathBuf {
+        match self.mode {
+            LocationMode::Global => {
+                let home = std::env::var("HOME").unwrap_or_default();
+                PathBuf::from(format!("{home}/.crane-worktrees/{project_name}"))
+            }
+            LocationMode::ProjectLocal => project_path.join(".crane-worktrees"),
+            LocationMode::Custom => PathBuf::from(shellexpand_home(&self.custom_path)),
+        }
+    }
 }
 
 pub struct App {
@@ -322,11 +343,11 @@ impl App {
             None => return,
         };
         let home = std::env::var("HOME").unwrap_or_default();
-        let default_path = format!("{home}/.crane-worktrees/{}", project.name);
         self.new_workspace_modal = Some(NewWorkspaceModal {
             project_id: pid,
             branch: String::new(),
-            path: default_path,
+            custom_path: format!("{home}/.crane-worktrees/{}", project.name),
+            mode: LocationMode::Global,
             create_new_branch: true,
             error: None,
         });
@@ -345,18 +366,16 @@ impl App {
             });
             return;
         }
-        let project = match self.projects.iter().find(|p| p.id == modal.project_id) {
-            Some(p) => p.path.clone(),
+        let (project_path, project_name) = match self.projects.iter().find(|p| p.id == modal.project_id) {
+            Some(p) => (p.path.clone(), p.name.clone()),
             None => return,
         };
-        let wt_path = PathBuf::from(
-            shellexpand_home(&modal.path).trim_end_matches('/').to_string() + "/" + &branch,
-        );
-        if let Some(parent) = wt_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match git::worktree_add(&project, &wt_path, &branch, modal.create_new_branch) {
+        let parent = modal.resolved_parent(&project_path, &project_name);
+        let wt_path = parent.join(&branch);
+        let _ = std::fs::create_dir_all(&parent);
+        match git::worktree_add(&project_path, &wt_path, &branch, modal.create_new_branch) {
             Ok(()) => {
+                let _ = project_name;
                 let project = match self.projects.iter_mut().find(|p| p.id == modal.project_id) {
                     Some(p) => p,
                     None => return,

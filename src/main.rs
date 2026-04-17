@@ -6,6 +6,7 @@ mod terminal_view;
 mod ui_left;
 mod ui_right;
 mod ui_top;
+mod ui_util;
 mod views;
 mod workspace;
 
@@ -341,11 +342,18 @@ fn render_new_workspace_modal(ctx: &egui::Context, app: &mut state::App) {
     let mut create = false;
     let mut cancel = false;
     let mut browse: Option<String> = None;
-    let modal_width = 460.0;
-    egui::Window::new("New Workspace")
+    let modal_width = 480.0;
+    let project_info = app.new_workspace_modal.as_ref().and_then(|m| {
+        app.projects
+            .iter()
+            .find(|p| p.id == m.project_id)
+            .map(|p| (p.path.clone(), p.name.clone()))
+    });
+
+    egui::Window::new("New Worktree")
         .collapsible(false)
         .resizable(false)
-        .fixed_size(egui::vec2(modal_width, 240.0))
+        .fixed_size(egui::vec2(modal_width, 280.0))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .open(&mut open)
         .show(ctx, |ui| {
@@ -363,28 +371,55 @@ fn render_new_workspace_modal(ctx: &egui::Context, app: &mut state::App) {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Location").strong());
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut modal.path)
-                            .hint_text("~/.crane-worktrees/<project>")
-                            .desired_width(input_width - 88.0),
-                    );
-                    if ui.button("Browse…").clicked() {
-                        browse = Some(modal.path.clone());
-                    }
+                    ui.selectable_value(
+                        &mut modal.mode,
+                        state::LocationMode::Global,
+                        "Global",
+                    )
+                    .on_hover_text("~/.crane-worktrees/<project>/<branch>");
+                    ui.selectable_value(
+                        &mut modal.mode,
+                        state::LocationMode::ProjectLocal,
+                        "Project-local",
+                    )
+                    .on_hover_text("<project>/.crane-worktrees/<branch>");
+                    ui.selectable_value(
+                        &mut modal.mode,
+                        state::LocationMode::Custom,
+                        "Custom",
+                    )
+                    .on_hover_text("Pick any folder");
                 });
+                if modal.mode == state::LocationMode::Custom {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut modal.custom_path)
+                                .hint_text("/path/to/parent")
+                                .desired_width(input_width - 88.0),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            browse = Some(modal.custom_path.clone());
+                        }
+                    });
+                }
+                let preview = project_info
+                    .as_ref()
+                    .map(|(p, n)| modal.resolved_parent(p, n))
+                    .unwrap_or_default();
+                let preview_str = format!(
+                    "→ {}/{}",
+                    preview.display().to_string().trim_end_matches('/'),
+                    if modal.branch.is_empty() {
+                        "<branch>"
+                    } else {
+                        &modal.branch
+                    }
+                );
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(format!(
-                            "→ {}/{}",
-                            modal.path.trim_end_matches('/'),
-                            if modal.branch.is_empty() {
-                                "<branch>"
-                            } else {
-                                &modal.branch
-                            }
-                        ))
-                        .size(10.5)
-                        .color(egui::Color32::from_rgb(130, 136, 150)),
+                        egui::RichText::new(preview_str)
+                            .size(10.5)
+                            .color(egui::Color32::from_rgb(130, 136, 150)),
                     )
                     .truncate(),
                 );
@@ -412,12 +447,13 @@ fn render_new_workspace_modal(ctx: &egui::Context, app: &mut state::App) {
             current
         });
         if let Some(p) = rfd::FileDialog::new()
-            .set_title("Choose workspace parent folder")
+            .set_title("Choose worktree parent folder")
             .set_directory(start)
             .pick_folder()
         {
             if let Some(modal) = app.new_workspace_modal.as_mut() {
-                modal.path = p.to_string_lossy().to_string();
+                modal.custom_path = p.to_string_lossy().to_string();
+                modal.mode = state::LocationMode::Custom;
             }
         }
     } else if create {

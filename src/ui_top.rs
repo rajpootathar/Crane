@@ -1,4 +1,5 @@
 use crate::state::App;
+use crate::ui_util::icon_button;
 use crate::workspace::{BrowserPane, Dir, PaneContent};
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
@@ -35,11 +36,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     } else {
         icons::SIDEBAR
     };
-    if bar_ui
-        .small_button(RichText::new(left_label).size(16.0))
-        .on_hover_text("Toggle Left Panel (Cmd+B)")
-        .clicked()
-    {
+    if icon_button(&mut bar_ui, left_label, 16.0, "Toggle Left Panel (Cmd+B)").clicked() {
         app.show_left = !app.show_left;
     }
     bar_ui.add_space(6.0);
@@ -55,19 +52,11 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         } else {
             icons::SIDEBAR
         };
-        if ui
-            .small_button(RichText::new(right_label).size(16.0))
-            .on_hover_text("Toggle Right Panel (Cmd+/)")
-            .clicked()
-        {
+        if icon_button(ui, right_label, 16.0, "Toggle Right Panel (Cmd+/)").clicked() {
             app.show_right = !app.show_right;
         }
         ui.separator();
-        if ui
-            .small_button(RichText::new(icons::QUESTION).size(16.0))
-            .on_hover_text("Keyboard shortcuts")
-            .clicked()
-        {
+        if icon_button(ui, icons::QUESTION, 16.0, "Keyboard shortcuts").clicked() {
             app.show_help = !app.show_help;
         }
         ui.separator();

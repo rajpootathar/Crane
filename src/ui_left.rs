@@ -1,4 +1,5 @@
 use crate::state::App;
+use crate::ui_util::icon_button;
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
 
@@ -92,18 +93,12 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if ui
-                                    .small_button(
-                                        RichText::new(icons::X).size(13.0).color(DIM),
-                                    )
-                                    .on_hover_text("Remove project from Crane")
+                                if icon_button(ui, icons::X, 14.0, "Remove project from Crane")
                                     .clicked()
                                 {
                                     remove_project = Some(project.id);
                                 }
-                                if ui
-                                    .small_button(RichText::new(icons::PLUS).size(13.0))
-                                    .on_hover_text("New workspace (branch)")
+                                if icon_button(ui, icons::PLUS, 14.0, "New worktree (branch checkout)")
                                     .clicked()
                                 {
                                     new_workspace_for_project = Some(project.id);
@@ -152,10 +147,13 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui
-                                            .small_button(RichText::new(icons::PLUS).size(13.0))
-                                            .on_hover_text("New tab in this workspace (Cmd+Shift+T)")
-                                            .clicked()
+                                        if icon_button(
+                                            ui,
+                                            icons::PLUS,
+                                            14.0,
+                                            "New tab in this workspace (Cmd+Shift+T)",
+                                        )
+                                        .clicked()
                                         {
                                             new_tab_for_worktree = Some((project.id, wt.id));
                                         }
@@ -182,13 +180,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                         {
                                             set_active = Some((project.id, wt.id, tab.id));
                                         }
-                                        if ui
-                                            .small_button(
-                                                RichText::new(icons::X).color(DIM).size(12.0),
-                                            )
-                                            .on_hover_text("Close tab")
-                                            .clicked()
-                                        {
+                                        if icon_button(ui, icons::X, 12.0, "Close tab").clicked() {
                                             close_tab = Some((project.id, wt.id, tab.id));
                                         }
                                     });
