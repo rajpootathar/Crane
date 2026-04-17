@@ -61,7 +61,12 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
 
     painter.rect_filled(response.rect, 0.0, BG);
 
-    // Mouse selection: drag to select, click to clear.
+    // I-beam over the terminal so it feels like selectable text.
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
+
+    // Drag: plain range select.
     if response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
             let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
@@ -78,8 +83,46 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             }
         }
     }
+
+    // Clicks: 1 → clear, 2 → word (Semantic), 3 → line (Lines),
+    // Shift+click → extend existing selection to click point.
     if response.clicked() {
-        terminal.term.lock().selection = None;
+        if let Some(pos) = response.interact_pointer_pos() {
+            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
+            let shift_held = ui.input(|i| i.modifiers.shift);
+            let now = std::time::Instant::now();
+            let is_multi = terminal
+                .last_click
+                .map(|(t, line, col)| {
+                    now.duration_since(t) < std::time::Duration::from_millis(500)
+                        && line == point.line.0
+                        && col == point.column.0
+                })
+                .unwrap_or(false);
+            terminal.click_count = if is_multi { terminal.click_count + 1 } else { 1 };
+            terminal.last_click = Some((now, point.line.0, point.column.0));
+
+            let mut guard = terminal.term.lock();
+            if shift_held && guard.selection.is_some() {
+                if let Some(sel) = guard.selection.as_mut() {
+                    sel.update(point, side);
+                }
+            } else {
+                match terminal.click_count {
+                    2 => {
+                        guard.selection =
+                            Some(Selection::new(SelectionType::Semantic, point, Side::Left));
+                    }
+                    3 => {
+                        guard.selection =
+                            Some(Selection::new(SelectionType::Lines, point, Side::Left));
+                    }
+                    _ => {
+                        guard.selection = None;
+                    }
+                }
+            }
+        }
     }
 
     let snapshot = {
@@ -164,6 +207,22 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                             copy_text = Some(t);
                         }
                     }
+                }
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.mac_cmd || modifiers.command => {
+                    let mut guard = terminal.term.lock();
+                    let start = Point::new(Line(0), Column(0));
+                    let end = Point::new(
+                        Line(rows.saturating_sub(1) as i32),
+                        Column(cols.saturating_sub(1)),
+                    );
+                    let mut sel = Selection::new(SelectionType::Simple, start, Side::Left);
+                    sel.update(end, Side::Right);
+                    guard.selection = Some(sel);
                 }
                 egui::Event::Paste(text) => {
                     if !text.is_empty() {

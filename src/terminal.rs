@@ -46,6 +46,8 @@ pub struct Terminal {
     pub rows: usize,
     pub cwd: std::path::PathBuf,
     pub history: Arc<Mutex<Vec<u8>>>,
+    pub last_click: Option<(std::time::Instant, i32, usize)>,
+    pub click_count: u8,
     master: Box<dyn MasterPty + Send>,
 }
 
@@ -135,6 +137,8 @@ impl Terminal {
             rows,
             cwd: cwd.map(|p| p.to_path_buf()).unwrap_or_default(),
             history,
+            last_click: None,
+            click_count: 0,
             master: pair.master,
         })
     }
