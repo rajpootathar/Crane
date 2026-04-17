@@ -1,0 +1,89 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle
+      - name: Build icon
+        run: ./scripts/make-icns.sh
+      - name: Build release
+        run: make release-universal
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crane-macos-universal
+          path: target/release/Crane-*-universal.dmg
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/Crane-*-universal.dmg
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libwayland-dev libgl-dev libx11-dev \
+            libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev pkg-config
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle
+      - name: Build release deb
+        run: cargo bundle --release --format deb
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp target/release/bundle/deb/*.deb dist/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crane-linux-x86_64
+          path: dist/*.deb
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release --bin crane
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $zip = "dist/Crane-$ver-windows-x86_64.zip"
+          Compress-Archive -Path target/release/crane.exe,crane.png,LICENSE,README.md -DestinationPath $zip
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crane-windows-x86_64
+          path: dist/*.zip
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip

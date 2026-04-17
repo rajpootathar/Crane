@@ -2,6 +2,29 @@
 name = "crane"
 version = "0.1.0"
 edition = "2024"
+description = "Native GPU-rendered terminal + IDE environment"
+authors = ["rajpootathar"]
+license = "MIT"
+
+[package.metadata.bundle]
+name = "Crane"
+identifier = "sh.superset.crane"
+icon = ["icons/crane.icns", "crane.png"]
+version = "0.1.0"
+copyright = "Copyright © 2026 rajpootathar"
+category = "Developer Tool"
+short_description = "GPU-rendered terminal environment"
+long_description = """
+Crane is a native, GPU-rendered desktop development environment for
+orchestrating terminals, editors, and git workflows across isolated
+git workspaces.
+"""
+
+[package.metadata.bundle.deb]
+depends = ["libxkbcommon0", "libwayland-client0", "libgl1", "libx11-6"]
+
+[package.metadata.bundle.windows]
+
 
 [dependencies]
 eframe = { version = "0.34", features = ["wgpu"] }
