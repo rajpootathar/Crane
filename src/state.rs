@@ -50,6 +50,44 @@ pub enum RightTab {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSection {
+    Appearance,
+    Editor,
+    Terminal,
+    Shortcuts,
+    About,
+}
+
+impl SettingsSection {
+    pub const ALL: &'static [SettingsSection] = &[
+        SettingsSection::Appearance,
+        SettingsSection::Editor,
+        SettingsSection::Terminal,
+        SettingsSection::Shortcuts,
+        SettingsSection::About,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => "Appearance",
+            SettingsSection::Editor => "Editor",
+            SettingsSection::Terminal => "Terminal",
+            SettingsSection::Shortcuts => "Keyboard Shortcuts",
+            SettingsSection::About => "About",
+        }
+    }
+    pub fn icon(self) -> &'static str {
+        use egui_phosphor::regular as i;
+        match self {
+            SettingsSection::Appearance => i::PAINT_BRUSH,
+            SettingsSection::Editor => i::CODE,
+            SettingsSection::Terminal => i::TERMINAL_WINDOW,
+            SettingsSection::Shortcuts => i::KEYBOARD,
+            SettingsSection::About => i::INFO,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LocationMode {
     Global,
     ProjectLocal,
@@ -95,6 +133,7 @@ pub struct App {
     pub update_check: UpdateCheck,
     pub selected_theme: String,
     pub show_settings: bool,
+    pub settings_section: SettingsSection,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -119,6 +158,7 @@ impl App {
             update_check: UpdateCheck::new(Default::default()),
             selected_theme: "crane-dark".to_string(),
             show_settings: false,
+            settings_section: SettingsSection::Appearance,
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,
