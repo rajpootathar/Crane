@@ -302,18 +302,27 @@ pub fn themes_dir() -> PathBuf {
 /// Scan `~/.config/crane/themes/*.toml` and return all successfully parsed
 /// themes. Built-in themes are returned first, then user themes.
 pub fn load_all() -> Vec<Theme> {
-    let mut out = Theme::builtins();
+    let mut out: Vec<Theme> = Vec::new();
     let dir = themes_dir();
+    let mut disk_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Ok(read) = std::fs::read_dir(&dir) {
         for entry in read.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "toml")
                 && let Some(theme) = load_from_path(&path)
             {
+                disk_names.insert(theme.name.clone());
                 out.push(theme);
             }
         }
     }
+    // Add any built-in not shadowed by an on-disk theme of the same name.
+    for theme in Theme::builtins() {
+        if !disk_names.contains(&theme.name) {
+            out.push(theme);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -324,6 +333,31 @@ pub fn load_from_path(path: &Path) -> Option<Theme> {
 
 pub fn find_by_name(name: &str) -> Option<Theme> {
     load_all().into_iter().find(|t| t.name == name)
+}
+
+/// On first launch, write every built-in theme out to
+/// `~/.config/crane/themes/<name>.toml` so users can see a working
+/// template + tweak any colour. Existing files are never overwritten.
+pub fn ensure_builtin_tomls_on_disk() {
+    let dir = themes_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for theme in Theme::builtins() {
+        let path = dir.join(format!("{}.toml", theme.name));
+        if path.exists() {
+            continue;
+        }
+        if let Ok(contents) = toml::to_string_pretty(&theme) {
+            let header = format!(
+                "# Crane theme: {}\n# \
+                 Edit any Rgb value below and Crane will pick up the file\n# \
+                 the next time you open the theme picker.\n\n",
+                theme.name
+            );
+            let _ = std::fs::write(&path, format!("{header}{contents}"));
+        }
+    }
 }
 
 #[cfg(test)]

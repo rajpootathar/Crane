@@ -154,6 +154,7 @@ impl CraneApp {
             Some(s) => s.restore(&cc.egui_ctx),
             None => App::new(),
         };
+        theme::ensure_builtin_tomls_on_disk();
         let initial = theme::find_by_name(&app.selected_theme)
             .unwrap_or_else(theme::Theme::dark);
         theme::init(initial);

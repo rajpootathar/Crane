@@ -1,4 +1,5 @@
 use crate::layout::FilesPane;
+use crate::theme;
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
 use egui_phosphor::regular as icons;
 
@@ -16,18 +17,19 @@ pub fn render(
 
 fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: &mut String) {
     if pane.tabs.is_empty() {
+        let t = theme::current();
         ui.add_space(8.0);
         ui.vertical_centered(|ui| {
             ui.add_space(20.0);
             ui.label(
                 RichText::new("No files open")
                     .size(14.0)
-                    .color(Color32::from_rgb(200, 204, 220)),
+                    .color(t.text.to_color32()),
             );
             ui.add_space(4.0);
             ui.label(
                 RichText::new("Click a file in the Files sidebar to open it here")
-                    .color(Color32::from_rgb(130, 136, 150))
+                    .color(t.text_muted.to_color32())
                     .size(11.5),
             );
         });
@@ -89,7 +91,7 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
             ui.label(
                 RichText::new(&tab.path)
                     .size(10.5)
-                    .color(Color32::from_rgb(130, 136, 150)),
+                    .color(theme::current().text_muted.to_color32()),
             );
             ui.with_layout(
                 egui::Layout::right_to_left(egui::Align::Center),
@@ -161,21 +163,13 @@ fn draw_file_tab(
         egui::Sense::click(),
     );
 
+    let t = theme::current();
     let (bg, fg) = if is_active {
-        (
-            egui::Color32::from_rgb(56, 100, 170),
-            egui::Color32::from_rgb(240, 243, 250),
-        )
+        (t.accent.to_color32(), t.text_hover.to_color32())
     } else if response.hovered() || close_response.hovered() {
-        (
-            egui::Color32::from_rgb(42, 47, 62),
-            egui::Color32::from_rgb(220, 224, 236),
-        )
+        (t.row_hover.to_color32(), t.text.to_color32())
     } else {
-        (
-            egui::Color32::TRANSPARENT,
-            egui::Color32::from_rgb(170, 176, 190),
-        )
+        (egui::Color32::TRANSPARENT, t.text_muted.to_color32())
     };
     if bg != egui::Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 5.0, bg);
@@ -191,7 +185,7 @@ fn draw_file_tab(
         ui.painter().rect_filled(
             close_rect.shrink(1.0),
             4.0,
-            egui::Color32::from_rgb(180, 60, 60),
+            theme::current().error.to_color32(),
         );
     }
     ui.painter().text(
