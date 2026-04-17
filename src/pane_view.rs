@@ -2,6 +2,7 @@ use crate::terminal_view;
 use crate::views::{browser_view, diff_view, file_view, markdown_view};
 use crate::workspace::{Dir, Node, PaneContent, PaneId, Workspace};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
+use egui_phosphor::regular as icons;
 
 pub const HEADER_H: f32 = 26.0;
 const BORDER_W: f32 = 1.0;
@@ -227,8 +228,8 @@ fn render_header(
     ui.painter().text(
         close_rect.center(),
         egui::Align2::CENTER_CENTER,
-        "×",
-        egui::FontId::new(16.0, egui::FontFamily::Proportional),
+        icons::X,
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
         HEADER_FG,
     );
     if close_response.clicked() {

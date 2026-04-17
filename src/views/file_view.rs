@@ -1,5 +1,6 @@
 use crate::workspace::FilesPane;
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
+use egui_phosphor::regular as icons;
 use std::path::Path;
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
@@ -68,8 +69,8 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
                 }
                 if ui
                     .small_button(
-                        RichText::new("×")
-                            .size(11.0)
+                        RichText::new(icons::X)
+                            .size(12.0)
                             .color(Color32::from_rgb(130, 136, 150)),
                     )
                     .on_hover_text("Close file")

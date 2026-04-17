@@ -1,6 +1,7 @@
 use crate::state::App;
-use crate::workspace::{BrowserPane, DiffPane, Dir, FilesPane, MarkdownPane, PaneContent};
+use crate::workspace::{BrowserPane, Dir, PaneContent};
 use egui::{Color32, RichText};
+use egui_phosphor::regular as icons;
 
 const TOPBAR_H: f32 = 34.0;
 const TOPBAR_BG: Color32 = Color32::from_rgb(20, 22, 32);
@@ -29,9 +30,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
 
-    let left_label = if app.show_left { "◧" } else { "▸" };
+    let left_label = if app.show_left {
+        icons::SIDEBAR_SIMPLE
+    } else {
+        icons::SIDEBAR
+    };
     if bar_ui
-        .small_button(RichText::new(left_label).size(14.0))
+        .small_button(RichText::new(left_label).size(16.0))
         .on_hover_text("Toggle Left Panel (Cmd+B)")
         .clicked()
     {
@@ -45,9 +50,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     );
 
     bar_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let right_label = if app.show_right { "◨" } else { "◂" };
+        let right_label = if app.show_right {
+            icons::SIDEBAR_SIMPLE
+        } else {
+            icons::SIDEBAR
+        };
         if ui
-            .small_button(RichText::new(right_label).size(14.0))
+            .small_button(RichText::new(right_label).size(16.0))
             .on_hover_text("Toggle Right Panel (Cmd+/)")
             .clicked()
         {
@@ -55,7 +64,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         }
         ui.separator();
         if ui
-            .small_button(RichText::new("?").size(13.0).strong())
+            .small_button(RichText::new(icons::QUESTION).size(16.0))
             .on_hover_text("Keyboard shortcuts")
             .clicked()
         {
@@ -64,7 +73,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         ui.separator();
         let mut split_content: Option<PaneContent> = None;
         if ui
-            .small_button("+ Browser")
+            .small_button(RichText::new(format!("{}  Browser", icons::GLOBE)))
             .on_hover_text("Split active pane with browser")
             .clicked()
         {
@@ -73,43 +82,9 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 input_buf: "https://".into(),
             }));
         }
-        if ui
-            .small_button("+ Diff")
-            .on_hover_text("Split active pane with diff")
-            .clicked()
-        {
-            split_content = Some(PaneContent::Diff(DiffPane {
-                left_path: String::new(),
-                right_path: String::new(),
-                left_text: String::new(),
-                right_text: String::new(),
-                left_buf: String::new(),
-                right_buf: String::new(),
-                error: None,
-            }));
-        }
-        if ui
-            .small_button("+ Markdown")
-            .on_hover_text("Split active pane with markdown")
-            .clicked()
-        {
-            split_content = Some(PaneContent::Markdown(MarkdownPane {
-                path: String::new(),
-                content: String::new(),
-                input_buf: String::new(),
-                error: None,
-            }));
-        }
-        if ui
-            .small_button("+ Files")
-            .on_hover_text("Split active pane with files pane")
-            .clicked()
-        {
-            split_content = Some(PaneContent::Files(FilesPane::empty()));
-        }
         let split_terminal = ui
-            .button(RichText::new("+ Terminal").strong())
-            .on_hover_text("Split active pane with terminal (⌘T or ⌘D)")
+            .button(RichText::new(format!("{}  Terminal", icons::TERMINAL_WINDOW)).strong())
+            .on_hover_text("Split active pane with terminal (Cmd+T or Cmd+D)")
             .clicked();
 
         if split_terminal {

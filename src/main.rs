@@ -60,6 +60,9 @@ struct CraneApp {
 impl CraneApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        cc.egui_ctx.set_fonts(fonts);
         cc.egui_ctx
             .request_repaint_after(std::time::Duration::from_millis(1500));
         Self { app: App::new() }

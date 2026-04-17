@@ -1,5 +1,6 @@
 use crate::state::App;
 use egui::{Color32, RichText};
+use egui_phosphor::regular as icons;
 
 pub const WIDTH: f32 = 220.0;
 
@@ -77,7 +78,11 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 ui.push_id(("project_row", project.id), |ui| {
                     ui.horizontal(|ui| {
                         ui.add_space(6.0);
-                        let arrow = if project.expanded { "▾" } else { "▸" };
+                        let arrow = if project.expanded {
+                            icons::CARET_DOWN
+                        } else {
+                            icons::CARET_RIGHT
+                        };
                         if ui
                             .small_button(format!("{arrow} {}", project.name))
                             .clicked()
@@ -88,14 +93,16 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 if ui
-                                    .small_button(RichText::new("×").size(11.0).color(DIM))
+                                    .small_button(
+                                        RichText::new(icons::X).size(13.0).color(DIM),
+                                    )
                                     .on_hover_text("Remove project from Crane")
                                     .clicked()
                                 {
                                     remove_project = Some(project.id);
                                 }
                                 if ui
-                                    .small_button(RichText::new("+").size(11.0))
+                                    .small_button(RichText::new(icons::PLUS).size(13.0))
                                     .on_hover_text("New workspace (branch)")
                                     .clicked()
                                 {
@@ -110,12 +117,20 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         ui.push_id(("wt_row", wt.id), |ui| {
                             ui.horizontal(|ui| {
                                 ui.add_space(18.0);
-                                let arrow = if wt.expanded { "▾" } else { "▸" };
+                                let arrow = if wt.expanded {
+                                    icons::CARET_DOWN
+                                } else {
+                                    icons::CARET_RIGHT
+                                };
                                 let active_wt =
                                     app.active.map(|(_, w, _)| w == wt.id).unwrap_or(false);
                                 let color = if active_wt { ACTIVE } else { HEADER };
-                                let label = RichText::new(format!("{arrow} {}", wt.name))
-                                    .color(color);
+                                let label = RichText::new(format!(
+                                    "{arrow} {} {}",
+                                    icons::GIT_BRANCH,
+                                    wt.name
+                                ))
+                                .color(color);
                                 if ui.small_button(label).clicked() {
                                     toggle_worktree = Some((project.id, wt.id));
                                 }
@@ -138,8 +153,8 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if ui
-                                            .small_button(RichText::new("+").size(11.0))
-                                            .on_hover_text("New tab in this worktree (⌘⇧T)")
+                                            .small_button(RichText::new(icons::PLUS).size(13.0))
+                                            .on_hover_text("New tab in this workspace (Cmd+Shift+T)")
                                             .clicked()
                                         {
                                             new_tab_for_worktree = Some((project.id, wt.id));
@@ -169,7 +184,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                         }
                                         if ui
                                             .small_button(
-                                                RichText::new("×").color(DIM).size(11.0),
+                                                RichText::new(icons::X).color(DIM).size(12.0),
                                             )
                                             .on_hover_text("Close tab")
                                             .clicked()

@@ -17,6 +17,7 @@ similar = "2"
 webbrowser = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.15"
+egui-phosphor = "0.12"
 
 [profile.dev]
 opt-level = 1
