@@ -40,6 +40,66 @@ fn main() -> eframe::Result {
     )
 }
 
+fn apply_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+
+    let surface_1 = egui::Color32::from_rgb(30, 34, 46);
+    let surface_2 = egui::Color32::from_rgb(42, 47, 62);
+    let surface_3 = egui::Color32::from_rgb(56, 62, 80);
+    let border_subtle = egui::Color32::from_rgb(48, 54, 70);
+    let border_strong = egui::Color32::from_rgb(78, 86, 108);
+    let text_primary = egui::Color32::from_rgb(212, 216, 228);
+    let text_hover = egui::Color32::from_rgb(234, 238, 248);
+    let accent = egui::Color32::from_rgb(90, 135, 220);
+
+    let corner = egui::CornerRadius::same(6);
+    for w in [
+        &mut style.visuals.widgets.noninteractive,
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+    ] {
+        w.corner_radius = corner;
+    }
+
+    style.visuals.widgets.inactive.weak_bg_fill = surface_1;
+    style.visuals.widgets.inactive.bg_fill = surface_1;
+    style.visuals.widgets.inactive.bg_stroke =
+        egui::Stroke::new(1.0, border_subtle);
+    style.visuals.widgets.inactive.fg_stroke =
+        egui::Stroke::new(1.0, text_primary);
+
+    style.visuals.widgets.hovered.weak_bg_fill = surface_2;
+    style.visuals.widgets.hovered.bg_fill = surface_2;
+    style.visuals.widgets.hovered.bg_stroke =
+        egui::Stroke::new(1.0, border_strong);
+    style.visuals.widgets.hovered.fg_stroke =
+        egui::Stroke::new(1.0, text_hover);
+
+    style.visuals.widgets.active.weak_bg_fill = surface_3;
+    style.visuals.widgets.active.bg_fill = surface_3;
+    style.visuals.widgets.active.bg_stroke =
+        egui::Stroke::new(1.0, border_strong);
+    style.visuals.widgets.active.fg_stroke =
+        egui::Stroke::new(1.0, text_hover);
+
+    style.visuals.selection.bg_fill =
+        egui::Color32::from_rgba_unmultiplied(90, 135, 220, 70);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+
+    style.visuals.window_corner_radius = egui::CornerRadius::same(10);
+    style.visuals.window_fill = egui::Color32::from_rgb(22, 25, 36);
+    style.visuals.window_stroke = egui::Stroke::new(1.0, border_subtle);
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(8);
+
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+    style.spacing.menu_margin = egui::Margin::symmetric(6, 6);
+
+    ctx.set_style(style);
+}
+
 fn load_app_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../crane.png");
     let image = image::load_from_memory(bytes).ok()?;
@@ -63,6 +123,7 @@ impl CraneApp {
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         cc.egui_ctx.set_fonts(fonts);
+        apply_style(&cc.egui_ctx);
         cc.egui_ctx
             .request_repaint_after(std::time::Duration::from_millis(1500));
         Self { app: App::new() }
