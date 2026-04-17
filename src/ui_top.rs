@@ -62,7 +62,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         ui.separator();
         let mut split_content: Option<PaneContent> = None;
         if ui
-            .small_button(RichText::new(format!("{}  Browser", icons::GLOBE)))
+            .button(RichText::new(format!("{}  Browser", icons::GLOBE)).size(12.5))
             .on_hover_text("Split active pane with browser")
             .clicked()
         {
@@ -72,7 +72,9 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             }));
         }
         let split_terminal = ui
-            .button(RichText::new(format!("{}  Terminal", icons::TERMINAL_WINDOW)).strong())
+            .button(
+                RichText::new(format!("{}  Terminal", icons::TERMINAL_WINDOW)).size(12.5),
+            )
             .on_hover_text("Split active pane with terminal (Cmd+T or Cmd+D)")
             .clicked();
 
