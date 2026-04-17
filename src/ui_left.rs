@@ -10,6 +10,50 @@ const ADD: Color32 = Color32::from_rgb(140, 220, 150);
 const DEL: Color32 = Color32::from_rgb(230, 130, 130);
 
 pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
+    let full = ui.available_rect_before_wrap();
+    let footer_h = 40.0;
+    let scroll_rect = egui::Rect::from_min_max(
+        full.min,
+        egui::pos2(full.max.x, full.max.y - footer_h),
+    );
+    let footer_rect = egui::Rect::from_min_max(
+        egui::pos2(full.min.x, full.max.y - footer_h),
+        full.max,
+    );
+
+    let mut scroll_ui = ui.new_child(egui::UiBuilder::new().max_rect(scroll_rect));
+    scroll_ui.set_clip_rect(scroll_rect);
+    render_tree(&mut scroll_ui, app, ctx);
+
+    let mut footer_ui = ui.new_child(egui::UiBuilder::new().max_rect(footer_rect));
+    footer_ui.set_clip_rect(footer_rect);
+    footer_ui.painter().line_segment(
+        [
+            egui::pos2(footer_rect.min.x, footer_rect.min.y),
+            egui::pos2(footer_rect.max.x, footer_rect.min.y),
+        ],
+        egui::Stroke::new(1.0, Color32::from_rgb(36, 40, 52)),
+    );
+    footer_ui.add_space(8.0);
+    footer_ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        if ui
+            .button(RichText::new("📁  Add Project…").size(11.5))
+            .on_hover_text("Choose a folder")
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Choose project folder")
+                .pick_folder()
+            {
+                app.add_project_from_path(path, ctx);
+            }
+        }
+    });
+}
+
+fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
+    let _ = ctx;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
@@ -22,21 +66,44 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut toggle_worktree: Option<(u64, u64)> = None;
     let mut close_tab: Option<(u64, u64, u64)> = None;
     let mut new_tab_for_worktree: Option<(u64, u64)> = None;
+    let mut new_workspace_for_project: Option<u64> = None;
+    let mut remove_project: Option<u64> = None;
 
     egui::ScrollArea::vertical()
         .id_salt("left_projects")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for project in &app.projects {
-                ui.horizontal(|ui| {
-                    ui.add_space(6.0);
-                    let arrow = if project.expanded { "▾" } else { "▸" };
-                    if ui
-                        .small_button(format!("{arrow} {}", project.name))
-                        .clicked()
-                    {
-                        toggle_project = Some(project.id);
-                    }
+                ui.push_id(("project_row", project.id), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        let arrow = if project.expanded { "▾" } else { "▸" };
+                        if ui
+                            .small_button(format!("{arrow} {}", project.name))
+                            .clicked()
+                        {
+                            toggle_project = Some(project.id);
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .small_button(RichText::new("×").size(11.0).color(DIM))
+                                    .on_hover_text("Remove project from Crane")
+                                    .clicked()
+                                {
+                                    remove_project = Some(project.id);
+                                }
+                                if ui
+                                    .small_button(RichText::new("+").size(11.0))
+                                    .on_hover_text("New workspace (branch)")
+                                    .clicked()
+                                {
+                                    new_workspace_for_project = Some(project.id);
+                                }
+                            },
+                        );
+                    });
                 });
                 if project.expanded {
                     for wt in &project.worktrees {
@@ -117,37 +184,6 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 }
                 ui.add_space(2.0);
             }
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(6.0);
-                ui.label(RichText::new("ADD PROJECT").size(10.5).color(DIM).strong());
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(6.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.add_project_buf)
-                        .hint_text("path…")
-                        .desired_width(WIDTH - 96.0),
-                );
-                if ui.small_button("Add").clicked() {
-                    let p = std::path::PathBuf::from(app.add_project_buf.trim());
-                    app.add_project_buf.clear();
-                    app.add_project_from_path(p, ctx);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(6.0);
-                if ui.small_button("📁 Browse…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_title("Choose project folder")
-                        .pick_folder()
-                    {
-                        app.add_project_from_path(path, ctx);
-                    }
-                }
-            });
         });
 
     if let Some(pid) = toggle_project {
@@ -172,6 +208,12 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         app.active = app.active.map(|(_, _, t)| (pid, wid, t)).or(Some((pid, wid, 0)));
         app.last_worktree = Some((pid, wid));
         app.new_tab_in_active_worktree(ctx);
+    }
+    if let Some(pid) = new_workspace_for_project {
+        app.open_new_workspace_modal(pid);
+    }
+    if let Some(pid) = remove_project {
+        app.remove_project(pid);
     }
     if let Some((pid, wid, tid)) = close_tab {
         if let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {

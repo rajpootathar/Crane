@@ -30,7 +30,24 @@ pub fn render(
 }
 
 fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: &mut String) {
-    let tab_count = pane.tabs.len();
+    if pane.tabs.is_empty() {
+        ui.add_space(8.0);
+        ui.vertical_centered(|ui| {
+            ui.add_space(20.0);
+            ui.label(
+                RichText::new("No files open")
+                    .size(14.0)
+                    .color(Color32::from_rgb(200, 204, 220)),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Click a file in the Files sidebar to open it here")
+                    .color(Color32::from_rgb(130, 136, 150))
+                    .size(11.5),
+            );
+        });
+        return;
+    }
 
     ui.horizontal(|ui| {
         ui.add_space(4.0);
@@ -50,7 +67,11 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
                     activate_idx = Some(idx);
                 }
                 if ui
-                    .small_button(RichText::new("×").size(11.0).color(Color32::from_rgb(130, 136, 150)))
+                    .small_button(
+                        RichText::new("×")
+                            .size(11.0)
+                            .color(Color32::from_rgb(130, 136, 150)),
+                    )
                     .on_hover_text("Close file")
                     .clicked()
                 {
@@ -58,13 +79,6 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
                 }
             });
             ui.add_space(2.0);
-        }
-        if ui
-            .small_button(RichText::new("+").size(11.0))
-            .on_hover_text("Open another file by path")
-            .clicked()
-        {
-            pane.active = tab_count;
         }
         if let Some(idx) = activate_idx {
             pane.active = idx;
@@ -75,53 +89,27 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
     });
     ui.separator();
 
-    if pane.tabs.is_empty() || pane.active >= pane.tabs.len() {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("Path:");
-            let response = ui.text_edit_singleline(&mut pane.input_buf);
-            let load = ui.button("Open").clicked()
-                || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-            if load {
-                let path = pane.input_buf.trim().to_string();
-                if path.is_empty() {
-                    pane.error = Some("Path is empty".into());
-                } else {
-                    match std::fs::read_to_string(&path) {
-                        Ok(content) => {
-                            let name = Path::new(&path)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or(&path)
-                                .to_string();
-                            pane.open(path, content, name.clone());
-                            pane.input_buf.clear();
-                            pane.error = None;
-                            *title = format!("Files · {name}");
-                        }
-                        Err(e) => pane.error = Some(e.to_string()),
-                    }
-                }
-            }
-        });
-        if let Some(err) = &pane.error {
-            ui.colored_label(Color32::from_rgb(220, 100, 100), err);
-        } else {
-            ui.label(
-                RichText::new("No files open. Enter a path or click a file from the sidebar.")
-                    .color(Color32::from_rgb(130, 136, 150)),
-            );
-        }
+    if pane.tabs.is_empty() {
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Click a file in the Files sidebar to open it here")
+                .color(Color32::from_rgb(130, 136, 150))
+                .size(11.5),
+        );
         return;
     }
 
-    let active = &pane.tabs[pane.active];
+    let active_idx = pane.active.min(pane.tabs.len() - 1);
+    pane.active = active_idx;
+    let active = &pane.tabs[active_idx];
     *title = format!("Files · {}", active.name);
 
     ScrollArea::both()
-        .id_salt(("file_scroll", pane.active))
+        .id_salt(("file_scroll", active_idx))
         .auto_shrink([false; 2])
-        .show(ui, |ui| render_highlighted(ui, &active.content, &active.path, font_size));
+        .show(ui, |ui| {
+            render_highlighted(ui, &active.content, &active.path, font_size)
+        });
 }
 
 fn render_highlighted(ui: &mut egui::Ui, content: &str, path: &str, font_size: f32) {

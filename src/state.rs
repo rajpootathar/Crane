@@ -4,6 +4,15 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+fn shellexpand_home(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    s.to_string()
+}
+
 pub type ProjectId = u64;
 pub type WorktreeId = u64;
 pub type TabId = u64;
@@ -39,6 +48,14 @@ pub enum RightTab {
     Files,
 }
 
+pub struct NewWorkspaceModal {
+    pub project_id: ProjectId,
+    pub branch: String,
+    pub path: String,
+    pub create_new_branch: bool,
+    pub error: Option<String>,
+}
+
 pub struct App {
     pub projects: Vec<Project>,
     pub active: Option<(ProjectId, WorktreeId, TabId)>,
@@ -51,6 +68,7 @@ pub struct App {
     pub add_project_buf: String,
     pub font_size: f32,
     pub expanded_dirs: HashSet<PathBuf>,
+    pub new_workspace_modal: Option<NewWorkspaceModal>,
     next_project: ProjectId,
     next_worktree: WorktreeId,
     next_tab: TabId,
@@ -70,6 +88,7 @@ impl App {
             add_project_buf: String::new(),
             font_size: 14.0,
             expanded_dirs: HashSet::new(),
+            new_workspace_modal: None,
             next_project: 1,
             next_worktree: 1,
             next_tab: 1,
@@ -266,6 +285,109 @@ impl App {
             if should {
                 wt.git_status = git::status(&wt.path);
                 wt.last_status_refresh = Some(now);
+            }
+        }
+    }
+
+    pub fn open_new_workspace_modal(&mut self, pid: ProjectId) {
+        let project = match self.projects.iter().find(|p| p.id == pid) {
+            Some(p) => p,
+            None => return,
+        };
+        let home = std::env::var("HOME").unwrap_or_default();
+        let default_path = format!("{home}/.crane-worktrees/{}", project.name);
+        self.new_workspace_modal = Some(NewWorkspaceModal {
+            project_id: pid,
+            branch: String::new(),
+            path: default_path,
+            create_new_branch: true,
+            error: None,
+        });
+    }
+
+    pub fn create_workspace_from_modal(&mut self, ctx: &egui::Context) {
+        let modal = match self.new_workspace_modal.take() {
+            Some(m) => m,
+            None => return,
+        };
+        let branch = modal.branch.trim().to_string();
+        if branch.is_empty() {
+            self.new_workspace_modal = Some(NewWorkspaceModal {
+                error: Some("Branch name is required".into()),
+                ..modal
+            });
+            return;
+        }
+        let project = match self.projects.iter().find(|p| p.id == modal.project_id) {
+            Some(p) => p.path.clone(),
+            None => return,
+        };
+        let wt_path = PathBuf::from(
+            shellexpand_home(&modal.path).trim_end_matches('/').to_string() + "/" + &branch,
+        );
+        if let Some(parent) = wt_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match git::worktree_add(&project, &wt_path, &branch, modal.create_new_branch) {
+            Ok(()) => {
+                let project = match self.projects.iter_mut().find(|p| p.id == modal.project_id) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let wt_id = self.next_worktree;
+                self.next_worktree += 1;
+                let tab_id = self.next_tab;
+                self.next_tab += 1;
+                let mut workspace = Workspace::new(wt_path.clone());
+                workspace.ensure_initial_terminal(ctx);
+                let tab = Tab {
+                    id: tab_id,
+                    name: "Terminal".into(),
+                    workspace,
+                };
+                project.worktrees.push(Worktree {
+                    id: wt_id,
+                    name: branch,
+                    path: wt_path,
+                    tabs: vec![tab],
+                    active_tab: Some(tab_id),
+                    expanded: true,
+                    git_status: None,
+                    last_status_refresh: None,
+                });
+                self.active = Some((modal.project_id, wt_id, tab_id));
+                self.last_worktree = Some((modal.project_id, wt_id));
+            }
+            Err(e) => {
+                self.new_workspace_modal = Some(NewWorkspaceModal {
+                    error: Some(e),
+                    ..modal
+                });
+            }
+        }
+    }
+
+    pub fn remove_project(&mut self, pid: ProjectId) {
+        self.projects.retain(|p| p.id != pid);
+        if let Some((p, _, _)) = self.active {
+            if p == pid {
+                self.active = self
+                    .projects
+                    .first()
+                    .and_then(|p| p.worktrees.first().map(|w| (p.id, w)))
+                    .and_then(|(pid, w)| w.active_tab.map(|t| (pid, w.id, t)));
+            }
+        }
+        if let Some((p, _)) = self.last_worktree {
+            if p == pid {
+                self.last_worktree = self
+                    .active
+                    .map(|(pid, wid, _)| (pid, wid))
+                    .or_else(|| {
+                        self.projects
+                            .first()
+                            .and_then(|p| p.worktrees.first().map(|w| (p.id, w.id)))
+                    });
             }
         }
     }

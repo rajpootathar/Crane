@@ -200,6 +200,36 @@ pub fn push(repo: &Path) -> Result<(), String> {
     run(repo, &["push"])
 }
 
+pub fn worktree_add(repo: &Path, path: &Path, branch: &str, create_new: bool) -> Result<(), String> {
+    let path_str = path.to_string_lossy();
+    let mut args: Vec<&str> = vec!["worktree", "add"];
+    if create_new {
+        args.push("-b");
+        args.push(branch);
+        args.push(&path_str);
+    } else {
+        args.push(&path_str);
+        args.push(branch);
+    }
+    run(repo, &args)
+}
+
+pub fn list_local_branches(repo: &Path) -> Vec<String> {
+    let out = match Command::new("git")
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+        .current_dir(repo)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub fn head_content(repo: &Path, path: &str) -> String {
     let out = match Command::new("git")
         .args(["show", &format!("HEAD:{path}")])

@@ -21,11 +21,15 @@ const DIVIDER: egui::Color32 = egui::Color32::from_rgb(36, 40, 52);
 fn main() -> eframe::Result {
     env_logger::init();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1480.0, 920.0])
+        .with_min_inner_size([800.0, 500.0])
+        .with_title("Crane");
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1480.0, 920.0])
-            .with_min_inner_size([800.0, 500.0])
-            .with_title("Crane"),
+        viewport,
         ..Default::default()
     };
 
@@ -36,9 +40,21 @@ fn main() -> eframe::Result {
     )
 }
 
+fn load_app_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../crane.png");
+    let image = image::load_from_memory(bytes).ok()?;
+    let rgba = image.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
+}
+
 struct CraneApp {
     app: App,
-    logo: Option<egui::TextureHandle>,
 }
 
 impl CraneApp {
@@ -46,11 +62,7 @@ impl CraneApp {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         cc.egui_ctx
             .request_repaint_after(std::time::Duration::from_millis(1500));
-        let logo = load_logo(&cc.egui_ctx);
-        Self {
-            app: App::new(),
-            logo,
-        }
+        Self { app: App::new() }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -183,7 +195,7 @@ impl eframe::App for CraneApp {
 
         let mut center_ui = ui.new_child(egui::UiBuilder::new().max_rect(center_rect));
         center_ui.set_clip_rect(center_rect);
-        ui_top::render(&mut center_ui, &mut self.app, &ctx, self.logo.as_ref());
+        ui_top::render(&mut center_ui, &mut self.app, &ctx);
 
         let canvas_rect = egui::Rect::from_min_max(
             egui::pos2(center_rect.min.x, center_rect.min.y + ui_top::TOTAL_H),
@@ -209,17 +221,95 @@ impl eframe::App for CraneApp {
         } else {
             render_empty_state(&mut center_ui, &mut self.app, &ctx, inset);
         }
+
+        render_new_workspace_modal(&ctx, &mut self.app);
     }
 }
 
-fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let bytes = include_bytes!("../crane.png");
-    let image = image::load_from_memory(bytes).ok()?;
-    let rgba = image.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    let pixels = rgba.into_raw();
-    let color = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-    Some(ctx.load_texture("crane_logo", color, egui::TextureOptions::LINEAR))
+fn render_new_workspace_modal(ctx: &egui::Context, app: &mut state::App) {
+    let mut open = app.new_workspace_modal.is_some();
+    if !open {
+        return;
+    }
+    let mut create = false;
+    let mut cancel = false;
+    let mut browse: Option<String> = None;
+    egui::Window::new("New Workspace")
+        .collapsible(false)
+        .resizable(false)
+        .default_width(420.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .open(&mut open)
+        .show(ctx, |ui| {
+            if let Some(modal) = app.new_workspace_modal.as_mut() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Branch").strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut modal.branch)
+                        .hint_text("feature/my-branch")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.checkbox(&mut modal.create_new_branch, "Create new branch");
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Location").strong());
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut modal.path)
+                            .hint_text("~/.crane-worktrees/<project>")
+                            .desired_width(ui.available_width() - 80.0),
+                    );
+                    if ui.button("Browse…").clicked() {
+                        browse = Some(modal.path.clone());
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Worktree will be created at: {}/{}",
+                        modal.path.trim_end_matches('/'),
+                        if modal.branch.is_empty() {
+                            "<branch>"
+                        } else {
+                            &modal.branch
+                        }
+                    ))
+                    .size(10.5)
+                    .color(egui::Color32::from_rgb(130, 136, 150)),
+                );
+                if let Some(err) = &modal.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(220, 100, 100), err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(egui::RichText::new("Create").strong()).clicked() {
+                        create = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            }
+        });
+    if !open || cancel {
+        app.new_workspace_modal = None;
+    } else if let Some(current) = browse {
+        let start = std::path::PathBuf::from(if current.is_empty() {
+            std::env::var("HOME").unwrap_or_default()
+        } else {
+            current
+        });
+        if let Some(p) = rfd::FileDialog::new()
+            .set_title("Choose workspace parent folder")
+            .set_directory(start)
+            .pick_folder()
+        {
+            if let Some(modal) = app.new_workspace_modal.as_mut() {
+                modal.path = p.to_string_lossy().to_string();
+            }
+        }
+    } else if create {
+        app.create_workspace_from_modal(ctx);
+    }
 }
 
 fn render_empty_state(

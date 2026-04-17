@@ -10,12 +10,7 @@ const PRIMARY: Color32 = Color32::from_rgb(210, 214, 224);
 
 pub const TOTAL_H: f32 = TOPBAR_H;
 
-pub fn render(
-    ui: &mut egui::Ui,
-    app: &mut App,
-    ctx: &egui::Context,
-    logo: Option<&egui::TextureHandle>,
-) {
+pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let rect = ui.available_rect_before_wrap();
     let bar_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TOPBAR_H));
 
@@ -34,10 +29,15 @@ pub fn render(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
 
-    if let Some(tex) = logo {
-        bar_ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(22.0, 22.0)));
-        bar_ui.add_space(8.0);
+    let left_label = if app.show_left { "◧" } else { "▸" };
+    if bar_ui
+        .small_button(RichText::new(left_label).size(14.0))
+        .on_hover_text("Toggle Left Panel (Cmd+B)")
+        .clicked()
+    {
+        app.show_left = !app.show_left;
     }
+    bar_ui.add_space(6.0);
     bar_ui.label(
         RichText::new(app.breadcrumb())
             .size(12.5)
@@ -45,9 +45,18 @@ pub fn render(
     );
 
     bar_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let right_label = if app.show_right { "◨" } else { "◂" };
+        if ui
+            .small_button(RichText::new(right_label).size(14.0))
+            .on_hover_text("Toggle Right Panel (Cmd+/)")
+            .clicked()
+        {
+            app.show_right = !app.show_right;
+        }
+        ui.separator();
         ui.label(
             RichText::new(
-                "Cmd+T split  ·  Cmd+Shift+T new tab  ·  Cmd+D split  ·  Cmd+W close  ·  Cmd+B / Cmd+/ sidebars",
+                "Cmd+T split  ·  Cmd+Shift+T new tab  ·  Cmd+D split  ·  Cmd+W close",
             )
             .size(10.5)
             .color(DIM),
