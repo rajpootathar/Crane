@@ -50,45 +50,29 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
         return;
     }
 
+    let mut close_idx: Option<usize> = None;
+    let mut activate_idx: Option<usize> = None;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
         ui.add_space(4.0);
-        let mut close_idx: Option<usize> = None;
-        let mut activate_idx: Option<usize> = None;
         for (idx, tab) in pane.tabs.iter().enumerate() {
             let is_active = idx == pane.active;
-            ui.push_id(("file_tab", idx), |ui| {
-                let label = RichText::new(&tab.name)
-                    .size(11.5)
-                    .color(if is_active {
-                        Color32::from_rgb(200, 204, 220)
-                    } else {
-                        Color32::from_rgb(130, 136, 150)
-                    });
-                if ui.selectable_label(is_active, label).clicked() {
-                    activate_idx = Some(idx);
-                }
-                if ui
-                    .small_button(
-                        RichText::new(icons::X)
-                            .size(12.0)
-                            .color(Color32::from_rgb(130, 136, 150)),
-                    )
-                    .on_hover_text("Close file")
-                    .clicked()
-                {
-                    close_idx = Some(idx);
-                }
-            });
-            ui.add_space(2.0);
-        }
-        if let Some(idx) = activate_idx {
-            pane.active = idx;
-        }
-        if let Some(idx) = close_idx {
-            pane.close(idx);
+            let (clicked, close_clicked) = draw_file_tab(ui, &tab.name, is_active, idx);
+            if clicked {
+                activate_idx = Some(idx);
+            }
+            if close_clicked {
+                close_idx = Some(idx);
+            }
         }
     });
-    ui.separator();
+    if let Some(idx) = activate_idx {
+        pane.active = idx;
+    }
+    if let Some(idx) = close_idx {
+        pane.close(idx);
+    }
+    ui.add_space(2.0);
 
     if pane.tabs.is_empty() {
         ui.add_space(8.0);
@@ -111,6 +95,84 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
         .show(ui, |ui| {
             render_highlighted(ui, &active.content, &active.path, font_size)
         });
+}
+
+fn draw_file_tab(
+    ui: &mut egui::Ui,
+    name: &str,
+    is_active: bool,
+    idx: usize,
+) -> (bool, bool) {
+    let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+    let close_font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+    let text_w = ui
+        .fonts_mut(|f| f.layout_no_wrap(name.to_string(), font.clone(), egui::Color32::WHITE))
+        .size()
+        .x;
+    let padding_x = 10.0;
+    let gap = 6.0;
+    let close_size = 16.0;
+    let height = 24.0;
+    let width = padding_x + text_w + gap + close_size + padding_x - 2.0;
+
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let close_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.max.x - padding_x - close_size + 2.0,
+            rect.min.y + (height - close_size) / 2.0,
+        ),
+        egui::vec2(close_size, close_size),
+    );
+    let close_response = ui.interact(
+        close_rect,
+        ui.id().with(("file_tab_close", idx)),
+        egui::Sense::click(),
+    );
+
+    let (bg, fg) = if is_active {
+        (
+            egui::Color32::from_rgb(56, 100, 170),
+            egui::Color32::from_rgb(240, 243, 250),
+        )
+    } else if response.hovered() || close_response.hovered() {
+        (
+            egui::Color32::from_rgb(42, 47, 62),
+            egui::Color32::from_rgb(220, 224, 236),
+        )
+    } else {
+        (
+            egui::Color32::TRANSPARENT,
+            egui::Color32::from_rgb(170, 176, 190),
+        )
+    };
+    if bg != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 5.0, bg);
+    }
+    ui.painter().text(
+        egui::pos2(rect.min.x + padding_x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        name,
+        font,
+        fg,
+    );
+    if close_response.hovered() {
+        ui.painter().rect_filled(
+            close_rect.shrink(1.0),
+            4.0,
+            egui::Color32::from_rgb(180, 60, 60),
+        );
+    }
+    ui.painter().text(
+        close_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icons::X,
+        close_font,
+        fg,
+    );
+    if response.hovered() || close_response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    (response.clicked() && !close_response.hovered(), close_response.clicked())
 }
 
 fn render_highlighted(ui: &mut egui::Ui, content: &str, path: &str, font_size: f32) {

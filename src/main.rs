@@ -43,11 +43,11 @@ fn main() -> eframe::Result {
 fn apply_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
 
-    let surface_1 = egui::Color32::from_rgb(30, 34, 46);
-    let surface_2 = egui::Color32::from_rgb(42, 47, 62);
-    let surface_3 = egui::Color32::from_rgb(56, 62, 80);
-    let border_subtle = egui::Color32::from_rgb(48, 54, 70);
-    let border_strong = egui::Color32::from_rgb(78, 86, 108);
+    let surface_1 = egui::Color32::from_rgb(40, 45, 60);
+    let surface_2 = egui::Color32::from_rgb(56, 62, 82);
+    let surface_3 = egui::Color32::from_rgb(72, 80, 104);
+    let border_subtle = egui::Color32::from_rgb(60, 66, 86);
+    let border_strong = egui::Color32::from_rgb(96, 106, 132);
     let text_primary = egui::Color32::from_rgb(212, 216, 228);
     let text_hover = egui::Color32::from_rgb(234, 238, 248);
     let accent = egui::Color32::from_rgb(90, 135, 220);
@@ -341,20 +341,23 @@ fn render_new_workspace_modal(ctx: &egui::Context, app: &mut state::App) {
     let mut create = false;
     let mut cancel = false;
     let mut browse: Option<String> = None;
+    let modal_width = 460.0;
     egui::Window::new("New Workspace")
         .collapsible(false)
         .resizable(false)
-        .default_width(420.0)
+        .fixed_size(egui::vec2(modal_width, 240.0))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .open(&mut open)
         .show(ctx, |ui| {
+            ui.set_width(modal_width - 20.0);
+            let input_width = modal_width - 40.0;
             if let Some(modal) = app.new_workspace_modal.as_mut() {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Branch").strong());
                 ui.add(
                     egui::TextEdit::singleline(&mut modal.branch)
                         .hint_text("feature/my-branch")
-                        .desired_width(f32::INFINITY),
+                        .desired_width(input_width),
                 );
                 ui.checkbox(&mut modal.create_new_branch, "Create new branch");
                 ui.add_space(6.0);
@@ -363,24 +366,27 @@ fn render_new_workspace_modal(ctx: &egui::Context, app: &mut state::App) {
                     ui.add(
                         egui::TextEdit::singleline(&mut modal.path)
                             .hint_text("~/.crane-worktrees/<project>")
-                            .desired_width(ui.available_width() - 80.0),
+                            .desired_width(input_width - 88.0),
                     );
                     if ui.button("Browse…").clicked() {
                         browse = Some(modal.path.clone());
                     }
                 });
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Worktree will be created at: {}/{}",
-                        modal.path.trim_end_matches('/'),
-                        if modal.branch.is_empty() {
-                            "<branch>"
-                        } else {
-                            &modal.branch
-                        }
-                    ))
-                    .size(10.5)
-                    .color(egui::Color32::from_rgb(130, 136, 150)),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "→ {}/{}",
+                            modal.path.trim_end_matches('/'),
+                            if modal.branch.is_empty() {
+                                "<branch>"
+                            } else {
+                                &modal.branch
+                            }
+                        ))
+                        .size(10.5)
+                        .color(egui::Color32::from_rgb(130, 136, 150)),
+                    )
+                    .truncate(),
                 );
                 if let Some(err) = &modal.error {
                     ui.add_space(4.0);
