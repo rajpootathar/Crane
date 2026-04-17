@@ -55,11 +55,16 @@ bundle: icns install-cargo-bundle
 	@echo "bundle ready: $(APP)"
 
 dmg: bundle
+	rm -rf target/release/dmg-staging
+	mkdir -p target/release/dmg-staging
+	cp -R "$(APP)" target/release/dmg-staging/
+	ln -s /Applications target/release/dmg-staging/Applications
 	rm -f "$(DMG)"
 	hdiutil create -volname "$(APP_NAME)" \
-		-srcfolder "$(APP)" \
+		-srcfolder target/release/dmg-staging \
 		-ov -format UDZO \
 		"$(DMG)"
+	rm -rf target/release/dmg-staging
 	@echo "dmg ready: $(DMG)"
 
 release: dmg
@@ -81,11 +86,16 @@ bundle-universal: icns install-cargo-bundle
 	@echo "universal bundle ready: $(UNIVERSAL_APP)"
 
 dmg-universal: bundle-universal
+	rm -rf target/release/dmg-staging-universal
+	mkdir -p target/release/dmg-staging-universal
+	cp -R "$(UNIVERSAL_APP)" target/release/dmg-staging-universal/
+	ln -s /Applications target/release/dmg-staging-universal/Applications
 	rm -f "$(UNIVERSAL_DMG)"
 	hdiutil create -volname "$(APP_NAME)" \
-		-srcfolder "$(UNIVERSAL_APP)" \
+		-srcfolder target/release/dmg-staging-universal \
 		-ov -format UDZO \
 		"$(UNIVERSAL_DMG)"
+	rm -rf target/release/dmg-staging-universal
 	@echo "universal dmg ready: $(UNIVERSAL_DMG)"
 
 release-universal: dmg-universal

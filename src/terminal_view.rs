@@ -79,15 +79,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         }
     }
     if response.clicked() {
-        let mut guard = terminal.term.lock();
-        if guard
-            .selection
-            .as_ref()
-            .map(|s| s.is_empty())
-            .unwrap_or(true)
-        {
-            guard.selection = None;
-        }
+        terminal.term.lock().selection = None;
     }
 
     let snapshot = {
