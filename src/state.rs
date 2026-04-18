@@ -144,6 +144,7 @@ pub struct App {
     pub left_panel_w: f32,
     pub right_panel_w: f32,
     pub lsp: crate::lsp::LspManager,
+    pub language_configs: crate::lsp::LanguageConfigs,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -175,6 +176,7 @@ impl App {
             left_panel_w: 240.0,
             right_panel_w: 300.0,
             lsp: crate::lsp::LspManager::new(),
+            language_configs: crate::lsp::LanguageConfigs::default(),
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,
@@ -322,8 +324,9 @@ impl App {
         if let Some(layout) = self.active_layout() {
             layout.open_file_in_files_pane(path.clone(), name, content.clone());
         }
+        let cfg_snapshot = self.language_configs.clone();
         self.lsp
-            .did_open(ctx, std::path::Path::new(&path), &content);
+            .did_open(ctx, std::path::Path::new(&path), &content, &cfg_snapshot);
     }
 
     /// Per-frame sync, scoped to the ACTIVE layout only. Was iterating every
@@ -347,12 +350,13 @@ impl App {
         let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tid) else {
             return;
         };
+        let configs_snapshot = self.language_configs.clone();
         for (_, pane) in tab.layout.panes.iter_mut() {
             if let crate::layout::PaneContent::Files(files) = &mut pane.content {
                 for ft in files.tabs.iter_mut() {
                     let path = std::path::Path::new(&ft.path);
                     if !self.lsp.is_tracked(path) {
-                        self.lsp.did_open(ctx, path, &ft.content);
+                        self.lsp.did_open(ctx, path, &ft.content, &configs_snapshot);
                         ft.last_lsp_content = ft.content.clone();
                         ft.last_lsp_sent_at = Some(now);
                     } else if ft.content != ft.last_lsp_content {

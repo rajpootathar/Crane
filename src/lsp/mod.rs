@@ -10,12 +10,85 @@ pub mod protocol;
 pub mod server;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use downloader::{DownloadState, Downloader};
 pub use server::{Diagnostic, ServerKey};
+
+/// Per-language behavior toggles. Persisted in the session so users don't
+/// have to reconfigure on every launch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LanguageConfig {
+    /// If false, don't spawn the LSP server or request diagnostics for
+    /// this language at all.
+    pub enabled: bool,
+    /// Send `textDocument/didSave` on save. rust-analyzer uses this to
+    /// trigger `cargo check` (full compile error coverage). Off for
+    /// languages that don't need an on-save checker.
+    pub check_on_save: bool,
+    /// Run the server's formatter (`textDocument/formatting`) on save and
+    /// apply returned TextEdits. Requires hover-style response handling;
+    /// wired up in Phase 2.
+    pub format_on_save: bool,
+}
+
+impl Default for LanguageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_on_save: true,
+            format_on_save: false,
+        }
+    }
+}
+
+impl LanguageConfig {
+    /// Sensible defaults per server. Rust gets `check_on_save` because
+    /// that's where the real errors come from. JS/TS/Python live-type
+    /// check so they don't need it as much but it's still a useful nudge.
+    pub fn defaults_for(key: ServerKey) -> Self {
+        match key {
+            ServerKey::RustAnalyzer => Self {
+                enabled: true,
+                check_on_save: true,
+                format_on_save: false,
+            },
+            ServerKey::TypeScript
+            | ServerKey::Pyright
+            | ServerKey::Gopls
+            | ServerKey::CssLs
+            | ServerKey::HtmlLs => Self {
+                enabled: true,
+                check_on_save: false,
+                format_on_save: false,
+            },
+        }
+    }
+}
+
+/// Storage for per-language configs, keyed by the Debug form of
+/// `ServerKey` ("RustAnalyzer", "TypeScript", …) so it survives
+/// enum-reorderings in the binary.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LanguageConfigs {
+    pub configs: HashMap<String, LanguageConfig>,
+}
+
+impl LanguageConfigs {
+    pub fn get_or_default(&self, key: ServerKey) -> LanguageConfig {
+        self.configs
+            .get(&format!("{key:?}"))
+            .cloned()
+            .unwrap_or_else(|| LanguageConfig::defaults_for(key))
+    }
+
+    pub fn set(&mut self, key: ServerKey, cfg: LanguageConfig) {
+        self.configs.insert(format!("{key:?}"), cfg);
+    }
+}
 
 pub fn which_on_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var("PATH").unwrap_or_default();
@@ -50,10 +123,19 @@ impl LspManager {
         Self::default()
     }
 
-    pub fn did_open(&mut self, ctx: &egui::Context, path: &Path, text: &str) {
+    pub fn did_open(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        text: &str,
+        configs: &LanguageConfigs,
+    ) {
         let Some(key) = server::key_for_path(path) else {
             return;
         };
+        if !configs.get_or_default(key).enabled {
+            return;
+        }
         self.files.write().insert(path.to_path_buf(), key);
 
         // Evict a dead server so a fresh spawn can replace it (e.g. after
@@ -210,11 +292,15 @@ impl LspManager {
         }
     }
 
-    pub fn did_save(&self, path: &Path, text: &str) {
+    pub fn did_save(&self, path: &Path, text: &str, configs: &LanguageConfigs) {
         let key = match self.files.read().get(path).copied() {
             Some(k) => k,
             None => return,
         };
+        let cfg = configs.get_or_default(key);
+        if !cfg.enabled || !cfg.check_on_save {
+            return;
+        }
         if let Some(s) = self.servers.get(&key) {
             s.did_save(path, text);
         }

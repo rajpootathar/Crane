@@ -40,6 +40,8 @@ pub struct Session {
     pub left_panel_w: f32,
     #[serde(default = "default_right_w")]
     pub right_panel_w: f32,
+    #[serde(default)]
+    pub language_configs: crate::lsp::LanguageConfigs,
 }
 
 fn default_left_w() -> f32 {
@@ -198,6 +200,7 @@ impl Session {
             syntax_theme_override: app.syntax_theme_override.clone(),
             left_panel_w: app.left_panel_w,
             right_panel_w: app.right_panel_w,
+            language_configs: app.language_configs.clone(),
         }
     }
 
@@ -252,6 +255,7 @@ impl Session {
         app.syntax_theme_override = self.syntax_theme_override;
         app.left_panel_w = self.left_panel_w.clamp(180.0, 600.0);
         app.right_panel_w = self.right_panel_w.clamp(200.0, 700.0);
+        app.language_configs = self.language_configs;
         app
     }
 }

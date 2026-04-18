@@ -561,6 +561,63 @@ fn render_lsp_row(
                         .color(theme::current().success.to_color32()),
                 );
             }
+
+            // Per-language toggles — configure diagnostics behavior without
+            // a binary rebuild. Persisted in session.
+            ui.add_space(6.0);
+            let mut cfg = app.language_configs.get_or_default(key);
+            let mut changed = false;
+            if ui
+                .checkbox(&mut cfg.enabled, "Enable language server")
+                .changed()
+            {
+                changed = true;
+            }
+            if matches!(key, crate::lsp::ServerKey::RustAnalyzer) {
+                if ui
+                    .add_enabled(
+                        cfg.enabled,
+                        egui::Checkbox::new(
+                            &mut cfg.check_on_save,
+                            "Run cargo check on save (real compile errors)",
+                        ),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+            } else if matches!(key, crate::lsp::ServerKey::Gopls) {
+                if ui
+                    .add_enabled(
+                        cfg.enabled,
+                        egui::Checkbox::new(
+                            &mut cfg.check_on_save,
+                            "Run go vet / build on save",
+                        ),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+            } else {
+                ui.add_enabled(
+                    cfg.enabled,
+                    egui::Checkbox::new(
+                        &mut cfg.check_on_save,
+                        "Notify server on save",
+                    ),
+                );
+            }
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(
+                    &mut cfg.format_on_save,
+                    "Format on save (coming soon)",
+                ),
+            );
+            if changed {
+                app.language_configs.set(key, cfg);
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if crate::lsp::Downloader::is_supported(key) {

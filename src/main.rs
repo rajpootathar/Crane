@@ -677,7 +677,11 @@ impl eframe::App for CraneApp {
         self.app.update_check.drain();
         render_update_toast(&ctx, &mut self.app);
         for (path, text) in save_queue.into_inner() {
-            self.app.lsp.did_save(std::path::Path::new(&path), &text);
+            self.app.lsp.did_save(
+                std::path::Path::new(&path),
+                &text,
+                &self.app.language_configs,
+            );
         }
         self.app.sync_lsp_changes(&ctx);
         self.maybe_save();
