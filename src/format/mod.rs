@@ -76,6 +76,53 @@ pub fn discover(file: &Path) -> FormatStyle {
     FormatStyle::default()
 }
 
+/// Run the language-appropriate formatter over `content`, piping through
+/// stdin and reading stdout. Returns None if the formatter isn't on PATH
+/// or exited non-zero, so callers can fall back to the original text.
+///
+/// Formatters used:
+///   TypeScript / CssLs / HtmlLs  → prettier (uses `--stdin-filepath`)
+///   RustAnalyzer                 → rustfmt  (`--emit stdout`)
+///   Pyright                      → ruff format -
+///   Gopls                        → gofmt
+pub fn format_text(
+    key: crate::lsp::ServerKey,
+    path: &Path,
+    content: &str,
+) -> Option<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let path_str = path.to_str()?;
+    let (cmd, args): (&str, Vec<String>) = match key {
+        crate::lsp::ServerKey::TypeScript
+        | crate::lsp::ServerKey::CssLs
+        | crate::lsp::ServerKey::HtmlLs => (
+            "prettier",
+            vec!["--stdin-filepath".into(), path_str.into()],
+        ),
+        crate::lsp::ServerKey::RustAnalyzer => {
+            ("rustfmt", vec!["--emit".into(), "stdout".into()])
+        }
+        crate::lsp::ServerKey::Pyright => ("ruff", vec!["format".into(), "-".into()]),
+        crate::lsp::ServerKey::Gopls => ("gofmt", vec![]),
+    };
+    let mut child = std::process::Command::new(cmd)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(content.as_bytes()).ok()?;
+    drop(child.stdin.take());
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
 fn parse_rc(path: &Path) -> Option<FormatStyle> {
     let bytes = std::fs::read(path).ok()?;
     let val = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;

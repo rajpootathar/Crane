@@ -643,6 +643,18 @@ impl eframe::App for CraneApp {
         let notify_saved = |path: &str, text: &str| {
             save_queue.borrow_mut().push((path.to_string(), text.to_string()));
         };
+        // Snapshot configs so the format closure doesn't need to borrow self.
+        let cfg_snapshot = self.app.language_configs.clone();
+        let format_before_save = |content: &str, path: &str| -> Option<String> {
+            let p = std::path::Path::new(path);
+            for key in lsp::server::keys_for_path(p) {
+                let cfg = cfg_snapshot.get_or_default(key);
+                if cfg.enabled && cfg.format_on_save {
+                    return format::format_text(key, p, content);
+                }
+            }
+            None
+        };
         let syntax_override = self.app.syntax_theme_override.clone();
         if self.app.active_layout().is_some() {
             if let Some(ws) = self.app.active_layout() {
@@ -654,6 +666,7 @@ impl eframe::App for CraneApp {
                     syntax_override.as_deref(),
                     &diag_fn,
                     &notify_saved,
+                    &format_before_save,
                 );
                 match action {
                     PaneAction::None => {}

@@ -114,6 +114,7 @@ pub fn render(
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
+    format_before_save: &dyn Fn(&str, &str) -> Option<String>,
 ) {
     ui.push_id(("files_pane", pane_id), |ui| {
         render_inner(
@@ -124,6 +125,7 @@ pub fn render(
             syntax_theme_override,
             diagnostics_for,
             notify_saved,
+            format_before_save,
         );
     });
 }
@@ -136,6 +138,7 @@ fn render_inner(
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
+    format_before_save: &dyn Fn(&str, &str) -> Option<String>,
 ) {
     if pane.tabs.is_empty() {
         let t = theme::current();
@@ -239,13 +242,16 @@ fn render_inner(
                         .min_size(egui::vec2(0.0, 24.0)),
                     );
                     if save_btn.clicked() || (save_pressed && tab.dirty()) {
+                        // Format-on-save: run the user's formatter over the
+                        // buffer; fall back to raw content if the tool is
+                        // missing or refuses the file.
+                        if let Some(formatted) = format_before_save(&tab.content, &tab.path) {
+                            tab.content = formatted;
+                        }
                         if let Err(e) = std::fs::write(&tab.path, &tab.content) {
                             eprintln!("save failed: {e}");
                         } else {
                             tab.original_content = tab.content.clone();
-                            // Ping the LSP so rust-analyzer / html-ls run
-                            // their on-save checks and publish fresh
-                            // diagnostics.
                             notify_saved(&tab.path, &tab.content);
                         }
                     }
@@ -598,6 +604,11 @@ fn render_inner(
                             }
                         });
                         if ctx_save.get() {
+                            if let Some(formatted) =
+                                format_before_save(&tab.content, &tab.path)
+                            {
+                                tab.content = formatted;
+                            }
                             if let Err(e) = std::fs::write(&tab.path, &tab.content) {
                                 eprintln!("save failed: {e}");
                             } else {

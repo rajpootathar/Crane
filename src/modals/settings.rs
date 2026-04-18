@@ -608,13 +608,23 @@ fn render_lsp_row(
                     ),
                 );
             }
-            ui.add_enabled(
-                false,
-                egui::Checkbox::new(
-                    &mut cfg.format_on_save,
-                    "Format on save (coming soon)",
-                ),
-            );
+            let fmt_label = match key {
+                crate::lsp::ServerKey::RustAnalyzer => "Format on save (rustfmt)",
+                crate::lsp::ServerKey::TypeScript
+                | crate::lsp::ServerKey::CssLs
+                | crate::lsp::ServerKey::HtmlLs => "Format on save (prettier)",
+                crate::lsp::ServerKey::Pyright => "Format on save (ruff)",
+                crate::lsp::ServerKey::Gopls => "Format on save (gofmt)",
+            };
+            if ui
+                .add_enabled(
+                    cfg.enabled,
+                    egui::Checkbox::new(&mut cfg.format_on_save, fmt_label),
+                )
+                .changed()
+            {
+                changed = true;
+            }
             if changed {
                 app.language_configs.set(key, cfg);
             }

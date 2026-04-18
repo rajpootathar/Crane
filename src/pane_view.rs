@@ -107,6 +107,7 @@ pub fn render_layout(
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
+    format_before_save: &dyn Fn(&str, &str) -> Option<String>,
 ) -> PaneAction {
     let mut action = PaneAction::None;
     let root = layout.root.take();
@@ -122,6 +123,7 @@ pub fn render_layout(
             syntax_theme_override,
             diagnostics_for,
             notify_saved,
+            format_before_save,
         );
         layout.root = Some(root);
     }
@@ -139,6 +141,7 @@ fn render_node(
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
+    format_before_save: &dyn Fn(&str, &str) -> Option<String>,
 ) {
     match node {
         Node::Leaf(id) => {
@@ -152,6 +155,7 @@ fn render_node(
                 syntax_theme_override,
                 diagnostics_for,
                 notify_saved,
+                format_before_save,
             );
         }
         Node::Split {
@@ -176,6 +180,7 @@ fn render_node(
                 syntax_theme_override,
                 diagnostics_for,
                 notify_saved,
+                format_before_save,
             );
             render_node(
                 ui,
@@ -188,6 +193,7 @@ fn render_node(
                 syntax_theme_override,
                 diagnostics_for,
                 notify_saved,
+                format_before_save,
             );
             render_splitter(ui, splitter, *direction, path, rect, action);
         }
@@ -261,6 +267,7 @@ fn render_pane(
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
+    format_before_save: &dyn Fn(&str, &str) -> Option<String>,
 ) {
     let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
@@ -344,6 +351,7 @@ fn render_pane(
                 syntax_theme_override,
                 diagnostics_for,
                 notify_saved,
+                format_before_save,
             );
         }
         PaneContent::Markdown(md) => {
