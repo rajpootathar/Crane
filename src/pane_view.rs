@@ -108,6 +108,7 @@ pub fn render_layout(
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
+    goto_request: &dyn Fn(&str, u32, u32),
 ) -> PaneAction {
     let mut action = PaneAction::None;
     let root = layout.root.take();
@@ -124,6 +125,7 @@ pub fn render_layout(
             diagnostics_for,
             notify_saved,
             format_before_save,
+            goto_request,
         );
         layout.root = Some(root);
     }
@@ -142,6 +144,7 @@ fn render_node(
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
+    goto_request: &dyn Fn(&str, u32, u32),
 ) {
     match node {
         Node::Leaf(id) => {
@@ -156,6 +159,7 @@ fn render_node(
                 diagnostics_for,
                 notify_saved,
                 format_before_save,
+                goto_request,
             );
         }
         Node::Split {
@@ -181,6 +185,7 @@ fn render_node(
                 diagnostics_for,
                 notify_saved,
                 format_before_save,
+                goto_request,
             );
             render_node(
                 ui,
@@ -194,6 +199,7 @@ fn render_node(
                 diagnostics_for,
                 notify_saved,
                 format_before_save,
+                goto_request,
             );
             render_splitter(ui, splitter, *direction, path, rect, action);
         }
@@ -268,6 +274,7 @@ fn render_pane(
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
+    goto_request: &dyn Fn(&str, u32, u32),
 ) {
     let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
@@ -352,6 +359,7 @@ fn render_pane(
                 diagnostics_for,
                 notify_saved,
                 format_before_save,
+                goto_request,
             );
         }
         PaneContent::Markdown(md) => {

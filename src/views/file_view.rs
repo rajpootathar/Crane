@@ -115,6 +115,7 @@ pub fn render(
     diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
+    goto_request: &dyn Fn(&str, u32, u32),
 ) {
     ui.push_id(("files_pane", pane_id), |ui| {
         render_inner(
@@ -126,6 +127,7 @@ pub fn render(
             diagnostics_for,
             notify_saved,
             format_before_save,
+            goto_request,
         );
     });
 }
@@ -139,6 +141,7 @@ fn render_inner(
     diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
+    goto_request: &dyn Fn(&str, u32, u32),
 ) {
     if pane.tabs.is_empty() {
         let t = theme::current();
@@ -584,6 +587,54 @@ fn render_inner(
                             out.galley_pos,
                             &diagnostics,
                         );
+
+                        // Apply a pending cursor (goto-definition landed
+                        // here in this frame or a previous one).
+                        if let Some((line, ch)) = tab.pending_cursor.take()
+                            && let Some(mut state) =
+                                egui::TextEdit::load_state(ui.ctx(), te_id)
+                        {
+                            let cc = crate::format::char_idx_to_byte(
+                                &tab.content,
+                                line_col_to_char(&tab.content, line, ch),
+                            );
+                            let _ = cc;
+                            let cursor = line_col_to_char(&tab.content, line, ch);
+                            let new_cc = egui::text::CCursor::new(cursor);
+                            state.cursor.set_char_range(Some(
+                                egui::text::CCursorRange::one(new_cc),
+                            ));
+                            state.store(ui.ctx(), te_id);
+                            ui.memory_mut(|m| m.request_focus(te_id));
+                        }
+
+                        // F12 or Cmd+click → goto-definition at cursor.
+                        let f12 = ui
+                            .input(|i| i.key_pressed(egui::Key::F12))
+                            && ui.memory(|m| m.has_focus(te_id));
+                        let cmd_click = out.response.clicked()
+                            && ui.input(|i| {
+                                i.modifiers.command || i.modifiers.mac_cmd
+                            });
+                        if f12 || cmd_click {
+                            // Locate the cursor's (line, col).
+                            let cc_idx = if cmd_click
+                                && let Some(p) = out.response.interact_pointer_pos()
+                            {
+                                let rel =
+                                    egui::pos2(p.x - out.galley_pos.x, p.y - out.galley_pos.y);
+                                out.galley.cursor_from_pos(rel.to_vec2()).index
+                            } else {
+                                egui::TextEdit::load_state(ui.ctx(), te_id)
+                                    .and_then(|s| {
+                                        s.cursor.char_range().map(|r| r.primary.index)
+                                    })
+                                    .unwrap_or(0)
+                            };
+                            let (line, ch) =
+                                char_idx_to_line_col(&tab.content, cc_idx);
+                            goto_request(&tab.path, line, ch);
+                        }
                         // Note: egui 0.34 keeps TextEditState.undoer private,
                         // so we can't tighten Ctrl+Z granularity without
                         // forking. Upstream issue; revisit when possible.
@@ -694,6 +745,44 @@ fn summarize_diagnostics(diags: &[Diagnostic]) -> (usize, usize, usize) {
         }
     }
     (errors, warnings, infos)
+}
+
+fn line_col_to_char(text: &str, line: u32, col: u32) -> usize {
+    let mut cur_line = 0u32;
+    let mut cur_col = 0u32;
+    let mut char_idx = 0usize;
+    for ch in text.chars() {
+        if cur_line == line && cur_col == col {
+            return char_idx;
+        }
+        char_idx += 1;
+        if ch == '\n' {
+            cur_line += 1;
+            cur_col = 0;
+        } else {
+            cur_col += 1;
+        }
+    }
+    char_idx
+}
+
+fn char_idx_to_line_col(text: &str, char_idx: usize) -> (u32, u32) {
+    let mut line = 0u32;
+    let mut col = 0u32;
+    let mut idx = 0usize;
+    for ch in text.chars() {
+        if idx == char_idx {
+            return (line, col);
+        }
+        idx += 1;
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
 }
 
 fn reveal_in_file_manager(path: &str) {

@@ -36,6 +36,10 @@ pub struct FileTab {
     /// rather than the source text editor. Toggled by the eye button in
     /// the file path row.
     pub preview_mode: bool,
+    /// When a goto-definition lands inside this file (or newly opens it),
+    /// we stash the target (line, character) here; the editor applies it
+    /// to the TextEdit state on the next render pass.
+    pub pending_cursor: Option<(u32, u32)>,
 }
 
 impl FileTab {
@@ -74,6 +78,7 @@ impl FilesPane {
             last_lsp_content: content.clone(),
             last_lsp_sent_at: None,
             preview_mode: false,
+            pending_cursor: None,
             content,
             name,
         });

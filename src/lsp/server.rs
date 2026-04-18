@@ -148,6 +148,14 @@ pub enum Status {
     Dead,
 }
 
+/// An LSP `Location` normalized to a local file path + 0-indexed line/col.
+#[derive(Clone, Debug)]
+pub struct Location {
+    pub path: PathBuf,
+    pub line: u32,
+    pub character: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub line: u32,
@@ -158,12 +166,21 @@ pub struct Diagnostic {
     pub source: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum RequestKind {
+    Hover,
+    Definition,
+}
+
 struct Shared {
     initialized: bool,
     dead: bool,
     pending_opens: Vec<PendingOpen>,
     diagnostics: HashMap<String, Vec<Diagnostic>>,
     hover_results: HashMap<i64, Option<String>>,
+    definition_results: HashMap<i64, Option<Location>>,
+    /// What kind of response we should parse when this id arrives.
+    pending_kinds: HashMap<i64, RequestKind>,
 }
 
 struct PendingOpen {
@@ -215,6 +232,8 @@ impl LspServer {
                 pending_opens: Vec::new(),
                 diagnostics: HashMap::new(),
                 hover_results: HashMap::new(),
+                definition_results: HashMap::new(),
+                pending_kinds: HashMap::new(),
             }),
             Condvar::new(),
         ));
@@ -521,6 +540,7 @@ impl LspServer {
             return None;
         }
         let id = self.next_id();
+        self.shared.0.lock().pending_kinds.insert(id, RequestKind::Hover);
         let uri = protocol::path_to_uri(path);
         self.send(&json!({
             "jsonrpc": "2.0",
@@ -538,6 +558,39 @@ impl LspServer {
             cv.wait_for(&mut g, Duration::from_millis(50));
         }
         g.hover_results.remove(&id).flatten()
+    }
+
+    pub fn goto_definition(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Option<Location> {
+        if self.is_dead() || !self.shared.0.lock().initialized {
+            return None;
+        }
+        let id = self.next_id();
+        self.shared.0.lock().pending_kinds.insert(id, RequestKind::Definition);
+        let uri = protocol::path_to_uri(path);
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }
+        }));
+        // Blocks the UI briefly — only triggered by explicit Cmd+click or
+        // F12, not per-frame. 1500 ms is enough for rust-analyzer on a
+        // cold cache; still feels reasonably responsive.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let (m, cv) = &*self.shared;
+        let mut g = m.lock();
+        while !g.definition_results.contains_key(&id) && Instant::now() < deadline {
+            cv.wait_for(&mut g, Duration::from_millis(50));
+        }
+        g.definition_results.remove(&id).flatten()
     }
 }
 
@@ -561,7 +614,7 @@ fn handle_message(shared: &Arc<(Mutex<Shared>, Condvar)>, v: &Value) {
         }
         return;
     }
-    // Response path: id + result (initialize, hover, etc.)
+    // Response path: id + result (initialize, hover, definition, etc.)
     if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
         let result = v.get("result");
         let mut g = m.lock();
@@ -569,15 +622,80 @@ fn handle_message(shared: &Arc<(Mutex<Shared>, Condvar)>, v: &Value) {
             // First response carrying an id is our initialize result.
             g.initialized = true;
         }
-        if let Some(r) = result
-            && let Some(text) = extract_hover(r)
-        {
-            g.hover_results.insert(id, Some(text));
-        } else {
-            g.hover_results.insert(id, None);
+        let kind = g.pending_kinds.remove(&id);
+        match kind {
+            Some(RequestKind::Definition) => {
+                let loc = result.and_then(extract_location);
+                g.definition_results.insert(id, loc);
+            }
+            Some(RequestKind::Hover) | None => {
+                let text = result.and_then(extract_hover);
+                g.hover_results.insert(id, text);
+            }
         }
         cv.notify_all();
     }
+}
+
+fn extract_location(result: &Value) -> Option<Location> {
+    if result.is_null() {
+        return None;
+    }
+    if let Some(loc) = parse_location(result) {
+        return Some(loc);
+    }
+    if let Some(arr) = result.as_array() {
+        for item in arr {
+            if let Some(loc) = parse_location(item) {
+                return Some(loc);
+            }
+            if let Some(loc) = parse_location_link(item) {
+                return Some(loc);
+            }
+        }
+    }
+    None
+}
+
+fn parse_location(v: &Value) -> Option<Location> {
+    let uri = v.get("uri")?.as_str()?;
+    let range = v.get("range")?;
+    let start = range.get("start")?;
+    let line = start.get("line")?.as_u64()? as u32;
+    let character = start.get("character")?.as_u64()? as u32;
+    let path = uri_to_path(uri)?;
+    Some(Location { path, line, character })
+}
+
+fn parse_location_link(v: &Value) -> Option<Location> {
+    let uri = v.get("targetUri")?.as_str()?;
+    let range = v
+        .get("targetSelectionRange")
+        .or_else(|| v.get("targetRange"))?;
+    let start = range.get("start")?;
+    let line = start.get("line")?.as_u64()? as u32;
+    let character = start.get("character")?.as_u64()? as u32;
+    let path = uri_to_path(uri)?;
+    Some(Location { path, line, character })
+}
+
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let stripped = uri.strip_prefix("file://")?;
+    let mut bytes: Vec<u8> = Vec::with_capacity(stripped.len());
+    let raw = stripped.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            let hex = std::str::from_utf8(&raw[i + 1..i + 3]).ok()?;
+            let n = u8::from_str_radix(hex, 16).ok()?;
+            bytes.push(n);
+            i += 3;
+        } else {
+            bytes.push(raw[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {

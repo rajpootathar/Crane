@@ -429,6 +429,7 @@ impl SPane {
                             last_lsp_content: content.clone(),
                             last_lsp_sent_at: None,
                             preview_mode: false,
+                            pending_cursor: None,
                             content,
                         }
                     })

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use downloader::{DownloadState, Downloader};
-pub use server::{Diagnostic, ServerKey};
+pub use server::{Diagnostic, Location, ServerKey};
 
 /// Per-language behavior toggles. Persisted in the session so users don't
 /// have to reconfigure on every launch.
@@ -334,6 +334,23 @@ impl LspManager {
             }
         }
         out
+    }
+
+    pub fn goto_definition(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Option<Location> {
+        let keys = self.files.read().get(path).cloned()?;
+        for key in keys {
+            if let Some(s) = self.servers.get(&key)
+                && let Some(loc) = s.goto_definition(path, line, character)
+            {
+                return Some(loc);
+            }
+        }
+        None
     }
 
     pub fn hover(&self, path: &Path, line: u32, character: u32) -> Option<String> {

@@ -311,6 +311,59 @@ impl CraneApp {
         }
     }
 
+    /// Land a goto-definition result: open the file in the Files Pane if
+    /// it's not already open, and stash the target line/column so the next
+    /// render moves the cursor there.
+    fn goto_location(&mut self, ctx: &egui::Context, loc: lsp::Location) {
+        let path_str = loc.path.to_string_lossy().to_string();
+        let mut placed = false;
+        if let Some(layout) = self.app.active_layout_ref() {
+            for (_, p) in &layout.panes {
+                if matches!(&p.content, layout::PaneContent::Files(_)) {
+                    placed = true;
+                    break;
+                }
+            }
+        }
+        if !placed {
+            let name = loc
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&path_str)
+                .to_string();
+            let content = std::fs::read_to_string(&loc.path).unwrap_or_default();
+            self.app
+                .open_file_into_active_layout(ctx, path_str.clone(), name, content);
+        }
+        if let Some(layout) = self.app.active_layout() {
+            for (_, pane) in layout.panes.iter_mut() {
+                if let layout::PaneContent::Files(files) = &mut pane.content {
+                    // Make sure the target file is a tab in this pane.
+                    let idx = files.tabs.iter().position(|t| t.path == path_str);
+                    let idx = match idx {
+                        Some(i) => i,
+                        None => {
+                            let content =
+                                std::fs::read_to_string(&loc.path).unwrap_or_default();
+                            let name = loc
+                                .path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(&path_str)
+                                .to_string();
+                            files.open(path_str.clone(), content, name);
+                            files.tabs.len() - 1
+                        }
+                    };
+                    files.active = idx;
+                    files.tabs[idx].pending_cursor = Some((loc.line, loc.character));
+                    break;
+                }
+            }
+        }
+    }
+
     fn render_confirm_close(&mut self, ctx: &egui::Context) {
         let Some(id) = self.pending_close else {
             return;
@@ -655,6 +708,15 @@ impl eframe::App for CraneApp {
             }
             None
         };
+        // Goto-definition: queue the request here; resolve + navigate
+        // AFTER render finishes (where we can freely borrow self.app).
+        let goto_queue: std::cell::RefCell<Vec<(String, u32, u32)>> =
+            std::cell::RefCell::new(Vec::new());
+        let goto_request = |path: &str, line: u32, character: u32| {
+            goto_queue
+                .borrow_mut()
+                .push((path.to_string(), line, character));
+        };
         let syntax_override = self.app.syntax_theme_override.clone();
         if self.app.active_layout().is_some() {
             if let Some(ws) = self.app.active_layout() {
@@ -667,6 +729,7 @@ impl eframe::App for CraneApp {
                     &diag_fn,
                     &notify_saved,
                     &format_before_save,
+                    &goto_request,
                 );
                 match action {
                     PaneAction::None => {}
@@ -715,6 +778,15 @@ impl eframe::App for CraneApp {
                 &text,
                 &self.app.language_configs,
             );
+        }
+        for (path, line, character) in goto_queue.into_inner() {
+            if let Some(loc) = self.app.lsp.goto_definition(
+                std::path::Path::new(&path),
+                line,
+                character,
+            ) {
+                self.goto_location(&ctx, loc);
+            }
         }
         self.app.sync_lsp_changes(&ctx);
         self.maybe_save();
