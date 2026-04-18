@@ -28,6 +28,7 @@ pub struct Downloader {
 }
 
 impl Downloader {
+    #[allow(dead_code)] // callers currently use `Downloader::default()`.
     pub fn new() -> Self {
         Self::default()
     }
@@ -175,6 +176,7 @@ pub fn has_npm() -> bool {
     which_on_path("npm").is_some()
 }
 
+#[allow(dead_code)] // public helper for future features that need Node detection.
 pub fn has_node() -> bool {
     which_on_path("node").is_some()
 }

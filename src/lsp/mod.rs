@@ -353,6 +353,7 @@ impl LspManager {
         None
     }
 
+    #[allow(dead_code)] // UI wiring deferred; tier-3 LSP feature.
     pub fn hover(&self, path: &Path, line: u32, character: u32) -> Option<String> {
         // Primary server wins for hover — later we could merge
         // markdown blocks from multiple sources.

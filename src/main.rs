@@ -12,6 +12,7 @@ mod terminal_view;
 mod theme;
 mod ui_left;
 mod ui_right;
+mod ui_status;
 mod ui_top;
 mod ui_util;
 mod update_check;
@@ -584,14 +585,25 @@ impl eframe::App for CraneApp {
             0.0
         };
 
-        let left_rect = egui::Rect::from_min_size(full.min, egui::vec2(left_w, full.height()));
-        let right_rect = egui::Rect::from_min_size(
+        // Reserve a strip along the very bottom for the status bar. Panels
+        // and center content compute their height above it.
+        let status_bar_rect = egui::Rect::from_min_max(
+            egui::pos2(full.min.x, full.max.y - ui_status::HEIGHT),
+            full.max,
+        );
+        let content_bottom = status_bar_rect.min.y;
+
+        let left_rect = egui::Rect::from_min_max(
+            full.min,
+            egui::pos2(full.min.x + left_w, content_bottom),
+        );
+        let right_rect = egui::Rect::from_min_max(
             egui::pos2(full.max.x - right_w, full.min.y),
-            egui::vec2(right_w, full.height()),
+            egui::pos2(full.max.x, content_bottom),
         );
         let center_rect = egui::Rect::from_min_max(
             egui::pos2(full.min.x + left_w, full.min.y),
-            egui::pos2(full.max.x - right_w, full.max.y),
+            egui::pos2(full.max.x - right_w, content_bottom),
         );
 
         if self.app.show_left {
@@ -790,6 +802,11 @@ impl eframe::App for CraneApp {
                 self.goto_location(&ctx, loc);
             }
         }
+
+        // Global status bar — active file's diagnostics, language, path.
+        let mut status_ui = ui.new_child(egui::UiBuilder::new().max_rect(status_bar_rect));
+        status_ui.set_clip_rect(status_bar_rect);
+        ui_status::render(&mut status_ui, &self.app);
         self.app.sync_lsp_changes(&ctx);
         self.maybe_save();
     }

@@ -573,22 +573,22 @@ fn render_change_node(
             if staged_here {
                 if ui.button(format!("{}  Unstage", icons::MINUS)).clicked() {
                     *unstage_path = Some(change_path.clone());
-                    ui.close_menu();
+                    ui.close();
                 }
             } else {
                 if ui.button(format!("{}  Stage", icons::PLUS)).clicked() {
                     *stage_path = Some(change_path.clone());
-                    ui.close_menu();
+                    ui.close();
                 }
             }
             if ui.button(format!("{}  Open Diff", icons::GIT_DIFF)).clicked() {
                 *open_diff = Some(change_path.clone());
-                ui.close_menu();
+                ui.close();
             }
             ui.separator();
             if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
                 ui.ctx().copy_text(change_path.clone());
-                ui.close_menu();
+                ui.close();
             }
         });
     }
@@ -693,18 +693,18 @@ fn render_fs_dir(
         row.response.context_menu(|ui| {
             if !is_dir && ui.button(format!("{}  Open", icons::FILE)).clicked() {
                 *open_file = Some(path_owned.clone());
-                ui.close_menu();
+                ui.close();
             }
             if ui
                 .button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN))
                 .clicked()
             {
                 reveal_in_file_manager(&path_owned);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
                 ui.ctx().copy_text(path_owned.to_string_lossy().to_string());
-                ui.close_menu();
+                ui.close();
             }
         });
         if is_dir && is_expanded {

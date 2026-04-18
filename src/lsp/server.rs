@@ -39,6 +39,7 @@ pub enum ServerKey {
 /// when a language supports secondary analyzers — e.g. TS gets tsserver
 /// for types plus (eventually) eslint-lsp for lint. One enum entry per
 /// extension is the MVP; see `keys_for_path_multi` for the layered path.
+#[allow(dead_code)] // kept for callers that only need the primary LSP key.
 pub fn key_for_path(path: &Path) -> Option<ServerKey> {
     keys_for_path(path).into_iter().next()
 }
@@ -162,11 +163,18 @@ pub struct Diagnostic {
     pub col_start: u32,
     pub col_end: u32,
     pub severity: u8, // 1 error, 2 warning, 3 info, 4 hint
+    /// Human-readable text from the LSP. Not shown yet (surfaces in a
+    /// future hover/inline tooltip).
+    #[allow(dead_code)]
     pub message: String,
+    /// Which linter produced the message (e.g. "tsserver", "eslint").
+    /// Wired for future source-tagged UI.
+    #[allow(dead_code)]
     pub source: Option<String>,
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Hover UI not wired yet; variant reserved for it.
 enum RequestKind {
     Hover,
     Definition,
@@ -535,6 +543,7 @@ impl LspServer {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)] // queued feature: UI-side dwell detection not yet wired.
     pub fn hover(&self, path: &Path, line: u32, character: u32) -> Option<String> {
         if self.is_dead() || !self.shared.0.lock().initialized {
             return None;

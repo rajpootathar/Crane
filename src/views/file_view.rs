@@ -310,7 +310,6 @@ fn render_inner(
         ui.add_space(2.0);
 
         let diagnostics: Vec<Diagnostic> = diagnostics_for(&tab.path);
-        let diag_counts = summarize_diagnostics(&diagnostics);
 
         let font = FontId::new(font_size, FontFamily::Monospace);
         let ext = Path::new(&tab.path)
@@ -485,7 +484,6 @@ fn render_inner(
                         );
                     }
                 });
-            render_status_strip(ui, (0, 0, 0));
             return;
         }
 
@@ -503,7 +501,6 @@ fn render_inner(
                         font_size,
                     );
                 });
-            render_status_strip(ui, diag_counts);
             return;
         }
 
@@ -714,16 +711,16 @@ fn render_inner(
                         out.response.context_menu(|ui| {
                             if ui.button(format!("{}  Save", icons::FLOPPY_DISK)).clicked() {
                                 cs.set(true);
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button(format!("{}  Reveal in Finder", icons::FOLDER_OPEN)).clicked() {
                                 cr.set(true);
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
                                 ui.ctx().copy_text(path_for_copy.clone());
                                 cc.set(true);
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                         if ctx_save.get() {
@@ -747,46 +744,7 @@ fn render_inner(
                 });
             });
 
-        render_status_strip(ui, diag_counts);
     }
-}
-
-fn render_status_strip(ui: &mut egui::Ui, counts: (usize, usize, usize)) {
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.add_space(6.0);
-        let (errs, warns, infos) = counts;
-        let t = theme::current();
-        if errs == 0 && warns == 0 && infos == 0 {
-            ui.label(
-                RichText::new("No problems")
-                    .size(10.5)
-                    .color(t.text_muted.to_color32()),
-            );
-        } else {
-            if errs > 0 {
-                ui.label(
-                    RichText::new(format!("{}  {errs}", icons::X_CIRCLE))
-                        .size(10.5)
-                        .color(severity_color(1)),
-                );
-            }
-            if warns > 0 {
-                ui.label(
-                    RichText::new(format!("{}  {warns}", icons::WARNING))
-                        .size(10.5)
-                        .color(severity_color(2)),
-                );
-            }
-            if infos > 0 {
-                ui.label(
-                    RichText::new(format!("{}  {infos}", icons::INFO))
-                        .size(10.5)
-                        .color(severity_color(3)),
-                );
-            }
-        }
-    });
 }
 
 fn severity_color(severity: u8) -> Color32 {
@@ -797,20 +755,6 @@ fn severity_color(severity: u8) -> Color32 {
         3 => t.accent.to_color32(),
         _ => t.text_muted.to_color32(),
     }
-}
-
-fn summarize_diagnostics(diags: &[Diagnostic]) -> (usize, usize, usize) {
-    let mut errors = 0usize;
-    let mut warnings = 0usize;
-    let mut infos = 0usize;
-    for d in diags {
-        match d.severity {
-            1 => errors += 1,
-            2 => warnings += 1,
-            _ => infos += 1,
-        }
-    }
-    (errors, warnings, infos)
 }
 
 fn line_col_to_char(text: &str, line: u32, col: u32) -> usize {

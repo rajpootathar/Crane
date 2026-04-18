@@ -125,16 +125,16 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 row.response.context_menu(|ui| {
                     if ui.button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN)).clicked() {
                         reveal_in_file_manager(&proj_path);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
                         ui.ctx().copy_text(proj_path.to_string_lossy().to_string());
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button(format!("{}  Remove Project", icons::X)).clicked() {
                         remove_project = Some(pid);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -180,16 +180,16 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         wt_row.response.context_menu(|ui| {
                             if ui.button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN)).clicked() {
                                 reveal_in_file_manager(&wt_path);
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
                                 ui.ctx().copy_text(wt_path.to_string_lossy().to_string());
-                                ui.close_menu();
+                                ui.close();
                             }
                             ui.separator();
                             if ui.button(format!("{}  Remove Worktree", icons::X)).clicked() {
                                 remove_worktree = Some((wt_pid, wt_id));
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
 
