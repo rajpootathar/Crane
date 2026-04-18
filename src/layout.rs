@@ -40,6 +40,10 @@ pub struct FileTab {
     /// we stash the target (line, character) here; the editor applies it
     /// to the TextEdit state on the next render pass.
     pub pending_cursor: Option<(u32, u32)>,
+    /// Lazy-loaded GPU texture for image files (.png / .jpg / .gif / .bmp
+    /// / .webp / .ico). None until the first render attempts a decode.
+    #[allow(dead_code)]
+    pub image_texture: Option<egui::TextureHandle>,
 }
 
 impl FileTab {
@@ -79,6 +83,7 @@ impl FilesPane {
             last_lsp_sent_at: None,
             preview_mode: false,
             pending_cursor: None,
+            image_texture: None,
             content,
             name,
         });

@@ -116,6 +116,7 @@ pub fn render(
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
+    workspace_root: Option<&std::path::Path>,
 ) {
     ui.push_id(("files_pane", pane_id), |ui| {
         render_inner(
@@ -128,8 +129,36 @@ pub fn render(
             notify_saved,
             format_before_save,
             goto_request,
+            workspace_root,
         );
     });
+}
+
+fn short_path(path: &str, workspace_root: Option<&std::path::Path>) -> String {
+    if let Some(root) = workspace_root
+        && let Ok(rel) = std::path::Path::new(path).strip_prefix(root)
+    {
+        return rel.to_string_lossy().to_string();
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && let Some(stripped) = path.strip_prefix(&home)
+    {
+        return format!("~{stripped}");
+    }
+    path.to_string()
+}
+
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
+
+fn is_image_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            IMAGE_EXTS.iter().any(|x| *x == e.as_str())
+        })
+        .unwrap_or(false)
 }
 
 fn render_inner(
@@ -142,6 +171,7 @@ fn render_inner(
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
+    workspace_root: Option<&std::path::Path>,
 ) {
     if pane.tabs.is_empty() {
         let t = theme::current();
@@ -228,11 +258,13 @@ fn render_inner(
 
         ui.horizontal(|ui| {
             ui.add_space(4.0);
+            let rel = short_path(&tab.path, workspace_root);
             ui.label(
-                RichText::new(&tab.path)
+                RichText::new(&rel)
                     .size(10.5)
                     .color(theme::current().text_muted.to_color32()),
-            );
+            )
+            .on_hover_text(&tab.path);
             ui.with_layout(
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
@@ -423,6 +455,40 @@ fn render_inner(
             .size()
             .x;
         let gutter_w = gutter_char_w * digits as f32 + 16.0;
+        // Image files: decode + upload a GPU texture once, then display.
+        if is_image_path(&tab.path) {
+            if tab.image_texture.is_none()
+                && let Ok(bytes) = std::fs::read(&tab.path)
+                && let Ok(img) = image::load_from_memory(&bytes)
+            {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                tab.image_texture = Some(ui.ctx().load_texture(
+                    format!("crane_img:{}", tab.path),
+                    color,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            ScrollArea::both()
+                .id_salt(("image_scroll", active_idx))
+                .auto_shrink([false; 2])
+                .max_height(editor_h)
+                .show(ui, |ui| {
+                    if let Some(tex) = &tab.image_texture {
+                        let size = tex.size_vec2();
+                        ui.add(egui::Image::from_texture(tex).fit_to_original_size(1.0).max_size(size));
+                    } else {
+                        ui.label(
+                            RichText::new("Couldn't decode image")
+                                .color(theme::current().error.to_color32()),
+                        );
+                    }
+                });
+            render_status_strip(ui, (0, 0, 0));
+            return;
+        }
+
         // Markdown preview mode: render formatted HTML instead of the
         // source editor. Same content buffer, no separate store.
         if is_md && tab.preview_mode {

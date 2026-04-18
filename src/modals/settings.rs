@@ -3,8 +3,8 @@ use crate::theme;
 use egui::{Color32, RichText};
 
 const SIDEBAR_W: f32 = 200.0;
-const WIN_W: f32 = 780.0;
-const WIN_H: f32 = 520.0;
+const WIN_W: f32 = 960.0;
+const WIN_H: f32 = 640.0;
 
 pub enum SettingsEffect {
     None,
@@ -25,8 +25,10 @@ pub fn render(
 
     egui::Window::new("Settings")
         .collapsible(false)
-        .resizable(false)
-        .fixed_size(egui::vec2(WIN_W, WIN_H))
+        .resizable(true)
+        .default_size(egui::vec2(WIN_W, WIN_H))
+        .min_width(720.0)
+        .min_height(460.0)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .open(&mut open)
         .show(ctx, |ui| {

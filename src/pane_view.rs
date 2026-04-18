@@ -109,6 +109,7 @@ pub fn render_layout(
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
+    workspace_root: Option<&std::path::Path>,
 ) -> PaneAction {
     let mut action = PaneAction::None;
     let root = layout.root.take();
@@ -126,6 +127,7 @@ pub fn render_layout(
             notify_saved,
             format_before_save,
             goto_request,
+            workspace_root,
         );
         layout.root = Some(root);
     }
@@ -145,6 +147,7 @@ fn render_node(
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
+    workspace_root: Option<&std::path::Path>,
 ) {
     match node {
         Node::Leaf(id) => {
@@ -160,6 +163,7 @@ fn render_node(
                 notify_saved,
                 format_before_save,
                 goto_request,
+                workspace_root,
             );
         }
         Node::Split {
@@ -186,6 +190,7 @@ fn render_node(
                 notify_saved,
                 format_before_save,
                 goto_request,
+                workspace_root,
             );
             render_node(
                 ui,
@@ -200,6 +205,7 @@ fn render_node(
                 notify_saved,
                 format_before_save,
                 goto_request,
+                workspace_root,
             );
             render_splitter(ui, splitter, *direction, path, rect, action);
         }
@@ -275,6 +281,7 @@ fn render_pane(
     notify_saved: &dyn Fn(&str, &str),
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
+    workspace_root: Option<&std::path::Path>,
 ) {
     let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
@@ -360,6 +367,7 @@ fn render_pane(
                 notify_saved,
                 format_before_save,
                 goto_request,
+                workspace_root,
             );
         }
         PaneContent::Markdown(md) => {

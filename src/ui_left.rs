@@ -123,10 +123,6 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 let pid = project.id;
                 let proj_path = project.path.clone();
                 row.response.context_menu(|ui| {
-                    if ui.button(format!("{}  New Worktree", icons::PLUS)).clicked() {
-                        new_workspace_for_project = Some(pid);
-                        ui.close_menu();
-                    }
                     if ui.button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN)).clicked() {
                         reveal_in_file_manager(&proj_path);
                         ui.close_menu();
@@ -182,10 +178,6 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         let wt_id = wt.id;
                         let wt_path = wt.path.clone();
                         wt_row.response.context_menu(|ui| {
-                            if ui.button(format!("{}  New Tab", icons::PLUS)).clicked() {
-                                new_tab_for_worktree = Some((wt_pid, wt_id));
-                                ui.close_menu();
-                            }
                             if ui.button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN)).clicked() {
                                 reveal_in_file_manager(&wt_path);
                                 ui.close_menu();
@@ -233,20 +225,8 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 } else if tab_row.main_clicked {
                                     set_active = Some((project.id, wt.id, tab.id));
                                 }
-                                let tb_pid = project.id;
-                                let tb_wid = wt.id;
-                                let tb_tid = tab.id;
-                                tab_row.response.context_menu(|ui| {
-                                    if ui.button(format!("{}  Activate", icons::ARROW_RIGHT)).clicked() {
-                                        set_active = Some((tb_pid, tb_wid, tb_tid));
-                                        ui.close_menu();
-                                    }
-                                    ui.separator();
-                                    if ui.button(format!("{}  Close Tab", icons::X)).clicked() {
-                                        close_tab = Some((tb_pid, tb_wid, tb_tid));
-                                        ui.close_menu();
-                                    }
-                                });
+                                // No context menu on tab rows — click
+                                // already activates, × already closes.
                             }
                         }
                     }
