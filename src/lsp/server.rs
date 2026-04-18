@@ -294,7 +294,16 @@ impl LspServer {
                 "workspace": { "workspaceFolders": false }
             },
             "clientInfo": { "name": "crane", "version": env!("CARGO_PKG_VERSION") },
-            "initializationOptions": Value::Null,
+            // rust-analyzer's real error diagnostics ("cannot find X", type
+            // mismatches, unused imports) come from cargo check. Without
+            // these options rust-analyzer only reports a handful of
+            // syntax/name-resolution infos. tsserver and others ignore.
+            "initializationOptions": {
+                "checkOnSave": true,
+                "check": { "command": "check", "extraArgs": [] },
+                "cargo": { "allFeatures": false },
+                "diagnostics": { "enable": true, "experimental": { "enable": true } }
+            },
         });
         self.send(&json!({
             "jsonrpc": "2.0",
@@ -405,6 +414,11 @@ impl LspServer {
         *version += 1;
         let v = *version;
         drop(versions);
+        // Drop stale diagnostics for this file. Old entries point to text
+        // positions that may no longer make sense (e.g. highlighting a
+        // comment line when the real error moved). The server will send
+        // fresh ones shortly.
+        self.shared.0.lock().diagnostics.remove(&uri);
         if !self.shared.0.lock().initialized {
             return;
         }

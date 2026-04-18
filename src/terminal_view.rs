@@ -4,6 +4,7 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
+use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, Pos2, Rect, Sense, Vec2};
 
 fn term_bg() -> Color32 {
@@ -144,48 +145,98 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     };
     let (cells, (cursor_col, cursor_line), selection) = snapshot;
 
+    // Group cells by line, then batch each line into a single LayoutJob
+    // grouped by contiguous runs of same (fg, bg, flags). This cuts paint
+    // calls from one-per-cell (~4800 for 120×40) down to a small handful
+    // per row (~3–10), and hands the font layout off to egui once per row
+    // instead of once per glyph.
+    let cols_count = cols;
+    let mut by_row: std::collections::BTreeMap<i32, Vec<(usize, alacritty_terminal::term::cell::Cell, bool)>> =
+        std::collections::BTreeMap::new();
     for (point, cell) in cells {
-        let col = point.column.0;
-        let line = point.line.0;
-        if line < 0 {
+        if point.line.0 < 0 {
             continue;
         }
-        let line = line as usize;
-
-        let x = (origin.x + col as f32 * cell_w).round();
-        let y = (origin.y + line as f32 * cell_h).round();
-        let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w.round(), cell_h.round()));
-
-        let bg = color_to_egui(cell.bg, false);
-        if bg != bg_theme {
-            painter.rect_filled(rect, 0.0, bg);
-        }
-
         let in_selection = selection
             .map(|sel| point_in_selection(point, &sel))
             .unwrap_or(false);
-        if in_selection {
-            painter.rect_filled(rect, 0.0, selection_bg());
-        }
+        by_row
+            .entry(point.line.0)
+            .or_default()
+            .push((point.column.0, cell, in_selection));
+    }
 
-        if cell.c != ' ' && cell.c != '\0' {
-            let fg = color_to_egui(cell.fg, true);
-            painter.text(
-                Pos2::new(x, y),
-                egui::Align2::LEFT_TOP,
-                cell.c,
-                font_id.clone(),
-                fg,
-            );
-            if cell.flags.contains(CellFlags::UNDERLINE) {
-                painter.line_segment(
-                    [
-                        Pos2::new(x, y + cell_h - 1.0),
-                        Pos2::new(x + cell_w, y + cell_h - 1.0),
-                    ],
-                    egui::Stroke::new(1.0, fg),
-                );
+    let fallback_fg = term_fg();
+    for (line, mut row_cells) in by_row {
+        row_cells.sort_by_key(|(c, _, _)| *c);
+        let row_y = (origin.y + line as f32 * cell_h).round();
+        let row_x = origin.x.round();
+        let row_rect = Rect::from_min_size(
+            Pos2::new(row_x, row_y),
+            Vec2::new(cols_count as f32 * cell_w, cell_h.round()),
+        );
+
+        // Coalesce runs of same (fg, bg, underline) into one LayoutJob
+        // section. Selection bg wins over cell bg.
+        let mut job = LayoutJob::default();
+        let mut cur_fg: Option<Color32> = None;
+        let mut cur_bg: Option<Color32> = None;
+        let mut cur_underline = false;
+        let mut buf = String::new();
+
+        let flush = |job: &mut LayoutJob,
+                     buf: &mut String,
+                     fg: Option<Color32>,
+                     bg: Option<Color32>,
+                     underline: bool| {
+            if buf.is_empty() {
+                return;
             }
+            let color = fg.unwrap_or(fallback_fg);
+            let background = bg
+                .filter(|&b| b != bg_theme)
+                .unwrap_or(Color32::TRANSPARENT);
+            let stroke = if underline {
+                egui::Stroke::new(1.0, color)
+            } else {
+                egui::Stroke::NONE
+            };
+            job.append(
+                buf,
+                0.0,
+                TextFormat {
+                    font_id: font_id.clone(),
+                    color,
+                    background,
+                    underline: stroke,
+                    ..Default::default()
+                },
+            );
+            buf.clear();
+        };
+
+        for (_col, cell, in_selection) in row_cells.iter() {
+            let fg = color_to_egui(cell.fg, true);
+            let bg = if *in_selection {
+                selection_bg()
+            } else {
+                color_to_egui(cell.bg, false)
+            };
+            let underline = cell.flags.contains(CellFlags::UNDERLINE);
+            if Some(fg) != cur_fg || Some(bg) != cur_bg || underline != cur_underline {
+                flush(&mut job, &mut buf, cur_fg, cur_bg, cur_underline);
+                cur_fg = Some(fg);
+                cur_bg = Some(bg);
+                cur_underline = underline;
+            }
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            buf.push(ch);
+        }
+        flush(&mut job, &mut buf, cur_fg, cur_bg, cur_underline);
+
+        if !job.is_empty() {
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            painter.galley(row_rect.min, galley, fallback_fg);
         }
     }
 
@@ -256,6 +307,33 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                         }
                     if modifiers.mac_cmd || modifiers.command {
                         continue;
+                    }
+                    // Alt/Option + arrow: emit word-navigation sequences
+                    // most shells expect (bash, zsh, fish all read ESC b / f
+                    // for word back / forward). Also covers Alt + letter as
+                    // generic "ESC + <char>".
+                    if modifiers.alt {
+                        match *key {
+                            egui::Key::ArrowLeft => {
+                                terminal.write_input(b"\x1bb");
+                                continue;
+                            }
+                            egui::Key::ArrowRight => {
+                                terminal.write_input(b"\x1bf");
+                                continue;
+                            }
+                            egui::Key::Backspace => {
+                                // Alt+Backspace → delete previous word.
+                                terminal.write_input(b"\x1b\x7f");
+                                continue;
+                            }
+                            _ => {
+                                if let Some(letter) = key_letter(*key) {
+                                    terminal.write_input(&[0x1b, letter]);
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     if let Some(bytes) = named_key_bytes(*key) {
                         terminal.write_input(&bytes);

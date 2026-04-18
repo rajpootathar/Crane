@@ -1,27 +1,27 @@
 use crate::layout::FilesPane;
 use crate::lsp::Diagnostic;
 use crate::theme;
+use crate::views::highlight::{rehighlight, LineHighlightCache};
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontFamily, FontId, RichText, ScrollArea, Stroke};
+use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
 use egui_phosphor::regular as icons;
 use std::path::Path;
 use std::sync::OnceLock;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Style, ThemeSet};
+use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
-use syntect::util::LinesWithEndings;
 
 static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
 static THEMES: OnceLock<ThemeSet> = OnceLock::new();
 
 /// Cross-frame cache for a Files Pane tab's rendered galley. Keeps syntect
-/// off the hot path — only runs when `key` changes (text / diagnostics /
-/// theme / font size).
+/// off the hot path — only runs when `key` changes (text / theme / font).
 #[derive(Clone)]
 struct CachedGalley {
     key: u64,
     galley: std::sync::Arc<egui::Galley>,
 }
+
+
 
 fn syntaxes() -> &'static SyntaxSet {
     SYNTAXES.get_or_init(|| {
@@ -154,28 +154,35 @@ fn render_inner(
         return;
     }
 
-    // Tab bar
+    // Tab bar — horizontal scroll so many-open-file cases don't hide
+    // tabs past the viewport edge.
     let mut close_idx: Option<usize> = None;
     let mut activate_idx: Option<usize> = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        ui.add_space(4.0);
-        for (idx, tab) in pane.tabs.iter().enumerate() {
-            let is_active = idx == pane.active;
-            let label = if tab.dirty() {
-                format!("● {}", tab.name)
-            } else {
-                tab.name.clone()
-            };
-            let (clicked, close_clicked) = draw_file_tab(ui, &label, is_active, idx);
-            if clicked {
-                activate_idx = Some(idx);
-            }
-            if close_clicked {
-                close_idx = Some(idx);
-            }
-        }
-    });
+    ScrollArea::horizontal()
+        .id_salt("file_tab_bar")
+        .auto_shrink([false, true])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.add_space(4.0);
+                for (idx, tab) in pane.tabs.iter().enumerate() {
+                    let is_active = idx == pane.active;
+                    let label = if tab.dirty() {
+                        format!("● {}", tab.name)
+                    } else {
+                        tab.name.clone()
+                    };
+                    let (clicked, close_clicked) = draw_file_tab(ui, &label, is_active, idx);
+                    if clicked {
+                        activate_idx = Some(idx);
+                    }
+                    if close_clicked {
+                        close_idx = Some(idx);
+                    }
+                }
+            });
+        });
     if let Some(idx) = activate_idx {
         pane.active = idx;
     }
@@ -204,6 +211,12 @@ fn render_inner(
         };
         *title = format!("Files · {name_label}");
 
+        let is_md = Path::new(&tab.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+            .unwrap_or(false);
+
         ui.horizontal(|ui| {
             ui.add_space(4.0);
             ui.label(
@@ -227,6 +240,20 @@ fn render_inner(
                             eprintln!("save failed: {e}");
                         } else {
                             tab.original_content = tab.content.clone();
+                        }
+                    }
+                    if is_md {
+                        let label = if tab.preview_mode {
+                            format!("{}  Edit", icons::PENCIL_SIMPLE)
+                        } else {
+                            format!("{}  Preview", icons::EYE)
+                        };
+                        let btn = ui.add(
+                            egui::Button::new(RichText::new(label).size(11.5))
+                                .min_size(egui::vec2(0.0, 24.0)),
+                        );
+                        if btn.clicked() {
+                            tab.preview_mode = !tab.preview_mode;
                         }
                     }
                 },
@@ -265,33 +292,21 @@ fn render_inner(
             .unwrap_or_else(|| all.values().next().expect("at least one theme"));
         let fallback_fg = theme::current().text.to_color32();
 
-        // Group diagnostics by line for O(1) lookup in the layouter.
-        let mut diags_by_line: std::collections::HashMap<u32, Vec<Diagnostic>> =
-            std::collections::HashMap::new();
-        for d in &diagnostics {
-            diags_by_line.entry(d.line).or_default().push(d.clone());
-        }
-
-        // Hash fingerprint of everything that affects the galley. We memoize
-        // across frames in egui's id-keyed memory so syntect only re-runs
-        // when the buffer / diagnostics / theme / font-size actually change.
-        // Previously the cache was per-frame and therefore useless.
+        // Salt the cache key on syntax-affecting inputs ONLY (text is
+        // hashed inside the closure). Diagnostics now render as an overlay
+        // pass after the galley, so LSP updates no longer invalidate the
+        // cached highlight.
         let layout_salt = {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
             let mut h = DefaultHasher::new();
             font_size.to_bits().hash(&mut h);
             requested.hash(&mut h);
-            diagnostics.len().hash(&mut h);
-            for d in &diagnostics {
-                d.line.hash(&mut h);
-                d.col_start.hash(&mut h);
-                d.col_end.hash(&mut h);
-                d.severity.hash(&mut h);
-            }
             h.finish()
         };
-        let cache_id = egui::Id::new(("file_view_layouter", &tab.path));
+        let cache_path = tab.path.clone();
+        let cache_id = egui::Id::new(("file_view_layouter", &cache_path));
+        let line_cache_id = egui::Id::new(("file_view_lines", &cache_path));
 
         let mut layouter = move |ui: &egui::Ui,
                                   buffer: &dyn egui::TextBuffer,
@@ -306,22 +321,42 @@ fn render_inner(
                 layout_salt.hash(&mut h);
                 h.finish()
             };
+
             if let Some(cached) = ui
                 .memory(|m| m.data.get_temp::<CachedGalley>(cache_id))
                 && cached.key == key
             {
                 return cached.galley;
             }
+
+            // Incremental path: sync the per-line highlight cache with the
+            // current buffer (runs syntect only on changed lines + all
+            // lines below the first change), then rebuild the LayoutJob
+            // from the cache. On a typical keystroke at the bottom of a
+            // file this rehighlights exactly one line.
+            let context_hash = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                requested.hash(&mut h);
+                syntax.name.hash(&mut h);
+                h.finish()
+            };
+            let mut line_cache: LineHighlightCache = ui
+                .memory(|m| m.data.get_temp::<LineHighlightCache>(line_cache_id))
+                .unwrap_or_default();
+            rehighlight(
+                &mut line_cache,
+                text,
+                syntax,
+                st_theme,
+                syntaxes(),
+                context_hash,
+            );
+
             let mut job = LayoutJob::default();
-            let mut hl = HighlightLines::new(syntax, st_theme);
-            let mut line_idx: u32 = 0;
-            for line in LinesWithEndings::from(text) {
-                let line_diags = diags_by_line.get(&line_idx).cloned().unwrap_or_default();
-                let segments: Vec<(Style, &str)> = hl
-                    .highlight_line(line, syntaxes())
-                    .unwrap_or_else(|_| vec![(Style::default(), line)]);
-                let mut col: u32 = 0;
-                for (style, segment) in segments {
+            for entry in &line_cache.lines {
+                for (style, piece) in &entry.segments {
                     let color = if style.foreground.a == 0 {
                         fallback_fg
                     } else {
@@ -331,18 +366,18 @@ fn render_inner(
                             style.foreground.b,
                         )
                     };
-                    append_with_diagnostics(
-                        &mut job,
-                        segment,
-                        col,
-                        &line_diags,
-                        &font,
-                        color,
+                    job.append(
+                        piece,
+                        0.0,
+                        TextFormat {
+                            font_id: font.clone(),
+                            color,
+                            ..Default::default()
+                        },
                     );
-                    col += segment.chars().count() as u32;
                 }
-                line_idx += 1;
             }
+
             let galley = ui.fonts_mut(|f| f.layout_job(job));
             ui.memory_mut(|m| {
                 m.data.insert_temp(
@@ -352,6 +387,7 @@ fn render_inner(
                         galley: galley.clone(),
                     },
                 );
+                m.data.insert_temp(line_cache_id, line_cache);
             });
             galley
         };
@@ -371,6 +407,24 @@ fn render_inner(
             .size()
             .x;
         let gutter_w = gutter_char_w * digits as f32 + 16.0;
+        // Markdown preview mode: render formatted HTML instead of the
+        // source editor. Same content buffer, no separate store.
+        if is_md && tab.preview_mode {
+            ScrollArea::vertical()
+                .id_salt(("md_preview", active_idx))
+                .auto_shrink([false; 2])
+                .max_height(editor_h)
+                .show(ui, |ui| {
+                    crate::views::markdown_view::render_md(
+                        ui,
+                        &tab.content,
+                        font_size,
+                    );
+                });
+            render_status_strip(ui, diag_counts);
+            return;
+        }
+
         ScrollArea::both()
             .id_salt(("file_scroll", active_idx))
             .auto_shrink([false; 2])
@@ -398,52 +452,69 @@ fn render_inner(
                         }
                         ui.add(egui::Label::new(job).selectable(false));
                     });
-                    let editor = egui::TextEdit::multiline(&mut tab.content)
-                        .code_editor()
-                        .frame(egui::Frame::NONE)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(30)
-                        .layouter(&mut layouter);
-                    ui.add(editor);
+                    // Scope the TextEdit's widget id by file path — without
+                    // this every tab in a Files Pane shared the same
+                    // source-location-derived id, so undo/redo history
+                    // (and cursor position + selection) leaked across files.
+                    // Ctrl+Z in file A would replay edits made in file B.
+                    ui.push_id(("file_editor", &tab.path), |ui| {
+                        let editor = egui::TextEdit::multiline(&mut tab.content)
+                            .code_editor()
+                            .frame(egui::Frame::NONE)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(30)
+                            .layouter(&mut layouter);
+                        let out = editor.show(ui);
+                        paint_diagnostic_overlay(
+                            ui,
+                            &out.galley,
+                            out.galley_pos,
+                            &diagnostics,
+                        );
+                    });
                 });
             });
 
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.add_space(6.0);
-            let (errs, warns, infos) = diag_counts;
-            let t = theme::current();
-            if errs == 0 && warns == 0 && infos == 0 {
-                ui.label(
-                    RichText::new("No problems")
-                        .size(10.5)
-                        .color(t.text_muted.to_color32()),
-                );
-            } else {
-                if errs > 0 {
-                    ui.label(
-                        RichText::new(format!("{}  {errs}", icons::X_CIRCLE))
-                            .size(10.5)
-                            .color(severity_color(1)),
-                    );
-                }
-                if warns > 0 {
-                    ui.label(
-                        RichText::new(format!("{}  {warns}", icons::WARNING))
-                            .size(10.5)
-                            .color(severity_color(2)),
-                    );
-                }
-                if infos > 0 {
-                    ui.label(
-                        RichText::new(format!("{}  {infos}", icons::INFO))
-                            .size(10.5)
-                            .color(severity_color(3)),
-                    );
-                }
-            }
-        });
+        render_status_strip(ui, diag_counts);
     }
+}
+
+fn render_status_strip(ui: &mut egui::Ui, counts: (usize, usize, usize)) {
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        let (errs, warns, infos) = counts;
+        let t = theme::current();
+        if errs == 0 && warns == 0 && infos == 0 {
+            ui.label(
+                RichText::new("No problems")
+                    .size(10.5)
+                    .color(t.text_muted.to_color32()),
+            );
+        } else {
+            if errs > 0 {
+                ui.label(
+                    RichText::new(format!("{}  {errs}", icons::X_CIRCLE))
+                        .size(10.5)
+                        .color(severity_color(1)),
+                );
+            }
+            if warns > 0 {
+                ui.label(
+                    RichText::new(format!("{}  {warns}", icons::WARNING))
+                        .size(10.5)
+                        .color(severity_color(2)),
+                );
+            }
+            if infos > 0 {
+                ui.label(
+                    RichText::new(format!("{}  {infos}", icons::INFO))
+                        .size(10.5)
+                        .color(severity_color(3)),
+                );
+            }
+        }
+    });
 }
 
 fn severity_color(severity: u8) -> Color32 {
@@ -470,81 +541,60 @@ fn summarize_diagnostics(diags: &[Diagnostic]) -> (usize, usize, usize) {
     (errors, warnings, infos)
 }
 
-fn append_with_diagnostics(
-    job: &mut LayoutJob,
-    segment: &str,
-    seg_start_col: u32,
-    line_diags: &[Diagnostic],
-    font: &FontId,
-    color: Color32,
+fn paint_diagnostic_overlay(
+    ui: &egui::Ui,
+    galley: &std::sync::Arc<egui::Galley>,
+    origin: egui::Pos2,
+    diagnostics: &[Diagnostic],
 ) {
-    let seg_chars: Vec<char> = segment.chars().collect();
-    let seg_end_col = seg_start_col + seg_chars.len() as u32;
-
-    if line_diags.is_empty() {
-        job.append(
-            segment,
-            0.0,
-            TextFormat {
-                font_id: font.clone(),
-                color,
-                ..Default::default()
-            },
-        );
+    if diagnostics.is_empty() {
         return;
     }
-
-    // For each character, pick the highest-severity (smallest `severity` u8)
-    // diagnostic covering that column, if any.
-    let mut spans: Vec<(usize, Option<Stroke>)> = Vec::with_capacity(seg_chars.len());
-    for (idx, _) in seg_chars.iter().enumerate() {
-        let col = seg_start_col + idx as u32;
-        let mut best: Option<&Diagnostic> = None;
-        for d in line_diags {
-            if col >= d.col_start && col < d.col_end
-                && best.map(|b| d.severity < b.severity).unwrap_or(true)
-            {
-                best = Some(d);
-            }
+    let text = galley.text();
+    // Precompute char-index of each line start once per paint. Was walking
+    // the full text per diagnostic — O(text × diag) every frame — which
+    // destroyed typing latency on files with many diagnostics (e.g. busy
+    // TSX files with a dozen tsserver errors).
+    let mut line_char_starts: Vec<usize> = vec![0];
+    let mut char_idx: usize = 0;
+    for ch in text.chars() {
+        char_idx += 1;
+        if ch == '\n' {
+            line_char_starts.push(char_idx);
         }
-        let stroke =
-            best.map(|d| Stroke::new(1.5, severity_color(d.severity)));
-        spans.push((idx, stroke));
     }
+    let total_chars = char_idx;
+    let ccursor_at = |line: u32, col: u32| -> egui::text::CCursor {
+        let Some(base) = line_char_starts.get(line as usize).copied() else {
+            return egui::text::CCursor::new(total_chars);
+        };
+        // Clamp to the END of this line (one char before the next line's
+        // start). Prevents u32::MAX "end-of-line" markers from multi-line
+        // diagnostics from painting underlines in random places.
+        let next = line_char_starts
+            .get(line as usize + 1)
+            .copied()
+            .unwrap_or(total_chars);
+        let line_len = next.saturating_sub(base).saturating_sub(1);
+        let col_clamped = (col as usize).min(line_len);
+        egui::text::CCursor::new(base + col_clamped)
+    };
 
-    // Coalesce consecutive chars that share the same underline state.
-    let mut i = 0;
-    while i < spans.len() {
-        let (start, stroke) = spans[i];
-        let mut j = i + 1;
-        while j < spans.len() && spans[j].1 == stroke {
-            j += 1;
+    let painter = ui.painter();
+    for d in diagnostics {
+        let start_rect = galley.pos_from_cursor(ccursor_at(d.line, d.col_start));
+        let end_rect = galley.pos_from_cursor(ccursor_at(d.line, d.col_end));
+        let y = origin.y + start_rect.max.y - 1.0;
+        let x0 = origin.x + start_rect.min.x;
+        let x1 = origin.x + end_rect.max.x;
+        if x1 <= x0 {
+            continue;
         }
-        // Slice segment by char count — find byte offsets for [start..j).
-        let end_char = if j < spans.len() { spans[j].0 } else { seg_chars.len() };
-        let byte_start = char_idx_to_byte(segment, start);
-        let byte_end = char_idx_to_byte(segment, end_char);
-        let part = &segment[byte_start..byte_end];
-        let _ = seg_end_col; // quiet the compiler — seg_end_col was the right-edge sentinel
-        job.append(
-            part,
-            0.0,
-            TextFormat {
-                font_id: font.clone(),
-                color,
-                underline: stroke.unwrap_or(Stroke::NONE),
-                ..Default::default()
-            },
+        painter.line_segment(
+            [egui::pos2(x0, y), egui::pos2(x1, y)],
+            egui::Stroke::new(1.5, severity_color(d.severity)),
         );
-        i = j;
     }
-}
-
-fn char_idx_to_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
 }
 
 fn draw_file_tab(

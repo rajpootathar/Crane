@@ -39,18 +39,23 @@ pub fn render(
                 ui.vertical(|ui| {
                     ui.set_min_height(content_h);
                     ui.set_max_height(content_h);
-                    match app.settings_section {
-                        SettingsSection::Appearance => {
-                            if render_appearance(ui, app, &mut theme_change) {
-                                effect = SettingsEffect::ReloadFonts;
+                    egui::ScrollArea::vertical()
+                        .id_salt(("settings_section", app.settings_section as u32))
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            match app.settings_section {
+                                SettingsSection::Appearance => {
+                                    if render_appearance(ui, app, &mut theme_change) {
+                                        effect = SettingsEffect::ReloadFonts;
+                                    }
+                                }
+                                SettingsSection::Editor => render_editor(ui),
+                                SettingsSection::Terminal => render_terminal(ui),
+                                SettingsSection::LanguageServers => render_lsp(ui, app),
+                                SettingsSection::Shortcuts => render_shortcuts(ui),
+                                SettingsSection::About => render_about(ui, app),
                             }
-                        }
-                        SettingsSection::Editor => render_editor(ui),
-                        SettingsSection::Terminal => render_terminal(ui),
-                        SettingsSection::LanguageServers => render_lsp(ui, app),
-                        SettingsSection::Shortcuts => render_shortcuts(ui),
-                        SettingsSection::About => render_about(ui, app),
-                    }
+                        });
                 });
             });
         });

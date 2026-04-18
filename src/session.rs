@@ -424,6 +424,7 @@ impl SPane {
                             original_content: content.clone(),
                             last_lsp_content: content.clone(),
                             last_lsp_sent_at: None,
+                            preview_mode: false,
                             content,
                         }
                     })

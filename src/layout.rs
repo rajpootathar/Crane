@@ -32,6 +32,10 @@ pub struct FileTab {
     pub last_lsp_content: String,
     /// Timestamp of the most recent didChange we sent, for rate-limiting.
     pub last_lsp_sent_at: Option<std::time::Instant>,
+    /// For Markdown files: when true, render the rendered-HTML preview
+    /// rather than the source text editor. Toggled by the eye button in
+    /// the file path row.
+    pub preview_mode: bool,
 }
 
 impl FileTab {
@@ -69,6 +73,7 @@ impl FilesPane {
             original_content: content.clone(),
             last_lsp_content: content.clone(),
             last_lsp_sent_at: None,
+            preview_mode: false,
             content,
             name,
         });

@@ -45,7 +45,7 @@ fn load_md(pane: &mut MarkdownPane, title: &mut String) {
     }
 }
 
-fn render_md(ui: &mut egui::Ui, src: &str, font_size: f32) {
+pub fn render_md(ui: &mut egui::Ui, src: &str, font_size: f32) {
     let parser = Parser::new_ext(src, Options::all());
     let mono = FontId::new(font_size, FontFamily::Monospace);
     let prop = FontId::new(font_size, FontFamily::Proportional);
