@@ -323,20 +323,22 @@ impl App {
     }
 
     /// Per-frame sync: for every open file tab across every Workspace Tab,
-    /// if the buffer changed since the last LSP push, send a full
-    /// `textDocument/didChange`. Cheap — we just compare strings.
-    pub fn sync_lsp_changes(&mut self) {
+    /// (a) if the manager hasn't seen this path yet — fire `did_open` (this
+    /// is how session-restored tabs start getting diagnostics); (b) if the
+    /// buffer changed since the last LSP push — fire `did_change`.
+    pub fn sync_lsp_changes(&mut self, ctx: &egui::Context) {
         for project in self.projects.iter_mut() {
             for ws in project.workspaces.iter_mut() {
                 for tab in ws.tabs.iter_mut() {
                     for (_, pane) in tab.layout.panes.iter_mut() {
                         if let crate::layout::PaneContent::Files(files) = &mut pane.content {
                             for ft in files.tabs.iter_mut() {
-                                if ft.content != ft.last_lsp_content {
-                                    self.lsp.did_change(
-                                        std::path::Path::new(&ft.path),
-                                        &ft.content,
-                                    );
+                                let path = std::path::Path::new(&ft.path);
+                                if !self.lsp.is_tracked(path) {
+                                    self.lsp.did_open(ctx, path, &ft.content);
+                                    ft.last_lsp_content = ft.content.clone();
+                                } else if ft.content != ft.last_lsp_content {
+                                    self.lsp.did_change(path, &ft.content);
                                     ft.last_lsp_content = ft.content.clone();
                                 }
                             }

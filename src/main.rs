@@ -27,6 +27,7 @@ use state::App;
 
 fn main() -> eframe::Result {
     env_logger::init();
+    fix_path_for_gui_launch();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1480.0, 920.0])
@@ -45,6 +46,60 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(CraneApp::new(cc)))),
     )
+}
+
+/// When a macOS .app is double-clicked from Finder, the process gets a stripped
+/// PATH (typically just `/usr/bin:/bin:/usr/sbin:/sbin`). This means LSP
+/// servers installed via cargo / brew / npm are not found, and terminals feel
+/// broken. Mirror what VSCode does: run the user's login shell once and
+/// copy its PATH + common env vars.
+fn fix_path_for_gui_launch() {
+    // Only do the shell dance when launched from a GUI context. A quick
+    // heuristic: PATH lacks `/usr/local/bin` AND `HOME` is set.
+    let current = std::env::var("PATH").unwrap_or_default();
+    let looks_gui = !current.contains("/usr/local/bin")
+        && !current.contains("/opt/homebrew/bin")
+        && !current.contains(".cargo/bin")
+        && std::env::var("HOME").is_ok();
+    if !looks_gui {
+        return;
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let output = std::process::Command::new(&shell)
+        .arg("-l")
+        .arg("-i")
+        .arg("-c")
+        .arg("echo __CRANE_PATH__:$PATH")
+        .output();
+    if let Ok(out) = output {
+        let s = String::from_utf8_lossy(&out.stdout);
+        if let Some(line) = s.lines().find(|l| l.starts_with("__CRANE_PATH__:")) {
+            let path = line.trim_start_matches("__CRANE_PATH__:").to_string();
+            if !path.is_empty() {
+                // SAFETY: called from main() before any threads spawn.
+                unsafe { std::env::set_var("PATH", &path) };
+                return;
+            }
+        }
+    }
+    // Fallback: sprinkle the usual suspects onto whatever PATH we have.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let extras = [
+        format!("{home}/.cargo/bin"),
+        format!("{home}/.local/bin"),
+        format!("{home}/go/bin"),
+        format!("{home}/.volta/bin"),
+        format!("{home}/.fnm/aliases/default/bin"),
+        "/opt/homebrew/bin".to_string(),
+        "/opt/homebrew/sbin".to_string(),
+        "/usr/local/bin".to_string(),
+    ];
+    let mut parts: Vec<String> = extras.into_iter().collect();
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    // SAFETY: called from main() before any threads spawn.
+    unsafe { std::env::set_var("PATH", parts.join(":")) };
 }
 
 fn apply_style(ctx: &egui::Context) {
@@ -547,7 +602,7 @@ impl eframe::App for CraneApp {
         self.render_confirm_close(&ctx);
         self.app.update_check.drain();
         render_update_toast(&ctx, &mut self.app);
-        self.app.sync_lsp_changes();
+        self.app.sync_lsp_changes(&ctx);
         self.maybe_save();
     }
 }

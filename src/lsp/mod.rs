@@ -49,6 +49,10 @@ impl LspManager {
         }
     }
 
+    pub fn is_tracked(&self, path: &Path) -> bool {
+        self.files.read().contains_key(path)
+    }
+
     pub fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
         let key = match self.files.read().get(path).copied() {
             Some(k) => k,
