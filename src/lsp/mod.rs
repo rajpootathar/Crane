@@ -65,4 +65,14 @@ impl LspManager {
         let server = self.servers.get(&key)?;
         server.hover(path, line, character)
     }
+
+    /// Status snapshot of every spawned server — used by Settings → About
+    /// to tell the user whether rust-analyzer / tsserver / gopls etc. are
+    /// actually running.
+    pub fn statuses(&self) -> Vec<(ServerKey, server::Status)> {
+        self.servers
+            .iter()
+            .map(|(k, s)| (*k, s.status()))
+            .collect()
+    }
 }

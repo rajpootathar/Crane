@@ -74,6 +74,14 @@ impl ServerKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Spawned,
+    Initializing,
+    Ready,
+    Dead,
+}
+
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub line: u32,
@@ -116,8 +124,11 @@ impl LspServer {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn();
+        if let Err(ref e) = child_res {
+            eprintln!("[lsp] failed to spawn {cmd}: {e}");
+        }
 
         let shared = Arc::new((
             Mutex::new(Shared {
@@ -130,10 +141,20 @@ impl LspServer {
             Condvar::new(),
         ));
 
-        let (stdin, stdout) = match child_res.as_mut() {
-            Ok(c) => (c.stdin.take(), c.stdout.take()),
-            Err(_) => (None, None),
+        let (stdin, stdout, stderr) = match child_res.as_mut() {
+            Ok(c) => (c.stdin.take(), c.stdout.take(), c.stderr.take()),
+            Err(_) => (None, None, None),
         };
+        if let Some(stderr) = stderr {
+            let key_label = format!("{key:?}");
+            thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                let r = BufReader::new(stderr);
+                for line in r.lines().map_while(Result::ok) {
+                    eprintln!("[lsp:{key_label}] {line}");
+                }
+            });
+        }
 
         if let Some(stdout) = stdout {
             let shared2 = shared.clone();
@@ -169,14 +190,53 @@ impl LspServer {
             _ctx: ctx,
         };
 
-        if !server.is_dead() {
-            server.send_initialize();
-        }
         server
+    }
+
+    /// Walk up from a file path to find the nearest project root. Returns
+    /// the directory containing the first found marker, or the file's parent
+    /// if nothing is found.
+    fn detect_project_root(path: &Path) -> PathBuf {
+        let markers = [
+            "Cargo.toml",
+            "package.json",
+            "tsconfig.json",
+            "go.mod",
+            "pyproject.toml",
+            "requirements.txt",
+            "setup.py",
+            ".git",
+        ];
+        let mut cur = path.parent().unwrap_or(path).to_path_buf();
+        loop {
+            for m in &markers {
+                if cur.join(m).exists() {
+                    return cur;
+                }
+            }
+            match cur.parent() {
+                Some(p) => cur = p.to_path_buf(),
+                None => break,
+            }
+        }
+        path.parent().unwrap_or(path).to_path_buf()
     }
 
     fn is_dead(&self) -> bool {
         self.shared.0.lock().dead
+    }
+
+    pub fn status(&self) -> Status {
+        let g = self.shared.0.lock();
+        if g.dead {
+            Status::Dead
+        } else if g.initialized {
+            Status::Ready
+        } else if !g.pending_opens.is_empty() {
+            Status::Initializing
+        } else {
+            Status::Spawned
+        }
     }
 
     fn next_id(&self) -> i64 {
@@ -193,11 +253,14 @@ impl LspServer {
         }
     }
 
-    fn send_initialize(&self) {
+    fn send_initialize(&self, root_uri: Option<String>) {
         let id = self.next_id();
         let params = json!({
             "processId": std::process::id(),
-            "rootUri": Value::Null,
+            "rootUri": root_uri.clone().map(Value::String).unwrap_or(Value::Null),
+            "workspaceFolders": root_uri.as_ref().map(|u| {
+                json!([{ "uri": u, "name": "root" }])
+            }).unwrap_or(Value::Null),
             "capabilities": {
                 "textDocument": {
                     "synchronization": { "dynamicRegistration": false, "didSave": true },
@@ -263,6 +326,19 @@ impl LspServer {
         if self.is_dead() {
             return;
         }
+        // First file open for this server triggers initialize with a
+        // discovered project root — rust-analyzer, gopls, tsserver all need
+        // this to actually produce diagnostics.
+        let needs_init = {
+            let g = self.shared.0.lock();
+            !g.initialized && g.pending_opens.is_empty()
+        };
+        if needs_init {
+            let root = Self::detect_project_root(path);
+            let root_uri = protocol::path_to_uri(&root);
+            self.send_initialize(Some(root_uri));
+        }
+
         let uri = protocol::path_to_uri(path);
         let ext = path
             .extension()

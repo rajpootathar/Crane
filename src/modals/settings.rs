@@ -435,6 +435,46 @@ fn render_about(ui: &mut egui::Ui, app: &mut App) {
                 .strong(),
         );
     }
+
+    ui.add_space(20.0);
+    ui.label(
+        RichText::new("Language servers")
+            .size(13.0)
+            .color(theme::current().text.to_color32())
+            .strong(),
+    );
+    ui.add_space(4.0);
+    let statuses = app.lsp.statuses();
+    if statuses.is_empty() {
+        ui.label(
+            RichText::new("No servers spawned yet — open a file to start one.")
+                .size(11.5)
+                .italics()
+                .color(theme::current().text_muted.to_color32()),
+        );
+    } else {
+        for (key, status) in statuses {
+            let (label, color) = match status {
+                crate::lsp::server::Status::Ready => ("ready", theme::current().success.to_color32()),
+                crate::lsp::server::Status::Initializing => ("initializing", theme::current().warning.to_color32()),
+                crate::lsp::server::Status::Spawned => ("starting", theme::current().warning.to_color32()),
+                crate::lsp::server::Status::Dead => ("dead (not installed?)", theme::current().error.to_color32()),
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{key:?}"))
+                        .size(11.5)
+                        .color(theme::current().text.to_color32())
+                        .monospace(),
+                );
+                ui.label(
+                    RichText::new(format!("  —  {label}"))
+                        .size(11.0)
+                        .color(color),
+                );
+            });
+        }
+    }
 }
 
 fn section_title(ui: &mut egui::Ui, label: &str) {
