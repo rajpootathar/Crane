@@ -5,7 +5,6 @@ use crate::ui_util::{
 use egui::{Color32, Pos2, Rect, RichText, Stroke};
 use egui_phosphor::regular as icons;
 
-pub const WIDTH: f32 = 240.0;
 
 const HEADER: Color32 = Color32::from_rgb(140, 146, 162);
 const ADD: Color32 = Color32::from_rgb(120, 210, 140);

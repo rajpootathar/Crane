@@ -9,7 +9,6 @@ use egui_phosphor::regular as icons;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const WIDTH: f32 = 300.0;
 
 const ADD: Color32 = Color32::from_rgb(120, 210, 140);
 const DEL: Color32 = Color32::from_rgb(220, 110, 110);
@@ -196,7 +195,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
             egui::TextEdit::multiline(&mut app.commit_message)
                 .hint_text("Commit message")
                 .desired_rows(2)
-                .desired_width(WIDTH - 28.0)
+                .desired_width(ui.available_width() - 20.0)
                 .font(egui::FontId::new(12.0, egui::FontFamily::Proportional)),
         );
         if text_resp.has_focus() {

@@ -36,6 +36,17 @@ pub struct Session {
     pub ui_scale: f32,
     #[serde(default)]
     pub syntax_theme_override: Option<String>,
+    #[serde(default = "default_left_w")]
+    pub left_panel_w: f32,
+    #[serde(default = "default_right_w")]
+    pub right_panel_w: f32,
+}
+
+fn default_left_w() -> f32 {
+    240.0
+}
+fn default_right_w() -> f32 {
+    300.0
 }
 
 fn default_ui_scale() -> f32 {
@@ -185,6 +196,8 @@ impl Session {
             custom_mono_font: app.custom_mono_font.clone(),
             ui_scale: app.ui_scale,
             syntax_theme_override: app.syntax_theme_override.clone(),
+            left_panel_w: app.left_panel_w,
+            right_panel_w: app.right_panel_w,
         }
     }
 
@@ -237,6 +250,8 @@ impl Session {
         app.custom_mono_font = self.custom_mono_font;
         app.ui_scale = self.ui_scale.clamp(0.75, 1.5);
         app.syntax_theme_override = self.syntax_theme_override;
+        app.left_panel_w = self.left_panel_w.clamp(180.0, 600.0);
+        app.right_panel_w = self.right_panel_w.clamp(200.0, 700.0);
         app
     }
 }

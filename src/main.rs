@@ -379,8 +379,16 @@ impl eframe::App for CraneApp {
         let divider = t.divider.to_color32();
         ui.painter().rect_filled(full, 0.0, bg);
 
-        let left_w = if self.app.show_left { ui_left::WIDTH } else { 0.0 };
-        let right_w = if self.app.show_right { ui_right::WIDTH } else { 0.0 };
+        let left_w = if self.app.show_left {
+            self.app.left_panel_w
+        } else {
+            0.0
+        };
+        let right_w = if self.app.show_right {
+            self.app.right_panel_w
+        } else {
+            0.0
+        };
 
         let left_rect = egui::Rect::from_min_size(full.min, egui::vec2(left_w, full.height()));
         let right_rect = egui::Rect::from_min_size(
@@ -404,6 +412,27 @@ impl eframe::App for CraneApp {
             let mut left_ui = ui.new_child(egui::UiBuilder::new().max_rect(left_rect));
             left_ui.set_clip_rect(left_rect);
             ui_left::render(&mut left_ui, &mut self.app, &ctx);
+
+            // 6 px drag handle straddling the right edge of the Left Panel.
+            let handle = egui::Rect::from_min_max(
+                egui::pos2(left_rect.max.x - 3.0, left_rect.min.y),
+                egui::pos2(left_rect.max.x + 3.0, left_rect.max.y),
+            );
+            let resp = ui.interact(
+                handle,
+                egui::Id::new("left_panel_resize"),
+                egui::Sense::click_and_drag(),
+            );
+            if resp.hovered() || resp.dragged() {
+                ui.ctx()
+                    .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if resp.dragged()
+                && let Some(pos) = resp.interact_pointer_pos()
+            {
+                self.app.left_panel_w =
+                    (pos.x - full.min.x).clamp(180.0, full.width() * 0.45);
+            }
         }
 
         if self.app.show_right {
@@ -418,6 +447,26 @@ impl eframe::App for CraneApp {
             let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(right_rect));
             right_ui.set_clip_rect(right_rect);
             ui_right::render(&mut right_ui, &mut self.app);
+
+            let handle = egui::Rect::from_min_max(
+                egui::pos2(right_rect.min.x - 3.0, right_rect.min.y),
+                egui::pos2(right_rect.min.x + 3.0, right_rect.max.y),
+            );
+            let resp = ui.interact(
+                handle,
+                egui::Id::new("right_panel_resize"),
+                egui::Sense::click_and_drag(),
+            );
+            if resp.hovered() || resp.dragged() {
+                ui.ctx()
+                    .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if resp.dragged()
+                && let Some(pos) = resp.interact_pointer_pos()
+            {
+                self.app.right_panel_w =
+                    (full.max.x - pos.x).clamp(200.0, full.width() * 0.5);
+            }
         }
 
         let mut center_ui = ui.new_child(egui::UiBuilder::new().max_rect(center_rect));
