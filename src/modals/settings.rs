@@ -443,7 +443,23 @@ fn render_about(ui: &mut egui::Ui, app: &mut App) {
             .color(theme::current().text.to_color32())
             .strong(),
     );
-    ui.add_space(4.0);
+    ui.add_space(2.0);
+    // Show the PATH Crane sees so users can tell if the macOS GUI-launch
+    // PATH fix worked.
+    let path_val = std::env::var("PATH").unwrap_or_default();
+    let short = if path_val.len() > 90 {
+        format!("{}…", &path_val[..90])
+    } else {
+        path_val.clone()
+    };
+    ui.label(
+        RichText::new(format!("PATH: {short}"))
+            .size(10.5)
+            .monospace()
+            .color(theme::current().text_muted.to_color32()),
+    );
+    ui.add_space(6.0);
+
     let statuses = app.lsp.statuses();
     if statuses.is_empty() {
         ui.label(
@@ -456,25 +472,85 @@ fn render_about(ui: &mut egui::Ui, app: &mut App) {
         for (key, status) in statuses {
             let (label, color) = match status {
                 crate::lsp::server::Status::Ready => ("ready", theme::current().success.to_color32()),
-                crate::lsp::server::Status::Initializing => ("initializing", theme::current().warning.to_color32()),
-                crate::lsp::server::Status::Spawned => ("starting", theme::current().warning.to_color32()),
-                crate::lsp::server::Status::Dead => ("dead (not installed?)", theme::current().error.to_color32()),
+                crate::lsp::server::Status::Initializing => {
+                    ("initializing", theme::current().warning.to_color32())
+                }
+                crate::lsp::server::Status::Spawned => {
+                    ("starting", theme::current().warning.to_color32())
+                }
+                crate::lsp::server::Status::Dead => {
+                    ("dead", theme::current().error.to_color32())
+                }
             };
+            let (cmd, _) = key.command();
+            let found = which_on_path(cmd);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("{key:?}"))
-                        .size(11.5)
+                        .size(12.0)
                         .color(theme::current().text.to_color32())
-                        .monospace(),
+                        .strong(),
                 );
                 ui.label(
-                    RichText::new(format!("  —  {label}"))
+                    RichText::new(format!("  {label}"))
                         .size(11.0)
                         .color(color),
                 );
             });
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(format!("$ {cmd}"))
+                        .size(10.5)
+                        .monospace()
+                        .color(theme::current().text_muted.to_color32()),
+                );
+                match found.clone() {
+                    Some(p) => {
+                        ui.label(
+                            RichText::new(format!("→ {p}"))
+                                .size(10.5)
+                                .monospace()
+                                .color(theme::current().success.to_color32()),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("→ not found on PATH")
+                                .size(10.5)
+                                .color(theme::current().error.to_color32()),
+                        );
+                    }
+                }
+            });
+            if status == crate::lsp::server::Status::Dead || found.is_none() {
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(format!("install: {}", key.install_hint()))
+                            .size(10.5)
+                            .monospace()
+                            .color(theme::current().accent.to_color32()),
+                    );
+                });
+            }
+            ui.add_space(4.0);
         }
     }
+}
+
+fn which_on_path(bin: &str) -> Option<String> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let full = std::path::Path::new(dir).join(bin);
+        if full.is_file() {
+            return Some(full.to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 fn section_title(ui: &mut egui::Ui, label: &str) {

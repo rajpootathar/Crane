@@ -46,7 +46,7 @@ pub fn key_for_path(path: &Path) -> Option<ServerKey> {
 }
 
 impl ServerKey {
-    fn command(self) -> (&'static str, &'static [&'static str]) {
+    pub fn command(self) -> (&'static str, &'static [&'static str]) {
         match self {
             ServerKey::RustAnalyzer => ("rust-analyzer", &[]),
             ServerKey::TypeScript => ("typescript-language-server", &["--stdio"]),
@@ -54,6 +54,18 @@ impl ServerKey {
             ServerKey::Pyright => ("pyright-langserver", &["--stdio"]),
             ServerKey::CssLs => ("vscode-css-language-server", &["--stdio"]),
             ServerKey::HtmlLs => ("vscode-html-language-server", &["--stdio"]),
+        }
+    }
+
+    pub fn install_hint(self) -> &'static str {
+        match self {
+            ServerKey::RustAnalyzer => "rustup component add rust-analyzer",
+            ServerKey::TypeScript => "npm i -g typescript typescript-language-server",
+            ServerKey::Gopls => "go install golang.org/x/tools/gopls@latest",
+            ServerKey::Pyright => "npm i -g pyright   (or: pip install pyright)",
+            ServerKey::CssLs | ServerKey::HtmlLs => {
+                "npm i -g vscode-langservers-extracted"
+            }
         }
     }
 

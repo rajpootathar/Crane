@@ -225,20 +225,42 @@ fn terminal_is_running(app: &App, id: layout::PaneId) -> bool {
     }
 }
 
+/// JetBrains Mono Regular — bundled (~264 KB). OFL 1.1 licensed. Used as the
+/// default Monospace font because egui's built-in Hack doesn't cover braille
+/// patterns (U+2800–U+28FF) or block elements, which breaks TUI apps like
+/// nvitop / btop / htop that draw with those glyphs.
+const JETBRAINS_MONO_TTF: &[u8] =
+    include_bytes!("../assets/JetBrainsMono-Regular.ttf");
+
 pub fn load_fonts(ctx: &egui::Context, custom_mono: Option<&str>) {
     let mut fonts = egui::FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+
+    // Always install JetBrains Mono as a Monospace entry ahead of egui
+    // defaults. Gives us braille + box-drawing + block-element glyphs for
+    // free, so nvitop / btop render correctly out of the box.
+    fonts.font_data.insert(
+        "jetbrains_mono".to_string(),
+        std::sync::Arc::new(egui::FontData::from_static(JETBRAINS_MONO_TTF)),
+    );
+    if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        mono.insert(0, "jetbrains_mono".to_string());
+    }
+
+    // A user-selected font takes priority over the bundled default.
     if let Some(path) = custom_mono
         && let Ok(bytes) = std::fs::read(path)
     {
         let name = "user_mono".to_string();
-        fonts
-            .font_data
-            .insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        fonts.font_data.insert(
+            name.clone(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
         if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
             mono.insert(0, name);
         }
     }
+
     ctx.set_fonts(fonts);
 }
 
