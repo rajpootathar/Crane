@@ -10,6 +10,15 @@ const HEADER: Color32 = Color32::from_rgb(140, 146, 162);
 const ADD: Color32 = Color32::from_rgb(120, 210, 140);
 const DEL: Color32 = Color32::from_rgb(220, 110, 110);
 
+fn reveal_in_file_manager(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+
 pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let full = ui.available_rect_before_wrap();
     let footer_h = 44.0;
@@ -73,6 +82,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut new_tab_for_worktree: Option<(u64, u64)> = None;
     let mut new_workspace_for_project: Option<u64> = None;
     let mut remove_project: Option<u64> = None;
+    let mut remove_worktree: Option<(u64, u64)> = None;
 
     egui::ScrollArea::vertical()
         .id_salt("left_projects")
@@ -110,6 +120,27 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 } else if row.main_clicked {
                     toggle_project = Some(project.id);
                 }
+                let pid = project.id;
+                let proj_path = project.path.clone();
+                row.response.context_menu(|ui| {
+                    if ui.button(format!("{}  New Worktree", icons::PLUS)).clicked() {
+                        new_workspace_for_project = Some(pid);
+                        ui.close_menu();
+                    }
+                    if ui.button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN)).clicked() {
+                        reveal_in_file_manager(&proj_path);
+                        ui.close_menu();
+                    }
+                    if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
+                        ui.ctx().copy_text(proj_path.to_string_lossy().to_string());
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button(format!("{}  Remove Project", icons::X)).clicked() {
+                        remove_project = Some(pid);
+                        ui.close_menu();
+                    }
+                });
 
                 if project.expanded {
                     for wt in &project.workspaces {
@@ -147,6 +178,28 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         } else if wt_row.main_clicked {
                             toggle_worktree = Some((project.id, wt.id));
                         }
+                        let wt_pid = project.id;
+                        let wt_id = wt.id;
+                        let wt_path = wt.path.clone();
+                        wt_row.response.context_menu(|ui| {
+                            if ui.button(format!("{}  New Tab", icons::PLUS)).clicked() {
+                                new_tab_for_worktree = Some((wt_pid, wt_id));
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN)).clicked() {
+                                reveal_in_file_manager(&wt_path);
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
+                                ui.ctx().copy_text(wt_path.to_string_lossy().to_string());
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button(format!("{}  Remove Worktree", icons::X)).clicked() {
+                                remove_worktree = Some((wt_pid, wt_id));
+                                ui.close_menu();
+                            }
+                        });
 
                         if wt.expanded {
                             for tab in &wt.tabs {
@@ -180,6 +233,20 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 } else if tab_row.main_clicked {
                                     set_active = Some((project.id, wt.id, tab.id));
                                 }
+                                let tb_pid = project.id;
+                                let tb_wid = wt.id;
+                                let tb_tid = tab.id;
+                                tab_row.response.context_menu(|ui| {
+                                    if ui.button(format!("{}  Activate", icons::ARROW_RIGHT)).clicked() {
+                                        set_active = Some((tb_pid, tb_wid, tb_tid));
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                    if ui.button(format!("{}  Close Tab", icons::X)).clicked() {
+                                        close_tab = Some((tb_pid, tb_wid, tb_tid));
+                                        ui.close_menu();
+                                    }
+                                });
                             }
                         }
                     }
@@ -213,6 +280,14 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     }
     if let Some(pid) = remove_project {
         app.remove_project(pid);
+    }
+    if let Some((pid, wid)) = remove_worktree
+        && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
+    {
+        p.workspaces.retain(|w| w.id != wid);
+        if app.active.map(|(_, w, _)| w == wid).unwrap_or(false) {
+            app.active = None;
+        }
     }
     if let Some((pid, wid, tid)) = close_tab
         && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
