@@ -14,6 +14,20 @@ const ADD: Color32 = Color32::from_rgb(120, 210, 140);
 const DEL: Color32 = Color32::from_rgb(220, 110, 110);
 const WARN: Color32 = Color32::from_rgb(220, 180, 110);
 
+fn reveal_in_file_manager(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(target_os = "linux")]
+    {
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("/"));
+        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+}
+
 pub fn render(ui: &mut egui::Ui, app: &mut App) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -552,6 +566,31 @@ fn render_change_node(
         } else if row.main_clicked {
             *open_diff = Some(change.path.clone());
         }
+        // Right-click → stage / unstage / open diff / copy path.
+        let change_path = change.path.clone();
+        let staged_here = staged;
+        row.response.context_menu(|ui| {
+            if staged_here {
+                if ui.button(format!("{}  Unstage", icons::MINUS)).clicked() {
+                    *unstage_path = Some(change_path.clone());
+                    ui.close_menu();
+                }
+            } else {
+                if ui.button(format!("{}  Stage", icons::PLUS)).clicked() {
+                    *stage_path = Some(change_path.clone());
+                    ui.close_menu();
+                }
+            }
+            if ui.button(format!("{}  Open Diff", icons::GIT_DIFF)).clicked() {
+                *open_diff = Some(change_path.clone());
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
+                ui.ctx().copy_text(change_path.clone());
+                ui.close_menu();
+            }
+        });
     }
 }
 
@@ -650,6 +689,24 @@ fn render_fs_dir(
                 *open_file = Some(entry_path.clone());
             }
         }
+        let path_owned = entry_path.clone();
+        row.response.context_menu(|ui| {
+            if !is_dir && ui.button(format!("{}  Open", icons::FILE)).clicked() {
+                *open_file = Some(path_owned.clone());
+                ui.close_menu();
+            }
+            if ui
+                .button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN))
+                .clicked()
+            {
+                reveal_in_file_manager(&path_owned);
+                ui.close_menu();
+            }
+            if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
+                ui.ctx().copy_text(path_owned.to_string_lossy().to_string());
+                ui.close_menu();
+            }
+        });
         if is_dir && is_expanded {
             render_fs_dir(ui, &entry_path, depth + 1, expanded, open_file, toggle_dir);
         }

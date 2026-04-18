@@ -121,6 +121,9 @@ pub struct RowResult {
     pub rect: Rect,
     pub main_clicked: bool,
     pub hovered: bool,
+    /// Response for the row's click-sense rect. Used by callers that need
+    /// `.context_menu(...)` for right-click actions.
+    pub response: Response,
 }
 
 pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
@@ -226,10 +229,12 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
+    let main_clicked = response.clicked();
     RowResult {
         rect,
-        main_clicked: response.clicked(),
+        main_clicked,
         hovered,
+        response,
     }
 }
 
