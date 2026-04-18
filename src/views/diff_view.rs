@@ -55,23 +55,38 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
 
     let diff = TextDiff::from_lines(&pane.left_text, &pane.right_text);
     let font = FontId::new(font_size, FontFamily::Monospace);
+    let left_lines = pane.left_text.lines().count().max(1);
+    let right_lines = pane.right_text.lines().count().max(1);
+    let ldigits = left_lines.to_string().len().max(3);
+    let rdigits = right_lines.to_string().len().max(3);
 
     ScrollArea::both()
         .auto_shrink([false; 2])
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
-        for change in diff.iter_all_changes() {
-            let (sign, fg, bg) = match change.tag() {
-                ChangeTag::Delete => ("-", DEL_FG, Some(DEL_BG)),
-                ChangeTag::Insert => ("+", ADD_FG, Some(ADD_BG)),
-                ChangeTag::Equal => (" ", CTX_FG, None),
-            };
-            let text = format!("{sign} {}", change.value().trim_end_matches('\n'));
-            let mut r = RichText::new(text).font(font.clone()).color(fg);
-            if let Some(bg) = bg {
-                r = r.background_color(bg);
+            for change in diff.iter_all_changes() {
+                let (sign, fg, bg) = match change.tag() {
+                    ChangeTag::Delete => ("-", DEL_FG, Some(DEL_BG)),
+                    ChangeTag::Insert => ("+", ADD_FG, Some(ADD_BG)),
+                    ChangeTag::Equal => (" ", CTX_FG, None),
+                };
+                let old_ln = change
+                    .old_index()
+                    .map(|i| format!("{:>w$}", i + 1, w = ldigits))
+                    .unwrap_or_else(|| " ".repeat(ldigits));
+                let new_ln = change
+                    .new_index()
+                    .map(|i| format!("{:>w$}", i + 1, w = rdigits))
+                    .unwrap_or_else(|| " ".repeat(rdigits));
+                let text = format!(
+                    "{old_ln}  {new_ln}  {sign} {}",
+                    change.value().trim_end_matches('\n')
+                );
+                let mut r = RichText::new(text).font(font.clone()).color(fg);
+                if let Some(bg) = bg {
+                    r = r.background_color(bg);
+                }
+                ui.label(r);
             }
-            ui.label(r);
-        }
-    });
+        });
 }
