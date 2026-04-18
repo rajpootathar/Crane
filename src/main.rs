@@ -43,6 +43,10 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // Persist the window size / position across launches. Backed by
+        // eframe's storage (ron file under the OS' app-data dir). Requires
+        // the `persistence` feature.
+        persist_window: true,
         ..Default::default()
     };
 

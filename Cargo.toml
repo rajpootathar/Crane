@@ -1,6 +1,6 @@
 [package]
 name = "crane"
-version = "0.1.54"
+version = "0.1.55"
 edition = "2024"
 description = "Native GPU-rendered terminal + IDE environment"
 authors = ["rajpootathar"]
@@ -26,7 +26,7 @@ depends = ["libxkbcommon0", "libwayland-client0", "libgl1", "libx11-6"]
 
 
 [dependencies]
-eframe = { version = "0.34", features = ["wgpu"] }
+eframe = { version = "0.34", features = ["wgpu", "persistence"] }
 egui = "0.34"
 alacritty_terminal = "0.25"
 portable-pty = "0.9"
