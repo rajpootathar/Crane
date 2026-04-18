@@ -25,6 +25,10 @@ pub struct Settings {
     pub left_panel_w: f32,
     #[serde(default = "default_right_w")]
     pub right_panel_w: f32,
+    #[serde(default)]
+    pub editor_word_wrap: bool,
+    #[serde(default)]
+    pub editor_trim_on_save: bool,
     #[serde(default = "t")]
     pub show_left: bool,
     #[serde(default = "t")]
@@ -64,6 +68,8 @@ impl Default for Settings {
             ui_scale: default_ui_scale(),
             left_panel_w: default_left_w(),
             right_panel_w: default_right_w(),
+            editor_word_wrap: false,
+            editor_trim_on_save: false,
             show_left: true,
             show_right: true,
             right_tab_files: false,
@@ -108,6 +114,8 @@ impl Settings {
             ui_scale: app.ui_scale,
             left_panel_w: app.left_panel_w,
             right_panel_w: app.right_panel_w,
+            editor_word_wrap: app.editor_word_wrap,
+            editor_trim_on_save: app.editor_trim_on_save,
             show_left: app.show_left,
             show_right: app.show_right,
             right_tab_files: matches!(app.right_tab, RightTab::Files),
@@ -124,6 +132,8 @@ impl Settings {
         app.ui_scale = self.ui_scale.clamp(0.75, 1.5);
         app.left_panel_w = self.left_panel_w.clamp(180.0, 600.0);
         app.right_panel_w = self.right_panel_w.clamp(200.0, 700.0);
+        app.editor_word_wrap = self.editor_word_wrap;
+        app.editor_trim_on_save = self.editor_trim_on_save;
         app.show_left = self.show_left;
         app.show_right = self.show_right;
         app.right_tab = if self.right_tab_files {

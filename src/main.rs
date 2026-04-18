@@ -731,6 +731,10 @@ impl eframe::App for CraneApp {
         };
         let syntax_override = self.app.syntax_theme_override.clone();
         let workspace_root = self.app.active_workspace_path().map(|p| p.to_path_buf());
+        let editor_prefs = views::file_view::EditorPrefs {
+            word_wrap: self.app.editor_word_wrap,
+            trim_on_save: self.app.editor_trim_on_save,
+        };
         if self.app.active_layout().is_some() {
             if let Some(ws) = self.app.active_layout() {
                 let action = pane_view::render_layout(
@@ -744,6 +748,7 @@ impl eframe::App for CraneApp {
                     &format_before_save,
                     &goto_request,
                     workspace_root.as_deref(),
+                    editor_prefs,
                 );
                 match action {
                     PaneAction::None => {}

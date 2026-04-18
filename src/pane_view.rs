@@ -99,6 +99,7 @@ fn zone_rect(rect: Rect, edge: DockEdge) -> Rect {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_layout(
     ui: &mut egui::Ui,
     layout: &mut Layout,
@@ -110,6 +111,7 @@ pub fn render_layout(
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
+    prefs: crate::views::file_view::EditorPrefs,
 ) -> PaneAction {
     let mut action = PaneAction::None;
     let root = layout.root.take();
@@ -128,6 +130,7 @@ pub fn render_layout(
             format_before_save,
             goto_request,
             workspace_root,
+            prefs,
         );
         layout.root = Some(root);
     }
@@ -148,6 +151,7 @@ fn render_node(
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
+    prefs: crate::views::file_view::EditorPrefs,
 ) {
     match node {
         Node::Leaf(id) => {
@@ -164,6 +168,7 @@ fn render_node(
                 format_before_save,
                 goto_request,
                 workspace_root,
+                prefs,
             );
         }
         Node::Split {
@@ -191,6 +196,7 @@ fn render_node(
                 format_before_save,
                 goto_request,
                 workspace_root,
+                prefs,
             );
             render_node(
                 ui,
@@ -206,6 +212,7 @@ fn render_node(
                 format_before_save,
                 goto_request,
                 workspace_root,
+                prefs,
             );
             render_splitter(ui, splitter, *direction, path, rect, action);
         }
@@ -282,6 +289,7 @@ fn render_pane(
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
+    prefs: crate::views::file_view::EditorPrefs,
 ) {
     let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
@@ -368,6 +376,7 @@ fn render_pane(
                 format_before_save,
                 goto_request,
                 workspace_root,
+                prefs,
             );
         }
         PaneContent::Markdown(md) => {

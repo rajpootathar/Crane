@@ -51,7 +51,7 @@ pub fn render(
                                         effect = SettingsEffect::ReloadFonts;
                                     }
                                 }
-                                SettingsSection::Editor => render_editor(ui),
+                                SettingsSection::Editor => render_editor(ui, app),
                                 SettingsSection::Terminal => render_terminal(ui),
                                 SettingsSection::LanguageServers => render_lsp(ui, app),
                                 SettingsSection::Shortcuts => render_shortcuts(ui),
@@ -319,12 +319,19 @@ fn render_appearance(
     reload_fonts
 }
 
-fn render_editor(ui: &mut egui::Ui) {
+fn render_editor(ui: &mut egui::Ui, app: &mut App) {
     section_title(ui, "Editor");
+    ui.add_space(10.0);
+    ui.checkbox(&mut app.editor_word_wrap, "Word wrap");
+    ui.add_space(2.0);
+    ui.checkbox(
+        &mut app.editor_trim_on_save,
+        "Trim trailing whitespace on save",
+    );
     ui.add_space(10.0);
     placeholder(
         ui,
-        "Syntax colour overrides, tab width, word-wrap, and cursor style will land here.",
+        "More editor prefs (show whitespace, cursor style, tab width override) will land here.",
     );
 }
 

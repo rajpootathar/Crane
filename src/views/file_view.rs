@@ -1,6 +1,11 @@
 use crate::layout::FilesPane;
 use crate::lsp::Diagnostic;
 use crate::theme;
+use crate::views::diagnostics_overlay;
+use crate::views::file_util::{
+    char_idx_to_line_col, is_image_path, line_col_to_char, reveal_in_file_manager,
+    short_path, trim_trailing_whitespace,
+};
 use crate::views::highlight::{rehighlight, LineHighlightCache};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
@@ -105,6 +110,13 @@ fn find_syntax_for_ext(ext: &str) -> &'static syntect::parsing::SyntaxReference 
         .unwrap_or_else(|| ss.find_syntax_plain_text())
 }
 
+/// Editor-level preferences read from `App` / `Settings`.
+#[derive(Clone, Copy)]
+pub struct EditorPrefs {
+    pub word_wrap: bool,
+    pub trim_on_save: bool,
+}
+
 pub fn render(
     ui: &mut egui::Ui,
     pane_id: u64,
@@ -117,6 +129,7 @@ pub fn render(
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
+    prefs: EditorPrefs,
 ) {
     ui.push_id(("files_pane", pane_id), |ui| {
         render_inner(
@@ -130,35 +143,9 @@ pub fn render(
             format_before_save,
             goto_request,
             workspace_root,
+            prefs,
         );
     });
-}
-
-fn short_path(path: &str, workspace_root: Option<&std::path::Path>) -> String {
-    if let Some(root) = workspace_root
-        && let Ok(rel) = std::path::Path::new(path).strip_prefix(root)
-    {
-        return rel.to_string_lossy().to_string();
-    }
-    if let Ok(home) = std::env::var("HOME")
-        && let Some(stripped) = path.strip_prefix(&home)
-    {
-        return format!("~{stripped}");
-    }
-    path.to_string()
-}
-
-const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
-
-fn is_image_path(path: &str) -> bool {
-    std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let e = e.to_ascii_lowercase();
-            IMAGE_EXTS.iter().any(|x| *x == e.as_str())
-        })
-        .unwrap_or(false)
 }
 
 fn render_inner(
@@ -172,6 +159,7 @@ fn render_inner(
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
+    prefs: EditorPrefs,
 ) {
     if pane.tabs.is_empty() {
         let t = theme::current();
@@ -277,9 +265,9 @@ fn render_inner(
                         .min_size(egui::vec2(0.0, 24.0)),
                     );
                     if save_btn.clicked() || (save_pressed && tab.dirty()) {
-                        // Format-on-save: run the user's formatter over the
-                        // buffer; fall back to raw content if the tool is
-                        // missing or refuses the file.
+                        if prefs.trim_on_save {
+                            tab.content = trim_trailing_whitespace(&tab.content);
+                        }
                         if let Some(formatted) = format_before_save(&tab.content, &tab.path) {
                             tab.content = formatted;
                         }
@@ -640,11 +628,15 @@ fn render_inner(
                             .code_editor()
                             .lock_focus(true)
                             .frame(egui::Frame::NONE)
-                            .desired_width(f32::INFINITY)
+                            .desired_width(if prefs.word_wrap {
+                                ui.available_width()
+                            } else {
+                                f32::INFINITY
+                            })
                             .desired_rows(30)
                             .layouter(&mut layouter);
                         let out = editor.show(ui);
-                        paint_diagnostic_overlay(
+                        diagnostics_overlay::paint(
                             ui,
                             &out.galley,
                             out.galley_pos,
@@ -724,6 +716,9 @@ fn render_inner(
                             }
                         });
                         if ctx_save.get() {
+                            if prefs.trim_on_save {
+                                tab.content = trim_trailing_whitespace(&tab.content);
+                            }
                             if let Some(formatted) =
                                 format_before_save(&tab.content, &tab.path)
                             {
@@ -747,125 +742,6 @@ fn render_inner(
     }
 }
 
-fn severity_color(severity: u8) -> Color32 {
-    let t = theme::current();
-    match severity {
-        1 => t.error.to_color32(),
-        2 => Color32::from_rgb(226, 192, 80),
-        3 => t.accent.to_color32(),
-        _ => t.text_muted.to_color32(),
-    }
-}
-
-fn line_col_to_char(text: &str, line: u32, col: u32) -> usize {
-    let mut cur_line = 0u32;
-    let mut cur_col = 0u32;
-    let mut char_idx = 0usize;
-    for ch in text.chars() {
-        if cur_line == line && cur_col == col {
-            return char_idx;
-        }
-        char_idx += 1;
-        if ch == '\n' {
-            cur_line += 1;
-            cur_col = 0;
-        } else {
-            cur_col += 1;
-        }
-    }
-    char_idx
-}
-
-fn char_idx_to_line_col(text: &str, char_idx: usize) -> (u32, u32) {
-    let mut line = 0u32;
-    let mut col = 0u32;
-    let mut idx = 0usize;
-    for ch in text.chars() {
-        if idx == char_idx {
-            return (line, col);
-        }
-        idx += 1;
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
-fn reveal_in_file_manager(path: &str) {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
-    #[cfg(target_os = "linux")]
-    {
-        let parent = std::path::Path::new(path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("/"));
-        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
-    }
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer")
-        .arg(format!("/select,{path}"))
-        .spawn();
-}
-
-fn paint_diagnostic_overlay(
-    ui: &egui::Ui,
-    galley: &std::sync::Arc<egui::Galley>,
-    origin: egui::Pos2,
-    diagnostics: &[Diagnostic],
-) {
-    if diagnostics.is_empty() {
-        return;
-    }
-    let text = galley.text();
-    // Precompute char-index of each line start once per paint. Was walking
-    // the full text per diagnostic — O(text × diag) every frame — which
-    // destroyed typing latency on files with many diagnostics (e.g. busy
-    // TSX files with a dozen tsserver errors).
-    let mut line_char_starts: Vec<usize> = vec![0];
-    let mut char_idx: usize = 0;
-    for ch in text.chars() {
-        char_idx += 1;
-        if ch == '\n' {
-            line_char_starts.push(char_idx);
-        }
-    }
-    let total_chars = char_idx;
-    let ccursor_at = |line: u32, col: u32| -> egui::text::CCursor {
-        let Some(base) = line_char_starts.get(line as usize).copied() else {
-            return egui::text::CCursor::new(total_chars);
-        };
-        // Clamp to the END of this line (one char before the next line's
-        // start). Prevents u32::MAX "end-of-line" markers from multi-line
-        // diagnostics from painting underlines in random places.
-        let next = line_char_starts
-            .get(line as usize + 1)
-            .copied()
-            .unwrap_or(total_chars);
-        let line_len = next.saturating_sub(base).saturating_sub(1);
-        let col_clamped = (col as usize).min(line_len);
-        egui::text::CCursor::new(base + col_clamped)
-    };
-
-    let painter = ui.painter();
-    for d in diagnostics {
-        let start_rect = galley.pos_from_cursor(ccursor_at(d.line, d.col_start));
-        let end_rect = galley.pos_from_cursor(ccursor_at(d.line, d.col_end));
-        let y = origin.y + start_rect.max.y - 1.0;
-        let x0 = origin.x + start_rect.min.x;
-        let x1 = origin.x + end_rect.max.x;
-        if x1 <= x0 {
-            continue;
-        }
-        painter.line_segment(
-            [egui::pos2(x0, y), egui::pos2(x1, y)],
-            egui::Stroke::new(1.5, severity_color(d.severity)),
-        );
-    }
-}
 
 fn draw_file_tab(
     ui: &mut egui::Ui,
