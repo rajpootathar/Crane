@@ -327,6 +327,7 @@ impl App {
     /// is how session-restored tabs start getting diagnostics); (b) if the
     /// buffer changed since the last LSP push — fire `did_change`.
     pub fn sync_lsp_changes(&mut self, ctx: &egui::Context) {
+        self.lsp.tick(ctx);
         for project in self.projects.iter_mut() {
             for ws in project.workspaces.iter_mut() {
                 for tab in ws.tabs.iter_mut() {

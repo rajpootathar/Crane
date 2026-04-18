@@ -16,7 +16,8 @@ mod update_check;
 mod views;
 
 use modals::{
-    render_empty_state, render_help_modal, render_new_workspace_modal, render_settings_modal,
+    render_empty_state, render_help_modal, render_lsp_download_toast,
+    render_lsp_install_prompt, render_new_workspace_modal, render_settings_modal,
     render_update_toast,
 };
 
@@ -622,6 +623,8 @@ impl eframe::App for CraneApp {
             load_fonts(&ctx, self.app.custom_mono_font.as_deref());
         }
         self.render_confirm_close(&ctx);
+        render_lsp_install_prompt(&ctx, &mut self.app);
+        render_lsp_download_toast(&ctx, &self.app);
         self.app.update_check.drain();
         render_update_toast(&ctx, &mut self.app);
         self.app.sync_lsp_changes(&ctx);

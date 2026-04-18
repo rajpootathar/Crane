@@ -5,20 +5,44 @@
 //! are parsed on a background thread and written to a shared state struct;
 //! the UI polls that state each repaint.
 
+pub mod downloader;
 pub mod protocol;
 pub mod server;
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use downloader::{DownloadState, Downloader};
 pub use server::{Diagnostic, ServerKey};
+
+pub fn which_on_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let full = Path::new(dir).join(bin);
+        if full.is_file() {
+            return Some(full);
+        }
+    }
+    None
+}
 
 #[derive(Default)]
 pub struct LspManager {
     servers: HashMap<ServerKey, Arc<server::LspServer>>,
     files: RwLock<HashMap<PathBuf, ServerKey>>,
+    pub downloader: Downloader,
+    /// Users who declined the install prompt this session — don't nag again
+    /// until restart.
+    pub declined: HashSet<ServerKey>,
+    /// The LSP the app is currently prompting the user to install, if any.
+    pub prompt_install: Option<ServerKey>,
+    /// Files we've queued up waiting for a server to become available.
+    pending_files: RwLock<HashMap<ServerKey, Vec<(PathBuf, String)>>>,
 }
 
 impl LspManager {
@@ -30,13 +54,85 @@ impl LspManager {
         let Some(key) = server::key_for_path(path) else {
             return;
         };
-        let server = self
-            .servers
-            .entry(key)
-            .or_insert_with(|| Arc::new(server::LspServer::spawn(ctx.clone(), key)))
-            .clone();
-        server.did_open(path, text);
         self.files.write().insert(path.to_path_buf(), key);
+
+        // Already running? Just forward the open.
+        if let Some(server) = self.servers.get(&key) {
+            server.did_open(path, text);
+            return;
+        }
+
+        // Resolve a binary: PATH first, then downloaded copy.
+        let (cmd, _) = key.command();
+        let path_bin = which_on_path(cmd);
+        let downloaded = self.downloader.resolved(key);
+        let resolved = path_bin.or(downloaded);
+
+        if let Some(bin) = resolved {
+            let server = Arc::new(server::LspServer::spawn(ctx.clone(), key, &bin));
+            self.servers.insert(key, server.clone());
+            server.did_open(path, text);
+            return;
+        }
+
+        // Not resolvable. Queue the open for when the server becomes
+        // available, and ask the user to opt in to download (if supported
+        // and they haven't already declined).
+        self.pending_files
+            .write()
+            .entry(key)
+            .or_default()
+            .push((path.to_path_buf(), text.to_string()));
+
+        if Downloader::is_supported(key)
+            && !self.declined.contains(&key)
+            && self.prompt_install.is_none()
+            && !matches!(
+                self.downloader.state(key),
+                DownloadState::Downloading { .. } | DownloadState::Ready(_)
+            )
+        {
+            self.prompt_install = Some(key);
+        }
+
+        // If a download finished since the last call, spawn now and flush.
+        self.try_spawn_pending(ctx, key);
+    }
+
+    fn try_spawn_pending(&mut self, ctx: &egui::Context, key: ServerKey) {
+        if self.servers.contains_key(&key) {
+            return;
+        }
+        let Some(bin) = self.downloader.resolved(key) else {
+            return;
+        };
+        let server = Arc::new(server::LspServer::spawn(ctx.clone(), key, &bin));
+        self.servers.insert(key, server.clone());
+        if let Some(queue) = self.pending_files.write().remove(&key) {
+            for (path, text) in queue {
+                server.did_open(&path, &text);
+            }
+        }
+    }
+
+    /// Called each frame to drain ready downloads into spawned servers.
+    pub fn tick(&mut self, ctx: &egui::Context) {
+        let keys: Vec<ServerKey> = self.pending_files.read().keys().copied().collect();
+        for key in keys {
+            self.try_spawn_pending(ctx, key);
+        }
+    }
+
+    pub fn accept_install(&mut self, ctx: &egui::Context) {
+        if let Some(key) = self.prompt_install.take() {
+            self.downloader.start_download(key, ctx.clone());
+        }
+    }
+
+    pub fn decline_install(&mut self) {
+        if let Some(key) = self.prompt_install.take() {
+            self.declined.insert(key);
+        }
     }
 
     pub fn did_change(&self, path: &Path, text: &str) {
