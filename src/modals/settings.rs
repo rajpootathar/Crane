@@ -450,150 +450,205 @@ fn render_lsp(ui: &mut egui::Ui, app: &mut App) {
         .color(theme::current().text_muted.to_color32()),
     );
     ui.add_space(6.0);
-    // Show the PATH Crane sees so users can tell if the macOS GUI-launch
-    // PATH fix worked.
-    let path_val = std::env::var("PATH").unwrap_or_default();
-    let short = if path_val.len() > 90 {
-        format!("{}…", &path_val[..90])
-    } else {
-        path_val.clone()
-    };
-    ui.label(
-        RichText::new(format!("PATH: {short}"))
-            .size(10.5)
-            .monospace()
-            .color(theme::current().text_muted.to_color32()),
-    );
-    ui.add_space(6.0);
 
-    let statuses = app.lsp.statuses();
-    if statuses.is_empty() {
-        ui.label(
-            RichText::new("No servers spawned yet — open a file to start one.")
-                .size(11.5)
-                .italics()
-                .color(theme::current().text_muted.to_color32()),
-        );
-    } else {
-        for (key, status) in statuses {
-            let (label, color) = match status {
-                crate::lsp::server::Status::Ready => ("ready", theme::current().success.to_color32()),
-                crate::lsp::server::Status::Initializing => {
-                    ("initializing", theme::current().warning.to_color32())
-                }
-                crate::lsp::server::Status::Spawned => {
-                    ("starting", theme::current().warning.to_color32())
-                }
-                crate::lsp::server::Status::Dead => {
-                    ("dead", theme::current().error.to_color32())
-                }
+    egui::ScrollArea::vertical()
+        .id_salt("lsp_list")
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            let path_val = std::env::var("PATH").unwrap_or_default();
+            let short = if path_val.len() > 90 {
+                format!("{}…", &path_val[..90])
+            } else {
+                path_val.clone()
             };
-            let (cmd, _) = key.command();
-            let found = which_on_path(cmd);
+            ui.label(
+                RichText::new(format!("PATH: {short}"))
+                    .size(10.5)
+                    .monospace()
+                    .color(theme::current().text_muted.to_color32()),
+            );
+            ui.add_space(10.0);
+
+            use crate::lsp::ServerKey as K;
+            let all = [
+                K::RustAnalyzer,
+                K::TypeScript,
+                K::Gopls,
+                K::Pyright,
+                K::CssLs,
+                K::HtmlLs,
+            ];
+            let statuses = app.lsp.statuses();
+
+            for key in all {
+                render_lsp_row(ui, app, key, &statuses);
+                ui.add_space(8.0);
+            }
+        });
+}
+
+fn render_lsp_row(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    key: crate::lsp::ServerKey,
+    statuses: &[(crate::lsp::ServerKey, crate::lsp::server::Status)],
+) {
+    use crate::lsp::DownloadState;
+    let status = statuses
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, s)| *s);
+    let (cmd, _) = key.command();
+    let found = which_on_path(cmd);
+    let dl_state = app.lsp.downloader.state(key);
+
+    egui::Frame::default()
+        .fill(theme::current().surface.to_color32())
+        .stroke(egui::Stroke::new(1.0, theme::current().border.to_color32()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("{key:?}"))
-                        .size(12.0)
+                        .size(13.0)
                         .color(theme::current().text.to_color32())
                         .strong(),
                 );
-                ui.label(
-                    RichText::new(format!("  {label}"))
-                        .size(11.0)
-                        .color(color),
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let (label, color) = status_chip(status, &dl_state, &found);
+                        ui.label(RichText::new(label).size(11.0).color(color).strong());
+                    },
                 );
             });
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(format!("$ {cmd}"))
+                    .size(10.5)
+                    .monospace()
+                    .color(theme::current().text_muted.to_color32()),
+            );
+            match &found {
+                Some(p) => {
+                    ui.label(
+                        RichText::new(format!("PATH → {p}"))
+                            .size(10.5)
+                            .monospace()
+                            .color(theme::current().success.to_color32()),
+                    );
+                }
+                None => {
+                    ui.label(
+                        RichText::new("PATH → not found")
+                            .size(10.5)
+                            .color(theme::current().text_muted.to_color32()),
+                    );
+                }
+            }
+            if let DownloadState::Ready(p) = &dl_state {
                 ui.label(
-                    RichText::new(format!("$ {cmd}"))
+                    RichText::new(format!("Crane → {}", p.display()))
                         .size(10.5)
                         .monospace()
-                        .color(theme::current().text_muted.to_color32()),
+                        .color(theme::current().success.to_color32()),
                 );
-                match found.clone() {
-                    Some(p) => {
-                        ui.label(
-                            RichText::new(format!("→ {p}"))
-                                .size(10.5)
-                                .monospace()
-                                .color(theme::current().success.to_color32()),
-                        );
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if crate::lsp::Downloader::is_supported(key) {
+                    match dl_state.clone() {
+                        DownloadState::Downloading { progress_bytes } => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "⬇ downloading… {}",
+                                    crate::lsp::downloader::human_bytes(progress_bytes)
+                                ))
+                                .size(11.0)
+                                .italics()
+                                .color(theme::current().warning.to_color32()),
+                            );
+                        }
+                        DownloadState::Ready(_) => {
+                            ui.label(
+                                RichText::new("✓ downloaded by Crane")
+                                    .size(11.0)
+                                    .color(theme::current().success.to_color32()),
+                            );
+                            if ui.small_button("Re-download").clicked() {
+                                app.lsp
+                                    .downloader
+                                    .start_download(key, ui.ctx().clone());
+                            }
+                        }
+                        DownloadState::Failed(e) => {
+                            ui.label(
+                                RichText::new(format!("✗ {e}"))
+                                    .size(10.5)
+                                    .color(theme::current().error.to_color32()),
+                            );
+                            if ui.small_button("Retry").clicked() {
+                                app.lsp
+                                    .downloader
+                                    .start_download(key, ui.ctx().clone());
+                            }
+                        }
+                        DownloadState::NotStarted => {
+                            if ui
+                                .button(
+                                    RichText::new("⬇ Download & use Crane's copy").strong(),
+                                )
+                                .clicked()
+                            {
+                                app.lsp.declined.remove(&key);
+                                app.lsp
+                                    .downloader
+                                    .start_download(key, ui.ctx().clone());
+                            }
+                        }
                     }
-                    None => {
-                        ui.label(
-                            RichText::new("→ not found on PATH")
-                                .size(10.5)
-                                .color(theme::current().error.to_color32()),
-                        );
-                    }
-                }
-            });
-            if status == crate::lsp::server::Status::Dead || found.is_none() {
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
+                } else {
                     ui.label(
-                        RichText::new(format!("install: {}", key.install_hint()))
+                        RichText::new(format!("install yourself: {}", key.install_hint()))
                             .size(10.5)
                             .monospace()
                             .color(theme::current().accent.to_color32()),
                     );
-                });
-                if crate::lsp::Downloader::is_supported(key) {
-                    ui.horizontal(|ui| {
-                        ui.add_space(12.0);
-                        match app.lsp.downloader.state(key) {
-                            crate::lsp::DownloadState::Downloading { progress_bytes } => {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "downloading… {}",
-                                        crate::lsp::downloader::human_bytes(progress_bytes)
-                                    ))
-                                    .size(11.0)
-                                    .italics()
-                                    .color(theme::current().warning.to_color32()),
-                                );
-                            }
-                            crate::lsp::DownloadState::Ready(p) => {
-                                ui.label(
-                                    RichText::new(format!("downloaded → {}", p.display()))
-                                        .size(10.5)
-                                        .monospace()
-                                        .color(theme::current().success.to_color32()),
-                                );
-                            }
-                            crate::lsp::DownloadState::Failed(e) => {
-                                ui.label(
-                                    RichText::new(format!("download failed: {e}"))
-                                        .size(10.5)
-                                        .color(theme::current().error.to_color32()),
-                                );
-                                if ui.small_button("Retry").clicked() {
-                                    app.lsp
-                                        .downloader
-                                        .start_download(key, ui.ctx().clone());
-                                }
-                            }
-                            crate::lsp::DownloadState::NotStarted => {
-                                if ui
-                                    .button(
-                                        RichText::new("⬇ Download & use Crane's copy").strong(),
-                                    )
-                                    .clicked()
-                                {
-                                    app.lsp.declined.remove(&key);
-                                    app.lsp
-                                        .downloader
-                                        .start_download(key, ui.ctx().clone());
-                                }
-                            }
-                        }
-                    });
                 }
-            }
-            ui.add_space(4.0);
-        }
+            });
+        });
+}
+
+fn status_chip(
+    status: Option<crate::lsp::server::Status>,
+    dl: &crate::lsp::DownloadState,
+    found_on_path: &Option<String>,
+) -> (String, egui::Color32) {
+    use crate::lsp::server::Status;
+    if let Some(s) = status {
+        let (label, color) = match s {
+            Status::Ready => ("ready", theme::current().success.to_color32()),
+            Status::Initializing => ("initializing", theme::current().warning.to_color32()),
+            Status::Spawned => ("starting", theme::current().warning.to_color32()),
+            Status::Dead => ("dead", theme::current().error.to_color32()),
+        };
+        return (label.to_string(), color);
     }
+    if matches!(dl, crate::lsp::DownloadState::Downloading { .. }) {
+        return ("downloading".to_string(), theme::current().warning.to_color32());
+    }
+    if matches!(dl, crate::lsp::DownloadState::Ready(_)) || found_on_path.is_some() {
+        return (
+            "installed (not started)".to_string(),
+            theme::current().text_muted.to_color32(),
+        );
+    }
+    (
+        "not installed".to_string(),
+        theme::current().text_muted.to_color32(),
+    )
 }
 
 fn which_on_path(bin: &str) -> Option<String> {

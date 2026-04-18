@@ -131,6 +131,33 @@ impl LspManager {
     /// (rust-analyzer crashes on incompatible workspaces, tsserver refuses
     /// bad installs, etc.).
     pub fn tick(&mut self, ctx: &egui::Context) {
+        // If a download landed for a key whose server previously died,
+        // evict the dead server and re-queue all tracked files so we spawn
+        // fresh with the downloaded binary.
+        let dead_with_download: Vec<ServerKey> = self
+            .servers
+            .iter()
+            .filter(|(k, s)| {
+                s.status() == server::Status::Dead
+                    && self.downloader.resolved(**k).is_some()
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for key in dead_with_download {
+            self.servers.remove(&key);
+            let files: Vec<(PathBuf, String)> = self
+                .files
+                .read()
+                .iter()
+                .filter(|(_, k)| **k == key)
+                .map(|(p, _)| {
+                    let text = std::fs::read_to_string(p).unwrap_or_default();
+                    (p.clone(), text)
+                })
+                .collect();
+            self.pending_files.write().entry(key).or_default().extend(files);
+        }
+
         let keys: Vec<ServerKey> = self.pending_files.read().keys().copied().collect();
         for key in keys {
             self.try_spawn_pending(ctx, key);
