@@ -525,10 +525,27 @@ impl CraneApp {
                 .active_layout_ref()
                 .and_then(|l| l.focus);
             if let Some(id) = focus {
-                if terminal_is_running(&self.app, id) {
-                    self.pending_close = Some(id);
-                } else if let Some(ws) = self.app.active_layout() {
-                    ws.close_focused();
+                // Special case: in a Files pane with multiple open tabs,
+                // Cmd+W closes the active file tab instead of the whole
+                // pane. The pane-close still fires when it's the last
+                // (or only) tab — user's expectation.
+                let closed_file_tab = if let Some(ws) = self.app.active_layout()
+                    && let Some(pane) = ws.panes.get_mut(&id)
+                    && let layout::PaneContent::Files(files) = &mut pane.content
+                    && files.tabs.len() > 1
+                {
+                    let idx = files.active.min(files.tabs.len() - 1);
+                    files.close(idx);
+                    true
+                } else {
+                    false
+                };
+                if !closed_file_tab {
+                    if terminal_is_running(&self.app, id) {
+                        self.pending_close = Some(id);
+                    } else if let Some(ws) = self.app.active_layout() {
+                        ws.close_focused();
+                    }
                 }
             }
         }

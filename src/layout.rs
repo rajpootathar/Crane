@@ -44,6 +44,8 @@ pub struct FileTab {
     /// / .webp / .ico). None until the first render attempts a decode.
     #[allow(dead_code)]
     pub image_texture: Option<egui::TextureHandle>,
+    /// Find bar state. None = closed; Some(query) = open and filtered.
+    pub find_query: Option<String>,
 }
 
 impl FileTab {
@@ -84,6 +86,7 @@ impl FilesPane {
             preview_mode: false,
             pending_cursor: None,
             image_texture: None,
+            find_query: None,
             content,
             name,
         });

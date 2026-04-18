@@ -431,6 +431,7 @@ impl SPane {
                             preview_mode: false,
                             pending_cursor: None,
                             image_texture: None,
+                            find_query: None,
                             content,
                         }
                     })

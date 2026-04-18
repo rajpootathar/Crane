@@ -228,6 +228,20 @@ fn render_inner(
     let save_pressed = ui.input(|i| {
         (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::S)
     });
+    // Cmd+F toggles the find bar for the active tab.
+    let find_toggle = ui.input(|i| {
+        (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::F)
+    });
+    if find_toggle
+        && !pane.tabs.is_empty()
+    {
+        let idx = pane.active.min(pane.tabs.len() - 1);
+        let t = &mut pane.tabs[idx];
+        t.find_query = match &t.find_query {
+            Some(_) => None,
+            None => Some(String::new()),
+        };
+    }
 
     {
         let tab = &mut pane.tabs[active_idx];
@@ -296,6 +310,95 @@ fn render_inner(
             );
         });
         ui.add_space(2.0);
+
+        // Find bar — rendered above the editor when open. Enter jumps to
+        // the next match; Shift+Enter the previous; Escape closes.
+        let mut find_close = false;
+        let mut find_next = false;
+        let mut find_prev = false;
+        if let Some(query) = tab.find_query.as_mut() {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("{}  Find", icons::MAGNIFYING_GLASS))
+                        .size(11.0)
+                        .color(theme::current().text_muted.to_color32()),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(query)
+                        .desired_width(ui.available_width() - 150.0)
+                        .hint_text("type to search…"),
+                );
+                if resp.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    find_next = true;
+                }
+                resp.request_focus();
+                let hits = if query.is_empty() {
+                    0
+                } else {
+                    tab.content.matches(query.as_str()).count()
+                };
+                ui.label(
+                    RichText::new(format!("{hits} hits"))
+                        .size(10.5)
+                        .color(theme::current().text_muted.to_color32()),
+                );
+                if ui.small_button("▲").on_hover_text("Previous (Shift+Enter)").clicked() {
+                    find_prev = true;
+                }
+                if ui.small_button("▼").on_hover_text("Next (Enter)").clicked() {
+                    find_next = true;
+                }
+                if ui.small_button("✕").on_hover_text("Close (Esc)").clicked() {
+                    find_close = true;
+                }
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                find_close = true;
+            }
+            if ui.input(|i| {
+                i.key_pressed(egui::Key::Enter) && i.modifiers.shift
+            }) {
+                find_prev = true;
+            }
+            ui.add_space(2.0);
+        }
+        if find_close {
+            tab.find_query = None;
+        }
+        if (find_next || find_prev)
+            && let Some(q) = tab.find_query.clone()
+            && !q.is_empty()
+        {
+            // Jump cursor to the next / prev occurrence of `q`.
+            let te_id = ui
+                .id()
+                .with(("file_editor", &tab.path))
+                .with("body");
+            let cur = egui::TextEdit::load_state(ui.ctx(), te_id)
+                .and_then(|s| s.cursor.char_range().map(|r| r.primary.index))
+                .unwrap_or(0);
+            let cur_byte =
+                crate::format::char_idx_to_byte(&tab.content, cur);
+            let target_byte = if find_next {
+                tab.content[cur_byte..]
+                    .find(&q)
+                    .map(|p| cur_byte + p)
+                    .or_else(|| tab.content.find(&q))
+            } else {
+                tab.content[..cur_byte]
+                    .rfind(&q)
+                    .or_else(|| tab.content.rfind(&q))
+            };
+            if let Some(byte) = target_byte {
+                let chars_up_to = tab.content[..byte].chars().count();
+                let (line, col) =
+                    char_idx_to_line_col(&tab.content, chars_up_to);
+                tab.pending_cursor = Some((line, col));
+            }
+        }
 
         let diagnostics: Vec<Diagnostic> = diagnostics_for(&tab.path);
 
@@ -642,6 +745,19 @@ fn render_inner(
                             out.galley_pos,
                             &diagnostics,
                         );
+                        // Find-bar match highlights — soft amber fill
+                        // behind every occurrence of the query in view.
+                        if let Some(q) = tab.find_query.as_deref()
+                            && !q.is_empty()
+                        {
+                            paint_find_matches(
+                                ui,
+                                &out.galley,
+                                out.galley_pos,
+                                &tab.content,
+                                q,
+                            );
+                        }
 
                         // Apply a pending cursor (goto-definition landed
                         // here in this frame or a previous one).
@@ -742,6 +858,37 @@ fn render_inner(
     }
 }
 
+
+fn paint_find_matches(
+    ui: &egui::Ui,
+    galley: &std::sync::Arc<egui::Galley>,
+    origin: egui::Pos2,
+    text: &str,
+    query: &str,
+) {
+    let amber = Color32::from_rgba_unmultiplied(220, 180, 50, 90);
+    let painter = ui.painter();
+    let mut byte = 0usize;
+    while let Some(offset) = text[byte..].find(query) {
+        let abs = byte + offset;
+        let end = abs + query.len();
+        let char_start = text[..abs].chars().count();
+        let char_end = char_start + text[abs..end].chars().count();
+        let r_start = galley.pos_from_cursor(egui::text::CCursor::new(char_start));
+        let r_end = galley.pos_from_cursor(egui::text::CCursor::new(char_end));
+        // Only paint matches that fit on a single visual line (the common
+        // case for a user-typed query; skipping multi-line avoids ugly
+        // cross-row rectangles).
+        if (r_start.max.y - r_end.max.y).abs() < 1.0 {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(origin.x + r_start.min.x, origin.y + r_start.min.y),
+                egui::pos2(origin.x + r_end.max.x, origin.y + r_start.max.y),
+            );
+            painter.rect_filled(rect, 2.0, amber);
+        }
+        byte = end;
+    }
+}
 
 fn draw_file_tab(
     ui: &mut egui::Ui,
