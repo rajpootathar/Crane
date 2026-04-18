@@ -4,6 +4,7 @@ mod lsp;
 mod modals;
 mod pane_view;
 mod session;
+mod settings;
 mod state;
 mod terminal;
 mod terminal_view;
@@ -223,6 +224,7 @@ fn load_app_icon() -> Option<egui::IconData> {
 struct CraneApp {
     app: App,
     last_saved_snapshot: String,
+    last_saved_settings_snapshot: String,
     last_save_at: std::time::Instant,
     pending_close: Option<layout::PaneId>,
 }
@@ -283,11 +285,14 @@ impl CraneApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx
             .request_repaint_after(std::time::Duration::from_millis(1500));
+        migrate_config_dir();
         let mut app = match session::load() {
             Some(s) => s.restore(&cc.egui_ctx),
             None => App::new(),
         };
-        migrate_config_dir();
+        // settings.json (user prefs) takes precedence over any matching
+        // keys that may still live in session.json from older installs.
+        settings::Settings::load().apply(&mut app);
         theme::ensure_builtin_tomls_on_disk();
         let initial = theme::find_by_name(&app.selected_theme)
             .unwrap_or_else(theme::Theme::dark);
@@ -299,6 +304,7 @@ impl CraneApp {
         Self {
             app,
             last_saved_snapshot: String::new(),
+            last_saved_settings_snapshot: String::new(),
             last_save_at: std::time::Instant::now(),
             pending_close: None,
         }
@@ -375,6 +381,19 @@ impl CraneApp {
         });
         self.last_saved_snapshot = snapshot;
         self.last_save_at = std::time::Instant::now();
+
+        // User prefs live in a separate file (~/.crane/settings.json) so
+        // they stay intact even when the session gets wiped.
+        let settings = settings::Settings::from_app(&self.app);
+        if let Ok(s_bytes) = serde_json::to_vec_pretty(&settings) {
+            let s_snap = String::from_utf8_lossy(&s_bytes).to_string();
+            if s_snap != self.last_saved_settings_snapshot {
+                std::thread::spawn(move || {
+                    let _ = settings.save();
+                });
+                self.last_saved_settings_snapshot = s_snap;
+            }
+        }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
