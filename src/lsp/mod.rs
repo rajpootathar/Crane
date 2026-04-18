@@ -107,7 +107,9 @@ pub fn which_on_path(bin: &str) -> Option<PathBuf> {
 #[derive(Default)]
 pub struct LspManager {
     servers: HashMap<ServerKey, Arc<server::LspServer>>,
-    files: RwLock<HashMap<PathBuf, ServerKey>>,
+    /// Which servers have been notified about a given file. A single file
+    /// can be attached to multiple servers (e.g. type-checker + linter).
+    files: RwLock<HashMap<PathBuf, Vec<ServerKey>>>,
     pub downloader: Downloader,
     /// Users who declined the install prompt this session — don't nag again
     /// until restart.
@@ -130,32 +132,41 @@ impl LspManager {
         text: &str,
         configs: &LanguageConfigs,
     ) {
-        let Some(key) = server::key_for_path(path) else {
-            return;
-        };
-        if !configs.get_or_default(key).enabled {
+        let keys: Vec<ServerKey> = server::keys_for_path(path)
+            .into_iter()
+            .filter(|k| configs.get_or_default(*k).enabled)
+            .collect();
+        if keys.is_empty() {
             return;
         }
-        self.files.write().insert(path.to_path_buf(), key);
+        self.files.write().insert(path.to_path_buf(), keys.clone());
+        for key in keys {
+            self.open_on_server(ctx, key, path, text);
+        }
+    }
 
+    fn open_on_server(
+        &mut self,
+        ctx: &egui::Context,
+        key: ServerKey,
+        path: &Path,
+        text: &str,
+    ) {
         // Evict a dead server so a fresh spawn can replace it (e.g. after
-        // the user downloads rust-analyzer via the prompt, we want to re-try
-        // spawn with the downloaded binary even though PATH-spawned one died).
+        // the user downloads the binary and wants to retry).
         if let Some(s) = self.servers.get(&key)
             && s.status() == server::Status::Dead
         {
             self.servers.remove(&key);
         }
 
-        // Already running? Just forward the open.
         if let Some(server) = self.servers.get(&key) {
             server.did_open(path, text);
             return;
         }
 
-        // Prefer a downloaded copy if present — the user explicitly chose
-        // it, often because their global install was broken. Fall back to
-        // PATH lookup for users who have a known-good global install.
+        // Prefer a downloaded copy — user explicitly chose it. Fall back
+        // to PATH for users with a known-good global install.
         let (cmd, _) = key.command();
         let downloaded = self.downloader.resolved(key);
         let path_bin = which_on_path(cmd);
@@ -168,9 +179,6 @@ impl LspManager {
             return;
         }
 
-        // Not resolvable. Queue the open for when the server becomes
-        // available, and ask the user to opt in to download (if supported
-        // and they haven't already declined).
         self.pending_files
             .write()
             .entry(key)
@@ -188,7 +196,6 @@ impl LspManager {
             self.prompt_install = Some(key);
         }
 
-        // If a download finished since the last call, spawn now and flush.
         self.try_spawn_pending(ctx, key);
     }
 
@@ -240,7 +247,7 @@ impl LspManager {
                 .files
                 .read()
                 .iter()
-                .filter(|(_, k)| **k == key)
+                .filter(|(_, ks)| ks.contains(&key))
                 .map(|(p, _)| {
                     let text = std::fs::read_to_string(p).unwrap_or_default();
                     (p.clone(), text)
@@ -283,26 +290,30 @@ impl LspManager {
     }
 
     pub fn did_change(&self, path: &Path, text: &str) {
-        let key = match self.files.read().get(path).copied() {
-            Some(k) => k,
+        let keys = match self.files.read().get(path).cloned() {
+            Some(ks) => ks,
             None => return,
         };
-        if let Some(s) = self.servers.get(&key) {
-            s.did_change(path, text);
+        for key in keys {
+            if let Some(s) = self.servers.get(&key) {
+                s.did_change(path, text);
+            }
         }
     }
 
     pub fn did_save(&self, path: &Path, text: &str, configs: &LanguageConfigs) {
-        let key = match self.files.read().get(path).copied() {
-            Some(k) => k,
+        let keys = match self.files.read().get(path).cloned() {
+            Some(ks) => ks,
             None => return,
         };
-        let cfg = configs.get_or_default(key);
-        if !cfg.enabled || !cfg.check_on_save {
-            return;
-        }
-        if let Some(s) = self.servers.get(&key) {
-            s.did_save(path, text);
+        for key in keys {
+            let cfg = configs.get_or_default(key);
+            if !cfg.enabled || !cfg.check_on_save {
+                continue;
+            }
+            if let Some(s) = self.servers.get(&key) {
+                s.did_save(path, text);
+            }
         }
     }
 
@@ -311,20 +322,31 @@ impl LspManager {
     }
 
     pub fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
-        let key = match self.files.read().get(path).copied() {
-            Some(k) => k,
+        let keys = match self.files.read().get(path).cloned() {
+            Some(ks) => ks,
             None => return Vec::new(),
         };
-        self.servers
-            .get(&key)
-            .map(|s| s.diagnostics_for(path))
-            .unwrap_or_default()
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some(s) = self.servers.get(&key) {
+                out.extend(s.diagnostics_for(path));
+            }
+        }
+        out
     }
 
     pub fn hover(&self, path: &Path, line: u32, character: u32) -> Option<String> {
-        let key = self.files.read().get(path).copied()?;
-        let server = self.servers.get(&key)?;
-        server.hover(path, line, character)
+        // Primary server wins for hover — later we could merge
+        // markdown blocks from multiple sources.
+        let keys = self.files.read().get(path).cloned()?;
+        for key in keys {
+            if let Some(s) = self.servers.get(&key)
+                && let Some(text) = s.hover(path, line, character)
+            {
+                return Some(text);
+            }
+        }
+        None
     }
 
     /// Status snapshot of every spawned server — used by Settings → About

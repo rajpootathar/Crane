@@ -32,16 +32,29 @@ pub enum ServerKey {
     HtmlLs,
 }
 
+/// All server keys that apply to `path`. Multiple entries are returned
+/// when a language supports secondary analyzers — e.g. TS gets tsserver
+/// for types plus (eventually) eslint-lsp for lint. One enum entry per
+/// extension is the MVP; see `keys_for_path_multi` for the layered path.
 pub fn key_for_path(path: &Path) -> Option<ServerKey> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    keys_for_path(path).into_iter().next()
+}
+
+pub fn keys_for_path(path: &Path) -> Vec<ServerKey> {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return Vec::new();
+    };
+    let ext = ext.to_ascii_lowercase();
     match ext.as_str() {
-        "rs" => Some(ServerKey::RustAnalyzer),
-        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" => Some(ServerKey::TypeScript),
-        "go" => Some(ServerKey::Gopls),
-        "py" => Some(ServerKey::Pyright),
-        "css" | "scss" | "less" => Some(ServerKey::CssLs),
-        "html" | "htm" | "vue" | "svelte" => Some(ServerKey::HtmlLs),
-        _ => None,
+        "rs" => vec![ServerKey::RustAnalyzer],
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" => {
+            vec![ServerKey::TypeScript]
+        }
+        "go" => vec![ServerKey::Gopls],
+        "py" => vec![ServerKey::Pyright],
+        "css" | "scss" | "less" => vec![ServerKey::CssLs],
+        "html" | "htm" | "vue" | "svelte" => vec![ServerKey::HtmlLs],
+        _ => Vec::new(),
     }
 }
 
