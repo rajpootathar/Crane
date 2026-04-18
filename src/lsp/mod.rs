@@ -131,6 +131,15 @@ impl LspManager {
     /// (rust-analyzer crashes on incompatible workspaces, tsserver refuses
     /// bad installs, etc.).
     pub fn tick(&mut self, ctx: &egui::Context) {
+        // Early exit: nothing to do. Avoids scanning servers and hitting
+        // locks every single frame when no state transition is possible.
+        if self.pending_files.read().is_empty()
+            && self.servers.values().all(|s| s.status() != server::Status::Dead)
+            && self.prompt_install.is_some()
+        {
+            // prompt already raised, no pending files, no dead servers.
+            return;
+        }
         // If a download landed for a key whose server previously died,
         // evict the dead server and re-queue all tracked files so we spawn
         // fresh with the downloaded binary.

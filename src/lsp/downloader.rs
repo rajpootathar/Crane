@@ -36,15 +36,21 @@ impl Downloader {
     /// ready to spawn. Does not kick off downloads on its own — callers
     /// must explicitly call `start_download`.
     pub fn resolved(&self, key: ServerKey) -> Option<PathBuf> {
-        let mut g = self.states.lock();
-        if let Some(DownloadState::Ready(p)) = g.get(&key)
-            && p.exists()
+        // Fast path — trust the state. If we already marked Ready, don't
+        // re-stat the path every frame (this was doing 6 syscalls/frame).
         {
-            return Some(p.clone());
+            let g = self.states.lock();
+            if let Some(DownloadState::Ready(p)) = g.get(&key) {
+                return Some(p.clone());
+            }
         }
+        // First-lookup path — stat the expected location and promote to
+        // Ready if the binary already exists from a prior session.
         let expected = Self::expected_path(key)?;
         if expected.exists() {
-            g.insert(key, DownloadState::Ready(expected.clone()));
+            self.states
+                .lock()
+                .insert(key, DownloadState::Ready(expected.clone()));
             return Some(expected);
         }
         None
