@@ -1,6 +1,6 @@
 [package]
 name = "crane"
-version = "0.1.32"
+version = "0.1.33"
 edition = "2024"
 description = "Native GPU-rendered terminal + IDE environment"
 authors = ["rajpootathar"]
@@ -55,3 +55,12 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# Release profile tuned for smallest binary without giving up speed.
+# Apply these to all release builds — Makefile + GitHub Actions.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
