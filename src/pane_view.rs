@@ -319,13 +319,17 @@ fn render_pane(
     let mut child = ui.new_child(UiBuilder::new().max_rect(body_rect));
     child.set_clip_rect(body_rect);
 
-    match &mut pane.content {
+    // Scope every pane's widgets under a unique id so that, e.g., two
+    // Markdown panes' ScrollAreas don't fight over the same auto-id. egui
+    // paints a red outline on id-collision and also pays a hashing cost
+    // to detect them, so this helps both speed and the "red flash" bug.
+    child.push_id(("pane_body", id), |child| match &mut pane.content {
         PaneContent::Terminal(term) => {
-            terminal_view::render_terminal(&mut child, term, font_size, is_focus);
+            terminal_view::render_terminal(child, term, font_size, is_focus);
         }
         PaneContent::Files(files) => {
             file_view::render(
-                &mut child,
+                child,
                 id,
                 files,
                 font_size,
@@ -335,15 +339,15 @@ fn render_pane(
             );
         }
         PaneContent::Markdown(md) => {
-            markdown_view::render(&mut child, md, font_size, &mut pane.title);
+            markdown_view::render(child, md, font_size, &mut pane.title);
         }
         PaneContent::Diff(diff) => {
-            diff_view::render(&mut child, diff, font_size, &mut pane.title);
+            diff_view::render(child, diff, font_size, &mut pane.title);
         }
         PaneContent::Browser(browser) => {
-            browser_view::render(&mut child, browser, &mut pane.title);
+            browser_view::render(child, browser, &mut pane.title);
         }
-    }
+    });
 
     // Warp-style active/inactive: dim inactive panes with a translucent
     // black overlay. No border, no highlight ring — just a subtle value

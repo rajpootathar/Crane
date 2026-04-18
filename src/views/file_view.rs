@@ -14,6 +14,15 @@ use syntect::util::LinesWithEndings;
 static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
 static THEMES: OnceLock<ThemeSet> = OnceLock::new();
 
+/// Cross-frame cache for a Files Pane tab's rendered galley. Keeps syntect
+/// off the hot path — only runs when `key` changes (text / diagnostics /
+/// theme / font size).
+#[derive(Clone)]
+struct CachedGalley {
+    key: u64,
+    galley: std::sync::Arc<egui::Galley>,
+}
+
 fn syntaxes() -> &'static SyntaxSet {
     SYNTAXES.get_or_init(|| {
         // two-face ships ~250 Sublime-grade syntaxes: TypeScript, TSX, JSX,
@@ -263,10 +272,10 @@ fn render_inner(
             diags_by_line.entry(d.line).or_default().push(d.clone());
         }
 
-        // Hash fingerprint of all inputs that affect the galley. We memoize
-        // the last galley and return it when the fingerprint matches —
-        // syntect highlighting (the real hot path) only re-runs when the
-        // buffer or diagnostics change, not on every mouse-move repaint.
+        // Hash fingerprint of everything that affects the galley. We memoize
+        // across frames in egui's id-keyed memory so syntect only re-runs
+        // when the buffer / diagnostics / theme / font-size actually change.
+        // Previously the cache was per-frame and therefore useless.
         let layout_salt = {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
@@ -282,7 +291,7 @@ fn render_inner(
             }
             h.finish()
         };
-        let mut cache: Option<(u64, std::sync::Arc<egui::Galley>)> = None;
+        let cache_id = egui::Id::new(("file_view_layouter", &tab.path));
 
         let mut layouter = move |ui: &egui::Ui,
                                   buffer: &dyn egui::TextBuffer,
@@ -297,10 +306,11 @@ fn render_inner(
                 layout_salt.hash(&mut h);
                 h.finish()
             };
-            if let Some((cached_key, galley)) = &cache
-                && *cached_key == key
+            if let Some(cached) = ui
+                .memory(|m| m.data.get_temp::<CachedGalley>(cache_id))
+                && cached.key == key
             {
-                return galley.clone();
+                return cached.galley;
             }
             let mut job = LayoutJob::default();
             let mut hl = HighlightLines::new(syntax, st_theme);
@@ -334,7 +344,15 @@ fn render_inner(
                 line_idx += 1;
             }
             let galley = ui.fonts_mut(|f| f.layout_job(job));
-            cache = Some((key, galley.clone()));
+            ui.memory_mut(|m| {
+                m.data.insert_temp(
+                    cache_id,
+                    CachedGalley {
+                        key,
+                        galley: galley.clone(),
+                    },
+                );
+            });
             galley
         };
 

@@ -175,6 +175,18 @@ fn apply_style(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(8.0, 5.0);
     style.spacing.menu_margin = egui::Margin::symmetric(6, 6);
 
+    // Nuke all of egui's debug paint overlays. One of these (most likely
+    // `show_interactive_widgets` or `show_widget_hits`) was drawing the
+    // red outlines users saw flash on tab/file switches.
+    style.debug = egui::style::DebugOptions::default();
+    style.debug.debug_on_hover = false;
+    style.debug.debug_on_hover_with_all_modifiers = false;
+    style.debug.show_expand_width = false;
+    style.debug.show_expand_height = false;
+    style.debug.show_resize = false;
+    style.debug.show_interactive_widgets = false;
+    style.debug.show_widget_hits = false;
+
     ctx.set_global_style(style);
 }
 

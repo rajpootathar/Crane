@@ -111,11 +111,6 @@ impl Terminal {
             let mut reader = reader;
             let mut processor: Processor<StdSyncHandler> = Processor::new();
             let mut buf = [0u8; 8192];
-            // A busy program (cat bigfile, tail -f, etc.) can produce many
-            // read chunks per millisecond. Request a repaint at most every
-            // 16 ms (≈ 60 fps) to stop PTY output from pegging the UI.
-            let mut last_repaint = std::time::Instant::now() - std::time::Duration::from_millis(20);
-            let frame_budget = std::time::Duration::from_millis(16);
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -130,16 +125,10 @@ impl Terminal {
                             h.drain(0..drop_n);
                         }
                         drop(h);
-                        let now = std::time::Instant::now();
-                        if now.duration_since(last_repaint) >= frame_budget {
-                            ctx_clone.request_repaint();
-                            last_repaint = now;
-                        } else {
-                            // Schedule a coalesced repaint for the end of
-                            // the current frame budget so we don't drop
-                            // the final chunk of output.
-                            ctx_clone.request_repaint_after(frame_budget);
-                        }
+                        // Immediate repaint: typing latency > throughput;
+                        // egui coalesces multiple requests within a frame
+                        // so this is cheap for bursty output too.
+                        ctx_clone.request_repaint();
                     }
                     Err(_) => break,
                 }
