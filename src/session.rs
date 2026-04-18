@@ -423,6 +423,7 @@ impl SPane {
                             name: sf.name,
                             original_content: content.clone(),
                             last_lsp_content: content.clone(),
+                            last_lsp_sent_at: None,
                             content,
                         }
                     })

@@ -11,7 +11,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         return;
     };
 
-    let (lang, bin, size) = describe(key);
+    let info = describe(key);
     let mut accept = false;
     let mut decline = false;
 
@@ -19,23 +19,22 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .fixed_size(egui::vec2(420.0, 220.0))
+        .fixed_size(egui::vec2(440.0, 240.0))
         .show(ctx, |ui| {
             ui.add_space(6.0);
             ui.label(
                 RichText::new(format!(
-                    "Crane can't find {bin} on your PATH — it's needed for {lang} diagnostics and (later) hover + formatting."
+                    "Crane can't find {} on your PATH — it's needed for {} diagnostics and (later) hover + formatting.",
+                    info.bin, info.lang
                 ))
                 .size(12.5)
                 .color(theme::current().text.to_color32()),
             );
             ui.add_space(10.0);
             ui.label(
-                RichText::new(format!(
-                    "Download the official prebuilt binary (~{size}) to ~/.crane/lsp/ ?"
-                ))
-                .size(12.0)
-                .color(theme::current().text_muted.to_color32()),
+                RichText::new(info.install_blurb)
+                    .size(12.0)
+                    .color(theme::current().text_muted.to_color32()),
             );
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -51,7 +50,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
             });
             ui.add_space(8.0);
             ui.label(
-                RichText::new("You won't be prompted again this session. Flip it back on from Settings → About.")
+                RichText::new("Won't prompt again this session. Re-enable from Settings > Language Servers.")
                     .size(10.5)
                     .italics()
                     .color(theme::current().text_muted.to_color32()),
@@ -65,14 +64,44 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     }
 }
 
-fn describe(key: ServerKey) -> (&'static str, &'static str, &'static str) {
+struct Info {
+    lang: &'static str,
+    bin: &'static str,
+    install_blurb: &'static str,
+}
+
+fn describe(key: ServerKey) -> Info {
     match key {
-        ServerKey::RustAnalyzer => ("Rust", "rust-analyzer", "15 MB"),
-        ServerKey::TypeScript => ("TypeScript / JavaScript", "typescript-language-server", "—"),
-        ServerKey::Gopls => ("Go", "gopls", "—"),
-        ServerKey::Pyright => ("Python", "pyright-langserver", "—"),
-        ServerKey::CssLs => ("CSS", "vscode-css-language-server", "—"),
-        ServerKey::HtmlLs => ("HTML", "vscode-html-language-server", "—"),
+        ServerKey::RustAnalyzer => Info {
+            lang: "Rust",
+            bin: "rust-analyzer",
+            install_blurb: "Download the official prebuilt binary (~15 MB) from rust-lang/rust-analyzer into ~/.crane/lsp/ ?",
+        },
+        ServerKey::TypeScript => Info {
+            lang: "TypeScript / JavaScript",
+            bin: "typescript-language-server",
+            install_blurb: "Install via npm (typescript + typescript-language-server) into ~/.crane/lsp/ ?",
+        },
+        ServerKey::Gopls => Info {
+            lang: "Go",
+            bin: "gopls",
+            install_blurb: "Install the Go toolchain first (go.dev/dl), then `go install golang.org/x/tools/gopls@latest`.",
+        },
+        ServerKey::Pyright => Info {
+            lang: "Python",
+            bin: "pyright-langserver",
+            install_blurb: "Install via npm (pyright) into ~/.crane/lsp/ ?",
+        },
+        ServerKey::CssLs => Info {
+            lang: "CSS",
+            bin: "vscode-css-language-server",
+            install_blurb: "Install via npm (vscode-langservers-extracted) into ~/.crane/lsp/ ?",
+        },
+        ServerKey::HtmlLs => Info {
+            lang: "HTML",
+            bin: "vscode-html-language-server",
+            install_blurb: "Install via npm (vscode-langservers-extracted) into ~/.crane/lsp/ ?",
+        },
     }
 }
 

@@ -326,27 +326,44 @@ impl App {
             .did_open(ctx, std::path::Path::new(&path), &content);
     }
 
-    /// Per-frame sync: for every open file tab across every Workspace Tab,
-    /// (a) if the manager hasn't seen this path yet — fire `did_open` (this
-    /// is how session-restored tabs start getting diagnostics); (b) if the
-    /// buffer changed since the last LSP push — fire `did_change`.
+    /// Per-frame sync, scoped to the ACTIVE layout only. Was iterating every
+    /// project × workspace × tab × pane × file on every frame, which made
+    /// the whole app (including the terminal) crawl on large sessions.
+    /// Also debounces `textDocument/didChange` to 300 ms idle so a burst of
+    /// keystrokes doesn't flood the LSP server.
     pub fn sync_lsp_changes(&mut self, ctx: &egui::Context) {
         self.lsp.tick(ctx);
-        for project in self.projects.iter_mut() {
-            for ws in project.workspaces.iter_mut() {
-                for tab in ws.tabs.iter_mut() {
-                    for (_, pane) in tab.layout.panes.iter_mut() {
-                        if let crate::layout::PaneContent::Files(files) = &mut pane.content {
-                            for ft in files.tabs.iter_mut() {
-                                let path = std::path::Path::new(&ft.path);
-                                if !self.lsp.is_tracked(path) {
-                                    self.lsp.did_open(ctx, path, &ft.content);
-                                    ft.last_lsp_content = ft.content.clone();
-                                } else if ft.content != ft.last_lsp_content {
-                                    self.lsp.did_change(path, &ft.content);
-                                    ft.last_lsp_content = ft.content.clone();
-                                }
-                            }
+        let debounce = std::time::Duration::from_millis(300);
+        let now = std::time::Instant::now();
+        let Some((pid, wid, tid)) = self.active else {
+            return;
+        };
+        let Some(project) = self.projects.iter_mut().find(|p| p.id == pid) else {
+            return;
+        };
+        let Some(ws) = project.workspaces.iter_mut().find(|w| w.id == wid) else {
+            return;
+        };
+        let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tid) else {
+            return;
+        };
+        for (_, pane) in tab.layout.panes.iter_mut() {
+            if let crate::layout::PaneContent::Files(files) = &mut pane.content {
+                for ft in files.tabs.iter_mut() {
+                    let path = std::path::Path::new(&ft.path);
+                    if !self.lsp.is_tracked(path) {
+                        self.lsp.did_open(ctx, path, &ft.content);
+                        ft.last_lsp_content = ft.content.clone();
+                        ft.last_lsp_sent_at = Some(now);
+                    } else if ft.content != ft.last_lsp_content {
+                        let quiet_enough = ft
+                            .last_lsp_sent_at
+                            .map(|t| now.duration_since(t) >= debounce)
+                            .unwrap_or(true);
+                        if quiet_enough {
+                            self.lsp.did_change(path, &ft.content);
+                            ft.last_lsp_content = ft.content.clone();
+                            ft.last_lsp_sent_at = Some(now);
                         }
                     }
                 }

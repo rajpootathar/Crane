@@ -30,6 +30,8 @@ pub struct FileTab {
     /// textDocument/didChange so we only push deltas when the user has
     /// actually edited the file.
     pub last_lsp_content: String,
+    /// Timestamp of the most recent didChange we sent, for rate-limiting.
+    pub last_lsp_sent_at: Option<std::time::Instant>,
 }
 
 impl FileTab {
@@ -66,6 +68,7 @@ impl FilesPane {
             path,
             original_content: content.clone(),
             last_lsp_content: content.clone(),
+            last_lsp_sent_at: None,
             content,
             name,
         });

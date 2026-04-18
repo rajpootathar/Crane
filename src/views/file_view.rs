@@ -263,11 +263,45 @@ fn render_inner(
             diags_by_line.entry(d.line).or_default().push(d.clone());
         }
 
+        // Hash fingerprint of all inputs that affect the galley. We memoize
+        // the last galley and return it when the fingerprint matches —
+        // syntect highlighting (the real hot path) only re-runs when the
+        // buffer or diagnostics change, not on every mouse-move repaint.
+        let layout_salt = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            font_size.to_bits().hash(&mut h);
+            requested.hash(&mut h);
+            diagnostics.len().hash(&mut h);
+            for d in &diagnostics {
+                d.line.hash(&mut h);
+                d.col_start.hash(&mut h);
+                d.col_end.hash(&mut h);
+                d.severity.hash(&mut h);
+            }
+            h.finish()
+        };
+        let mut cache: Option<(u64, std::sync::Arc<egui::Galley>)> = None;
+
         let mut layouter = move |ui: &egui::Ui,
                                   buffer: &dyn egui::TextBuffer,
                                   _wrap_width: f32|
               -> std::sync::Arc<egui::Galley> {
             let text = buffer.as_str();
+            let key = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                text.hash(&mut h);
+                layout_salt.hash(&mut h);
+                h.finish()
+            };
+            if let Some((cached_key, galley)) = &cache
+                && *cached_key == key
+            {
+                return galley.clone();
+            }
             let mut job = LayoutJob::default();
             let mut hl = HighlightLines::new(syntax, st_theme);
             let mut line_idx: u32 = 0;
@@ -299,7 +333,9 @@ fn render_inner(
                 }
                 line_idx += 1;
             }
-            ui.fonts_mut(|f| f.layout_job(job))
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            cache = Some((key, galley.clone()));
+            galley
         };
 
         // Reserve a status strip at the bottom for diagnostics counts.
