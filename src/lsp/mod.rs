@@ -60,7 +60,8 @@ impl LanguageConfig {
             | ServerKey::Pyright
             | ServerKey::Gopls
             | ServerKey::CssLs
-            | ServerKey::HtmlLs => Self {
+            | ServerKey::HtmlLs
+            | ServerKey::Eslint => Self {
                 enabled: true,
                 check_on_save: false,
                 format_on_save: false,

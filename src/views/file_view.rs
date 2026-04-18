@@ -479,6 +479,34 @@ fn render_inner(
                         let indent = style.indent_unit();
                         let focused = ui.memory(|m| m.has_focus(te_id));
                         if focused {
+                            // Cmd+Shift+Z → redo. egui 0.34 wires Cmd+Y as
+                            // redo; Cmd+Shift+Z is Mac convention but isn't
+                            // mapped. Intercept and synthesize a Cmd+Y.
+                            ui.input_mut(|i| {
+                                let cmd = i.modifiers.command || i.modifiers.mac_cmd;
+                                if cmd && i.modifiers.shift && i.key_pressed(egui::Key::Z) {
+                                    i.consume_key(
+                                        egui::Modifiers {
+                                            command: true,
+                                            mac_cmd: true,
+                                            shift: true,
+                                            ..Default::default()
+                                        },
+                                        egui::Key::Z,
+                                    );
+                                    i.events.push(egui::Event::Key {
+                                        key: egui::Key::Y,
+                                        physical_key: None,
+                                        pressed: true,
+                                        repeat: false,
+                                        modifiers: egui::Modifiers {
+                                            command: true,
+                                            mac_cmd: true,
+                                            ..Default::default()
+                                        },
+                                    });
+                                }
+                            });
                             let (tab_pressed, enter_pressed) = ui.input_mut(|i| {
                                 let t = i.key_pressed(egui::Key::Tab)
                                     && !i.modifiers.shift

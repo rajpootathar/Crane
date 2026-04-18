@@ -106,6 +106,11 @@ pub fn format_text(
         }
         crate::lsp::ServerKey::Pyright => ("ruff", vec!["format".into(), "-".into()]),
         crate::lsp::ServerKey::Gopls => ("gofmt", vec![]),
+        // Eslint's stdin-fix output is JSON-wrapped; parsing it correctly
+        // across eslint versions is brittle. Prettier (triggered by the
+        // TypeScript key's toggle) already formats the file, and ESLint
+        // diagnostics still surface via its LSP. So we skip ESLint here.
+        crate::lsp::ServerKey::Eslint => return None,
     };
     let mut child = std::process::Command::new(cmd)
         .args(&args)

@@ -30,6 +30,9 @@ pub enum ServerKey {
     Pyright,
     CssLs,
     HtmlLs,
+    /// Secondary analyzer for TS/JS — added to the file's server list only
+    /// when an eslint config is detected in the ancestor tree.
+    Eslint,
 }
 
 /// All server keys that apply to `path`. Multiple entries are returned
@@ -48,13 +51,44 @@ pub fn keys_for_path(path: &Path) -> Vec<ServerKey> {
     match ext.as_str() {
         "rs" => vec![ServerKey::RustAnalyzer],
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" => {
-            vec![ServerKey::TypeScript]
+            let mut keys = vec![ServerKey::TypeScript];
+            if has_eslint_config(path) {
+                keys.push(ServerKey::Eslint);
+            }
+            keys
         }
         "go" => vec![ServerKey::Gopls],
         "py" => vec![ServerKey::Pyright],
         "css" | "scss" | "less" => vec![ServerKey::CssLs],
         "html" | "htm" | "vue" | "svelte" => vec![ServerKey::HtmlLs],
         _ => Vec::new(),
+    }
+}
+
+fn has_eslint_config(start: &Path) -> bool {
+    const NAMES: &[&str] = &[
+        ".eslintrc",
+        ".eslintrc.js",
+        ".eslintrc.cjs",
+        ".eslintrc.mjs",
+        ".eslintrc.yaml",
+        ".eslintrc.yml",
+        ".eslintrc.json",
+        "eslint.config.js",
+        "eslint.config.cjs",
+        "eslint.config.mjs",
+        "eslint.config.ts",
+    ];
+    let mut cur = start.parent().unwrap_or(start).to_path_buf();
+    loop {
+        for name in NAMES {
+            if cur.join(name).is_file() {
+                return true;
+            }
+        }
+        if !cur.pop() {
+            return false;
+        }
     }
 }
 
@@ -67,6 +101,7 @@ impl ServerKey {
             ServerKey::Pyright => ("pyright-langserver", &["--stdio"]),
             ServerKey::CssLs => ("vscode-css-language-server", &["--stdio"]),
             ServerKey::HtmlLs => ("vscode-html-language-server", &["--stdio"]),
+            ServerKey::Eslint => ("vscode-eslint-language-server", &["--stdio"]),
         }
     }
 
@@ -76,7 +111,7 @@ impl ServerKey {
             ServerKey::TypeScript => "npm i -g typescript typescript-language-server",
             ServerKey::Gopls => "go install golang.org/x/tools/gopls@latest",
             ServerKey::Pyright => "npm i -g pyright   (or: pip install pyright)",
-            ServerKey::CssLs | ServerKey::HtmlLs => {
+            ServerKey::CssLs | ServerKey::HtmlLs | ServerKey::Eslint => {
                 "npm i -g vscode-langservers-extracted"
             }
         }
@@ -95,6 +130,12 @@ impl ServerKey {
             ServerKey::Pyright => "python",
             ServerKey::CssLs => "css",
             ServerKey::HtmlLs => "html",
+            ServerKey::Eslint => match ext {
+                "ts" | "mts" | "cts" => "typescript",
+                "tsx" => "typescriptreact",
+                "jsx" => "javascriptreact",
+                _ => "javascript",
+            },
         }
     }
 }

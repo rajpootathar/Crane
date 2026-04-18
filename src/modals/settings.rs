@@ -478,6 +478,7 @@ fn render_lsp(ui: &mut egui::Ui, app: &mut App) {
             let all = [
                 K::RustAnalyzer,
                 K::TypeScript,
+                K::Eslint,
                 K::Gopls,
                 K::Pyright,
                 K::CssLs,
@@ -615,6 +616,7 @@ fn render_lsp_row(
                 | crate::lsp::ServerKey::HtmlLs => "Format on save (prettier)",
                 crate::lsp::ServerKey::Pyright => "Format on save (ruff)",
                 crate::lsp::ServerKey::Gopls => "Format on save (gofmt)",
+                crate::lsp::ServerKey::Eslint => "(ESLint fixes via Prettier)",
             };
             if ui
                 .add_enabled(

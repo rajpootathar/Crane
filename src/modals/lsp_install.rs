@@ -102,6 +102,11 @@ fn describe(key: ServerKey) -> Info {
             bin: "vscode-html-language-server",
             install_blurb: "Install via npm (vscode-langservers-extracted) into ~/.crane/lsp/ ?",
         },
+        ServerKey::Eslint => Info {
+            lang: "JavaScript / TypeScript (ESLint)",
+            bin: "vscode-eslint-language-server",
+            install_blurb: "Install via npm (vscode-langservers-extracted) into ~/.crane/lsp/ ?",
+        },
     }
 }
 
@@ -110,6 +115,7 @@ pub fn render_download_toast(ctx: &egui::Context, app: &App) {
     for key in [
         K::RustAnalyzer,
         K::TypeScript,
+        K::Eslint,
         K::Gopls,
         K::Pyright,
         K::CssLs,

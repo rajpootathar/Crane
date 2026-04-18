@@ -70,7 +70,8 @@ impl Downloader {
             ServerKey::TypeScript
             | ServerKey::Pyright
             | ServerKey::CssLs
-            | ServerKey::HtmlLs => has_npm(),
+            | ServerKey::HtmlLs
+            | ServerKey::Eslint => has_npm(),
             ServerKey::Gopls => false,
         }
     }
@@ -81,6 +82,7 @@ impl Downloader {
             | ServerKey::Pyright
             | ServerKey::CssLs
             | ServerKey::HtmlLs
+            | ServerKey::Eslint
                 if !has_npm() =>
             {
                 Some("Requires Node.js (npm) — install from https://nodejs.org")
@@ -112,11 +114,9 @@ impl Downloader {
                     &["typescript-language-server", "typescript"],
                 ),
                 ServerKey::Pyright => install_npm_server(key, "pyright", &["pyright"]),
-                ServerKey::CssLs | ServerKey::HtmlLs => install_npm_server(
-                    key,
-                    "vscode-langservers",
-                    &["vscode-langservers-extracted"],
-                ),
+                ServerKey::CssLs | ServerKey::HtmlLs | ServerKey::Eslint => {
+                    install_npm_server(key, "vscode-langservers", &["vscode-langservers-extracted"])
+                }
                 ServerKey::Gopls => Err(std::io::Error::other(
                     "gopls auto-install not yet supported (needs Go SDK)",
                 )),
@@ -161,6 +161,10 @@ impl Downloader {
             ServerKey::HtmlLs => Some(
                 base.join("vscode-langservers")
                     .join("node_modules/vscode-langservers-extracted/bin/vscode-html-language-server"),
+            ),
+            ServerKey::Eslint => Some(
+                base.join("vscode-langservers")
+                    .join("node_modules/vscode-langservers-extracted/bin/vscode-eslint-language-server"),
             ),
             ServerKey::Gopls => None,
         }
