@@ -403,6 +403,7 @@ impl SPane {
                             path: sf.path,
                             name: sf.name,
                             original_content: content.clone(),
+                            last_lsp_content: content.clone(),
                             content,
                         }
                     })

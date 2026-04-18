@@ -591,9 +591,8 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
             .unwrap_or(&path_str)
             .to_string();
         let content = std::fs::read_to_string(&p).unwrap_or_default();
-        if let Some(ws) = app.active_layout() {
-            ws.open_file_in_files_pane(path_str, name, content);
-        }
+        let ctx = ui.ctx().clone();
+        app.open_file_into_active_layout(&ctx, path_str, name, content);
     }
 }
 

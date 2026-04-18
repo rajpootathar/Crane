@@ -1,7 +1,8 @@
 use crate::layout::FilesPane;
+use crate::lsp::Diagnostic;
 use crate::theme;
-use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
 use egui::text::{LayoutJob, TextFormat};
+use egui::{Color32, FontFamily, FontId, RichText, ScrollArea, Stroke};
 use egui_phosphor::regular as icons;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -58,13 +59,20 @@ pub fn render(
     pane: &mut FilesPane,
     font_size: f32,
     title: &mut String,
+    diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
 ) {
     ui.push_id(("files_pane", pane_id), |ui| {
-        render_inner(ui, pane, font_size, title);
+        render_inner(ui, pane, font_size, title, diagnostics_for);
     });
 }
 
-fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: &mut String) {
+fn render_inner(
+    ui: &mut egui::Ui,
+    pane: &mut FilesPane,
+    font_size: f32,
+    title: &mut String,
+    diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
+) {
     if pane.tabs.is_empty() {
         let t = theme::current();
         ui.add_space(8.0);
@@ -165,6 +173,9 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
         });
         ui.add_space(2.0);
 
+        let diagnostics: Vec<Diagnostic> = diagnostics_for(&tab.path);
+        let diag_counts = summarize_diagnostics(&diagnostics);
+
         let font = FontId::new(font_size, FontFamily::Monospace);
         let ext = Path::new(&tab.path)
             .extension()
@@ -183,6 +194,13 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
         };
         let fallback_fg = theme::current().text.to_color32();
 
+        // Group diagnostics by line for O(1) lookup in the layouter.
+        let mut diags_by_line: std::collections::HashMap<u32, Vec<Diagnostic>> =
+            std::collections::HashMap::new();
+        for d in &diagnostics {
+            diags_by_line.entry(d.line).or_default().push(d.clone());
+        }
+
         let mut layouter = move |ui: &egui::Ui,
                                   buffer: &dyn egui::TextBuffer,
                                   _wrap_width: f32|
@@ -190,16 +208,15 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
             let text = buffer.as_str();
             let mut job = LayoutJob::default();
             let mut hl = HighlightLines::new(syntax, st_theme);
+            let mut line_idx: u32 = 0;
             for line in LinesWithEndings::from(text) {
+                let line_diags = diags_by_line.get(&line_idx).cloned().unwrap_or_default();
                 let segments: Vec<(Style, &str)> = hl
                     .highlight_line(line, syntaxes())
                     .unwrap_or_else(|_| vec![(Style::default(), line)]);
+                let mut col: u32 = 0;
                 for (style, segment) in segments {
-                    let color = if style.foreground.r == 0
-                        && style.foreground.g == 0
-                        && style.foreground.b == 0
-                        && style.foreground.a == 0
-                    {
+                    let color = if style.foreground.a == 0 {
                         fallback_fg
                     } else {
                         Color32::from_rgb(
@@ -208,23 +225,29 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
                             style.foreground.b,
                         )
                     };
-                    job.append(
+                    append_with_diagnostics(
+                        &mut job,
                         segment,
-                        0.0,
-                        TextFormat {
-                            font_id: font.clone(),
-                            color,
-                            ..Default::default()
-                        },
+                        col,
+                        &line_diags,
+                        &font,
+                        color,
                     );
+                    col += segment.chars().count() as u32;
                 }
+                line_idx += 1;
             }
             ui.fonts_mut(|f| f.layout_job(job))
         };
 
+        // Reserve a status strip at the bottom for diagnostics counts.
+        let avail_h = ui.available_height();
+        let status_h = 22.0;
+        let editor_h = (avail_h - status_h).max(80.0);
         ScrollArea::both()
             .id_salt(("file_scroll", active_idx))
             .auto_shrink([false; 2])
+            .max_height(editor_h)
             .show(ui, |ui| {
                 let editor = egui::TextEdit::multiline(&mut tab.content)
                     .code_editor()
@@ -234,7 +257,144 @@ fn render_inner(ui: &mut egui::Ui, pane: &mut FilesPane, font_size: f32, title: 
                     .layouter(&mut layouter);
                 ui.add(editor);
             });
+
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            let (errs, warns, infos) = diag_counts;
+            let t = theme::current();
+            if errs == 0 && warns == 0 && infos == 0 {
+                ui.label(
+                    RichText::new("No problems")
+                        .size(10.5)
+                        .color(t.text_muted.to_color32()),
+                );
+            } else {
+                if errs > 0 {
+                    ui.label(
+                        RichText::new(format!("{}  {errs}", icons::X_CIRCLE))
+                            .size(10.5)
+                            .color(severity_color(1)),
+                    );
+                }
+                if warns > 0 {
+                    ui.label(
+                        RichText::new(format!("{}  {warns}", icons::WARNING))
+                            .size(10.5)
+                            .color(severity_color(2)),
+                    );
+                }
+                if infos > 0 {
+                    ui.label(
+                        RichText::new(format!("{}  {infos}", icons::INFO))
+                            .size(10.5)
+                            .color(severity_color(3)),
+                    );
+                }
+            }
+        });
     }
+}
+
+fn severity_color(severity: u8) -> Color32 {
+    let t = theme::current();
+    match severity {
+        1 => t.error.to_color32(),
+        2 => Color32::from_rgb(226, 192, 80),
+        3 => t.accent.to_color32(),
+        _ => t.text_muted.to_color32(),
+    }
+}
+
+fn summarize_diagnostics(diags: &[Diagnostic]) -> (usize, usize, usize) {
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut infos = 0usize;
+    for d in diags {
+        match d.severity {
+            1 => errors += 1,
+            2 => warnings += 1,
+            _ => infos += 1,
+        }
+    }
+    (errors, warnings, infos)
+}
+
+fn append_with_diagnostics(
+    job: &mut LayoutJob,
+    segment: &str,
+    seg_start_col: u32,
+    line_diags: &[Diagnostic],
+    font: &FontId,
+    color: Color32,
+) {
+    let seg_chars: Vec<char> = segment.chars().collect();
+    let seg_end_col = seg_start_col + seg_chars.len() as u32;
+
+    if line_diags.is_empty() {
+        job.append(
+            segment,
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color,
+                ..Default::default()
+            },
+        );
+        return;
+    }
+
+    // For each character, pick the highest-severity (smallest `severity` u8)
+    // diagnostic covering that column, if any.
+    let mut spans: Vec<(usize, Option<Stroke>)> = Vec::with_capacity(seg_chars.len());
+    for (idx, _) in seg_chars.iter().enumerate() {
+        let col = seg_start_col + idx as u32;
+        let mut best: Option<&Diagnostic> = None;
+        for d in line_diags {
+            if col >= d.col_start && col < d.col_end
+                && best.map(|b| d.severity < b.severity).unwrap_or(true)
+            {
+                best = Some(d);
+            }
+        }
+        let stroke =
+            best.map(|d| Stroke::new(1.5, severity_color(d.severity)));
+        spans.push((idx, stroke));
+    }
+
+    // Coalesce consecutive chars that share the same underline state.
+    let mut i = 0;
+    while i < spans.len() {
+        let (start, stroke) = spans[i];
+        let mut j = i + 1;
+        while j < spans.len() && spans[j].1 == stroke {
+            j += 1;
+        }
+        // Slice segment by char count — find byte offsets for [start..j).
+        let end_char = if j < spans.len() { spans[j].0 } else { seg_chars.len() };
+        let byte_start = char_idx_to_byte(segment, start);
+        let byte_end = char_idx_to_byte(segment, end_char);
+        let part = &segment[byte_start..byte_end];
+        let _ = seg_end_col; // quiet the compiler — seg_end_col was the right-edge sentinel
+        job.append(
+            part,
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color,
+                underline: stroke.unwrap_or(Stroke::NONE),
+                ..Default::default()
+            },
+        );
+        i = j;
+    }
+}
+
+fn char_idx_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
 }
 
 fn draw_file_tab(

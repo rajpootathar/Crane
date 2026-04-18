@@ -136,6 +136,7 @@ pub struct App {
     pub settings_section: SettingsSection,
     pub custom_mono_font: Option<String>,
     pub ui_scale: f32,
+    pub lsp: crate::lsp::LspManager,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -163,6 +164,7 @@ impl App {
             settings_section: SettingsSection::Appearance,
             custom_mono_font: None,
             ui_scale: 1.0,
+            lsp: crate::lsp::LspManager::new(),
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,
@@ -296,6 +298,47 @@ impl App {
 
     pub fn new_tab_in_active_workspace(&mut self, ctx: &egui::Context) {
         self.push_tab(ctx, None, None);
+    }
+
+    /// Open a file in the active Workspace's Files Pane and notify the LSP
+    /// manager. Called from the Right Panel / file picker / Files browser.
+    pub fn open_file_into_active_layout(
+        &mut self,
+        ctx: &egui::Context,
+        path: String,
+        name: String,
+        content: String,
+    ) {
+        if let Some(layout) = self.active_layout() {
+            layout.open_file_in_files_pane(path.clone(), name, content.clone());
+        }
+        self.lsp
+            .did_open(ctx, std::path::Path::new(&path), &content);
+    }
+
+    /// Per-frame sync: for every open file tab across every Workspace Tab,
+    /// if the buffer changed since the last LSP push, send a full
+    /// `textDocument/didChange`. Cheap — we just compare strings.
+    pub fn sync_lsp_changes(&mut self) {
+        for project in self.projects.iter_mut() {
+            for ws in project.workspaces.iter_mut() {
+                for tab in ws.tabs.iter_mut() {
+                    for (_, pane) in tab.layout.panes.iter_mut() {
+                        if let crate::layout::PaneContent::Files(files) = &mut pane.content {
+                            for ft in files.tabs.iter_mut() {
+                                if ft.content != ft.last_lsp_content {
+                                    self.lsp.did_change(
+                                        std::path::Path::new(&ft.path),
+                                        &ft.content,
+                                    );
+                                    ft.last_lsp_content = ft.content.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn push_tab(

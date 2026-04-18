@@ -26,6 +26,10 @@ pub struct FileTab {
     pub content: String,
     pub original_content: String,
     pub name: String,
+    /// Last content snapshot sent to the LSP server — used to debounce
+    /// textDocument/didChange so we only push deltas when the user has
+    /// actually edited the file.
+    pub last_lsp_content: String,
 }
 
 impl FileTab {
@@ -61,6 +65,7 @@ impl FilesPane {
         self.tabs.push(FileTab {
             path,
             original_content: content.clone(),
+            last_lsp_content: content.clone(),
             content,
             name,
         });

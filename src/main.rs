@@ -1,5 +1,6 @@
 mod git;
 mod layout;
+mod lsp;
 mod modals;
 mod pane_view;
 mod session;
@@ -429,9 +430,28 @@ impl eframe::App for CraneApp {
         );
         let font_size = self.app.font_size;
         let inset = canvas_rect.shrink(6.0);
+        // Snapshot diagnostics for every open file in the active layout — this
+        // avoids borrowing `self.app.lsp` while `self.app.active_layout()`
+        // holds a mutable borrow.
+        let mut diag_map: std::collections::HashMap<String, Vec<lsp::Diagnostic>> =
+            std::collections::HashMap::new();
+        if let Some(layout_ref) = self.app.active_layout_ref() {
+            for (_, p) in &layout_ref.panes {
+                if let layout::PaneContent::Files(f) = &p.content {
+                    for t in &f.tabs {
+                        diag_map.insert(
+                            t.path.clone(),
+                            self.app.lsp.diagnostics(std::path::Path::new(&t.path)),
+                        );
+                    }
+                }
+            }
+        }
+        let diag_fn = |path: &str| diag_map.get(path).cloned().unwrap_or_default();
         if self.app.active_layout().is_some() {
             if let Some(ws) = self.app.active_layout() {
-                let action = pane_view::render_layout(&mut center_ui, ws, font_size, inset);
+                let action =
+                    pane_view::render_layout(&mut center_ui, ws, font_size, inset, &diag_fn);
                 match action {
                     PaneAction::None => {}
                     PaneAction::Focus(id) => ws.focus = Some(id),
@@ -471,6 +491,7 @@ impl eframe::App for CraneApp {
         self.render_confirm_close(&ctx);
         self.app.update_check.drain();
         render_update_toast(&ctx, &mut self.app);
+        self.app.sync_lsp_changes();
         self.maybe_save();
     }
 }

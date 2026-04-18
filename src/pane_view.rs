@@ -104,11 +104,21 @@ pub fn render_layout(
     layout: &mut Layout,
     font_size: f32,
     rect: Rect,
+    diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
 ) -> PaneAction {
     let mut action = PaneAction::None;
     let root = layout.root.take();
     if let Some(root) = root {
-        render_node(ui, layout, &root, rect, font_size, &mut action, &[]);
+        render_node(
+            ui,
+            layout,
+            &root,
+            rect,
+            font_size,
+            &mut action,
+            &[],
+            diagnostics_for,
+        );
         layout.root = Some(root);
     }
     action
@@ -122,10 +132,11 @@ fn render_node(
     font_size: f32,
     action: &mut PaneAction,
     path: &[usize],
+    diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
 ) {
     match node {
         Node::Leaf(id) => {
-            render_pane(ui, layout, *id, rect, font_size, action);
+            render_pane(ui, layout, *id, rect, font_size, action, diagnostics_for);
         }
         Node::Split {
             direction,
@@ -138,8 +149,26 @@ fn render_node(
             first_path.push(0);
             let mut second_path = path.to_vec();
             second_path.push(1);
-            render_node(ui, layout, first, r1, font_size, action, &first_path);
-            render_node(ui, layout, second, r2, font_size, action, &second_path);
+            render_node(
+                ui,
+                layout,
+                first,
+                r1,
+                font_size,
+                action,
+                &first_path,
+                diagnostics_for,
+            );
+            render_node(
+                ui,
+                layout,
+                second,
+                r2,
+                font_size,
+                action,
+                &second_path,
+                diagnostics_for,
+            );
             render_splitter(ui, splitter, *direction, path, rect, action);
         }
     }
@@ -209,6 +238,7 @@ fn render_pane(
     rect: Rect,
     font_size: f32,
     action: &mut PaneAction,
+    diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
 ) {
     let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
@@ -279,7 +309,14 @@ fn render_pane(
             terminal_view::render_terminal(&mut child, term, font_size, is_focus);
         }
         PaneContent::Files(files) => {
-            file_view::render(&mut child, id, files, font_size, &mut pane.title);
+            file_view::render(
+                &mut child,
+                id,
+                files,
+                font_size,
+                &mut pane.title,
+                diagnostics_for,
+            );
         }
         PaneContent::Markdown(md) => {
             markdown_view::render(&mut child, md, font_size, &mut pane.title);
