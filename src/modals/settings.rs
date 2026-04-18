@@ -47,6 +47,7 @@ pub fn render(
                         }
                         SettingsSection::Editor => render_editor(ui),
                         SettingsSection::Terminal => render_terminal(ui),
+                        SettingsSection::LanguageServers => render_lsp(ui, app),
                         SettingsSection::Shortcuts => render_shortcuts(ui),
                         SettingsSection::About => render_about(ui, app),
                     }
@@ -436,14 +437,19 @@ fn render_about(ui: &mut egui::Ui, app: &mut App) {
         );
     }
 
-    ui.add_space(20.0);
+}
+
+fn render_lsp(ui: &mut egui::Ui, app: &mut App) {
+    section_title(ui, "Language Servers");
+    ui.add_space(6.0);
     ui.label(
-        RichText::new("Language servers")
-            .size(13.0)
-            .color(theme::current().text.to_color32())
-            .strong(),
+        RichText::new(
+            "Crane speaks LSP to external servers for diagnostics, hover, and formatting. It prefers anything already on your PATH; otherwise you can download a vetted binary here."
+        )
+        .size(11.5)
+        .color(theme::current().text_muted.to_color32()),
     );
-    ui.add_space(2.0);
+    ui.add_space(6.0);
     // Show the PATH Crane sees so users can tell if the macOS GUI-launch
     // PATH fix worked.
     let path_val = std::env::var("PATH").unwrap_or_default();
@@ -533,6 +539,57 @@ fn render_about(ui: &mut egui::Ui, app: &mut App) {
                             .color(theme::current().accent.to_color32()),
                     );
                 });
+                if crate::lsp::Downloader::is_supported(key) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        match app.lsp.downloader.state(key) {
+                            crate::lsp::DownloadState::Downloading { progress_bytes } => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "downloading… {}",
+                                        crate::lsp::downloader::human_bytes(progress_bytes)
+                                    ))
+                                    .size(11.0)
+                                    .italics()
+                                    .color(theme::current().warning.to_color32()),
+                                );
+                            }
+                            crate::lsp::DownloadState::Ready(p) => {
+                                ui.label(
+                                    RichText::new(format!("downloaded → {}", p.display()))
+                                        .size(10.5)
+                                        .monospace()
+                                        .color(theme::current().success.to_color32()),
+                                );
+                            }
+                            crate::lsp::DownloadState::Failed(e) => {
+                                ui.label(
+                                    RichText::new(format!("download failed: {e}"))
+                                        .size(10.5)
+                                        .color(theme::current().error.to_color32()),
+                                );
+                                if ui.small_button("Retry").clicked() {
+                                    app.lsp
+                                        .downloader
+                                        .start_download(key, ui.ctx().clone());
+                                }
+                            }
+                            crate::lsp::DownloadState::NotStarted => {
+                                if ui
+                                    .button(
+                                        RichText::new("⬇ Download & use Crane's copy").strong(),
+                                    )
+                                    .clicked()
+                                {
+                                    app.lsp.declined.remove(&key);
+                                    app.lsp
+                                        .downloader
+                                        .start_download(key, ui.ctx().clone());
+                                }
+                            }
+                        }
+                    });
+                }
             }
             ui.add_space(4.0);
         }

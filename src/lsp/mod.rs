@@ -56,17 +56,28 @@ impl LspManager {
         };
         self.files.write().insert(path.to_path_buf(), key);
 
+        // Evict a dead server so a fresh spawn can replace it (e.g. after
+        // the user downloads rust-analyzer via the prompt, we want to re-try
+        // spawn with the downloaded binary even though PATH-spawned one died).
+        if let Some(s) = self.servers.get(&key)
+            && s.status() == server::Status::Dead
+        {
+            self.servers.remove(&key);
+        }
+
         // Already running? Just forward the open.
         if let Some(server) = self.servers.get(&key) {
             server.did_open(path, text);
             return;
         }
 
-        // Resolve a binary: PATH first, then downloaded copy.
+        // Prefer a downloaded copy if present — the user explicitly chose
+        // it, often because their global install was broken. Fall back to
+        // PATH lookup for users who have a known-good global install.
         let (cmd, _) = key.command();
-        let path_bin = which_on_path(cmd);
         let downloaded = self.downloader.resolved(key);
-        let resolved = path_bin.or(downloaded);
+        let path_bin = which_on_path(cmd);
+        let resolved = downloaded.or(path_bin);
 
         if let Some(bin) = resolved {
             let server = Arc::new(server::LspServer::spawn(ctx.clone(), key, &bin));
@@ -115,11 +126,29 @@ impl LspManager {
         }
     }
 
-    /// Called each frame to drain ready downloads into spawned servers.
+    /// Called each frame to drain ready downloads into spawned servers,
+    /// and to offer the install prompt when a spawn-from-PATH server dies
+    /// (rust-analyzer crashes on incompatible workspaces, tsserver refuses
+    /// bad installs, etc.).
     pub fn tick(&mut self, ctx: &egui::Context) {
         let keys: Vec<ServerKey> = self.pending_files.read().keys().copied().collect();
         for key in keys {
             self.try_spawn_pending(ctx, key);
+        }
+        if self.prompt_install.is_none() {
+            for (key, server) in &self.servers {
+                if server.status() == server::Status::Dead
+                    && Downloader::is_supported(*key)
+                    && !self.declined.contains(key)
+                    && !matches!(
+                        self.downloader.state(*key),
+                        DownloadState::Downloading { .. } | DownloadState::Ready(_)
+                    )
+                {
+                    self.prompt_install = Some(*key);
+                    break;
+                }
+            }
         }
     }
 

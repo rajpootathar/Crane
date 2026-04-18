@@ -54,6 +54,7 @@ pub enum SettingsSection {
     Appearance,
     Editor,
     Terminal,
+    LanguageServers,
     Shortcuts,
     About,
 }
@@ -63,6 +64,7 @@ impl SettingsSection {
         SettingsSection::Appearance,
         SettingsSection::Editor,
         SettingsSection::Terminal,
+        SettingsSection::LanguageServers,
         SettingsSection::Shortcuts,
         SettingsSection::About,
     ];
@@ -71,6 +73,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Editor => "Editor",
             SettingsSection::Terminal => "Terminal",
+            SettingsSection::LanguageServers => "Language Servers",
             SettingsSection::Shortcuts => "Keyboard Shortcuts",
             SettingsSection::About => "About",
         }
@@ -81,6 +84,7 @@ impl SettingsSection {
             SettingsSection::Appearance => i::PAINT_BRUSH,
             SettingsSection::Editor => i::CODE,
             SettingsSection::Terminal => i::TERMINAL_WINDOW,
+            SettingsSection::LanguageServers => i::LIGHTNING,
             SettingsSection::Shortcuts => i::KEYBOARD,
             SettingsSection::About => i::INFO,
         }
