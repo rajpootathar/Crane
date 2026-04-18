@@ -132,12 +132,24 @@ pub struct LspServer {
 impl LspServer {
     pub fn spawn(ctx: egui::Context, key: ServerKey, bin: &Path) -> Self {
         let (_cmd_name, args) = key.command();
-        let mut child_res = Command::new(bin)
-            .args(args)
-            .stdin(Stdio::piped())
+        // JS/MJS entrypoints (tsserver, pyright) need Node to launch.
+        let needs_node = bin
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "js" || e == "mjs");
+        let mut cmd = if needs_node {
+            let mut c = Command::new("node");
+            c.arg(bin).args(args);
+            c
+        } else {
+            let mut c = Command::new(bin);
+            c.args(args);
+            c
+        };
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
+        let mut child_res = cmd.spawn();
         if let Err(ref e) = child_res {
             eprintln!("[lsp] failed to spawn {}: {e}", bin.display());
         }

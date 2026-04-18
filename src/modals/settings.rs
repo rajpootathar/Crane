@@ -609,6 +609,13 @@ fn render_lsp_row(
                             }
                         }
                     }
+                } else if let Some(hint) = crate::lsp::Downloader::runtime_missing_hint(key) {
+                    ui.label(
+                        RichText::new(hint)
+                            .size(11.0)
+                            .italics()
+                            .color(theme::current().warning.to_color32()),
+                    );
                 } else {
                     ui.label(
                         RichText::new(format!("install yourself: {}", key.install_hint()))

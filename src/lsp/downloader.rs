@@ -59,7 +59,29 @@ impl Downloader {
     }
 
     pub fn is_supported(key: ServerKey) -> bool {
-        matches!(key, ServerKey::RustAnalyzer)
+        match key {
+            ServerKey::RustAnalyzer => true,
+            ServerKey::TypeScript
+            | ServerKey::Pyright
+            | ServerKey::CssLs
+            | ServerKey::HtmlLs => has_npm(),
+            ServerKey::Gopls => false,
+        }
+    }
+
+    pub fn runtime_missing_hint(key: ServerKey) -> Option<&'static str> {
+        match key {
+            ServerKey::TypeScript
+            | ServerKey::Pyright
+            | ServerKey::CssLs
+            | ServerKey::HtmlLs
+                if !has_npm() =>
+            {
+                Some("Requires Node.js (npm) — install from https://nodejs.org")
+            }
+            ServerKey::Gopls => Some("Requires Go — install from https://go.dev/dl/"),
+            _ => None,
+        }
     }
 
     pub fn start_download(&self, key: ServerKey, ctx: egui::Context) {
@@ -78,8 +100,19 @@ impl Downloader {
         thread::spawn(move || {
             let result = match key {
                 ServerKey::RustAnalyzer => download_rust_analyzer(&states, key, &ctx2),
-                _ => Err(std::io::Error::other(
-                    "auto-download not yet supported for this server",
+                ServerKey::TypeScript => install_npm_server(
+                    key,
+                    "typescript",
+                    &["typescript-language-server", "typescript"],
+                ),
+                ServerKey::Pyright => install_npm_server(key, "pyright", &["pyright"]),
+                ServerKey::CssLs | ServerKey::HtmlLs => install_npm_server(
+                    key,
+                    "vscode-langservers",
+                    &["vscode-langservers-extracted"],
+                ),
+                ServerKey::Gopls => Err(std::io::Error::other(
+                    "gopls auto-install not yet supported (needs Go SDK)",
                 )),
             };
             let mut g = states.lock();
@@ -107,9 +140,47 @@ impl Downloader {
                 };
                 Some(base.join("rust-analyzer").join(bin))
             }
-            _ => None,
+            ServerKey::TypeScript => Some(
+                base.join("typescript")
+                    .join("node_modules/typescript-language-server/lib/cli.mjs"),
+            ),
+            ServerKey::Pyright => Some(
+                base.join("pyright")
+                    .join("node_modules/pyright/dist/pyright-langserver.js"),
+            ),
+            ServerKey::CssLs => Some(
+                base.join("vscode-langservers")
+                    .join("node_modules/vscode-langservers-extracted/bin/vscode-css-language-server"),
+            ),
+            ServerKey::HtmlLs => Some(
+                base.join("vscode-langservers")
+                    .join("node_modules/vscode-langservers-extracted/bin/vscode-html-language-server"),
+            ),
+            ServerKey::Gopls => None,
         }
     }
+}
+
+pub fn has_npm() -> bool {
+    which_on_path("npm").is_some()
+}
+
+pub fn has_node() -> bool {
+    which_on_path("node").is_some()
+}
+
+fn which_on_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let full = Path::new(dir).join(bin);
+        if full.is_file() {
+            return Some(full);
+        }
+    }
+    None
 }
 
 fn download_rust_analyzer(
@@ -189,6 +260,52 @@ fn download_rust_analyzer(
             .output();
     }
 
+    Ok(expected)
+}
+
+fn install_npm_server(
+    key: ServerKey,
+    install_subdir: &str,
+    packages: &[&str],
+) -> std::io::Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|_| std::io::Error::other("no HOME dir"))?;
+    let dir = PathBuf::from(home).join(".crane").join("lsp").join(install_subdir);
+    std::fs::create_dir_all(&dir)?;
+
+    // Seed a package.json so `npm install` doesn't complain.
+    let pkg_json = dir.join("package.json");
+    if !pkg_json.exists() {
+        std::fs::write(&pkg_json, br#"{"name":"crane-lsp","private":true}"#)?;
+    }
+
+    let mut cmd = std::process::Command::new("npm");
+    cmd.arg("install")
+        .arg("--prefix")
+        .arg(&dir)
+        .arg("--silent")
+        .arg("--no-audit")
+        .arg("--no-fund")
+        .arg("--no-progress");
+    for pkg in packages {
+        cmd.arg(*pkg);
+    }
+    let out = cmd.output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "npm install failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+
+    let expected = Downloader::expected_path(key)
+        .ok_or_else(|| std::io::Error::other("no expected path"))?;
+    if !expected.exists() {
+        return Err(std::io::Error::other(format!(
+            "installed but entrypoint not found at {}",
+            expected.display()
+        )));
+    }
     Ok(expected)
 }
 
