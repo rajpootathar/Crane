@@ -324,9 +324,11 @@ fn render_inner(
                         .size(11.0)
                         .color(theme::current().text_muted.to_color32()),
                 );
+                let input_id = egui::Id::new(("find_input", &tab.path));
                 let resp = ui.add(
                     egui::TextEdit::singleline(query)
-                        .desired_width(ui.available_width() - 150.0)
+                        .id(input_id)
+                        .desired_width(ui.available_width() - 180.0)
                         .hint_text("type to search…"),
                 );
                 if resp.lost_focus()
@@ -334,7 +336,17 @@ fn render_inner(
                 {
                     find_next = true;
                 }
-                resp.request_focus();
+                // Focus ONCE when the bar opens, not every frame — the
+                // per-frame request_focus was stealing clicks from the
+                // nav/close buttons.
+                let focus_flag = egui::Id::new(("find_focused", &tab.path));
+                let already_focused = ui
+                    .memory(|m| m.data.get_temp::<bool>(focus_flag))
+                    .unwrap_or(false);
+                if !already_focused {
+                    resp.request_focus();
+                    ui.memory_mut(|m| m.data.insert_temp(focus_flag, true));
+                }
                 let hits = if query.is_empty() {
                     0
                 } else {
@@ -345,13 +357,33 @@ fn render_inner(
                         .size(10.5)
                         .color(theme::current().text_muted.to_color32()),
                 );
-                if ui.small_button("▲").on_hover_text("Previous (Shift+Enter)").clicked() {
+                let btn = |glyph: &str| {
+                    egui::Button::new(
+                        RichText::new(glyph)
+                            .size(14.0)
+                            .color(theme::current().text.to_color32()),
+                    )
+                    .min_size(egui::vec2(22.0, 22.0))
+                };
+                if ui
+                    .add(btn(icons::ARROW_UP))
+                    .on_hover_text("Previous (Shift+Enter)")
+                    .clicked()
+                {
                     find_prev = true;
                 }
-                if ui.small_button("▼").on_hover_text("Next (Enter)").clicked() {
+                if ui
+                    .add(btn(icons::ARROW_DOWN))
+                    .on_hover_text("Next (Enter)")
+                    .clicked()
+                {
                     find_next = true;
                 }
-                if ui.small_button("✕").on_hover_text("Close (Esc)").clicked() {
+                if ui
+                    .add(btn(icons::X_CIRCLE))
+                    .on_hover_text("Close (Esc)")
+                    .clicked()
+                {
                     find_close = true;
                 }
             });
@@ -364,6 +396,13 @@ fn render_inner(
                 find_prev = true;
             }
             ui.add_space(2.0);
+        } else {
+            // Bar just closed — reset the one-shot focus flag so the next
+            // Cmd+F will refocus cleanly.
+            let focus_flag = egui::Id::new(("find_focused", &tab.path));
+            ui.memory_mut(|m| {
+                m.data.remove::<bool>(focus_flag);
+            });
         }
         if find_close {
             tab.find_query = None;
