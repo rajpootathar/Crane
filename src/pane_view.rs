@@ -104,6 +104,7 @@ pub fn render_layout(
     layout: &mut Layout,
     font_size: f32,
     rect: Rect,
+    syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
 ) -> PaneAction {
     let mut action = PaneAction::None;
@@ -117,6 +118,7 @@ pub fn render_layout(
             font_size,
             &mut action,
             &[],
+            syntax_theme_override,
             diagnostics_for,
         );
         layout.root = Some(root);
@@ -132,11 +134,21 @@ fn render_node(
     font_size: f32,
     action: &mut PaneAction,
     path: &[usize],
+    syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
 ) {
     match node {
         Node::Leaf(id) => {
-            render_pane(ui, layout, *id, rect, font_size, action, diagnostics_for);
+            render_pane(
+                ui,
+                layout,
+                *id,
+                rect,
+                font_size,
+                action,
+                syntax_theme_override,
+                diagnostics_for,
+            );
         }
         Node::Split {
             direction,
@@ -157,6 +169,7 @@ fn render_node(
                 font_size,
                 action,
                 &first_path,
+                syntax_theme_override,
                 diagnostics_for,
             );
             render_node(
@@ -167,6 +180,7 @@ fn render_node(
                 font_size,
                 action,
                 &second_path,
+                syntax_theme_override,
                 diagnostics_for,
             );
             render_splitter(ui, splitter, *direction, path, rect, action);
@@ -238,6 +252,7 @@ fn render_pane(
     rect: Rect,
     font_size: f32,
     action: &mut PaneAction,
+    syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
 ) {
     let is_focus = layout.focus == Some(id);
@@ -315,6 +330,7 @@ fn render_pane(
                 files,
                 font_size,
                 &mut pane.title,
+                syntax_theme_override,
                 diagnostics_for,
             );
         }

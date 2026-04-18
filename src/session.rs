@@ -34,6 +34,8 @@ pub struct Session {
     pub custom_mono_font: Option<String>,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    #[serde(default)]
+    pub syntax_theme_override: Option<String>,
 }
 
 fn default_ui_scale() -> f32 {
@@ -182,6 +184,7 @@ impl Session {
             selected_theme: app.selected_theme.clone(),
             custom_mono_font: app.custom_mono_font.clone(),
             ui_scale: app.ui_scale,
+            syntax_theme_override: app.syntax_theme_override.clone(),
         }
     }
 
@@ -233,6 +236,7 @@ impl Session {
         app.selected_theme = self.selected_theme;
         app.custom_mono_font = self.custom_mono_font;
         app.ui_scale = self.ui_scale.clamp(0.75, 1.5);
+        app.syntax_theme_override = self.syntax_theme_override;
         app
     }
 }

@@ -16,10 +16,11 @@ static THEMES: OnceLock<ThemeSet> = OnceLock::new();
 
 fn syntaxes() -> &'static SyntaxSet {
     SYNTAXES.get_or_init(|| {
-        let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
-        // User-dropped `.sublime-syntax` / `.tmLanguage` packages in
-        // ~/.crane/syntaxes/ get folded in so Babel/TSX/custom grammars
-        // work without recompiling.
+        // two-face ships ~250 Sublime-grade syntaxes: TypeScript, TSX, JSX,
+        // Dockerfile, Astro, Svelte, GraphQL, Prisma, Nix, Zig, etc. — a
+        // big step up from syntect's bundled set for modern dev work.
+        let mut builder = two_face::syntax::extra_newlines().into_builder();
+        // User-dropped packages still fold in on top.
         if let Ok(home) = std::env::var("HOME") {
             let dir = std::path::PathBuf::from(format!("{home}/.crane/syntaxes"));
             if dir.is_dir() {
@@ -29,8 +30,50 @@ fn syntaxes() -> &'static SyntaxSet {
         builder.build()
     })
 }
+pub fn available_syntax_themes() -> Vec<String> {
+    let mut names: Vec<String> = themes().themes.keys().cloned().collect();
+    names.sort_unstable();
+    let priority = [
+        "VisualStudioDarkPlus",
+        "OneHalfDark",
+        "OneHalfLight",
+        "TwoDark",
+        "Dracula",
+        "MonokaiExtended",
+        "MonokaiExtendedBright",
+        "MonokaiExtendedOrigin",
+        "Nord",
+        "SolarizedDark",
+        "SolarizedLight",
+        "GruvboxDark",
+        "GruvboxLight",
+        "Github",
+        "InspiredGithub",
+    ];
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    for p in priority {
+        if names.iter().any(|n| n == p) {
+            out.push(p.to_string());
+        }
+    }
+    for n in names {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
 fn themes() -> &'static ThemeSet {
-    THEMES.get_or_init(ThemeSet::load_defaults)
+    THEMES.get_or_init(|| {
+        let mut set = ThemeSet::load_defaults();
+        let extras = two_face::theme::extra();
+        for name in two_face::theme::EmbeddedLazyThemeSet::theme_names() {
+            let key = format!("{name:?}"); // enum Debug prints the variant name, e.g. "VisualStudioDarkPlus"
+            set.themes.insert(key, extras.get(*name).clone());
+        }
+        set
+    })
 }
 
 /// Map file extension to a syntax name, with sensible fallbacks for flavours
@@ -59,10 +102,18 @@ pub fn render(
     pane: &mut FilesPane,
     font_size: f32,
     title: &mut String,
+    syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
 ) {
     ui.push_id(("files_pane", pane_id), |ui| {
-        render_inner(ui, pane, font_size, title, diagnostics_for);
+        render_inner(
+            ui,
+            pane,
+            font_size,
+            title,
+            syntax_theme_override,
+            diagnostics_for,
+        );
     });
 }
 
@@ -71,6 +122,7 @@ fn render_inner(
     pane: &mut FilesPane,
     font_size: f32,
     title: &mut String,
+    syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
 ) {
     if pane.tabs.is_empty() {
@@ -184,14 +236,24 @@ fn render_inner(
         let syntax: &'static syntect::parsing::SyntaxReference = find_syntax_for_ext(ext);
         let bg = theme::current().bg;
         let is_light = bg.r as u32 + bg.g as u32 + bg.b as u32 > 128 * 3;
-        let st_theme: &'static syntect::highlighting::Theme = if is_light {
-            themes()
-                .themes
-                .get("InspiredGitHub")
-                .unwrap_or_else(|| &themes().themes["base16-ocean.light"])
-        } else {
-            &themes().themes["base16-ocean.dark"]
-        };
+        let requested = syntax_theme_override
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| theme::current().syntax_theme.clone());
+        let all = &themes().themes;
+        let st_theme: &'static syntect::highlighting::Theme = all
+            .get(&requested)
+            .or_else(|| {
+                if is_light {
+                    all.get("InspiredGithub")
+                        .or_else(|| all.get("InspiredGitHub"))
+                        .or_else(|| all.get("base16-ocean.light"))
+                } else {
+                    all.get("OneHalfDark")
+                        .or_else(|| all.get("base16-eighties.dark"))
+                        .or_else(|| all.get("base16-ocean.dark"))
+                }
+            })
+            .unwrap_or_else(|| all.values().next().expect("at least one theme"));
         let fallback_fg = theme::current().text.to_color32();
 
         // Group diagnostics by line for O(1) lookup in the layouter.
@@ -244,18 +306,52 @@ fn render_inner(
         let avail_h = ui.available_height();
         let status_h = 22.0;
         let editor_h = (avail_h - status_h).max(80.0);
+        let line_count = tab.content.lines().count().max(1)
+            + if tab.content.ends_with('\n') { 1 } else { 0 };
+        let digits = line_count.to_string().len().max(2);
+        let gutter_font = FontId::new(font_size, FontFamily::Monospace);
+        let gutter_char_w = ui
+            .fonts_mut(|f| {
+                f.layout_no_wrap("0".to_string(), gutter_font.clone(), Color32::WHITE)
+            })
+            .size()
+            .x;
+        let gutter_w = gutter_char_w * digits as f32 + 16.0;
         ScrollArea::both()
             .id_salt(("file_scroll", active_idx))
             .auto_shrink([false; 2])
             .max_height(editor_h)
             .show(ui, |ui| {
-                let editor = egui::TextEdit::multiline(&mut tab.content)
-                    .code_editor()
-                    .frame(egui::Frame::NONE)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(30)
-                    .layouter(&mut layouter);
-                ui.add(editor);
+                ui.horizontal_top(|ui| {
+                    // Gutter: right-aligned muted line numbers in the editor's
+                    // monospace font so the baseline matches the code rows.
+                    let gutter_color = theme::current().text_muted.to_color32();
+                    ui.vertical(|ui| {
+                        ui.set_min_width(gutter_w);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let mut job = LayoutJob::default();
+                        for n in 1..=line_count {
+                            let s = format!("{n:>width$}  \n", n = n, width = digits);
+                            job.append(
+                                &s,
+                                0.0,
+                                TextFormat {
+                                    font_id: gutter_font.clone(),
+                                    color: gutter_color,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        ui.add(egui::Label::new(job).selectable(false));
+                    });
+                    let editor = egui::TextEdit::multiline(&mut tab.content)
+                        .code_editor()
+                        .frame(egui::Frame::NONE)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(30)
+                        .layouter(&mut layouter);
+                    ui.add(editor);
+                });
             });
 
         ui.add_space(2.0);

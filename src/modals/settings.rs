@@ -133,32 +133,7 @@ fn render_appearance(
     let mut reload_fonts = false;
     ui.add_space(6.0);
 
-    // --- Fonts & scale section (compact rows) ---
-    setting_row(ui, "UI scale", |ui| {
-        ui.scope(|ui| {
-            let v = ui.visuals_mut();
-            v.widgets.inactive.bg_fill = theme::current().surface_alt.to_color32();
-            v.widgets.hovered.bg_fill = theme::current().surface_hi.to_color32();
-            v.widgets.active.bg_fill = theme::current().accent.to_color32();
-            let mut s = app.ui_scale;
-            let resp = ui.add(
-                egui::Slider::new(&mut s, 0.85..=1.3)
-                    .step_by(0.05)
-                    .trailing_fill(true)
-                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                    .custom_parser(|s| s.trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)),
-            );
-            if resp.changed() {
-                app.ui_scale = s;
-                ui.ctx().set_zoom_factor(s);
-            }
-        });
-        if ui.small_button("Reset").clicked() {
-            app.ui_scale = 1.0;
-            ui.ctx().set_zoom_factor(1.0);
-        }
-    });
-    ui.add_space(4.0);
+    // --- Fonts section ---
     setting_row(ui, "Editor / Terminal font size", |ui| {
         ui.scope(|ui| {
             let v = ui.visuals_mut();
@@ -174,6 +149,16 @@ fn render_appearance(
         if ui.small_button("Reset").clicked() {
             app.font_size = 14.0;
         }
+    });
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("Tip: Cmd +  /  Cmd −  /  Cmd 0 also resize the editor & terminal.")
+                .size(10.5)
+                .italics()
+                .color(theme::current().text_muted.to_color32()),
+        );
     });
     ui.add_space(4.0);
     setting_row(ui, "Monospace font", |ui| {
@@ -293,6 +278,36 @@ fn render_appearance(
         let _ = std::fs::create_dir_all(&dir);
         super::open_in_file_manager(&dir);
     }
+
+    ui.add_space(12.0);
+    setting_row(ui, "Syntax highlighting", |ui| {
+        let current_label = app
+            .syntax_theme_override
+            .clone()
+            .unwrap_or_else(|| format!("Auto ({})", theme::current().syntax_theme));
+        egui::ComboBox::from_id_salt("syntax_theme_override")
+            .selected_text(current_label)
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(app.syntax_theme_override.is_none(), "Auto (pair with UI theme)")
+                    .clicked()
+                {
+                    app.syntax_theme_override = None;
+                }
+                ui.separator();
+                for name in crate::views::file_view::available_syntax_themes() {
+                    let is_active = app
+                        .syntax_theme_override
+                        .as_deref()
+                        .map(|s| s == name.as_str())
+                        .unwrap_or(false);
+                    if ui.selectable_label(is_active, &name).clicked() {
+                        app.syntax_theme_override = Some(name);
+                    }
+                }
+            });
+    });
     reload_fonts
 }
 

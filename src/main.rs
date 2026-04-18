@@ -448,10 +448,17 @@ impl eframe::App for CraneApp {
             }
         }
         let diag_fn = |path: &str| diag_map.get(path).cloned().unwrap_or_default();
+        let syntax_override = self.app.syntax_theme_override.clone();
         if self.app.active_layout().is_some() {
             if let Some(ws) = self.app.active_layout() {
-                let action =
-                    pane_view::render_layout(&mut center_ui, ws, font_size, inset, &diag_fn);
+                let action = pane_view::render_layout(
+                    &mut center_ui,
+                    ws,
+                    font_size,
+                    inset,
+                    syntax_override.as_deref(),
+                    &diag_fn,
+                );
                 match action {
                     PaneAction::None => {}
                     PaneAction::Focus(id) => ws.focus = Some(id),

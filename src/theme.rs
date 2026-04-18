@@ -54,6 +54,12 @@ pub struct Theme {
     pub warning: Rgb,
     pub terminal_bg: Rgb,
     pub terminal_fg: Rgb,
+    /// Name of the syntect theme to use for code highlighting. Matches a
+    /// `two_face::theme::EmbeddedThemeName` display name (e.g. "OneHalfDark",
+    /// "VisualStudioDarkPlus", "Dracula") or a syntect default. Falls back to
+    /// a bg-brightness heuristic in file_view if absent/unresolved.
+    #[serde(default)]
+    pub syntax_theme: String,
 }
 
 impl Theme {
@@ -83,6 +89,7 @@ impl Theme {
             warning: Rgb::new(220, 180, 110),
             terminal_bg: Rgb::new(14, 16, 24),
             terminal_fg: Rgb::new(176, 180, 192),
+            syntax_theme: "OneHalfDark".into(),
         }
     }
 
@@ -112,6 +119,7 @@ impl Theme {
             warning: Rgb::new(200, 140, 40),
             terminal_bg: Rgb::new(248, 249, 252),
             terminal_fg: Rgb::new(36, 40, 52),
+            syntax_theme: "InspiredGithub".into(),
         }
     }
 
@@ -142,6 +150,7 @@ impl Theme {
             warning: Rgb::new(220, 170, 90),
             terminal_bg: Rgb::new(43, 43, 43),
             terminal_fg: Rgb::new(187, 187, 187),
+            syntax_theme: "Dracula".into(),
         }
     }
 
@@ -171,6 +180,7 @@ impl Theme {
             warning: Rgb::new(210, 153, 34),
             terminal_bg: Rgb::new(13, 17, 23),
             terminal_fg: Rgb::new(201, 209, 217),
+            syntax_theme: "TwoDark".into(),
         }
     }
 
@@ -200,6 +210,7 @@ impl Theme {
             warning: Rgb::new(220, 180, 90),
             terminal_bg: Rgb::new(30, 30, 30),
             terminal_fg: Rgb::new(212, 212, 212),
+            syntax_theme: "VisualStudioDarkPlus".into(),
         }
     }
 
@@ -232,6 +243,7 @@ impl Theme {
             warning: Rgb::new(191, 138, 0),
             terminal_bg: Rgb::new(255, 255, 255),
             terminal_fg: Rgb::new(37, 37, 37),
+            syntax_theme: "OneHalfLight".into(),
         }
     }
 
@@ -261,6 +273,7 @@ impl Theme {
             warning: Rgb::new(229, 192, 123),
             terminal_bg: Rgb::new(40, 44, 52),
             terminal_fg: Rgb::new(171, 178, 191),
+            syntax_theme: "TwoDark".into(),
         }
     }
 
