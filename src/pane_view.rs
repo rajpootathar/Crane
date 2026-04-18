@@ -106,6 +106,7 @@ pub fn render_layout(
     rect: Rect,
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
+    notify_saved: &dyn Fn(&str, &str),
 ) -> PaneAction {
     let mut action = PaneAction::None;
     let root = layout.root.take();
@@ -120,6 +121,7 @@ pub fn render_layout(
             &[],
             syntax_theme_override,
             diagnostics_for,
+            notify_saved,
         );
         layout.root = Some(root);
     }
@@ -136,6 +138,7 @@ fn render_node(
     path: &[usize],
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
+    notify_saved: &dyn Fn(&str, &str),
 ) {
     match node {
         Node::Leaf(id) => {
@@ -148,6 +151,7 @@ fn render_node(
                 action,
                 syntax_theme_override,
                 diagnostics_for,
+                notify_saved,
             );
         }
         Node::Split {
@@ -171,6 +175,7 @@ fn render_node(
                 &first_path,
                 syntax_theme_override,
                 diagnostics_for,
+                notify_saved,
             );
             render_node(
                 ui,
@@ -182,6 +187,7 @@ fn render_node(
                 &second_path,
                 syntax_theme_override,
                 diagnostics_for,
+                notify_saved,
             );
             render_splitter(ui, splitter, *direction, path, rect, action);
         }
@@ -254,6 +260,7 @@ fn render_pane(
     action: &mut PaneAction,
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<crate::lsp::Diagnostic>,
+    notify_saved: &dyn Fn(&str, &str),
 ) {
     let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
@@ -336,6 +343,7 @@ fn render_pane(
                 &mut pane.title,
                 syntax_theme_override,
                 diagnostics_for,
+                notify_saved,
             );
         }
         PaneContent::Markdown(md) => {

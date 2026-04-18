@@ -432,6 +432,25 @@ impl LspServer {
         }));
     }
 
+    pub fn did_save(&self, path: &Path, text: &str) {
+        if self.is_dead() || !self.shared.0.lock().initialized {
+            return;
+        }
+        let uri = protocol::path_to_uri(path);
+        // rust-analyzer's `checkOnSave` hook triggers `cargo check` on this
+        // notification — that's what produces real compile errors (the
+        // kind you see underlined in VSCode). Without it, rust-analyzer
+        // only reports a handful of info-level diagnostics.
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didSave",
+            "params": {
+                "textDocument": { "uri": uri },
+                "text": text
+            }
+        }));
+    }
+
     pub fn diagnostics_for(&self, path: &Path) -> Vec<Diagnostic> {
         let uri = protocol::path_to_uri(path);
         self.shared

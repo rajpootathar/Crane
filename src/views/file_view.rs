@@ -113,6 +113,7 @@ pub fn render(
     title: &mut String,
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
+    notify_saved: &dyn Fn(&str, &str),
 ) {
     ui.push_id(("files_pane", pane_id), |ui| {
         render_inner(
@@ -122,6 +123,7 @@ pub fn render(
             title,
             syntax_theme_override,
             diagnostics_for,
+            notify_saved,
         );
     });
 }
@@ -133,6 +135,7 @@ fn render_inner(
     title: &mut String,
     syntax_theme_override: Option<&str>,
     diagnostics_for: &dyn Fn(&str) -> Vec<Diagnostic>,
+    notify_saved: &dyn Fn(&str, &str),
 ) {
     if pane.tabs.is_empty() {
         let t = theme::current();
@@ -240,6 +243,10 @@ fn render_inner(
                             eprintln!("save failed: {e}");
                         } else {
                             tab.original_content = tab.content.clone();
+                            // Ping the LSP so rust-analyzer / html-ls run
+                            // their on-save checks and publish fresh
+                            // diagnostics.
+                            notify_saved(&tab.path, &tab.content);
                         }
                     }
                     if is_md {

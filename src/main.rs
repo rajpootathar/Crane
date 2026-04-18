@@ -378,6 +378,35 @@ impl CraneApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // When any modal is open, Cmd+W closes the modal instead of the
+        // pane underneath. Also absorb Escape. Everything else falls
+        // through so Cmd+S etc. still work inside modals.
+        let modal_open = self.app.show_settings
+            || self.app.show_help
+            || self.app.new_workspace_modal.is_some()
+            || self.pending_close.is_some();
+        if modal_open {
+            let (cmd_w, esc) = ctx.input(|i| {
+                let cmd = i.modifiers.command || i.modifiers.mac_cmd;
+                (cmd && i.key_pressed(egui::Key::W), i.key_pressed(egui::Key::Escape))
+            });
+            if cmd_w || esc {
+                if self.app.show_settings {
+                    self.app.show_settings = false;
+                }
+                if self.app.show_help {
+                    self.app.show_help = false;
+                }
+                if esc && self.app.new_workspace_modal.is_some() {
+                    self.app.new_workspace_modal = None;
+                }
+                if esc && self.pending_close.is_some() {
+                    self.pending_close = None;
+                }
+                return;
+            }
+        }
+
         let (split_terminal, new_tab, split_h, split_v, close_pane, next_pane, prev_pane,
              zoom_in, zoom_out, zoom_reset, toggle_left, toggle_right, close_tab) =
             ctx.input(|i| {
@@ -589,6 +618,11 @@ impl eframe::App for CraneApp {
             }
         }
         let diag_fn = |path: &str| diag_map.get(path).cloned().unwrap_or_default();
+        let save_queue: std::cell::RefCell<Vec<(String, String)>> =
+            std::cell::RefCell::new(Vec::new());
+        let notify_saved = |path: &str, text: &str| {
+            save_queue.borrow_mut().push((path.to_string(), text.to_string()));
+        };
         let syntax_override = self.app.syntax_theme_override.clone();
         if self.app.active_layout().is_some() {
             if let Some(ws) = self.app.active_layout() {
@@ -599,6 +633,7 @@ impl eframe::App for CraneApp {
                     inset,
                     syntax_override.as_deref(),
                     &diag_fn,
+                    &notify_saved,
                 );
                 match action {
                     PaneAction::None => {}
@@ -641,6 +676,9 @@ impl eframe::App for CraneApp {
         render_lsp_download_toast(&ctx, &self.app);
         self.app.update_check.drain();
         render_update_toast(&ctx, &mut self.app);
+        for (path, text) in save_queue.into_inner() {
+            self.app.lsp.did_save(std::path::Path::new(&path), &text);
+        }
         self.app.sync_lsp_changes(&ctx);
         self.maybe_save();
     }

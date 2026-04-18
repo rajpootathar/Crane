@@ -210,6 +210,16 @@ impl LspManager {
         }
     }
 
+    pub fn did_save(&self, path: &Path, text: &str) {
+        let key = match self.files.read().get(path).copied() {
+            Some(k) => k,
+            None => return,
+        };
+        if let Some(s) = self.servers.get(&key) {
+            s.did_save(path, text);
+        }
+    }
+
     pub fn is_tracked(&self, path: &Path) -> bool {
         self.files.read().contains_key(path)
     }
