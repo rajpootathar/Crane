@@ -16,6 +16,7 @@ mod ui_status;
 mod ui_top;
 mod ui_util;
 mod update_check;
+mod updater;
 mod views;
 
 use modals::{
