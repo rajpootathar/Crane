@@ -465,8 +465,102 @@ fn render_inner(
                     // (and cursor position + selection) leaked across files.
                     // Ctrl+Z in file A would replay edits made in file B.
                     ui.push_id(("file_editor", &tab.path), |ui| {
+                        let te_id = ui.id().with("body");
+                        // Project-local indent rules from nearest .prettierrc
+                        // or package.json "prettier" field. In a monorepo
+                        // each subproject's rules apply to its own files.
+                        let style = crate::format::discover(Path::new(&tab.path));
+                        let indent = style.indent_unit();
+                        let focused = ui.memory(|m| m.has_focus(te_id));
+                        if focused {
+                            let (tab_pressed, enter_pressed) = ui.input_mut(|i| {
+                                let t = i.key_pressed(egui::Key::Tab)
+                                    && !i.modifiers.shift
+                                    && !i.modifiers.command
+                                    && !i.modifiers.mac_cmd;
+                                if t {
+                                    i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+                                }
+                                let e = i.key_pressed(egui::Key::Enter)
+                                    && !i.modifiers.shift
+                                    && !i.modifiers.command
+                                    && !i.modifiers.mac_cmd;
+                                if e {
+                                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                                }
+                                (t, e)
+                            });
+
+                            if tab_pressed
+                                && let Some(mut state) =
+                                    egui::TextEdit::load_state(ui.ctx(), te_id)
+                            {
+                                let cursor = state
+                                    .cursor
+                                    .char_range()
+                                    .map(|r| r.primary.index)
+                                    .unwrap_or(0);
+                                let byte =
+                                    crate::format::char_idx_to_byte(&tab.content, cursor);
+                                tab.content.insert_str(byte, &indent);
+                                let new_cc = egui::text::CCursor::new(
+                                    cursor + indent.chars().count(),
+                                );
+                                state.cursor.set_char_range(Some(
+                                    egui::text::CCursorRange::one(new_cc),
+                                ));
+                                state.store(ui.ctx(), te_id);
+                            }
+
+                            if enter_pressed
+                                && let Some(mut state) =
+                                    egui::TextEdit::load_state(ui.ctx(), te_id)
+                            {
+                                let cursor = state
+                                    .cursor
+                                    .char_range()
+                                    .map(|r| r.primary.index)
+                                    .unwrap_or(0);
+                                let byte =
+                                    crate::format::char_idx_to_byte(&tab.content, cursor);
+                                let (prev_indent, bump) =
+                                    crate::format::auto_indent_context(&tab.content, byte);
+                                let next_is_close = tab
+                                    .content
+                                    .as_bytes()
+                                    .get(byte)
+                                    .map(|c| matches!(c, b'}' | b')' | b']'))
+                                    .unwrap_or(false);
+                                let body_indent =
+                                    if bump { format!("{prev_indent}{indent}") } else { prev_indent.clone() };
+                                let inserted = if bump && next_is_close {
+                                    // Sitting between { and } — split onto
+                                    // three lines, cursor on the indented
+                                    // middle one.
+                                    format!("\n{body_indent}\n{prev_indent}")
+                                } else {
+                                    format!("\n{body_indent}")
+                                };
+                                tab.content.insert_str(byte, &inserted);
+                                let advance = if bump && next_is_close {
+                                    // cursor lands after the first newline
+                                    // + body_indent (so before the second
+                                    // newline).
+                                    1 + body_indent.chars().count()
+                                } else {
+                                    inserted.chars().count()
+                                };
+                                let new_cc = egui::text::CCursor::new(cursor + advance);
+                                state.cursor.set_char_range(Some(
+                                    egui::text::CCursorRange::one(new_cc),
+                                ));
+                                state.store(ui.ctx(), te_id);
+                            }
+                        }
                         let editor = egui::TextEdit::multiline(&mut tab.content)
+                            .id(te_id)
                             .code_editor()
+                            .lock_focus(true)
                             .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY)
                             .desired_rows(30)
@@ -478,6 +572,43 @@ fn render_inner(
                             out.galley_pos,
                             &diagnostics,
                         );
+                        // Note: egui 0.34 keeps TextEditState.undoer private,
+                        // so we can't tighten Ctrl+Z granularity without
+                        // forking. Upstream issue; revisit when possible.
+                        let ctx_save = std::rc::Rc::new(std::cell::Cell::new(false));
+                        let ctx_reveal = std::rc::Rc::new(std::cell::Cell::new(false));
+                        let ctx_copy = std::rc::Rc::new(std::cell::Cell::new(false));
+                        let path_for_copy = tab.path.clone();
+                        let cs = ctx_save.clone();
+                        let cr = ctx_reveal.clone();
+                        let cc = ctx_copy.clone();
+                        out.response.context_menu(|ui| {
+                            if ui.button(format!("{}  Save", icons::FLOPPY_DISK)).clicked() {
+                                cs.set(true);
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("{}  Reveal in Finder", icons::FOLDER_OPEN)).clicked() {
+                                cr.set(true);
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
+                                ui.ctx().copy_text(path_for_copy.clone());
+                                cc.set(true);
+                                ui.close_menu();
+                            }
+                        });
+                        if ctx_save.get() {
+                            if let Err(e) = std::fs::write(&tab.path, &tab.content) {
+                                eprintln!("save failed: {e}");
+                            } else {
+                                tab.original_content = tab.content.clone();
+                                notify_saved(&tab.path, &tab.content);
+                            }
+                        }
+                        if ctx_reveal.get() {
+                            reveal_in_file_manager(&tab.path);
+                        }
+                        let _ = ctx_copy.get();
                     });
                 });
             });
@@ -546,6 +677,22 @@ fn summarize_diagnostics(diags: &[Diagnostic]) -> (usize, usize, usize) {
         }
     }
     (errors, warnings, infos)
+}
+
+fn reveal_in_file_manager(path: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(target_os = "linux")]
+    {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/"));
+        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .spawn();
 }
 
 fn paint_diagnostic_overlay(

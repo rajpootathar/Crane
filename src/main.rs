@@ -1,3 +1,4 @@
+mod format;
 mod git;
 mod layout;
 mod lsp;
