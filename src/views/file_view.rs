@@ -379,13 +379,20 @@ fn render_inner(
                 {
                     find_next = true;
                 }
-                if ui
-                    .add(btn(icons::X_CIRCLE))
-                    .on_hover_text("Close (Esc)")
-                    .clicked()
-                {
-                    find_close = true;
-                }
+                // Close pinned to the far-right edge.
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(6.0);
+                        if ui
+                            .add(btn(icons::X_CIRCLE))
+                            .on_hover_text("Close (Esc)")
+                            .clicked()
+                        {
+                            find_close = true;
+                        }
+                    },
+                );
             });
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 find_close = true;

@@ -80,6 +80,10 @@ Keep `opt-level = 1` for `[profile.dev]` and `opt-level = 3` for `[profile.dev.p
 - **Inner pane padding**: panes get a 5×3px interior shrink so content doesn't kiss the border.
 - **Focus border**: 2px accent on the active Pane; other Panes get a subtle border.
 - **Panel toggles**: visible buttons in the Main Panel top bar for both Left and Right Panel collapse.
+- **Icons — NEVER use Unicode glyphs (▲ ▼ ✕ ▎ · 🔍 etc.)** in buttons or text. Our bundled `JetBrains Mono` + `egui` default proportional font don't cover those ranges, so they render as tofu boxes. **Always use `egui_phosphor::regular::*`** (examples: `ARROW_UP`, `ARROW_DOWN`, `X_CIRCLE`, `MAGNIFYING_GLASS`, `FLOPPY_DISK`, `FOLDER_OPEN`, `COPY`, `PENCIL_SIMPLE`, `EYE`, `X`, `PLUS`, `MINUS`, `CARET_UP`, `CARET_DOWN`, `GIT_BRANCH`, `GIT_DIFF`, `INFO`, `WARNING`, `X_CIRCLE`, `CUBE`, `ARROW_RIGHT`, `ARROW_COUNTER_CLOCKWISE`, `DOWNLOAD_SIMPLE`, `FILE`, `FOLDER`, `FOLDER_PLUS`, `PAINT_BRUSH`, `CODE`, `TERMINAL_WINDOW`, `KEYBOARD`, `LIGHTNING`, `ARROW_CIRCLE_UP`, `TRASH`).
+- **`request_focus()` must fire once, not every frame.** Per-frame `resp.request_focus()` steals clicks from sibling buttons in the same row — the TextEdit reclaims focus before the button processes its click. Gate with an egui memory flag keyed by the widget path and reset it when the container closes.
+- **Close buttons live on the far right.** For toolbars / find bars / modal headers: pin the close × with `ui.with_layout(Layout::right_to_left(Align::Center), |ui| { … })` so the row stays visually anchored.
+- **Icon buttons need `min_size`** (≥ 22×22) — egui sizes by text, and a single-glyph button can collapse into an invisible hitbox.
 
 ## Keyboard (canonical)
 
