@@ -3,6 +3,7 @@ use crate::theme;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 use egui::text::{LayoutJob, TextFormat};
@@ -150,15 +151,19 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let snapshot = {
         let guard = terminal.term.lock();
         let content = guard.renderable_content();
-        let cursor = (content.cursor.point.column.0, content.cursor.point.line.0);
+        let offset = content.display_offset as i32;
+        let cursor = (
+            content.cursor.point.column.0,
+            content.cursor.point.line.0 + offset,
+        );
         let selection = content.selection;
         let cells: Vec<_> = content
             .display_iter
             .map(|item| (item.point, item.cell.clone()))
             .collect();
-        (cells, cursor, selection)
+        (cells, cursor, selection, offset)
     };
-    let (cells, (cursor_col, cursor_line), selection) = snapshot;
+    let (cells, (cursor_col, cursor_line), selection, display_offset) = snapshot;
 
     // Group cells by line, then batch each line into a single LayoutJob
     // grouped by contiguous runs of same (fg, bg, flags). This cuts paint
@@ -169,14 +174,19 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let mut by_row: std::collections::BTreeMap<i32, Vec<(usize, alacritty_terminal::term::cell::Cell, bool)>> =
         std::collections::BTreeMap::new();
     for (point, cell) in cells {
-        if point.line.0 < 0 {
+        // alacritty yields display_iter items in grid-absolute line
+        // coordinates, which go negative into history when the user has
+        // scrolled up. Translate to viewport-local (0..screen_lines) by
+        // adding the current display offset.
+        let viewport_line = point.line.0 + display_offset;
+        if viewport_line < 0 || viewport_line as usize >= rows {
             continue;
         }
         let in_selection = selection
             .map(|sel| point_in_selection(point, &sel))
             .unwrap_or(false);
         by_row
-            .entry(point.line.0)
+            .entry(viewport_line)
             .or_default()
             .push((point.column.0, cell, in_selection));
     }
@@ -275,6 +285,12 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     if !has_focus {
         return;
     }
+    // Don't grab keyboard when another egui widget (e.g. the tab-rename
+    // TextEdit in the Left Panel) has keyboard focus. Without this the
+    // user's rename keystrokes also get written to the PTY.
+    if ui.memory(|m| m.focused().is_some()) {
+        return;
+    }
 
     let mut copy_text: Option<String> = None;
     let mut paste_text: Option<String> = None;
@@ -287,6 +303,28 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                         && !t.is_empty() {
                             copy_text = Some(t);
                         }
+                }
+                egui::Event::Key {
+                    key: egui::Key::K,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.mac_cmd || modifiers.command => {
+                    // iTerm-style Cmd+K: wipe screen + scrollback.
+                    // Drive the ANSI parser directly so the PTY stays
+                    // idle; then send Ctrl+L (form-feed) so the shell
+                    // redraws its prompt on the now-empty screen.
+                    let mut processor: Processor<StdSyncHandler> = Processor::new();
+                    {
+                        let mut guard = terminal.term.lock();
+                        // \x1b[H       → cursor home
+                        // \x1b[2J      → erase entire display
+                        // \x1b[3J      → erase saved (scrollback) lines
+                        processor.advance(&mut *guard, b"\x1b[H\x1b[2J\x1b[3J");
+                        guard.scroll_display(Scroll::Bottom);
+                    }
+                    terminal.write_input(b"\x0c");
+                    terminal.history.lock().clear();
                 }
                 egui::Event::Key {
                     key: egui::Key::A,

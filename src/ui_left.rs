@@ -241,12 +241,24 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                         resp.request_focus();
                                         rename_focused = true;
                                     }
-                                    let enter = resp.lost_focus()
+                                    // Detect Enter while the TextEdit is
+                                    // focused — `resp.lost_focus()` fires
+                                    // the frame AFTER the key, by which
+                                    // time the Enter event has drained.
+                                    let is_focused = ui.memory(|m| m.has_focus(te_id));
+                                    let enter = is_focused
                                         && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    let esc = is_focused
+                                        && ui.input(|i| i.key_pressed(egui::Key::Escape));
                                     if enter {
-                                        commit_rename = Some((project.id, wt.id, tab.id, buf.clone()));
-                                    } else if esc || (resp.lost_focus() && !enter) {
+                                        commit_rename =
+                                            Some((project.id, wt.id, tab.id, buf.clone()));
+                                    } else if esc {
+                                        cancel_rename = true;
+                                    } else if resp.lost_focus() {
+                                        // Clicked away without Enter —
+                                        // cancel (preserves the current
+                                        // tab name).
                                         cancel_rename = true;
                                     }
                                     continue;
