@@ -624,8 +624,11 @@ fn strip_ansi(input: &[u8]) -> Vec<u8> {
             }
             continue;
         }
-        // Drop stray bell + carriage return; keep \n \t and printable bytes.
-        if b == 0x07 || b == b'\r' {
+        // Drop only the bell (0x07) — CR must stay or lines collapse
+        // together. LF alone moves the cursor down but keeps the
+        // column, so stripping CR from "\r\n" endings piled every line
+        // at an increasing indent.
+        if b == 0x07 {
             i += 1;
             continue;
         }
