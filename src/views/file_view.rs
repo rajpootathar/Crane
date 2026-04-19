@@ -354,105 +354,8 @@ fn render_scoped(
         ui.add_space(2.0);
 
         // Find bar — rendered above the editor when open. Enter jumps to
-        // the next match; Shift+Enter the previous; Escape closes.
-        let mut find_close = false;
-        let mut find_next = false;
-        let mut find_prev = false;
-        if let Some(query) = tab.find_query.as_mut() {
-            ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!("{}  Find", icons::MAGNIFYING_GLASS))
-                        .size(11.0)
-                        .color(theme::current().text_muted.to_color32()),
-                );
-                let input_id = egui::Id::new(("find_input", &tab.path));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(query)
-                        .id(input_id)
-                        .desired_width(ui.available_width() - 180.0)
-                        .hint_text("type to search…"),
-                );
-                if resp.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                {
-                    find_next = true;
-                }
-                // Focus ONCE when the bar opens, not every frame — the
-                // per-frame request_focus was stealing clicks from the
-                // nav/close buttons.
-                let focus_flag = egui::Id::new(("find_focused", &tab.path));
-                let already_focused = ui
-                    .memory(|m| m.data.get_temp::<bool>(focus_flag))
-                    .unwrap_or(false);
-                if !already_focused {
-                    resp.request_focus();
-                    ui.memory_mut(|m| m.data.insert_temp(focus_flag, true));
-                }
-                let hits = if query.is_empty() {
-                    0
-                } else {
-                    tab.content.matches(query.as_str()).count()
-                };
-                ui.label(
-                    RichText::new(format!("{hits} hits"))
-                        .size(10.5)
-                        .color(theme::current().text_muted.to_color32()),
-                );
-                let btn = |glyph: &str| {
-                    egui::Button::new(
-                        RichText::new(glyph)
-                            .size(14.0)
-                            .color(theme::current().text.to_color32()),
-                    )
-                    .min_size(egui::vec2(22.0, 22.0))
-                };
-                if ui
-                    .add(btn(icons::ARROW_UP))
-                    .on_hover_text("Previous (Shift+Enter)")
-                    .clicked()
-                {
-                    find_prev = true;
-                }
-                if ui
-                    .add(btn(icons::ARROW_DOWN))
-                    .on_hover_text("Next (Enter)")
-                    .clicked()
-                {
-                    find_next = true;
-                }
-                // Close pinned to the far-right edge.
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        ui.add_space(6.0);
-                        if ui
-                            .add(btn(icons::X_CIRCLE))
-                            .on_hover_text("Close (Esc)")
-                            .clicked()
-                        {
-                            find_close = true;
-                        }
-                    },
-                );
-            });
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                find_close = true;
-            }
-            if ui.input(|i| {
-                i.key_pressed(egui::Key::Enter) && i.modifiers.shift
-            }) {
-                find_prev = true;
-            }
-            ui.add_space(2.0);
-        } else {
-            // Bar just closed — reset the one-shot focus flag so the next
-            // Cmd+F will refocus cleanly.
-            let focus_flag = egui::Id::new(("find_focused", &tab.path));
-            ui.memory_mut(|m| {
-                m.data.remove::<bool>(focus_flag);
-            });
-        }
+        let FindBarOutcome { close: find_close, next: find_next, prev: find_prev } =
+            render_find_bar(ui, tab);
         if find_close {
             tab.find_query = None;
         }
@@ -1205,6 +1108,112 @@ fn paint_scrollbar_diag_markers(
         );
         painter.rect_filled(rect, 0.5, color);
     }
+}
+
+struct FindBarOutcome {
+    close: bool,
+    next: bool,
+    prev: bool,
+}
+
+/// Renders the Cmd+F find bar when `tab.find_query` is Some. Returns
+/// which navigation action was triggered this frame (close / next /
+/// prev). Mutates only the editable query string; the caller is
+/// responsible for clearing `tab.find_query` on close.
+fn render_find_bar(ui: &mut egui::Ui, tab: &mut crate::layout::FileTab) -> FindBarOutcome {
+    let mut close = false;
+    let mut next = false;
+    let mut prev = false;
+    let Some(query) = tab.find_query.as_mut() else {
+        // Bar just closed — reset the one-shot focus flag so the next
+        // Cmd+F will refocus cleanly.
+        let focus_flag = egui::Id::new(("find_focused", &tab.path));
+        ui.memory_mut(|m| {
+            m.data.remove::<bool>(focus_flag);
+        });
+        return FindBarOutcome { close, next, prev };
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("{}  Find", icons::MAGNIFYING_GLASS))
+                .size(11.0)
+                .color(theme::current().text_muted.to_color32()),
+        );
+        let input_id = egui::Id::new(("find_input", &tab.path));
+        let resp = ui.add(
+            egui::TextEdit::singleline(query)
+                .id(input_id)
+                .desired_width(ui.available_width() - 180.0)
+                .hint_text("type to search…"),
+        );
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            next = true;
+        }
+        // Focus ONCE when the bar opens — per-frame request_focus was
+        // stealing clicks from the nav/close buttons.
+        let focus_flag = egui::Id::new(("find_focused", &tab.path));
+        let already_focused = ui
+            .memory(|m| m.data.get_temp::<bool>(focus_flag))
+            .unwrap_or(false);
+        if !already_focused {
+            resp.request_focus();
+            ui.memory_mut(|m| m.data.insert_temp(focus_flag, true));
+        }
+        let hits = if query.is_empty() {
+            0
+        } else {
+            tab.content.matches(query.as_str()).count()
+        };
+        ui.label(
+            RichText::new(format!("{hits} hits"))
+                .size(10.5)
+                .color(theme::current().text_muted.to_color32()),
+        );
+        let btn = |glyph: &str| {
+            egui::Button::new(
+                RichText::new(glyph)
+                    .size(14.0)
+                    .color(theme::current().text.to_color32()),
+            )
+            .min_size(egui::vec2(22.0, 22.0))
+        };
+        if ui
+            .add(btn(icons::ARROW_UP))
+            .on_hover_text("Previous (Shift+Enter)")
+            .clicked()
+        {
+            prev = true;
+        }
+        if ui
+            .add(btn(icons::ARROW_DOWN))
+            .on_hover_text("Next (Enter)")
+            .clicked()
+        {
+            next = true;
+        }
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.add_space(6.0);
+                if ui
+                    .add(btn(icons::X_CIRCLE))
+                    .on_hover_text("Close (Esc)")
+                    .clicked()
+                {
+                    close = true;
+                }
+            },
+        );
+    });
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        close = true;
+    }
+    if ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.shift) {
+        prev = true;
+    }
+    ui.add_space(2.0);
+    FindBarOutcome { close, next, prev }
 }
 
 /// Write `tab.content` to disk. When `force` is false and `tab.external_change`
