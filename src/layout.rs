@@ -22,6 +22,10 @@ pub enum Node {
 }
 
 pub struct FileTab {
+    /// Absolute path on disk. Kept as `String` so it round-trips
+    /// through the session JSON schema unchanged. Migrating to
+    /// `PathBuf` would force ~40 callsites in LSP / format / UI to
+    /// switch from `&str` to `&Path`; we'd like to, but not today.
     pub path: String,
     pub content: String,
     pub original_content: String,
