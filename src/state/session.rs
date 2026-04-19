@@ -435,14 +435,14 @@ impl SPane {
                 } else {
                     saved_cwd.as_path()
                 };
-                // Strip ANSI escape sequences (anything starting with
-                // ESC) before replay. Colors + styles are lost but the
-                // text + newlines survive — and without the absolute-
-                // column cursor-positioning escapes we don't get the
-                // staggered RPROMPT bakelines that broke rendering.
-                let raw = base64_decode(&history_b64).unwrap_or_default();
-                let sanitized = strip_ansi(&raw);
-                let spawned = if sanitized.is_empty() {
+                // Raw VT byte replay. Our ANSI-stripper experiments
+                // dropped content the user actually wanted to see, so
+                // we hand alacritty the full saved stream. Side effect:
+                // RPROMPT cursor-positioning escapes render staggered
+                // against the restored terminal width — tracked for a
+                // proper fix (grid-text snapshot instead of byte replay).
+                let history = base64_decode(&history_b64).unwrap_or_default();
+                let spawned = if history.is_empty() {
                     crate::terminal::Terminal::spawn(ctx.clone(), 80, 24, Some(spawn_cwd))
                 } else {
                     crate::terminal::Terminal::spawn_with_history(
@@ -450,7 +450,7 @@ impl SPane {
                         80,
                         24,
                         Some(spawn_cwd),
-                        &sanitized,
+                        &history,
                     )
                 };
                 match spawned {
