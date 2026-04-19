@@ -77,10 +77,10 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let cols = ((available.x / cell_w).floor() as usize).max(20);
     let rows = ((available.y / cell_h).floor() as usize).max(5);
     terminal.resize(cols, rows);
-    // VT replies (CSI 6n cursor position, DSR, etc.) are now written
-    // to the PTY immediately from the listener's send_event — a queued
-    // one-frame delay was tripping ZSH's RPROMPT reply timeout, which
-    // made the cursor land a few columns short of the prompt end.
+    // Flush any VT replies alacritty's parser queued (CSI 6n cursor
+    // position, DSR, etc.). See WakeListener comment for why these
+    // are queued rather than written synchronously.
+    terminal.flush_pty_replies();
 
     let (response, painter) = ui.allocate_painter(
         Vec2::new(cols as f32 * cell_w, rows as f32 * cell_h),

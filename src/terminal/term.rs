@@ -29,22 +29,23 @@ impl Dimensions for TermSize {
 #[derive(Clone)]
 pub struct WakeListener {
     ctx: egui::Context,
-    /// PTY writer shared with the Terminal so VT replies go out *now*,
-    /// not on the next render frame. ZSH's prompt logic issues `ESC[6n`
-    /// (cursor-position query) synchronously and uses a short timeout
-    /// to read the reply; a one-frame delay (~16ms) lands right on the
-    /// edge of that timeout and causes the RPROMPT column math to be
-    /// computed against a fallback value, leaving the cursor a few
-    /// columns short of where it should be.
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Queue of VT-parser replies (CSI 6n / DSR / title ack) the
+    /// Terminal drains and writes back to the PTY on each render.
+    /// Deliberately a queue rather than a direct write: making these
+    /// replies synchronous (write from the listener in-line) exposed
+    /// a Powerlevel10k width-miscount bug where P10k computes its
+    /// RPROMPT cursor-back against byte-width instead of column-width
+    /// of Nerd Font icons, landing the cursor a few columns short of
+    /// the prompt end. With a small delay, P10k's internal timeout
+    /// falls through to an absolute-positioning code path that
+    /// doesn't rely on width counting.
+    pty_replies: Arc<Mutex<Vec<u8>>>,
 }
 
 impl EventListener for WakeListener {
     fn send_event(&self, event: TermEvent) {
         if let TermEvent::PtyWrite(s) = event {
-            let mut w = self.writer.lock();
-            let _ = w.write_all(s.as_bytes());
-            let _ = w.flush();
+            self.pty_replies.lock().extend_from_slice(s.as_bytes());
         }
         self.ctx.request_repaint();
     }
@@ -63,6 +64,25 @@ pub struct Terminal {
     pub click_count: u8,
     master: Box<dyn MasterPty + Send>,
     shell_pid: Option<u32>,
+    /// Shared with WakeListener; flushed once per render frame via
+    /// `flush_pty_replies`.
+    pty_replies: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Terminal {
+    /// Drain any VT replies the parser has queued and forward them
+    /// to the PTY. Called once per render.
+    pub fn flush_pty_replies(&mut self) {
+        let mut q = self.pty_replies.lock();
+        if q.is_empty() {
+            return;
+        }
+        let bytes = std::mem::take(&mut *q);
+        drop(q);
+        let mut w = self.writer.lock();
+        let _ = w.write_all(&bytes);
+        let _ = w.flush();
+    }
 }
 
 impl Terminal {
@@ -117,9 +137,10 @@ impl Terminal {
                 .map_err(|e| std::io::Error::other(e.to_string()))?,
         ));
 
+        let pty_replies = Arc::new(Mutex::new(Vec::<u8>::with_capacity(64)));
         let listener = WakeListener {
             ctx: ctx.clone(),
-            writer: writer.clone(),
+            pty_replies: pty_replies.clone(),
         };
         let term = Arc::new(Mutex::new(Term::new(
             Config::default(),
@@ -206,6 +227,7 @@ impl Terminal {
             click_count: 0,
             master: pair.master,
             shell_pid,
+            pty_replies,
         })
     }
 
