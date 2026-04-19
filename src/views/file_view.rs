@@ -425,7 +425,13 @@ fn render_scoped(
         // hashed inside the closure). Diagnostics now render as an overlay
         // pass after the galley, so LSP updates no longer invalidate the
         // cached highlight.
-        let layout_salt = crate::util::hash64((font_size.to_bits(), &requested));
+        // Include the current UI theme name in the cache key. Without
+        // it, switching theme (e.g. crane-dark → crane-light) returned
+        // a stale galley whose foreground colors and glyph indices
+        // were baked against the previous theme + font atlas, showing
+        // up as scrambled / gibberish text until the file was edited.
+        let theme_name = theme::current().name.clone();
+        let layout_salt = crate::util::hash64((font_size.to_bits(), &requested, &theme_name));
         let cache_path = tab.path.clone();
         let cache_id = egui::Id::new(("file_view_layouter", &cache_path));
         let line_cache_id = egui::Id::new(("file_view_lines", &cache_path));
@@ -449,7 +455,8 @@ fn render_scoped(
             // lines below the first change), then rebuild the LayoutJob
             // from the cache. On a typical keystroke at the bottom of a
             // file this rehighlights exactly one line.
-            let context_hash = crate::util::hash64((&requested, syntax.name.as_str()));
+            let context_hash =
+                crate::util::hash64((&requested, syntax.name.as_str(), &theme_name));
             let mut line_cache: LineHighlightCache = ui
                 .memory(|m| m.data.get_temp::<LineHighlightCache>(line_cache_id))
                 .unwrap_or_default();
