@@ -573,6 +573,17 @@ impl App {
 
         if let Some(rx) = wt.git_rx.as_ref()
             && let Ok(status) = rx.try_recv() {
+                // Pull the branch name forward from the freshly-polled
+                // git status: branches renamed outside Crane (e.g.
+                // `git branch -m`) now show up on the next tick instead
+                // of being frozen at worktree-creation time. Canonical
+                // `name` updates; `display_name` alias stays intact.
+                if let Some(s) = status.as_ref()
+                    && !s.branch.is_empty()
+                    && s.branch != wt.name
+                {
+                    wt.name = s.branch.clone();
+                }
                 wt.git_status = status;
                 wt.last_status_refresh = Some(now);
                 wt.git_rx = None;
