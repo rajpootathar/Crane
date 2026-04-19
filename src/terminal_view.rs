@@ -1,6 +1,6 @@
 use crate::terminal::Terminal;
 use crate::theme;
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
@@ -161,9 +161,11 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             .display_iter
             .map(|item| (item.point, item.cell.clone()))
             .collect();
-        (cells, cursor, selection, offset)
+        // history_size lives on the Dimensions trait (Grid impls it).
+        let history = guard.history_size();
+        (cells, cursor, selection, offset, history)
     };
-    let (cells, (cursor_col, cursor_line), selection, display_offset) = snapshot;
+    let (cells, (cursor_col, cursor_line), selection, display_offset, history_size) = snapshot;
 
     // Group cells by line, then batch each line into a single LayoutJob
     // grouped by contiguous runs of same (fg, bg, flags). This cuts paint
@@ -312,6 +314,60 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         0.0,
         cursor_color,
     );
+
+    // Scrollbar — right-edge thumb whose height reflects the visible
+    // viewport's share of (history + viewport), and whose y reflects
+    // the current display_offset. Drag scrolls; no scrollbar drawn
+    // when there's no history yet.
+    let total = history_size + rows;
+    if history_size > 0 && total > rows {
+        let track_w = 6.0;
+        let track_rect = Rect::from_min_max(
+            Pos2::new(response.rect.max.x - track_w, response.rect.min.y),
+            Pos2::new(response.rect.max.x, response.rect.max.y),
+        );
+        let thumb_h = (track_rect.height() * rows as f32 / total as f32).max(20.0);
+        // display_offset = 0 → thumb at bottom; display_offset = history
+        // → thumb at top. The scrollable thumb range is
+        // (track_height - thumb_h).
+        let scrollable = (track_rect.height() - thumb_h).max(1.0);
+        let y_from_top =
+            scrollable * (1.0 - display_offset as f32 / history_size as f32);
+        let thumb_rect = Rect::from_min_size(
+            Pos2::new(track_rect.min.x, track_rect.min.y + y_from_top),
+            Vec2::new(track_w, thumb_h),
+        );
+        let t = theme::current();
+        let track_col = Color32::from_rgba_unmultiplied(255, 255, 255, 8);
+        painter.rect_filled(track_rect, 3.0, track_col);
+        let scroll_id = ui.id().with("terminal_scrollbar");
+        let thumb_resp = ui.interact(thumb_rect, scroll_id, egui::Sense::drag());
+        let thumb_col = if thumb_resp.dragged() {
+            t.accent.to_color32()
+        } else if thumb_resp.hovered() {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 90)
+        } else {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 55)
+        };
+        painter.rect_filled(thumb_rect, 3.0, thumb_col);
+        if thumb_resp.hovered() || thumb_resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+        }
+        if thumb_resp.dragged() {
+            let dy = thumb_resp.drag_delta().y;
+            // Drag down → positive dy → scroll toward newer content
+            // (decrease display_offset). One thumb-pixel equals
+            // `history / scrollable` history-lines.
+            let lines_per_px = history_size as f32 / scrollable;
+            let delta_lines = -(dy * lines_per_px).round() as i32;
+            if delta_lines != 0 {
+                terminal
+                    .term
+                    .lock()
+                    .scroll_display(Scroll::Delta(delta_lines));
+            }
+        }
+    }
 
     if !has_focus {
         return;
