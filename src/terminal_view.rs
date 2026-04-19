@@ -240,9 +240,32 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             buf.clear();
         };
 
-        for (_col, cell, in_selection) in row_cells.iter() {
+        // Walk columns strictly 0..cols_count, pulling the cell for
+        // each column from `row_cells`. This keeps buf's character
+        // count === visual column, which is the invariant that was
+        // being violated (resized grids occasionally emit display_iter
+        // cells with col values that no longer align to the current
+        // viewport, leading to packed/misaligned text). Row_cells was
+        // already sorted ascending above, so we walk both in lockstep.
+        let mut idx = 0;
+        let default_cell = alacritty_terminal::term::cell::Cell::default();
+        for col in 0..cols_count {
+            while idx < row_cells.len() && row_cells[idx].0 < col {
+                idx += 1;
+            }
+            let (cell, in_selection) = if idx < row_cells.len() && row_cells[idx].0 == col {
+                (&row_cells[idx].1, row_cells[idx].2)
+            } else {
+                (&default_cell, false)
+            };
+            // Skip the spacer half of a wide char — alacritty emits a
+            // WIDE_CHAR cell followed by a WIDE_CHAR_SPACER for east-
+            // asian glyphs; rendering both doubles them up visually.
+            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                continue;
+            }
             let fg = color_to_egui(cell.fg, true);
-            let bg = if *in_selection {
+            let bg = if in_selection {
                 selection_bg()
             } else {
                 color_to_egui(cell.bg, false)
@@ -254,7 +277,15 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                 cur_bg = Some(bg);
                 cur_underline = underline;
             }
-            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            // Sanitize control characters that would otherwise break
+            // galley layout. `\n` in particular was the smoking gun for
+            // the "ls rows appear continuous" bug — egui wraps internally
+            // on a newline, which collapses our row stride. `\t` / `\r`
+            // are equally wrong to emit verbatim; treat all as spaces.
+            let ch = match cell.c {
+                '\0' | '\n' | '\r' | '\t' => ' ',
+                c => c,
+            };
             buf.push(ch);
         }
         flush(&mut job, &mut buf, cur_fg, cur_bg, cur_underline);
