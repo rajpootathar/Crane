@@ -33,7 +33,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     };
 
     let t = theme::current();
-    let screen = ctx.screen_rect();
+    let screen = ctx.content_rect();
     let max_h = screen.height() - crate::ui_status::HEIGHT - 40.0;
     let max_w = screen.width() - 24.0;
     let width = app.branch_picker_width.clamp(MIN_WIDTH, max_w);

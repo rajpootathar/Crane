@@ -33,6 +33,9 @@ pub fn slug_for(project_path: &Path) -> String {
 }
 
 /// Returns (and creates if missing) the cache dir for `project_path`.
+/// Public API — first consumers will be the commit-tree index and
+/// fuzzy-file-finder recent list.
+#[allow(dead_code)]
 pub fn ensure_project_dir(project_path: &Path) -> Option<PathBuf> {
     let dir = root()?.join(slug_for(project_path));
     std::fs::create_dir_all(&dir).ok()?;
@@ -41,6 +44,7 @@ pub fn ensure_project_dir(project_path: &Path) -> Option<PathBuf> {
 
 /// Convenience: path to a named file inside the project's cache dir.
 /// Caller is responsible for creating/reading/writing the file itself.
+#[allow(dead_code)]
 pub fn file(project_path: &Path, name: &str) -> Option<PathBuf> {
     Some(ensure_project_dir(project_path)?.join(name))
 }

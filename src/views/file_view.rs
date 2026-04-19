@@ -131,8 +131,11 @@ pub fn render(
     workspace_root: Option<&std::path::Path>,
     prefs: EditorPrefs,
 ) {
+    // Scope widget ids by pane so unrelated Files panes don't share
+    // state (undo history, scroll positions, etc.) — the real work
+    // lives entirely in this function; there's no separate inner.
     ui.push_id(("files_pane", pane_id), |ui| {
-        render_inner(
+        render_scoped(
             ui,
             pane,
             font_size,
@@ -148,7 +151,7 @@ pub fn render(
     });
 }
 
-fn render_inner(
+fn render_scoped(
     ui: &mut egui::Ui,
     pane: &mut FilesPane,
     font_size: f32,
@@ -603,12 +606,28 @@ fn render_inner(
         let line_count = tab.content.split('\n').count().max(1);
         let digits = line_count.to_string().len().max(2);
         let gutter_font = FontId::new(font_size, FontFamily::Monospace);
-        let gutter_char_w = ui
-            .fonts_mut(|f| {
-                f.layout_no_wrap("0".to_string(), gutter_font.clone(), Color32::WHITE)
-            })
-            .size()
-            .x;
+        // Cache the monospace glyph width per font size in egui memory
+        // so we're not doing a full font layout every frame just to
+        // measure the number "0".
+        let gutter_char_w = {
+            let key = egui::Id::new(("gutter_char_w", font_size.to_bits()));
+            if let Some(w) = ui.memory(|m| m.data.get_temp::<f32>(key)) {
+                w
+            } else {
+                let w = ui
+                    .fonts_mut(|f| {
+                        f.layout_no_wrap(
+                            "0".to_string(),
+                            gutter_font.clone(),
+                            Color32::WHITE,
+                        )
+                    })
+                    .size()
+                    .x;
+                ui.memory_mut(|m| m.data.insert_temp(key, w));
+                w
+            }
+        };
         let gutter_w = gutter_char_w * digits as f32 + 16.0;
         // Image files: decode + upload a GPU texture once, then display.
         if is_image_path(&tab.path) {
@@ -961,25 +980,18 @@ fn render_file_status_strip(
     let lang = language_label(&tab.path);
 
     let mut clicked_sev: Option<u8> = None;
+    let pills: [(&str, usize, Color32, u8); 3] = [
+        (icons::X_CIRCLE, e, t.error.to_color32(), 1),
+        (icons::WARNING, w, Color32::from_rgb(226, 192, 80), 2),
+        (icons::INFO, i, t.accent.to_color32(), 3),
+    ];
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.horizontal_centered(|ui| {
-            ui.add_space(8.0);
-            if sev_button(ui, icons::X_CIRCLE, e, t.error.to_color32(), t.text_muted.to_color32()) {
-                clicked_sev = Some(1);
-            }
-            ui.add_space(8.0);
-            if sev_button(
-                ui,
-                icons::WARNING,
-                w,
-                Color32::from_rgb(226, 192, 80),
-                t.text_muted.to_color32(),
-            ) {
-                clicked_sev = Some(2);
-            }
-            ui.add_space(8.0);
-            if sev_button(ui, icons::INFO, i, t.accent.to_color32(), t.text_muted.to_color32()) {
-                clicked_sev = Some(3);
+            for (icon, count, active_color, sev) in pills {
+                ui.add_space(8.0);
+                if sev_button(ui, icon, count, active_color, t.text_muted.to_color32()) {
+                    clicked_sev = Some(sev);
+                }
             }
 
             ui.with_layout(
