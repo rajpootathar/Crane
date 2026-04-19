@@ -410,14 +410,22 @@ fn render_repo_section(
         for b in &local_filtered {
             let existing_wt = if match_existing { existing.get(*b).copied() } else { None };
             let is_active = existing_wt.map(|(w, _)| w == active_wid).unwrap_or(false);
-            match row(
-                ui,
-                b,
-                is_active,
-                existing_wt.is_some(),
-                if multi_repo { 2 } else { 1 },
-                t,
-            ) {
+            // Scope every row's widget ids by (repo, local, branch) —
+            // without this, `main` appearing in Local + origin + another
+            // repo all share the same egui id and trigger clash overlays.
+            let action = ui
+                .push_id((repo_root, "local", b.as_str()), |ui| {
+                    row(
+                        ui,
+                        b,
+                        is_active,
+                        existing_wt.is_some(),
+                        if multi_repo { 2 } else { 1 },
+                        t,
+                    )
+                })
+                .inner;
+            match action {
                 RowAction::Primary => {
                     if let Some((w, tab)) = existing_wt {
                         *switch_to = Some((w, tab));
@@ -452,14 +460,19 @@ fn render_repo_section(
         for b in branches {
             let existing_wt = if match_existing { existing.get(b.as_str()).copied() } else { None };
             let is_active = existing_wt.map(|(w, _)| w == active_wid).unwrap_or(false);
-            match row(
-                ui,
-                b,
-                is_active,
-                existing_wt.is_some(),
-                if multi_repo { 2 } else { 1 },
-                t,
-            ) {
+            let action = ui
+                .push_id((repo_root, "remote", remote.as_str(), b.as_str()), |ui| {
+                    row(
+                        ui,
+                        b,
+                        is_active,
+                        existing_wt.is_some(),
+                        if multi_repo { 2 } else { 1 },
+                        t,
+                    )
+                })
+                .inner;
+            match action {
                 RowAction::Primary => {
                     if let Some((w, tab)) = existing_wt {
                         *switch_to = Some((w, tab));
@@ -596,9 +609,11 @@ fn row(
             ),
             egui::vec2(icon_size, icon_size),
         );
+        // Row itself is already scoped via ui.push_id by the caller, so
+        // a constant local salt is enough to disambiguate body vs icon.
         let icon_resp = ui.interact(
             icon_rect,
-            ui.id().with(("in_place", branch)),
+            ui.id().with("in_place_icon"),
             egui::Sense::click(),
         );
         let icon_color = if icon_resp.hovered() {
