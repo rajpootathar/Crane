@@ -1,6 +1,6 @@
-use crate::terminal_view;
+use crate::terminal::view;
 use crate::views::{browser_view, diff_view, file_view, markdown_view};
-use crate::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
+use crate::state::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
 use egui_phosphor::regular as icons;
@@ -361,7 +361,7 @@ fn render_pane(
     // to detect them, so this helps both speed and the "red flash" bug.
     child.push_id(("pane_body", id), |child| match &mut pane.content {
         PaneContent::Terminal(term) => {
-            terminal_view::render_terminal(child, term, font_size, is_focus);
+            crate::terminal::view::render_terminal(child, term, font_size, is_focus);
         }
         PaneContent::Files(files) => {
             file_view::render(

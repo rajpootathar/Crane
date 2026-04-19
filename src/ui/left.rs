@@ -1,5 +1,5 @@
 use crate::state::App;
-use crate::ui_util::{
+use crate::ui::util::{
     accent, draw_row, draw_trailing, full_width_primary_button, RowConfig,
 };
 use egui::{Color32, Pos2, Rect, RichText, Stroke};

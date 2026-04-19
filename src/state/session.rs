@@ -1,8 +1,8 @@
 use crate::state::{
     App, Project, RightTab, Tab, Workspace, WorkspaceId, TabId, ProjectId,
 };
-use crate::update_check::{PromptState, UpdateCheck};
-use crate::layout::{
+use crate::update::check::{PromptState, UpdateCheck};
+use crate::state::layout::{
     self, BrowserPane, DiffPane, Dir, FileTab, FilesPane, Layout, MarkdownPane, Node, Pane,
     PaneContent, PaneId,
 };

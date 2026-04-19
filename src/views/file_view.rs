@@ -1,4 +1,4 @@
-use crate::layout::FilesPane;
+use crate::state::layout::FilesPane;
 use crate::lsp::Diagnostic;
 use crate::theme;
 use crate::views::diagnostics_overlay;
@@ -846,7 +846,7 @@ fn render_scoped(
 /// Right: Ln/Col · indent · language.
 fn render_file_status_strip(
     ui: &mut egui::Ui,
-    tab: &mut crate::layout::FileTab,
+    tab: &mut crate::state::layout::FileTab,
     diagnostics: &[Diagnostic],
     height: f32,
 ) {
@@ -966,7 +966,7 @@ fn count_by_severity(diags: &[Diagnostic]) -> (usize, usize, usize) {
 }
 
 fn jump_to_next_diagnostic(
-    tab: &mut crate::layout::FileTab,
+    tab: &mut crate::state::layout::FileTab,
     diags: &[Diagnostic],
     sev: u8,
     from_line: u32,
@@ -1120,7 +1120,7 @@ struct FindBarOutcome {
 /// which navigation action was triggered this frame (close / next /
 /// prev). Mutates only the editable query string; the caller is
 /// responsible for clearing `tab.find_query` on close.
-fn render_find_bar(ui: &mut egui::Ui, tab: &mut crate::layout::FileTab) -> FindBarOutcome {
+fn render_find_bar(ui: &mut egui::Ui, tab: &mut crate::state::layout::FileTab) -> FindBarOutcome {
     let mut close = false;
     let mut next = false;
     let mut prev = false;
@@ -1220,7 +1220,7 @@ fn render_find_bar(ui: &mut egui::Ui, tab: &mut crate::layout::FileTab) -> FindB
 /// is set, the save is refused — the caller is expected to surface the
 /// banner that lets the user pick Reload / Overwrite (force) / Cancel.
 fn save_tab(
-    tab: &mut crate::layout::FileTab,
+    tab: &mut crate::state::layout::FileTab,
     prefs: EditorPrefs,
     format_before_save: &dyn Fn(&str, &str) -> Option<String>,
     notify_saved: &dyn Fn(&str, &str),
@@ -1251,7 +1251,7 @@ fn save_tab(
 /// `tab.external_change` when the mtime advanced AND the disk bytes
 /// differ from what we'd write. Called once per render for the active
 /// tab — cheap on SSDs and gated by the mtime check.
-fn poll_external_change(tab: &mut crate::layout::FileTab) {
+fn poll_external_change(tab: &mut crate::state::layout::FileTab) {
     if tab.external_change {
         return;
     }
@@ -1282,7 +1282,7 @@ fn poll_external_change(tab: &mut crate::layout::FileTab) {
 }
 
 /// Reload the active tab from disk, discarding any unsaved edits.
-fn reload_tab(tab: &mut crate::layout::FileTab) {
+fn reload_tab(tab: &mut crate::state::layout::FileTab) {
     let Ok(disk_content) = std::fs::read_to_string(&tab.path) else {
         return;
     };

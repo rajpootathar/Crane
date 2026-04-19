@@ -26,7 +26,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     if !app.branch_picker.open {
         return;
     }
-    crate::ui_status::poll_branch_picker(app);
+    crate::ui::status::poll_branch_picker(app);
     let Some((pid, wid, _)) = app.active else {
         app.branch_picker.open = false;
         return;
@@ -34,7 +34,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
 
     let t = theme::current();
     let screen = ctx.content_rect();
-    let max_h = screen.height() - crate::ui_status::HEIGHT - 40.0;
+    let max_h = screen.height() - crate::ui::status::HEIGHT - 40.0;
     let max_w = screen.width() - 24.0;
     let width = app.branch_picker.width.clamp(MIN_WIDTH, max_w);
     let height = app.branch_picker.height.clamp(MIN_HEIGHT, max_h);
@@ -42,7 +42,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     app.branch_picker.height = height;
 
     // Fixed position: bottom-left, floating just above the status bar.
-    let bottom = screen.max.y - crate::ui_status::HEIGHT - 6.0;
+    let bottom = screen.max.y - crate::ui::status::HEIGHT - 6.0;
     let left = screen.min.x + 12.0;
     let top = bottom - height;
     let right = left + width;

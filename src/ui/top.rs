@@ -1,6 +1,6 @@
 use crate::state::App;
-use crate::ui_util::icon_button;
-use crate::layout::{BrowserPane, Dir, PaneContent};
+use crate::ui::util::icon_button;
+use crate::state::layout::{BrowserPane, Dir, PaneContent};
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
 

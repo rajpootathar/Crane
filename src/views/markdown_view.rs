@@ -1,4 +1,4 @@
-use crate::layout::MarkdownPane;
+use crate::state::layout::MarkdownPane;
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::path::Path;

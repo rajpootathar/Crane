@@ -1,24 +1,12 @@
-mod branch_picker;
 mod format;
 mod git;
-mod layout;
 mod lsp;
 mod modals;
-mod pane_view;
-mod project_cache;
-mod session;
-mod settings;
 mod state;
 mod terminal;
-mod terminal_view;
 mod theme;
-mod ui_left;
-mod ui_right;
-mod ui_status;
-mod ui_top;
-mod ui_util;
-mod update_check;
-mod updater;
+mod ui;
+mod update;
 mod util;
 mod views;
 
@@ -29,9 +17,9 @@ use modals::{
 };
 
 use eframe::egui;
-use layout::Dir;
-use pane_view::PaneAction;
 use state::App;
+use state::layout::Dir;
+use ui::pane_view::PaneAction;
 
 fn main() -> eframe::Result {
     env_logger::init();
@@ -240,10 +228,10 @@ struct CraneApp {
     last_saved_snapshot: String,
     last_saved_settings_snapshot: String,
     last_save_at: std::time::Instant,
-    pending_close: Option<layout::PaneId>,
+    pending_close: Option<state::layout::PaneId>,
 }
 
-fn terminal_is_running(app: &App, id: layout::PaneId) -> bool {
+fn terminal_is_running(app: &App, id: state::layout::PaneId) -> bool {
     let Some(layout) = app.active_layout_ref() else {
         return false;
     };
@@ -251,7 +239,7 @@ fn terminal_is_running(app: &App, id: layout::PaneId) -> bool {
         return false;
     };
     match &pane.content {
-        layout::PaneContent::Terminal(t) => t.has_foreground_process(),
+        state::layout::PaneContent::Terminal(t) => t.has_foreground_process(),
         _ => false,
     }
 }
@@ -300,13 +288,13 @@ impl CraneApp {
         cc.egui_ctx
             .request_repaint_after(std::time::Duration::from_millis(1500));
         migrate_config_dir();
-        let mut app = match session::load() {
+        let mut app = match state::session::load() {
             Some(s) => s.restore(&cc.egui_ctx),
             None => App::new(),
         };
         // settings.json (user prefs) takes precedence over any matching
         // keys that may still live in session.json from older installs.
-        settings::Settings::load().apply(&mut app);
+        state::settings::Settings::load().apply(&mut app);
         theme::ensure_builtin_tomls_on_disk();
         let initial = theme::find_by_name(&app.selected_theme)
             .unwrap_or_else(theme::Theme::dark);
@@ -332,7 +320,7 @@ impl CraneApp {
         let mut placed = false;
         if let Some(layout) = self.app.active_layout_ref() {
             for (_, p) in &layout.panes {
-                if matches!(&p.content, layout::PaneContent::Files(_)) {
+                if matches!(&p.content, state::layout::PaneContent::Files(_)) {
                     placed = true;
                     break;
                 }
@@ -351,7 +339,7 @@ impl CraneApp {
         }
         if let Some(layout) = self.app.active_layout() {
             for (_, pane) in layout.panes.iter_mut() {
-                if let layout::PaneContent::Files(files) = &mut pane.content {
+                if let state::layout::PaneContent::Files(files) = &mut pane.content {
                     // Make sure the target file is a tab in this pane.
                     let idx = files.tabs.iter().position(|t| t.path == path_str);
                     let idx = match idx {
@@ -416,14 +404,14 @@ impl CraneApp {
     }
 
     fn maybe_save(&mut self) {
-        if self.last_save_at.elapsed() < session::SAVE_DEBOUNCE {
+        if self.last_save_at.elapsed() < state::session::SAVE_DEBOUNCE {
             return;
         }
         // Serialise on the render thread (fast — bytes for a modest
         // session ≈ tens of KB), diff against the last snapshot, then
         // hand the bytes to a background thread to write. The UI never
         // blocks on fsync.
-        let session_value = session::Session::from_app(&self.app);
+        let session_value = state::session::Session::from_app(&self.app);
         let bytes = match serde_json::to_vec_pretty(&session_value) {
             Ok(b) => b,
             Err(_) => return,
@@ -436,7 +424,7 @@ impl CraneApp {
             self.last_save_at = std::time::Instant::now();
             return;
         }
-        let path = session::session_file();
+        let path = state::session::session_file();
         std::thread::spawn(move || {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -451,7 +439,7 @@ impl CraneApp {
 
         // User prefs live in a separate file (~/.crane/settings.json) so
         // they stay intact even when the session gets wiped.
-        let settings = settings::Settings::from_app(&self.app);
+        let settings = state::settings::Settings::from_app(&self.app);
         if let Ok(s_bytes) = serde_json::to_vec_pretty(&settings) {
             let s_snap = String::from_utf8_lossy(&s_bytes).to_string();
             if s_snap != self.last_saved_settings_snapshot {
@@ -542,7 +530,7 @@ impl CraneApp {
                 // (or only) tab — user's expectation.
                 let closed_file_tab = if let Some(ws) = self.app.active_layout()
                     && let Some(pane) = ws.panes.get_mut(&id)
-                    && let layout::PaneContent::Files(files) = &mut pane.content
+                    && let state::layout::PaneContent::Files(files) = &mut pane.content
                     && files.tabs.len() > 1
                 {
                     let idx = files.active.min(files.tabs.len() - 1);
@@ -617,7 +605,7 @@ impl eframe::App for CraneApp {
         // Reserve a strip along the very bottom for the status bar. Panels
         // and center content compute their height above it.
         let status_bar_rect = egui::Rect::from_min_max(
-            egui::pos2(full.min.x, full.max.y - ui_status::HEIGHT),
+            egui::pos2(full.min.x, full.max.y - ui::status::HEIGHT),
             full.max,
         );
         let content_bottom = status_bar_rect.min.y;
@@ -646,7 +634,7 @@ impl eframe::App for CraneApp {
             );
             let mut left_ui = ui.new_child(egui::UiBuilder::new().max_rect(left_rect));
             left_ui.set_clip_rect(left_rect);
-            ui_left::render(&mut left_ui, &mut self.app, &ctx);
+            ui::left::render(&mut left_ui, &mut self.app, &ctx);
 
             // 6 px drag handle straddling the right edge of the Left Panel.
             let handle = egui::Rect::from_min_max(
@@ -681,7 +669,7 @@ impl eframe::App for CraneApp {
             );
             let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(right_rect));
             right_ui.set_clip_rect(right_rect);
-            ui_right::render(&mut right_ui, &mut self.app);
+            ui::right::render(&mut right_ui, &mut self.app);
 
             let handle = egui::Rect::from_min_max(
                 egui::pos2(right_rect.min.x - 3.0, right_rect.min.y),
@@ -706,10 +694,10 @@ impl eframe::App for CraneApp {
 
         let mut center_ui = ui.new_child(egui::UiBuilder::new().max_rect(center_rect));
         center_ui.set_clip_rect(center_rect);
-        ui_top::render(&mut center_ui, &mut self.app, &ctx);
+        ui::top::render(&mut center_ui, &mut self.app, &ctx);
 
         let canvas_rect = egui::Rect::from_min_max(
-            egui::pos2(center_rect.min.x, center_rect.min.y + ui_top::TOTAL_H),
+            egui::pos2(center_rect.min.x, center_rect.min.y + ui::top::TOTAL_H),
             center_rect.max,
         );
         let font_size = self.app.font_size;
@@ -721,7 +709,7 @@ impl eframe::App for CraneApp {
             std::collections::HashMap::new();
         if let Some(layout_ref) = self.app.active_layout_ref() {
             for (_, p) in &layout_ref.panes {
-                if let layout::PaneContent::Files(f) = &p.content {
+                if let state::layout::PaneContent::Files(f) = &p.content {
                     for t in &f.tabs {
                         diag_map.insert(
                             t.path.clone(),
@@ -766,7 +754,7 @@ impl eframe::App for CraneApp {
         };
         if self.app.active_layout().is_some() {
             if let Some(ws) = self.app.active_layout() {
-                let action = pane_view::render_layout(
+                let action = ui::pane_view::render_layout(
                     &mut center_ui,
                     ws,
                     font_size,
@@ -785,7 +773,7 @@ impl eframe::App for CraneApp {
                     PaneAction::Close(id) => {
                         let running = matches!(
                             ws.panes.get(&id).map(|p| &p.content),
-                            Some(layout::PaneContent::Terminal(t)) if t.has_foreground_process()
+                            Some(state::layout::PaneContent::Terminal(t)) if t.has_foreground_process()
                         );
                         if running {
                             self.pending_close = Some(id);
@@ -873,8 +861,8 @@ impl eframe::App for CraneApp {
         // Global status bar — active file's diagnostics, language, path.
         let mut status_ui = ui.new_child(egui::UiBuilder::new().max_rect(status_bar_rect));
         status_ui.set_clip_rect(status_bar_rect);
-        ui_status::render(&mut status_ui, &mut self.app);
-        branch_picker::render(&ctx, &mut self.app);
+        ui::status::render(&mut status_ui, &mut self.app);
+        ui::branch_picker::render(&ctx, &mut self.app);
         self.app.sync_lsp_changes(&ctx);
         self.maybe_save();
     }

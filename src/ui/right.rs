@@ -1,6 +1,6 @@
 use crate::git::{self, FileChange};
 use crate::state::{App, RightTab};
-use crate::ui_util::{
+use crate::ui::util::{
     draw_row, draw_trailing, section_header,
     RowConfig, accent, muted, text,
 };

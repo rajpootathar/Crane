@@ -79,9 +79,9 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                     });
                     ui.add_space(10.0);
                     let dmg_url = dmg_url_for(&version);
-                    let supports_in_app = crate::updater::Updater::is_supported_platform()
+                    let supports_in_app = crate::update::apply::Updater::is_supported_platform()
                         && dmg_url.is_some();
-                    use crate::updater::UpdateState;
+                    use crate::update::apply::UpdateState;
                     match app.updater.state() {
                         UpdateState::Downloading { bytes } => {
                             ui.label(

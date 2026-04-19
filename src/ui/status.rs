@@ -4,7 +4,7 @@
 //! concerns (diagnostics, cursor, indent, language) live in the Files
 //! pane's own status strip — this bar is Workspace chrome.
 
-use crate::layout::PaneContent;
+use crate::state::layout::PaneContent;
 use crate::state::App;
 use crate::theme;
 use egui::RichText;

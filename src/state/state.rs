@@ -1,6 +1,6 @@
 use crate::git::{self, GitStatus};
-use crate::layout::Layout;
-use crate::update_check::UpdateCheck;
+use crate::state::layout::Layout;
+use crate::update::check::UpdateCheck;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -231,7 +231,7 @@ pub struct App {
     pub collapsed_change_dirs: HashSet<String>,
     pub new_workspace_modal: Option<NewWorkspaceModal>,
     pub update_check: UpdateCheck,
-    pub updater: crate::updater::Updater,
+    pub updater: crate::update::apply::Updater,
     pub selected_theme: String,
     pub show_settings: bool,
     pub settings_section: SettingsSection,
@@ -280,7 +280,7 @@ impl App {
             collapsed_change_dirs: HashSet::new(),
             new_workspace_modal: None,
             update_check: UpdateCheck::new(Default::default()),
-            updater: crate::updater::Updater::new(),
+            updater: crate::update::apply::Updater::new(),
             selected_theme: "crane-dark".to_string(),
             show_settings: false,
             settings_section: SettingsSection::Appearance,
@@ -437,7 +437,7 @@ impl App {
     }
 
     fn active_file_path_str(&self) -> Option<String> {
-        use crate::layout::PaneContent;
+        use crate::state::layout::PaneContent;
         let layout = self.active_layout_ref()?;
         if let Some(id) = layout.focus
             && let Some(p) = layout.panes.get(&id)
@@ -540,7 +540,7 @@ impl App {
         };
         let configs_snapshot = self.language_configs.clone();
         for (_, pane) in tab.layout.panes.iter_mut() {
-            if let crate::layout::PaneContent::Files(files) = &mut pane.content {
+            if let crate::state::layout::PaneContent::Files(files) = &mut pane.content {
                 for ft in files.tabs.iter_mut() {
                     let path = std::path::Path::new(&ft.path);
                     if !self.lsp.is_tracked(path) {
@@ -566,7 +566,7 @@ impl App {
     fn push_tab(
         &mut self,
         ctx: &egui::Context,
-        initial_content: Option<crate::layout::PaneContent>,
+        initial_content: Option<crate::state::layout::PaneContent>,
         tab_name: Option<String>,
     ) {
         let (pid, wid) = match self.active.map(|(p, w, _)| (p, w)).or(self.last_workspace) {

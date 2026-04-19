@@ -1,4 +1,4 @@
-use crate::layout::DiffPane;
+use crate::state::layout::DiffPane;
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
 use similar::{ChangeTag, TextDiff};
 
