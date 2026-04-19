@@ -60,13 +60,8 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         if icon_button(ui, right_label, 16.0, "Toggle Right Panel (Cmd+/)").clicked() {
             app.show_right = !app.show_right;
         }
-        ui.separator();
-        if icon_button(ui, icons::GEAR, 16.0, "Settings").clicked() {
-            app.show_settings = !app.show_settings;
-        }
-        if icon_button(ui, icons::QUESTION, 16.0, "Keyboard shortcuts").clicked() {
-            app.show_help = !app.show_help;
-        }
+        // Settings / Help live in the status bar bottom-right now;
+        // top bar stays focused on layout chrome.
         ui.separator();
         let mut split_content: Option<PaneContent> = None;
         if ui

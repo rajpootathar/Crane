@@ -301,21 +301,26 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
             } else {
                 t.text_muted.to_color32()
             };
-            // Two diagonal ticks forming a resize indicator.
+            // Two diagonal ticks flush with the outer corner. Previously
+            // sat 2px inset which looked detached from the frame border;
+            // hugging the edge gives the grip a clearer "grab here" cue
+            // and respects the corner radius.
             let painter = ui.painter();
+            let right = handle_rect.max.x;
+            let top = handle_rect.min.y;
             painter.line_segment(
                 [
-                    egui::pos2(handle_rect.max.x - 2.0, handle_rect.min.y + 8.0),
-                    egui::pos2(handle_rect.max.x - 8.0, handle_rect.min.y + 2.0),
+                    egui::pos2(right, top + 10.0),
+                    egui::pos2(right - 10.0, top),
                 ],
-                egui::Stroke::new(1.5, grip_color),
+                egui::Stroke::new(1.75, grip_color),
             );
             painter.line_segment(
                 [
-                    egui::pos2(handle_rect.max.x - 2.0, handle_rect.min.y + 12.0),
-                    egui::pos2(handle_rect.max.x - 12.0, handle_rect.min.y + 2.0),
+                    egui::pos2(right, top + 14.0),
+                    egui::pos2(right - 14.0, top),
                 ],
-                egui::Stroke::new(1.5, grip_color),
+                egui::Stroke::new(1.75, grip_color),
             );
             if handle_resp.hovered() || handle_resp.dragged() {
                 ctx.set_cursor_icon(egui::CursorIcon::ResizeNeSw);

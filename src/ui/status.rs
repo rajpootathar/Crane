@@ -61,6 +61,42 @@ pub fn render(ui: &mut egui::Ui, app: &mut App) {
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     ui.add_space(10.0);
+                    // Settings + Help pinned to the bar's far right.
+                    // Frameless buttons so they blend with the bar.
+                    let mk = |glyph: &'static str| {
+                        egui::Button::new(
+                            RichText::new(glyph)
+                                .size(13.0)
+                                .color(t.text_muted.to_color32()),
+                        )
+                        .frame(false)
+                        .min_size(egui::vec2(22.0, 20.0))
+                    };
+                    if ui
+                        .add(mk(icons::QUESTION))
+                        .on_hover_text("Keyboard shortcuts")
+                        .clicked()
+                    {
+                        app.show_help = !app.show_help;
+                    }
+                    if ui
+                        .add(mk(icons::GEAR))
+                        .on_hover_text("Settings")
+                        .clicked()
+                    {
+                        app.show_settings = !app.show_settings;
+                    }
+                    ui.add_space(4.0);
+                    // Divider between chrome buttons and the path.
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(1.0, 14.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().line_segment(
+                        [rect.left_top(), rect.left_bottom()],
+                        egui::Stroke::new(1.0, t.divider.to_color32()),
+                    );
+                    ui.add_space(6.0);
                     if let Some(path) = &active_path {
                         let shown = relative_to_workspace(app, path);
                         ui.label(

@@ -12,7 +12,7 @@ mod views;
 
 use modals::{
     render_empty_state, render_help_modal, render_lsp_download_toast,
-    render_lsp_install_prompt, render_new_workspace_modal, render_settings_modal,
+    render_lsp_install_prompt, render_missing_project_modal, render_new_workspace_modal, render_settings_modal,
     render_update_toast,
 };
 
@@ -797,6 +797,7 @@ impl eframe::App for CraneApp {
             render_empty_state(&mut center_ui, &mut self.app, &ctx, inset);
         }
 
+        render_missing_project_modal(&ctx, &mut self.app);
         render_new_workspace_modal(&ctx, &mut self.app);
         render_help_modal(&ctx, &mut self.app);
         let settings_effect = render_settings_modal(&ctx, &mut self.app, apply_style);

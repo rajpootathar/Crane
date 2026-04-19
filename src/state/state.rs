@@ -54,6 +54,11 @@ pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub path: PathBuf,
+    /// True when the folder on disk was missing the last time we
+    /// looked. Git / LSP / new-tab / worktree-add all no-op on missing
+    /// projects; the user sees a "Project Not Found" modal offering
+    /// Relocate / Close.
+    pub missing: bool,
     pub workspaces: Vec<Workspace>,
     pub expanded: bool,
     /// Most recently active workspace within this project. Restored on
@@ -253,6 +258,9 @@ pub struct App {
     /// `Workspace::display_name`, not `name` — the canonical folder /
     /// branch label is preserved, the custom alias just decorates.
     pub renaming_workspace: Option<(ProjectId, WorkspaceId, String)>,
+    /// Queue of projects whose root folder was missing at session
+    /// restore. The `missing_project` modal dequeues one at a time.
+    pub missing_project_modals: Vec<ProjectId>,
     /// In-flight goto-definition requests. Each tick we poll these for
     /// results and land at most one successful jump. A 5 s watchdog
     /// drops any request that never comes back so we don't leak ids.
@@ -296,6 +304,7 @@ impl App {
             branch_picker: BranchPickerState::default(),
             renaming_tab: None,
             renaming_workspace: None,
+            missing_project_modals: Vec::new(),
             pending_gotos: Vec::new(),
             repo_branch_cache: std::collections::HashMap::new(),
             next_project: 1,
@@ -382,6 +391,7 @@ impl App {
             id,
             name,
             path,
+            missing: false,
             workspaces,
             expanded: true,
             last_active_workspace: first_active.map(|(wt, _)| wt),
@@ -627,6 +637,15 @@ impl App {
 
     pub fn refresh_active_git_status(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
+        // Skip polls on projects whose root folder is gone. Spares us
+        // a pile of spurious "fatal: not a git repository" subprocess
+        // errors per tick while the user hasn't relocated yet.
+        if let Some((pid, _, _)) = self.active
+            && let Some(p) = self.projects.iter().find(|p| p.id == pid)
+            && p.missing
+        {
+            return;
+        }
         let wt = match self.active_workspace_mut() {
             Some(w) => w,
             None => return,

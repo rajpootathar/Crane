@@ -249,10 +249,16 @@ impl Session {
                     git_rx: None,
                 });
             }
+            // Stat the folder on restore. Missing projects still load
+            // (so they keep their ids + expanded state) but all git /
+            // LSP / terminal / worktree actions skip them until the
+            // user relocates or removes via the modal.
+            let missing = !sp.path.exists();
             app.projects.push(Project {
                 id: sp.id,
                 name: sp.name,
                 path: sp.path,
+                missing,
                 expanded: sp.expanded,
                 workspaces,
                 last_active_workspace: sp.last_active_workspace,
@@ -262,6 +268,9 @@ impl Session {
                     .and_then(crate::state::LocationMode::parse),
                 preferred_custom_path: sp.preferred_custom_path,
             });
+            if missing {
+                app.missing_project_modals.push(sp.id);
+            }
         }
 
         app.active = self.active;
