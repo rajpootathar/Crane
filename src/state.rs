@@ -141,6 +141,15 @@ impl NewWorkspaceModal {
     }
 }
 
+/// One in-flight goto-definition request. `dispatched_at` lets us drop
+/// requests that never come back (slow LSP, crashed server) so the
+/// list doesn't leak.
+pub struct PendingGoto {
+    pub server: crate::lsp::ServerKey,
+    pub request_id: i64,
+    pub dispatched_at: Instant,
+}
+
 pub struct App {
     pub projects: Vec<Project>,
     pub active: Option<(ProjectId, WorkspaceId, TabId)>,
@@ -184,6 +193,10 @@ pub struct App {
     /// `Workspace::display_name`, not `name` — the canonical folder /
     /// branch label is preserved, the custom alias just decorates.
     pub renaming_workspace: Option<(ProjectId, WorkspaceId, String)>,
+    /// In-flight goto-definition requests. Each tick we poll these for
+    /// results and land at most one successful jump. A 5 s watchdog
+    /// drops any request that never comes back so we don't leak ids.
+    pub pending_gotos: Vec<PendingGoto>,
     pub branch_picker_loading: bool,
     pub branch_picker_rx:
         Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Vec<String>, Vec<String>)>>>,
@@ -237,6 +250,7 @@ impl App {
             branch_picker_error: None,
             renaming_tab: None,
             renaming_workspace: None,
+            pending_gotos: Vec::new(),
             branch_picker_loading: false,
             branch_picker_rx: None,
             branch_picker_repos: Vec::new(),

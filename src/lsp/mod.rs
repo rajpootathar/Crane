@@ -336,21 +336,39 @@ impl LspManager {
         out
     }
 
-    pub fn goto_definition(
+    /// Fire-and-forget goto-definition. Dispatches the request against
+    /// every server attached to `path`; returns one (ServerKey, id)
+    /// token per dispatched server. Caller polls those tokens via
+    /// `take_goto_result`. Previously this method blocked the render
+    /// thread for up to 1.5s per server — rolled up on slow LSPs.
+    pub fn goto_dispatch(
         &self,
         path: &Path,
         line: u32,
         character: u32,
-    ) -> Option<Location> {
-        let keys = self.files.read().get(path).cloned()?;
+    ) -> Vec<(ServerKey, i64)> {
+        let Some(keys) = self.files.read().get(path).cloned() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
         for key in keys {
             if let Some(s) = self.servers.get(&key)
-                && let Some(loc) = s.goto_definition(path, line, character)
+                && let Some(id) = s.goto_definition_dispatch(path, line, character)
             {
-                return Some(loc);
+                out.push((key, id));
             }
         }
-        None
+        out
+    }
+
+    /// Outer Some = result available (inner Some = location, inner None
+    /// = server returned null). Outer None = still waiting.
+    pub fn take_goto_result(
+        &self,
+        key: ServerKey,
+        id: i64,
+    ) -> Option<Option<Location>> {
+        self.servers.get(&key)?.take_definition_result(id)
     }
 
     #[allow(dead_code)] // UI wiring deferred; tier-3 LSP feature.

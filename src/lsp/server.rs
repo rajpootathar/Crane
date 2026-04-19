@@ -601,12 +601,15 @@ impl LspServer {
         g.hover_results.remove(&id).flatten()
     }
 
-    pub fn goto_definition(
+    /// Fire-and-forget: sends the definition request and returns the
+    /// request id (to be polled via `take_definition_result`). Returns
+    /// None if the server isn't usable right now. Non-blocking.
+    pub fn goto_definition_dispatch(
         &self,
         path: &Path,
         line: u32,
         character: u32,
-    ) -> Option<Location> {
+    ) -> Option<i64> {
         if self.is_dead() || !self.shared.0.lock().initialized {
             return None;
         }
@@ -622,9 +625,32 @@ impl LspServer {
                 "position": { "line": line, "character": character }
             }
         }));
-        // Blocks the UI briefly — only triggered by explicit Cmd+click or
-        // F12, not per-frame. 1500 ms is enough for rust-analyzer on a
-        // cold cache; still feels reasonably responsive.
+        Some(id)
+    }
+
+    /// Outer Option: Some(_) = result arrived and was taken (inner Some =
+    /// got a location, inner None = server returned null). Outer None =
+    /// still waiting. Non-blocking.
+    pub fn take_definition_result(&self, id: i64) -> Option<Option<Location>> {
+        let mut g = self.shared.0.lock();
+        if g.definition_results.contains_key(&id) {
+            Some(g.definition_results.remove(&id).flatten())
+        } else {
+            None
+        }
+    }
+
+    /// Legacy synchronous wrapper kept as a short blocking fallback for
+    /// code paths that haven't been migrated. New callers should use
+    /// the dispatch + poll pair above.
+    #[allow(dead_code)]
+    pub fn goto_definition(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Option<Location> {
+        let id = self.goto_definition_dispatch(path, line, character)?;
         let deadline = Instant::now() + Duration::from_millis(1500);
         let (m, cv) = &*self.shared;
         let mut g = m.lock();

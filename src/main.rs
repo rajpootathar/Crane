@@ -827,15 +827,48 @@ impl eframe::App for CraneApp {
                 &self.app.language_configs,
             );
         }
+        // Dispatch any goto-definition requests queued this frame
+        // without blocking on a response. The LSP reader thread will
+        // wake us via ctx.request_repaint() when the result arrives.
         for (path, line, character) in goto_queue.into_inner() {
-            if let Some(loc) = self.app.lsp.goto_definition(
+            let tokens = self.app.lsp.goto_dispatch(
                 std::path::Path::new(&path),
                 line,
                 character,
-            ) {
-                self.goto_location(&ctx, loc);
+            );
+            for (server, request_id) in tokens {
+                self.app.pending_gotos.push(state::PendingGoto {
+                    server,
+                    request_id,
+                    dispatched_at: std::time::Instant::now(),
+                });
             }
         }
+
+        // Drain ready goto results. Jump to the first successful
+        // location and drop any of its siblings (multiple LSPs per
+        // file) so we don't double-navigate. 5s watchdog prunes
+        // requests that never resolve.
+        let mut landed = false;
+        let mut pending = std::mem::take(&mut self.app.pending_gotos);
+        pending.retain(|p| {
+            if landed {
+                return false;
+            }
+            if p.dispatched_at.elapsed() > std::time::Duration::from_secs(5) {
+                return false;
+            }
+            match self.app.lsp.take_goto_result(p.server, p.request_id) {
+                Some(Some(loc)) => {
+                    self.goto_location(&ctx, loc);
+                    landed = true;
+                    false
+                }
+                Some(None) => false,
+                None => true,
+            }
+        });
+        self.app.pending_gotos = pending;
 
         // Global status bar — active file's diagnostics, language, path.
         let mut status_ui = ui.new_child(egui::UiBuilder::new().max_rect(status_bar_rect));
