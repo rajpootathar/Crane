@@ -90,6 +90,16 @@ impl Terminal {
         rows: usize,
         cwd: Option<&Path>,
     ) -> std::io::Result<Self> {
+        Self::spawn_inner(ctx, cols, rows, cwd, None)
+    }
+
+    fn spawn_inner(
+        ctx: egui::Context,
+        cols: usize,
+        rows: usize,
+        cwd: Option<&Path>,
+        pre_reader_text: Option<&str>,
+    ) -> std::io::Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
@@ -139,6 +149,33 @@ impl Terminal {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let history = Arc::new(Mutex::new(Vec::<u8>::with_capacity(HISTORY_MAX / 2)));
+
+        // Pre-reader history injection: write the saved text snapshot
+        // into the grid BEFORE the reader thread starts, so there is
+        // no race with the shell's startup output. The text is pure
+        // printable chars + CRLF (no escapes), so it flows into the
+        // grid predictably — filling the visible rows first, scrolling
+        // earlier rows into alacritty's scrollback buffer. When the
+        // reader thread starts and the shell prints its first prompt,
+        // it lands below our replayed history. If the shell clears
+        // the visible screen, our history still lives in scrollback
+        // (Ctrl+Wheel / scrollbar to view).
+        if let Some(text) = pre_reader_text
+            && !text.is_empty()
+        {
+            let mut processor: Processor<StdSyncHandler> = Processor::new();
+            let mut guard = term.lock();
+            processor.advance(&mut *guard, text.as_bytes());
+            // Append a final CRLF so the shell's own first prompt
+            // starts on its own line rather than concatenating.
+            processor.advance(&mut *guard, b"\r\n");
+            drop(guard);
+            // Any PtyWrite events that accumulated during replay are
+            // replies to stale queries from the prior session — they
+            // mustn't reach the new shell.
+            pty_replies.lock().clear();
+        }
+
         let term_clone = term.clone();
         let history_clone = history.clone();
         let ctx_clone = ctx.clone();
@@ -208,35 +245,61 @@ impl Terminal {
         false
     }
 
-    /// Restore a terminal from saved scrollback bytes. Spawns a live shell in
-    /// the given cwd; then replays the saved bytes through the VT processor so
-    /// the grid shows the prior visual state. New input/output starts fresh.
-    #[allow(dead_code)] // staged for session scrollback replay
-    pub fn spawn_with_history(
+    /// Restore a terminal with a plain-text scrollback snapshot. The
+    /// snapshot (produced by `snapshot_text()` on save) is pure text +
+    /// CRLF — no escapes — so replaying it into a fresh grid produces
+    /// predictable line-by-line layout regardless of the new terminal
+    /// width. Happens BEFORE the reader thread starts, so there's no
+    /// race with the new shell's startup output.
+    pub fn spawn_with_text_history(
         ctx: egui::Context,
         cols: usize,
         rows: usize,
         cwd: Option<&Path>,
-        saved_history: &[u8],
+        history_text: &str,
     ) -> std::io::Result<Self> {
-        let term = Self::spawn(ctx, cols, rows, cwd)?;
-        if !saved_history.is_empty() {
-            let mut processor: Processor<StdSyncHandler> = Processor::new();
-            let mut guard = term.term.lock();
-            processor.advance(&mut *guard, saved_history);
-            drop(guard);
-            let mut h = term.history.lock();
-            h.extend_from_slice(saved_history);
-            if h.len() > HISTORY_MAX {
-                let drop_n = h.len() - HISTORY_MAX;
-                h.drain(0..drop_n);
-            }
-        }
-        Ok(term)
+        Self::spawn_inner(ctx, cols, rows, cwd, Some(history_text))
     }
 
+    /// Raw PTY byte log. Retained on `Terminal` for future features
+    /// (e.g. exporting a session transcript); no longer written to
+    /// session state since the grid-text snapshot is more useful there.
+    #[allow(dead_code)]
     pub fn history_snapshot(&self) -> Vec<u8> {
         self.history.lock().clone()
+    }
+
+    /// Plain-text snapshot of the terminal's scrollback + visible grid,
+    /// joined with CRLF. This is what the session should persist —
+    /// replaying the raw PTY byte log doesn't work because shell prompts
+    /// (especially ZSH RPROMPT) use absolute cursor-positioning escapes
+    /// that were baked against the original terminal width and emit no
+    /// LFs; replaying them into a fresh terminal stacks everything on
+    /// one row.
+    ///
+    /// Trailing trailing empty rows are trimmed. Returns an empty
+    /// string when there's nothing meaningful to capture.
+    pub fn snapshot_text(&self) -> String {
+        use alacritty_terminal::index::{Column, Line, Point};
+        let guard = self.term.lock();
+        let grid = guard.grid();
+        let cols = grid.columns();
+        let screen_lines = grid.screen_lines() as i32;
+        let history = grid.history_size() as i32;
+        let mut rows: Vec<String> = Vec::with_capacity((history + screen_lines) as usize);
+        for line in -history..screen_lines {
+            let mut row = String::with_capacity(cols);
+            for c in 0..cols {
+                let cell = &grid[Point::new(Line(line), Column(c))];
+                let ch = cell.c;
+                row.push(if ch == '\0' { ' ' } else { ch });
+            }
+            rows.push(row.trim_end().to_string());
+        }
+        while rows.last().is_some_and(|r| r.is_empty()) {
+            rows.pop();
+        }
+        rows.join("\r\n")
     }
 
     pub fn write_input(&mut self, data: &[u8]) {

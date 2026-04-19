@@ -118,6 +118,13 @@ pub struct SPane {
 pub enum SPaneContent {
     Terminal {
         cwd: PathBuf,
+        /// Plain-text grid snapshot (rows joined with CRLF). Preferred
+        /// format — replay is width-stable.
+        #[serde(default)]
+        history_text: String,
+        /// Legacy raw-PTY-byte log. Kept so old session files still
+        /// restore *something*, but write path no longer populates it.
+        #[serde(default)]
         history_b64: String,
     },
     Files {
@@ -392,10 +399,12 @@ impl SPane {
     fn from_pane(id: PaneId, p: &Pane) -> Self {
         let content = match &p.content {
             PaneContent::Terminal(t) => {
-                let bytes = t.history_snapshot();
+                // Rendered-grid text snapshot instead of the raw PTY byte
+                // log — see Terminal::snapshot_text for the reasoning.
                 SPaneContent::Terminal {
                     cwd: t.cwd.clone(),
-                    history_b64: base64_encode(&bytes),
+                    history_text: t.snapshot_text(),
+                    history_b64: String::new(),
                 }
             }
             PaneContent::Files(f) => SPaneContent::Files {
@@ -429,28 +438,42 @@ impl SPane {
 
     fn into_pane(self, ctx: &egui::Context, cwd: &Path) -> (PaneId, Pane) {
         let content = match self.content {
-            SPaneContent::Terminal { cwd: saved_cwd, history_b64 } => {
+            SPaneContent::Terminal {
+                cwd: saved_cwd,
+                history_text,
+                history_b64,
+            } => {
                 let spawn_cwd = if saved_cwd.as_os_str().is_empty() {
                     cwd
                 } else {
                     saved_cwd.as_path()
                 };
-                // Raw VT byte replay. Our ANSI-stripper experiments
-                // dropped content the user actually wanted to see, so
-                // we hand alacritty the full saved stream. Side effect:
-                // RPROMPT cursor-positioning escapes render staggered
-                // against the restored terminal width — tracked for a
-                // proper fix (grid-text snapshot instead of byte replay).
-                let history = base64_decode(&history_b64).unwrap_or_default();
-                let spawned = if history.is_empty() {
-                    crate::terminal::Terminal::spawn(ctx.clone(), 80, 24, Some(spawn_cwd))
+                // Prefer the text snapshot. Fall back to legacy raw-byte
+                // log only when a session.json pre-dating the text-
+                // snapshot format is loaded — strip ANSI escapes so the
+                // staggered RPROMPT mess doesn't come back.
+                let replay_text = if !history_text.is_empty() {
+                    history_text.clone()
+                } else if !history_b64.is_empty() {
+                    let raw = base64_decode(&history_b64).unwrap_or_default();
+                    String::from_utf8_lossy(&strip_ansi(&raw)).into_owned()
                 } else {
-                    crate::terminal::Terminal::spawn_with_history(
+                    String::new()
+                };
+                let spawned = if replay_text.is_empty() {
+                    crate::terminal::Terminal::spawn(
                         ctx.clone(),
                         80,
                         24,
                         Some(spawn_cwd),
-                        &history,
+                    )
+                } else {
+                    crate::terminal::Terminal::spawn_with_text_history(
+                        ctx.clone(),
+                        80,
+                        24,
+                        Some(spawn_cwd),
+                        &replay_text,
                     )
                 };
                 match spawned {
@@ -539,6 +562,7 @@ impl SPane {
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#[allow(dead_code)] // paired with base64_decode; retained for legacy session read path
 fn base64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;

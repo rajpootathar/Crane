@@ -1,4 +1,3 @@
-use crate::terminal::view;
 use crate::views::{browser_view, diff_view, file_view, markdown_view};
 use crate::state::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
 use crate::theme;
