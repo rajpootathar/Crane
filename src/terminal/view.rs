@@ -513,7 +513,18 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         ui.ctx().copy_text(t);
     }
     if let Some(t) = paste_text {
-        terminal.write_input(t.as_bytes());
+        // Bracketed paste: wrap with ESC[200~ … ESC[201~ so the shell
+        // treats multi-line clipboard content as literal input instead
+        // of executing each line as a command. Modern zsh / bash
+        // enable bracketed-paste mode automatically (the `\x1b[?2004h`
+        // sequence in their prompt init); if the running app doesn't
+        // support it, it'll just see the markers as stray text — not
+        // worse than the unwrapped paste.
+        let mut bytes = Vec::with_capacity(t.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(t.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        terminal.write_input(&bytes);
     }
     if clear_requested {
         // \x1b[H → cursor home, \x1b[2J → erase display, \x1b[3J → erase
