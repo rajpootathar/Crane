@@ -59,17 +59,6 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
     let cell_h = ui.fonts_mut(|f| f.row_height(&font_id));
 
-    // Previous-session transcript panel. Rendered ABOVE the live grid
-    // as plain, dimmed text — not injected into alacritty. This keeps
-    // the shell's cursor/prompt logic isolated from replay state.
-    let mut dismiss_transcript = false;
-    if let Some(txt) = terminal.transcript.clone() {
-        render_transcript_panel(ui, &txt, &font_id, cell_h, &mut dismiss_transcript);
-    }
-    if dismiss_transcript {
-        terminal.transcript = None;
-    }
-
     let available = ui.available_size();
     let cols = ((available.x / cell_w).floor() as usize).max(20);
     let rows = ((available.y / cell_h).floor() as usize).max(5);
@@ -633,82 +622,3 @@ fn named_key_bytes(key: egui::Key) -> Option<Vec<u8>> {
     }
 }
 
-/// Read-only "previous session" panel painted at the top of a restored
-/// terminal pane. Plain monospace text (dimmed), capped in height, with
-/// a one-click × to dismiss. The live alacritty grid takes whatever
-/// vertical space remains — alacritty sees a clean, untouched Term on
-/// spawn, so cursor and RPROMPT logic are unaffected.
-fn render_transcript_panel(
-    ui: &mut egui::Ui,
-    text: &str,
-    font_id: &FontId,
-    cell_h: f32,
-    dismiss: &mut bool,
-) {
-    let t = theme::current();
-    // Cap the transcript at 40% of the pane height; use a scroll area
-    // if the transcript overflows so every line is reachable.
-    let pane_h = ui.available_height();
-    let line_count = text.lines().count().max(1);
-    let wanted_h = (line_count as f32 + 1.0) * cell_h;
-    let max_h = (pane_h * 0.4).max(cell_h * 3.0);
-    let panel_h = wanted_h.min(max_h);
-
-    egui::Frame::NONE
-        .fill(theme::current().sidebar_bg.to_color32())
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-
-            // Header row: label + dismiss button.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("── Previous session ──")
-                        .size(11.0)
-                        .color(t.text_muted.to_color32())
-                        .monospace(),
-                );
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("×").size(13.0),
-                                )
-                                .frame(false)
-                                .min_size(egui::vec2(20.0, 18.0)),
-                            )
-                            .on_hover_text("Dismiss transcript")
-                            .clicked()
-                        {
-                            *dismiss = true;
-                        }
-                    },
-                );
-            });
-
-            // Dimmed transcript text, scrollable.
-            let dim = {
-                let c = t.terminal_fg;
-                Color32::from_rgba_unmultiplied(c.r, c.g, c.b, 140)
-            };
-            egui::ScrollArea::vertical()
-                .id_salt("terminal_transcript")
-                .max_height(panel_h)
-                .auto_shrink([false, true])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(text)
-                                .font(font_id.clone())
-                                .color(dim),
-                        )
-                        .selectable(true)
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                });
-        });
-    ui.add_space(2.0);
-}

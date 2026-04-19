@@ -63,11 +63,6 @@ pub struct Terminal {
     pub click_count: u8,
     master: Box<dyn MasterPty + Send>,
     shell_pid: Option<u32>,
-    /// Plain-text snapshot of the previous session's grid, shown as a
-    /// read-only panel above the live alacritty grid. None after the
-    /// user dismisses it or on first-run terminals. Lives outside
-    /// alacritty entirely — no escape replay, no cursor interference.
-    pub transcript: Option<String>,
 }
 
 impl Terminal {
@@ -137,9 +132,38 @@ impl Terminal {
 
         let history = Arc::new(Mutex::new(Vec::<u8>::with_capacity(HISTORY_MAX / 2)));
 
-        // Transcript (if any) renders as a separate read-only panel in
-        // terminal/view.rs, NOT into alacritty's grid — keeps the
-        // live shell's cursor / RPROMPT logic isolated.
+        // If the caller provided transcript text (from a previous
+        // session), write it into alacritty's scrollback BEFORE the
+        // reader thread starts — followed by enough blank lines to
+        // push the whole transcript up into the history buffer, and
+        // finally an explicit cursor-home so the shell's subsequent
+        // prompt-drawing starts from a known (0,0) state. This gives
+        // us unified scroll: alacritty's own scrollbar spans both
+        // transcript + live content. Cursor correctness is preserved
+        // because the shell boots with a clean cursor position; any
+        // PtyWrite replies accumulated during this pre-injection get
+        // written immediately by the WakeListener and are harmless
+        // (empty Term queries have no cursor queries yet).
+        if let Some(text) = transcript.as_deref()
+            && !text.is_empty()
+        {
+            let mut processor: Processor<StdSyncHandler> = Processor::new();
+            let mut guard = term.lock();
+            processor.advance(&mut *guard, text.as_bytes());
+            if !text.ends_with('\n') {
+                processor.advance(&mut *guard, b"\r\n");
+            }
+            // Pad with screen_lines blank rows so every transcript
+            // line ends up in scrollback (none left in visible grid).
+            let padding = "\r\n".repeat(rows);
+            processor.advance(&mut *guard, padding.as_bytes());
+            // Home cursor — shell boots with a known-good state.
+            processor.advance(&mut *guard, b"\x1b[H");
+            // Make sure the viewport is at the bottom so the shell's
+            // first prompt is visible without the user needing to scroll.
+            guard.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        }
+
         let term_clone = term.clone();
         let history_clone = history.clone();
         let ctx_clone = ctx.clone();
@@ -182,7 +206,6 @@ impl Terminal {
             click_count: 0,
             master: pair.master,
             shell_pid,
-            transcript,
         })
     }
 
