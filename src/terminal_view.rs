@@ -1,5 +1,6 @@
 use crate::terminal::Terminal;
 use crate::theme;
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags as CellFlags;
@@ -74,6 +75,20 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     // I-beam over the terminal so it feels like selectable text.
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
+
+    // Scrollback: mouse wheel → alacritty Scroll::Delta. Positive delta
+    // is upward in egui (history); alacritty's convention is that a
+    // positive delta scrolls up into history. `scroll_display` is a
+    // no-op when no history is available, so no guard needed.
+    if response.hovered() {
+        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+        if wheel.abs() > 0.5 {
+            let lines = (wheel / cell_h).round() as i32;
+            if lines != 0 {
+                terminal.term.lock().scroll_display(Scroll::Delta(lines));
+            }
+        }
     }
 
     // Drag: plain range select.

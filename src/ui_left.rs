@@ -84,6 +84,18 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut remove_project: Option<u64> = None;
     let mut remove_worktree: Option<(u64, u64)> = None;
 
+    // Snapshot rename state into a local buffer so the tree walk below
+    // only needs an immutable borrow of `app`. The buffer is flushed
+    // back into `app.renaming_tab` after the walk.
+    let renaming_ref: Option<(u64, u64, u64, String)> =
+        app.renaming_tab.as_ref().map(|(p, w, t, b)| (*p, *w, *t, b.clone()));
+    let mut rename_buffer: Option<String> =
+        renaming_ref.as_ref().map(|(_, _, _, b)| b.clone());
+    let mut start_rename: Option<(u64, u64, u64, String)> = None;
+    let mut commit_rename: Option<(u64, u64, u64, String)> = None;
+    let mut cancel_rename = false;
+    let mut rename_focused = false;
+
     egui::ScrollArea::vertical()
         .id_salt("left_projects")
         .auto_shrink([false, false])
@@ -199,6 +211,46 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                     .active
                                     .map(|(_, w, t)| w == wt.id && t == tab.id)
                                     .unwrap_or(false);
+                                let is_renaming = renaming_ref
+                                    .as_ref()
+                                    .map(|(p, w, t, _)| *p == project.id && *w == wt.id && *t == tab.id)
+                                    .unwrap_or(false);
+                                if is_renaming {
+                                    // Render the row as an inline TextEdit
+                                    // bound to the rename buffer. Caller
+                                    // applies commit/cancel after the
+                                    // tree walk to avoid double borrows.
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 26.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let mut child = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .max_rect(rect.shrink2(egui::vec2(32.0, 2.0))),
+                                    );
+                                    let buf = rename_buffer
+                                        .as_mut()
+                                        .expect("rename buffer matches renaming_ref");
+                                    let te_id = egui::Id::new(("rename_tab", tab.id));
+                                    let resp = child.add(
+                                        egui::TextEdit::singleline(buf)
+                                            .id(te_id)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    if !ui.memory(|m| m.has_focus(te_id)) && !rename_focused {
+                                        resp.request_focus();
+                                        rename_focused = true;
+                                    }
+                                    let enter = resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    if enter {
+                                        commit_rename = Some((project.id, wt.id, tab.id, buf.clone()));
+                                    } else if esc || (resp.lost_focus() && !enter) {
+                                        cancel_rename = true;
+                                    }
+                                    continue;
+                                }
                                 let tab_row = draw_row(
                                     ui,
                                     RowConfig {
@@ -222,11 +274,22 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 );
                                 if tab_trailing[0] {
                                     close_tab = Some((project.id, wt.id, tab.id));
+                                } else if tab_row.response.double_clicked() {
+                                    start_rename = Some((project.id, wt.id, tab.id, tab.name.clone()));
                                 } else if tab_row.main_clicked {
                                     set_active = Some((project.id, wt.id, tab.id));
                                 }
-                                // No context menu on tab rows — click
-                                // already activates, × already closes.
+                                tab_row.response.context_menu(|ui| {
+                                    if ui.button(format!("{}  Rename", icons::PENCIL_SIMPLE)).clicked() {
+                                        start_rename = Some((
+                                            project.id,
+                                            wt.id,
+                                            tab.id,
+                                            tab.name.clone(),
+                                        ));
+                                        ui.close();
+                                    }
+                                });
                             }
                         }
                     }
@@ -234,6 +297,26 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             }
         });
 
+
+    // Flush rename edits back into App.
+    if let (Some(buf), Some(slot)) = (rename_buffer.as_ref(), app.renaming_tab.as_mut()) {
+        slot.3 = buf.clone();
+    }
+    if let Some((pid, wid, tid, new_name)) = commit_rename {
+        let trimmed = new_name.trim().to_string();
+        if !trimmed.is_empty()
+            && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
+            && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid)
+            && let Some(t) = w.tabs.iter_mut().find(|t| t.id == tid)
+        {
+            t.name = trimmed;
+        }
+        app.renaming_tab = None;
+    } else if cancel_rename {
+        app.renaming_tab = None;
+    } else if let Some(start) = start_rename {
+        app.renaming_tab = Some(start);
+    }
 
     if let Some(pid) = toggle_project
         && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
