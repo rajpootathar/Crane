@@ -46,13 +46,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut App) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 if resp.clicked() {
-                    app.branch_picker_open = !app.branch_picker_open;
-                    app.branch_picker_query.clear();
-                    if app.branch_picker_open {
+                    app.branch_picker.open = !app.branch_picker.open;
+                    app.branch_picker.query.clear();
+                    if app.branch_picker.open {
                         load_branch_picker(app, ui.ctx());
-                        app.branch_picker_opened_at = Some(std::time::Instant::now());
+                        app.branch_picker.opened_at = Some(std::time::Instant::now());
                     } else {
-                        app.branch_picker_opened_at = None;
+                        app.branch_picker.opened_at = None;
                     }
                 }
             }
@@ -83,10 +83,10 @@ pub fn load_branch_picker(app: &mut App, ctx: &egui::Context) {
     let Some(ws) = app.active_workspace_path().map(|p| p.to_path_buf()) else {
         return;
     };
-    app.branch_picker_loading = true;
-    app.branch_picker_repos.clear();
+    app.branch_picker.loading = true;
+    app.branch_picker.repos.clear();
     let (tx, rx) = std::sync::mpsc::channel();
-    app.branch_picker_rx = Some(rx);
+    app.branch_picker.rx = Some(rx);
     let ctx = ctx.clone();
     std::thread::spawn(move || {
         let roots = crate::git::discover_repos(&ws, 5);
@@ -106,23 +106,23 @@ pub fn load_branch_picker(app: &mut App, ctx: &egui::Context) {
 /// Drain the worker's result once it finishes. Called once per picker
 /// frame — non-blocking.
 pub fn poll_branch_picker(app: &mut App) {
-    let Some(rx) = app.branch_picker_rx.as_ref() else {
+    let Some(rx) = app.branch_picker.rx.as_ref() else {
         return;
     };
     match rx.try_recv() {
         Ok(data) => {
             let active = app.active_repo_root();
-            app.branch_picker_repos = data;
-            app.branch_picker_filter = active.filter(|a| {
-                app.branch_picker_repos.iter().any(|(r, _, _)| r == a)
+            app.branch_picker.repos = data;
+            app.branch_picker.filter = active.filter(|a| {
+                app.branch_picker.repos.iter().any(|(r, _, _)| r == a)
             });
-            app.branch_picker_loading = false;
-            app.branch_picker_rx = None;
+            app.branch_picker.loading = false;
+            app.branch_picker.rx = None;
         }
         Err(std::sync::mpsc::TryRecvError::Empty) => {}
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            app.branch_picker_loading = false;
-            app.branch_picker_rx = None;
+            app.branch_picker.loading = false;
+            app.branch_picker.rx = None;
         }
     }
 }

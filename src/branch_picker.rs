@@ -23,12 +23,12 @@ const MIN_HEIGHT: f32 = 200.0;
 const CORNER_HANDLE: f32 = 14.0;
 
 pub fn render(ctx: &egui::Context, app: &mut App) {
-    if !app.branch_picker_open {
+    if !app.branch_picker.open {
         return;
     }
     crate::ui_status::poll_branch_picker(app);
     let Some((pid, wid, _)) = app.active else {
-        app.branch_picker_open = false;
+        app.branch_picker.open = false;
         return;
     };
 
@@ -36,10 +36,10 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     let screen = ctx.content_rect();
     let max_h = screen.height() - crate::ui_status::HEIGHT - 40.0;
     let max_w = screen.width() - 24.0;
-    let width = app.branch_picker_width.clamp(MIN_WIDTH, max_w);
-    let height = app.branch_picker_height.clamp(MIN_HEIGHT, max_h);
-    app.branch_picker_width = width;
-    app.branch_picker_height = height;
+    let width = app.branch_picker.width.clamp(MIN_WIDTH, max_w);
+    let height = app.branch_picker.height.clamp(MIN_HEIGHT, max_h);
+    app.branch_picker.width = width;
+    app.branch_picker.height = height;
 
     // Fixed position: bottom-left, floating just above the status bar.
     let bottom = screen.max.y - crate::ui_status::HEIGHT - 6.0;
@@ -60,8 +60,8 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         .unwrap_or_default();
 
     let repos_snapshot: Vec<(PathBuf, Vec<String>, Vec<String>)> =
-        app.branch_picker_repos.clone();
-    let filter_snapshot: Option<PathBuf> = app.branch_picker_filter.clone();
+        app.branch_picker.repos.clone();
+    let filter_snapshot: Option<PathBuf> = app.branch_picker.filter.clone();
 
     let existing: std::collections::HashMap<String, (crate::state::WorkspaceId, crate::state::TabId)> = {
         let project = app.projects.iter().find(|p| p.id == pid);
@@ -149,7 +149,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
 
                     let input_id = egui::Id::new("branch_picker_query");
                     let resp = ui.add(
-                        egui::TextEdit::singleline(&mut app.branch_picker_query)
+                        egui::TextEdit::singleline(&mut app.branch_picker.query)
                             .id(input_id)
                             .hint_text("Filter branches…")
                             .desired_width(f32::INFINITY),
@@ -168,7 +168,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                     // Surface the last in-place switch error (typically
                     // "please commit or stash first"). Dismissible by
                     // clicking it. No auto-stash — by design.
-                    if let Some(err) = app.branch_picker_error.clone() {
+                    if let Some(err) = app.branch_picker.error.clone() {
                         let resp = ui.add(
                             egui::Label::new(
                                 RichText::new(err)
@@ -179,12 +179,12 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                             .wrap(),
                         );
                         if resp.clicked() {
-                            app.branch_picker_error = None;
+                            app.branch_picker.error = None;
                         }
                         ui.add_space(4.0);
                     }
 
-                    let query = app.branch_picker_query.trim().to_lowercase();
+                    let query = app.branch_picker.query.trim().to_lowercase();
                     let visible_repos: Vec<&(PathBuf, Vec<String>, Vec<String>)> =
                         repos_snapshot
                             .iter()
@@ -196,7 +196,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                             })
                             .collect();
 
-                    if app.branch_picker_loading && visible_repos.is_empty() {
+                    if app.branch_picker.loading && visible_repos.is_empty() {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.add_space(4.0);
@@ -231,7 +231,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                                         &existing,
                                         wid,
                                         multi_repo,
-                                        &mut app.branch_picker_collapsed,
+                                        &mut app.branch_picker.collapsed,
                                         &mut switch_to,
                                         &mut create_branch,
                                         &mut in_place,
@@ -281,10 +281,10 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
             if handle_resp.dragged() {
                 let d = handle_resp.drag_delta();
                 // Up/left = grow; down/right = shrink.
-                app.branch_picker_height =
-                    (app.branch_picker_height - d.y).clamp(MIN_HEIGHT, max_h);
-                app.branch_picker_width =
-                    (app.branch_picker_width + d.x).clamp(MIN_WIDTH, max_w);
+                app.branch_picker.height =
+                    (app.branch_picker.height - d.y).clamp(MIN_HEIGHT, max_h);
+                app.branch_picker.width =
+                    (app.branch_picker.width + d.x).clamp(MIN_WIDTH, max_w);
             }
         });
 
@@ -294,7 +294,8 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     // Grace window: ignore outside-clicks in the first 150ms so the
     // opening click itself can't race-close the popup.
     let grace = app
-        .branch_picker_opened_at
+        .branch_picker
+        .opened_at
         .map(|t| t.elapsed().as_millis() < 150)
         .unwrap_or(false);
     if !grace
@@ -306,15 +307,15 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     }
 
     if let Some(f) = new_filter {
-        app.branch_picker_filter = f;
+        app.branch_picker.filter = f;
     }
     if close {
-        app.branch_picker_open = false;
+        app.branch_picker.open = false;
         ctx.memory_mut(|m| m.data.remove::<bool>(egui::Id::new("branch_picker_focused")));
     }
     if let Some((w, tab)) = switch_to {
         app.set_active(pid, w, tab);
-        app.branch_picker_open = false;
+        app.branch_picker.open = false;
     }
     if let Some(b) = create_branch {
         app.open_new_workspace_modal(pid);
@@ -323,7 +324,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
             modal.create_new_branch = false;
             modal.branch_locked = true;
         }
-        app.branch_picker_open = false;
+        app.branch_picker.open = false;
     }
     if let Some((repo, branch)) = in_place {
         // Synchronous shell-out — git switch is fast when the tree is
@@ -331,11 +332,11 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         // the refusal we want to surface. No worker thread needed.
         match crate::git::checkout_branch(&repo, &branch) {
             Ok(()) => {
-                app.branch_picker_error = None;
+                app.branch_picker.error = None;
                 app.refresh_active_git_status(ctx);
             }
             Err(msg) => {
-                app.branch_picker_error = Some(msg);
+                app.branch_picker.error = Some(msg);
             }
         }
     }

@@ -150,6 +150,46 @@ pub struct PendingGoto {
     pub dispatched_at: Instant,
 }
 
+/// All state that only matters while the bottom-anchored branch picker
+/// is open (or caching recent picker state across opens). Previously
+/// lived as 11 flat `branch_picker_*` fields on `App`; grouping them
+/// keeps `App::new` readable and makes it obvious what is scoped to
+/// this one subsystem.
+pub struct BranchPickerState {
+    pub open: bool,
+    pub query: String,
+    pub collapsed: std::collections::HashSet<String>,
+    pub width: f32,
+    pub height: f32,
+    pub opened_at: Option<Instant>,
+    pub error: Option<String>,
+    pub loading: bool,
+    pub rx: Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Vec<String>, Vec<String>)>>>,
+    /// Per-repo branch data loaded when the picker opens:
+    /// repo_root → (local branches, remote branches in `remote/branch` form).
+    pub repos: Vec<(PathBuf, Vec<String>, Vec<String>)>,
+    /// None = "All repos" aggregate view; Some(root) = filter to one repo.
+    pub filter: Option<PathBuf>,
+}
+
+impl Default for BranchPickerState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            collapsed: std::collections::HashSet::new(),
+            width: 420.0,
+            height: 360.0,
+            opened_at: None,
+            error: None,
+            loading: false,
+            rx: None,
+            repos: Vec::new(),
+            filter: None,
+        }
+    }
+}
+
 pub struct App {
     pub projects: Vec<Project>,
     pub active: Option<(ProjectId, WorkspaceId, TabId)>,
@@ -178,13 +218,7 @@ pub struct App {
     pub editor_trim_on_save: bool,
     pub lsp: crate::lsp::LspManager,
     pub language_configs: crate::lsp::LanguageConfigs,
-    pub branch_picker_open: bool,
-    pub branch_picker_query: String,
-    pub branch_picker_collapsed: std::collections::HashSet<String>,
-    pub branch_picker_width: f32,
-    pub branch_picker_height: f32,
-    pub branch_picker_opened_at: Option<Instant>,
-    pub branch_picker_error: Option<String>,
+    pub branch_picker: BranchPickerState,
     /// (project, workspace, tab, edit buffer) of the tab currently in
     /// inline rename mode. Set on double-click; committed on Enter /
     /// focus-lost, cancelled on Esc.
@@ -197,14 +231,6 @@ pub struct App {
     /// results and land at most one successful jump. A 5 s watchdog
     /// drops any request that never comes back so we don't leak ids.
     pub pending_gotos: Vec<PendingGoto>,
-    pub branch_picker_loading: bool,
-    pub branch_picker_rx:
-        Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Vec<String>, Vec<String>)>>>,
-    /// Per-repo branch data loaded when the picker opens:
-    /// repo_root → (local branches, remote branches in `remote/branch` form).
-    pub branch_picker_repos: Vec<(PathBuf, Vec<String>, Vec<String>)>,
-    /// None = "All repos" aggregate view; Some(root) = filter to one repo.
-    pub branch_picker_filter: Option<PathBuf>,
     pub repo_branch_cache: std::collections::HashMap<PathBuf, (String, Instant)>,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
@@ -241,20 +267,10 @@ impl App {
             right_panel_w: 300.0,
             lsp: crate::lsp::LspManager::new(),
             language_configs: crate::lsp::LanguageConfigs::default(),
-            branch_picker_open: false,
-            branch_picker_query: String::new(),
-            branch_picker_collapsed: std::collections::HashSet::new(),
-            branch_picker_width: 420.0,
-            branch_picker_height: 360.0,
-            branch_picker_opened_at: None,
-            branch_picker_error: None,
+            branch_picker: BranchPickerState::default(),
             renaming_tab: None,
             renaming_workspace: None,
             pending_gotos: Vec::new(),
-            branch_picker_loading: false,
-            branch_picker_rx: None,
-            branch_picker_repos: Vec::new(),
-            branch_picker_filter: None,
             repo_branch_cache: std::collections::HashMap::new(),
             next_project: 1,
             next_workspace: 1,
