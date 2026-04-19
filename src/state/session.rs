@@ -429,28 +429,31 @@ impl SPane {
 
     fn into_pane(self, ctx: &egui::Context, cwd: &Path) -> (PaneId, Pane) {
         let content = match self.content {
-            SPaneContent::Terminal { cwd: saved_cwd, history_b64: _ } => {
+            SPaneContent::Terminal { cwd: saved_cwd, history_b64 } => {
                 let spawn_cwd = if saved_cwd.as_os_str().is_empty() {
                     cwd
                 } else {
                     saved_cwd.as_path()
                 };
-                // Skip replaying saved scrollback bytes into alacritty.
-                // Raw VT streams contain absolute-column escapes (CSI C
-                // / CSI G / RPROMPT cursor positioning) that were baked
-                // against the original terminal width. Replaying them
-                // into a fresh 80×24 grid and then resizing to the real
-                // width produces the staggered / gibberish spacing users
-                // hit on reload. Shell history is in ~/.zsh_history
-                // anyway; losing scroll-back is the lesser evil.
-                // (The encode path stays so sessions written by newer
-                // versions remain forward-compatible.)
-                match crate::terminal::Terminal::spawn(
-                    ctx.clone(),
-                    80,
-                    24,
-                    Some(spawn_cwd),
-                ) {
+                // Strip ANSI escape sequences (anything starting with
+                // ESC) before replay. Colors + styles are lost but the
+                // text + newlines survive — and without the absolute-
+                // column cursor-positioning escapes we don't get the
+                // staggered RPROMPT bakelines that broke rendering.
+                let raw = base64_decode(&history_b64).unwrap_or_default();
+                let sanitized = strip_ansi(&raw);
+                let spawned = if sanitized.is_empty() {
+                    crate::terminal::Terminal::spawn(ctx.clone(), 80, 24, Some(spawn_cwd))
+                } else {
+                    crate::terminal::Terminal::spawn_with_history(
+                        ctx.clone(),
+                        80,
+                        24,
+                        Some(spawn_cwd),
+                        &sanitized,
+                    )
+                };
+                match spawned {
                     Ok(t) => PaneContent::Terminal(t),
                     Err(_) => PaneContent::Files(FilesPane::empty()),
                 }
@@ -559,6 +562,75 @@ fn base64_encode(input: &[u8]) -> String {
         out.push(B64[((n >> 12) & 0x3f) as usize] as char);
         out.push(B64[((n >> 6) & 0x3f) as usize] as char);
         out.push('=');
+    }
+    out
+}
+
+/// Remove ANSI escape sequences from `input`. Preserves text + newlines
+/// + tabs. Strips CSI (`ESC [ … letter`), OSC (`ESC ] … BEL or ESC \`),
+/// simple ESC sequences (`ESC letter`), single-char `\x07` bell, and
+/// `\r` carriage returns (which would overwrite previous content on
+/// replay).
+fn strip_ansi(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        if b == 0x1b && i + 1 < input.len() {
+            let next = input[i + 1];
+            match next {
+                b'[' => {
+                    // CSI: ESC [ params* intermediates* final-byte
+                    i += 2;
+                    while i < input.len() {
+                        let c = input[i];
+                        i += 1;
+                        if c.is_ascii_alphabetic() || c == b'~' {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    // OSC: ESC ] … (BEL | ESC \\)
+                    i += 2;
+                    while i < input.len() {
+                        let c = input[i];
+                        if c == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if c == 0x1b && input.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                b'P' | b'X' | b'^' | b'_' => {
+                    // DCS / SOS / PM / APC: until ESC \\
+                    i += 2;
+                    while i < input.len() {
+                        if input[i] == 0x1b && input.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    // Two-byte ESC sequence (ESC letter).
+                    i += 2;
+                }
+            }
+            continue;
+        }
+        // Drop stray bell + carriage return; keep \n \t and printable bytes.
+        if b == 0x07 || b == b'\r' {
+            i += 1;
+            continue;
+        }
+        out.push(b);
+        i += 1;
     }
     out
 }
