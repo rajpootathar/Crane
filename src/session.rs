@@ -436,6 +436,9 @@ impl SPane {
                     .into_iter()
                     .map(|sf| {
                         let content = std::fs::read_to_string(&sf.path).unwrap_or_default();
+                        let disk_mtime = std::fs::metadata(&sf.path)
+                            .and_then(|m| m.modified())
+                            .ok();
                         FileTab {
                             path: sf.path,
                             name: sf.name,
@@ -446,6 +449,8 @@ impl SPane {
                             pending_cursor: None,
                             image_texture: None,
                             find_query: None,
+                            disk_mtime,
+                            external_change: false,
                             content,
                         }
                     })

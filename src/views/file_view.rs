@@ -245,12 +245,62 @@ fn render_inner(
 
     {
         let tab = &mut pane.tabs[active_idx];
+        poll_external_change(tab);
         let name_label = if tab.dirty() {
             format!("{}  {}", icons::CIRCLE, tab.name)
         } else {
             tab.name.clone()
         };
         *title = format!("Files · {name_label}");
+
+        // External-change banner. Shown when another editor modified
+        // the file on disk. Three actions: Reload (drops our edits),
+        // Overwrite (force-save our buffer), Dismiss (just clear the
+        // warning — user accepts the divergence).
+        if tab.external_change {
+            let t = theme::current();
+            egui::Frame::NONE
+                .fill(Color32::from_rgba_unmultiplied(220, 100, 100, 28))
+                .stroke(egui::Stroke::new(1.0, t.error.to_color32()))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  This file changed on disk outside Crane.",
+                                icons::WARNING
+                            ))
+                            .size(11.5)
+                            .color(t.text.to_color32()),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("Dismiss").clicked() {
+                                    tab.external_change = false;
+                                    tab.disk_mtime = std::fs::metadata(&tab.path)
+                                        .and_then(|m| m.modified())
+                                        .ok();
+                                }
+                                if ui.small_button("Overwrite").clicked() {
+                                    save_tab(
+                                        tab,
+                                        prefs,
+                                        format_before_save,
+                                        notify_saved,
+                                        true,
+                                    );
+                                }
+                                if ui.small_button("Reload").clicked() {
+                                    reload_tab(tab);
+                                }
+                            },
+                        );
+                    });
+                });
+            ui.add_space(4.0);
+        }
 
         let is_md = Path::new(&tab.path)
             .extension()
@@ -279,18 +329,7 @@ fn render_inner(
                         .min_size(egui::vec2(0.0, 24.0)),
                     );
                     if save_btn.clicked() || (save_pressed && tab.dirty()) {
-                        if prefs.trim_on_save {
-                            tab.content = trim_trailing_whitespace(&tab.content);
-                        }
-                        if let Some(formatted) = format_before_save(&tab.content, &tab.path) {
-                            tab.content = formatted;
-                        }
-                        if let Err(e) = std::fs::write(&tab.path, &tab.content) {
-                            eprintln!("save failed: {e}");
-                        } else {
-                            tab.original_content = tab.content.clone();
-                            notify_saved(&tab.path, &tab.content);
-                        }
+                        save_tab(tab, prefs, format_before_save, notify_saved, false);
                     }
                     if is_md {
                         let label = if tab.preview_mode {
@@ -653,7 +692,8 @@ fn render_inner(
                     // source-location-derived id, so undo/redo history
                     // (and cursor position + selection) leaked across files.
                     // Ctrl+Z in file A would replay edits made in file B.
-                    ui.push_id(("file_editor", &tab.path), |ui| {
+                    let tab_path_for_id = tab.path.clone();
+                    ui.push_id(("file_editor", tab_path_for_id), |ui| {
                         let te_id = ui.id().with("body");
                         // Project-local indent rules from nearest .prettierrc
                         // or package.json "prettier" field. In a monorepo
@@ -858,20 +898,7 @@ fn render_inner(
                             }
                         });
                         if ctx_save.get() {
-                            if prefs.trim_on_save {
-                                tab.content = trim_trailing_whitespace(&tab.content);
-                            }
-                            if let Some(formatted) =
-                                format_before_save(&tab.content, &tab.path)
-                            {
-                                tab.content = formatted;
-                            }
-                            if let Err(e) = std::fs::write(&tab.path, &tab.content) {
-                                eprintln!("save failed: {e}");
-                            } else {
-                                tab.original_content = tab.content.clone();
-                                notify_saved(&tab.path, &tab.content);
-                            }
+                            save_tab(tab, prefs, format_before_save, notify_saved, false);
                         }
                         if ctx_reveal.get() {
                             reveal_in_file_manager(&tab.path);
@@ -1166,6 +1193,84 @@ fn paint_scrollbar_diag_markers(
         );
         painter.rect_filled(rect, 0.5, color);
     }
+}
+
+/// Write `tab.content` to disk. When `force` is false and `tab.external_change`
+/// is set, the save is refused — the caller is expected to surface the
+/// banner that lets the user pick Reload / Overwrite (force) / Cancel.
+fn save_tab(
+    tab: &mut crate::layout::FileTab,
+    prefs: EditorPrefs,
+    format_before_save: &dyn Fn(&str, &str) -> Option<String>,
+    notify_saved: &dyn Fn(&str, &str),
+    force: bool,
+) {
+    if tab.external_change && !force {
+        return;
+    }
+    if prefs.trim_on_save {
+        tab.content = trim_trailing_whitespace(&tab.content);
+    }
+    if let Some(formatted) = format_before_save(&tab.content, &tab.path) {
+        tab.content = formatted;
+    }
+    if let Err(e) = std::fs::write(&tab.path, &tab.content) {
+        eprintln!("save failed: {e}");
+        return;
+    }
+    tab.original_content = tab.content.clone();
+    tab.disk_mtime = std::fs::metadata(&tab.path)
+        .and_then(|m| m.modified())
+        .ok();
+    tab.external_change = false;
+    notify_saved(&tab.path, &tab.content);
+}
+
+/// Poll the filesystem for external edits to the active tab. Sets
+/// `tab.external_change` when the mtime advanced AND the disk bytes
+/// differ from what we'd write. Called once per render for the active
+/// tab — cheap on SSDs and gated by the mtime check.
+fn poll_external_change(tab: &mut crate::layout::FileTab) {
+    if tab.external_change {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(&tab.path) else {
+        return;
+    };
+    let Ok(disk_mtime) = meta.modified() else {
+        return;
+    };
+    let stale = match tab.disk_mtime {
+        Some(prev) => disk_mtime > prev,
+        None => true,
+    };
+    if !stale {
+        return;
+    }
+    // mtime advanced — compare bytes before alarming (some editors
+    // rewrite without changing content).
+    let Ok(disk_content) = std::fs::read_to_string(&tab.path) else {
+        return;
+    };
+    if disk_content == tab.original_content {
+        // Content matches our baseline: silently catch up the mtime.
+        tab.disk_mtime = Some(disk_mtime);
+        return;
+    }
+    tab.external_change = true;
+}
+
+/// Reload the active tab from disk, discarding any unsaved edits.
+fn reload_tab(tab: &mut crate::layout::FileTab) {
+    let Ok(disk_content) = std::fs::read_to_string(&tab.path) else {
+        return;
+    };
+    tab.content = disk_content.clone();
+    tab.original_content = disk_content;
+    tab.disk_mtime = std::fs::metadata(&tab.path)
+        .and_then(|m| m.modified())
+        .ok();
+    tab.external_change = false;
 }
 
 fn paint_find_matches(

@@ -46,6 +46,15 @@ pub struct FileTab {
     pub image_texture: Option<egui::TextureHandle>,
     /// Find bar state. None = closed; Some(query) = open and filtered.
     pub find_query: Option<String>,
+    /// File mtime at last read (open / reload / save). Used to detect
+    /// edits made outside Crane: if the file on disk has a newer mtime
+    /// AND its bytes differ from `original_content`, we refuse to save
+    /// over it without explicit user confirmation.
+    pub disk_mtime: Option<std::time::SystemTime>,
+    /// When set, the file on disk has changed out from under us since
+    /// we last read it. The UI surfaces a banner with Reload /
+    /// Overwrite / Cancel; cleared when the user picks one.
+    pub external_change: bool,
 }
 
 impl FileTab {
@@ -78,6 +87,9 @@ impl FilesPane {
             self.active = idx;
             return;
         }
+        let disk_mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok();
         self.tabs.push(FileTab {
             path,
             original_content: content.clone(),
@@ -87,6 +99,8 @@ impl FilesPane {
             pending_cursor: None,
             image_texture: None,
             find_query: None,
+            disk_mtime,
+            external_change: false,
             content,
             name,
         });
