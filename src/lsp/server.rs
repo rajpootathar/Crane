@@ -67,6 +67,9 @@ pub fn keys_for_path(path: &Path) -> Vec<ServerKey> {
 }
 
 fn has_eslint_config(start: &Path) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
     const NAMES: &[&str] = &[
         ".eslintrc",
         ".eslintrc.js",
@@ -80,17 +83,41 @@ fn has_eslint_config(start: &Path) -> bool {
         "eslint.config.mjs",
         "eslint.config.ts",
     ];
-    let mut cur = start.parent().unwrap_or(start).to_path_buf();
-    loop {
+    // `keys_for_path` runs per-frame for every open TS file, so without
+    // a cache this would fire ~15 `is_file()` syscalls per ancestor
+    // per file per frame. Cache per starting directory for 5 s.
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, (bool, Instant)>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    let key = start.parent().unwrap_or(start).to_path_buf();
+    if let Ok(map) = cache.lock()
+        && let Some((hit, t)) = map.get(&key)
+        && t.elapsed().as_secs() < 5
+    {
+        return *hit;
+    }
+
+    let mut cur = key.clone();
+    let found = loop {
+        let mut hit = false;
         for name in NAMES {
             if cur.join(name).is_file() {
-                return true;
+                hit = true;
+                break;
             }
         }
-        if !cur.pop() {
-            return false;
+        if hit {
+            break true;
         }
+        if !cur.pop() {
+            break false;
+        }
+    };
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, (found, Instant::now()));
     }
+    found
 }
 
 impl ServerKey {
@@ -182,6 +209,11 @@ enum RequestKind {
 
 struct Shared {
     initialized: bool,
+    /// The id of the `initialize` request, so we can distinguish its
+    /// response from any other id-bearing message. Previously we set
+    /// `initialized = true` on the first id we saw, which raced with
+    /// out-of-order hover/definition responses during startup.
+    init_request_id: Option<i64>,
     dead: bool,
     pending_opens: Vec<PendingOpen>,
     diagnostics: HashMap<String, Vec<Diagnostic>>,
@@ -236,6 +268,7 @@ impl LspServer {
         let shared = Arc::new((
             Mutex::new(Shared {
                 initialized: false,
+                init_request_id: None,
                 dead: child_res.is_err(),
                 pending_opens: Vec::new(),
                 diagnostics: HashMap::new(),
@@ -360,6 +393,7 @@ impl LspServer {
 
     fn send_initialize(&self, root_uri: Option<String>) {
         let id = self.next_id();
+        self.shared.0.lock().init_request_id = Some(id);
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri.clone().map(Value::String).unwrap_or(Value::Null),
@@ -406,6 +440,13 @@ impl LspServer {
             }
             let pending = std::mem::take(&mut g.pending_opens);
             drop(g);
+            // Re-check dead before each write: the server may have been
+            // dropped while we were waiting on the condvar. Without this
+            // check we'd keep writing to a dead process's stdin for up
+            // to 8s, producing spurious errors in the log.
+            if shared.0.lock().dead {
+                return;
+            }
             let mut guard = stdin.lock();
             let Some(stdin) = guard.as_mut() else { return };
             let _ = protocol::send(
@@ -417,6 +458,9 @@ impl LspServer {
                 }),
             );
             for po in pending {
+                if shared.0.lock().dead {
+                    return;
+                }
                 let _ = protocol::send(
                     stdin,
                     &json!({
@@ -627,8 +671,10 @@ fn handle_message(shared: &Arc<(Mutex<Shared>, Condvar)>, v: &Value) {
     if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
         let result = v.get("result");
         let mut g = m.lock();
-        if !g.initialized {
-            // First response carrying an id is our initialize result.
+        // Match the initialize response by its explicit request id —
+        // not "first id we see" (which raced with out-of-order
+        // hover/definition responses).
+        if g.init_request_id == Some(id) {
             g.initialized = true;
         }
         let kind = g.pending_kinds.remove(&id);
@@ -637,9 +683,15 @@ fn handle_message(shared: &Arc<(Mutex<Shared>, Condvar)>, v: &Value) {
                 let loc = result.and_then(extract_location);
                 g.definition_results.insert(id, loc);
             }
-            Some(RequestKind::Hover) | None => {
+            Some(RequestKind::Hover) => {
                 let text = result.and_then(extract_hover);
                 g.hover_results.insert(id, text);
+            }
+            None => {
+                // Response to an untracked id (initialize, or a stray
+                // server-initiated registration/capability reply we
+                // don't wait on). Drop — previously this grew
+                // hover_results unboundedly.
             }
         }
         cv.notify_all();

@@ -19,6 +19,7 @@ mod ui_top;
 mod ui_util;
 mod update_check;
 mod updater;
+mod util;
 mod views;
 
 use modals::{
@@ -76,9 +77,13 @@ fn fix_path_for_gui_launch() {
         return;
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    // Login-only (`-l`) — `-i` used to be here, but interactive shells
+    // source `.zshrc`/`.bashrc` which triggers nvm/brew-shellenv/banners
+    // and can add several seconds to startup. Login mode sources the
+    // profile files (`.zprofile`, `.bash_profile`), which is the
+    // standard place to set PATH.
     let output = std::process::Command::new(&shell)
         .arg("-l")
-        .arg("-i")
         .arg("-c")
         .arg("echo __CRANE_PATH__:$PATH")
         .output();

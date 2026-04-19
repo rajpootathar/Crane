@@ -100,9 +100,11 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                // Reserve the corner for the resize handle so
-                                // the close × sits just to its left.
-                                ui.add_space(CORNER_HANDLE + 2.0);
+                                // Close × flush with the right edge — the
+                                // resize handle now lives in its own row
+                                // anchored to the outer top-right corner,
+                                // so the title bar no longer has to
+                                // reserve space for it.
                                 if ui
                                     .add(
                                         egui::Button::new(RichText::new(icons::X).size(13.0))

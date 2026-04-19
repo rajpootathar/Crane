@@ -176,13 +176,14 @@ pub fn pull(repo: &Path) -> Result<(), String> {
 
 pub fn workspace_add(repo: &Path, path: &Path, branch: &str, create_new: bool) -> Result<(), String> {
     let path_str = path.to_string_lossy();
-    // `--` before positional args so branches like "-foo" aren't parsed
-    // as flags.
+    // With -b, git requires `-b <new-branch> <path>` — no `--` between
+    // them; `--` would be parsed as commit-ish. Only the non-`-b` form
+    // (which takes `<path> <commit-ish>`) benefits from `--` to prevent
+    // a leading-dash path being read as a flag.
     let mut args: Vec<&str> = vec!["worktree", "add"];
     if create_new {
         args.push("-b");
         args.push(branch);
-        args.push("--");
         args.push(&path_str);
     } else {
         args.push("--");
@@ -245,7 +246,7 @@ pub fn discover_repos(start: &Path, max_depth: usize) -> Vec<PathBuf> {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() {
+            if !ft.is_dir() || ft.is_symlink() {
                 continue;
             }
             let name = entry.file_name();

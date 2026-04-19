@@ -572,10 +572,24 @@ impl App {
             None => return,
         };
         let home = std::env::var("HOME").unwrap_or_default();
+        // Sanitize the project name for use as a path segment: drop any
+        // character that could break out of ~/.crane-worktrees (leading
+        // dots, slashes, backslashes). Prevents a project folder named
+        // "../escape" from producing a traversal path.
+        let safe: String = project
+            .name
+            .chars()
+            .map(|c| match c {
+                '/' | '\\' | '\0' => '_',
+                c => c,
+            })
+            .collect();
+        let safe = safe.trim_start_matches('.').trim_start_matches('_');
+        let safe = if safe.is_empty() { "project" } else { safe };
         self.new_workspace_modal = Some(NewWorkspaceModal {
             project_id: pid,
             branch: String::new(),
-            custom_path: format!("{home}/.crane-worktrees/{}", project.name),
+            custom_path: format!("{home}/.crane-worktrees/{safe}"),
             mode: LocationMode::Global,
             create_new_branch: true,
             error: None,
@@ -674,8 +688,11 @@ impl App {
         let project = self.projects.iter().find(|p| p.id == pid);
         let wt = project.and_then(|p| p.workspaces.iter().find(|w| w.id == wid));
         let tab = wt.and_then(|w| w.tabs.iter().find(|t| t.id == tid));
+        // Separator is ASCII '/' — U+203A is tofu in JetBrains Mono
+        // (per CLAUDE.md). If we want a caret glyph later, source it
+        // from egui_phosphor::regular::CARET_RIGHT.
         format!(
-            "{}  ›  {}  ›  {}",
+            "{} / {} / {}",
             project.map(|p| p.name.as_str()).unwrap_or("?"),
             wt.map(|w| w.name.as_str()).unwrap_or("?"),
             tab.map(|t| t.name.as_str()).unwrap_or("?"),

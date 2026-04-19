@@ -196,7 +196,7 @@ fn render_inner(
                 for (idx, tab) in pane.tabs.iter().enumerate() {
                     let is_active = idx == pane.active;
                     let label = if tab.dirty() {
-                        format!("● {}", tab.name)
+                        format!("{}  {}", icons::CIRCLE, tab.name)
                     } else {
                         tab.name.clone()
                     };
@@ -246,7 +246,7 @@ fn render_inner(
     {
         let tab = &mut pane.tabs[active_idx];
         let name_label = if tab.dirty() {
-            format!("● {}", tab.name)
+            format!("{}  {}", icons::CIRCLE, tab.name)
         } else {
             tab.name.clone()
         };
@@ -480,14 +480,7 @@ fn render_inner(
         // hashed inside the closure). Diagnostics now render as an overlay
         // pass after the galley, so LSP updates no longer invalidate the
         // cached highlight.
-        let layout_salt = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            font_size.to_bits().hash(&mut h);
-            requested.hash(&mut h);
-            h.finish()
-        };
+        let layout_salt = crate::util::hash64((font_size.to_bits(), &requested));
         let cache_path = tab.path.clone();
         let cache_id = egui::Id::new(("file_view_layouter", &cache_path));
         let line_cache_id = egui::Id::new(("file_view_lines", &cache_path));

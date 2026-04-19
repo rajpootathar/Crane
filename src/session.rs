@@ -401,18 +401,28 @@ impl SPane {
 
     fn into_pane(self, ctx: &egui::Context, cwd: &Path) -> (PaneId, Pane) {
         let content = match self.content {
-            SPaneContent::Terminal { cwd: saved_cwd, history_b64: _ } => {
+            SPaneContent::Terminal { cwd: saved_cwd, history_b64 } => {
                 let spawn_cwd = if saved_cwd.as_os_str().is_empty() {
                     cwd
                 } else {
                     saved_cwd.as_path()
                 };
-                match crate::terminal::Terminal::spawn(
-                    ctx.clone(),
-                    80,
-                    24,
-                    Some(spawn_cwd),
-                ) {
+                // Replay the saved scrollback if we have it — decoding
+                // failures fall back to a fresh terminal rather than
+                // blocking the whole session restore.
+                let history = base64_decode(&history_b64).unwrap_or_default();
+                let spawned = if history.is_empty() {
+                    crate::terminal::Terminal::spawn(ctx.clone(), 80, 24, Some(spawn_cwd))
+                } else {
+                    crate::terminal::Terminal::spawn_with_history(
+                        ctx.clone(),
+                        80,
+                        24,
+                        Some(spawn_cwd),
+                        &history,
+                    )
+                };
+                match spawned {
                     Ok(t) => PaneContent::Terminal(t),
                     Err(_) => PaneContent::Files(FilesPane::empty()),
                 }
@@ -520,7 +530,6 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-#[allow(dead_code)] // paired with base64_encode; staged for scrollback replay
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     let mut lookup = [255u8; 256];
     for (i, &b) in B64.iter().enumerate() {
