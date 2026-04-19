@@ -379,6 +379,31 @@ impl LspServer {
         }
     }
 
+    /// LSP-spec graceful shutdown: send `shutdown` request, brief wait,
+    /// then `exit` notification, then a beat before Drop kills the
+    /// child. rust-analyzer otherwise leaves its DB dirty (full
+    /// re-index on next open) and typescript-language-server can
+    /// leak orphan node processes.
+    fn graceful_shutdown(&self) {
+        if self.shared.0.lock().dead {
+            return;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "shutdown",
+            "params": null,
+        }));
+        std::thread::sleep(Duration::from_millis(200));
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "exit",
+            "params": null,
+        }));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     fn send_initialize(&self, root_uri: Option<String>) {
         let id = self.next_id();
         self.shared.0.lock().init_request_id = Some(id);
@@ -658,6 +683,12 @@ impl LspServer {
             cv.wait_for(&mut g, Duration::from_millis(50));
         }
         g.definition_results.remove(&id).flatten()
+    }
+}
+
+impl Drop for LspServer {
+    fn drop(&mut self) {
+        self.graceful_shutdown();
     }
 }
 

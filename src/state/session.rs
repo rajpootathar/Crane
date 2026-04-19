@@ -297,8 +297,33 @@ impl Session {
             }
         }
 
-        app.active = self.active;
-        app.last_workspace = self.last_workspace;
+        // Sanitize cursors: a saved (pid, wid, tid) might reference a
+        // project/workspace/tab that no longer exists (e.g., the user
+        // ran `git worktree remove` outside Crane, or we pruned a
+        // missing project above). Dangling ids used to surface as
+        // blank panels / panics on first interaction; now we drop
+        // them cleanly.
+        if let Some((pid, wid, tid)) = self.active
+            && !app.projects.iter().any(|p| {
+                p.id == pid && p.workspaces.iter().any(|w| {
+                    w.id == wid && w.tabs.iter().any(|t| t.id == tid)
+                })
+            })
+        {
+            app.active = None;
+        } else {
+            app.active = self.active;
+        }
+        if let Some((pid, wid)) = self.last_workspace
+            && !app
+                .projects
+                .iter()
+                .any(|p| p.id == pid && p.workspaces.iter().any(|w| w.id == wid))
+        {
+            app.last_workspace = None;
+        } else {
+            app.last_workspace = self.last_workspace;
+        }
         app.set_id_counters(self.next_project, self.next_workspace, self.next_tab);
         app.update_check = UpdateCheck::new(self.update_prompts);
         app.selected_theme = self.selected_theme;

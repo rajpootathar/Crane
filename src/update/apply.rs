@@ -274,9 +274,13 @@ fn current_bundle_path() -> Option<PathBuf> {
 fn write_and_spawn_swap_script(target: &Path, staged: &Path) -> std::io::Result<()> {
     let pid = std::process::id();
     let script_path = std::env::temp_dir().join(format!("crane-swap-{pid}.sh"));
+    // Escape any embedded quotes so a path containing a `"` can't
+    // break out of the here-doc assignment.
+    let target_esc = target.to_string_lossy().replace('"', "\\\"");
+    let staged_esc = staged.to_string_lossy().replace('"', "\\\"");
     let script = format!(
         r#"#!/bin/bash
-set -e
+set -euo pipefail
 TARGET="{}"
 STAGED="{}"
 PID="{}"
@@ -302,9 +306,7 @@ open "$TARGET"
 rm -rf "$STAGED"
 rm -rf "${{TARGET}}.old"
 "#,
-        target.to_string_lossy(),
-        staged.to_string_lossy(),
-        pid
+        target_esc, staged_esc, pid
     );
     std::fs::write(&script_path, script)?;
     #[cfg(unix)]
