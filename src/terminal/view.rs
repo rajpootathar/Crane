@@ -70,8 +70,27 @@ fn pixel_to_point(
 
 pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f32, has_focus: bool) {
     let font_id = FontId::new(font_size, FontFamily::Monospace);
-    let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+    // Measure the stride egui actually uses when it lays out a galley,
+    // not the bare glyph advance. `glyph_width('M')` differs from the
+    // per-char step of a laid-out galley by a fraction of a pixel —
+    // enough to drift the cursor onto the previous cell after ~25
+    // columns of typed text. Laying out a 32-char string of 'M' and
+    // dividing by 32 gives the real stride that `painter.galley` will
+    // step by, so cursor math matches exactly.
     let cell_h = ui.fonts_mut(|f| f.row_height(&font_id));
+    let cell_w = {
+        let mut job = LayoutJob::default();
+        job.append(
+            "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM",
+            0.0,
+            TextFormat {
+                font_id: font_id.clone(),
+                ..Default::default()
+            },
+        );
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        galley.rect.width() / 32.0
+    };
 
     let available = ui.available_size();
     let cols = ((available.x / cell_w).floor() as usize).max(20);
@@ -218,28 +237,34 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     }
 
     let fallback_fg = term_fg();
+    // Per-run pinning: each style run is painted at run_start_col *
+    // col_stride, so egui's galley advance only accumulates WITHIN a
+    // run, not across the whole row. Use the raw (unrounded) cell_w so
+    // text and cursor share the same stride — rounding here introduces
+    // a sub-pixel gap per column that shows up as a visible gap between
+    // the last prompt char and the cursor on wider widths.
+    let col_stride = cell_w.max(1.0);
     for (line, mut row_cells) in by_row {
         row_cells.sort_by_key(|(c, _, _)| *c);
         let row_y = (origin.y + line as f32 * cell_h).round();
         let row_x = origin.x.round();
-        let row_rect = Rect::from_min_size(
-            Pos2::new(row_x, row_y),
-            Vec2::new(cols_count as f32 * cell_w, cell_h.round()),
-        );
 
-        // Coalesce runs of same (fg, bg, underline) into one LayoutJob
-        // section. Selection bg wins over cell bg.
-        let mut job = LayoutJob::default();
+        // Paint each style run as its own galley pinned to
+        // `row_x + run_start_col * col_stride`. This guarantees
+        // text columns match cursor column exactly regardless of how
+        // egui's font layout accumulates per-glyph advance.
         let mut cur_fg: Option<Color32> = None;
         let mut cur_bg: Option<Color32> = None;
         let mut cur_underline = false;
         let mut buf = String::new();
+        let mut run_start_col: usize = 0;
 
-        let flush = |job: &mut LayoutJob,
-                     buf: &mut String,
-                     fg: Option<Color32>,
-                     bg: Option<Color32>,
-                     underline: bool| {
+        let flush = |buf: &mut String,
+                         run_start_col: usize,
+                         fg: Option<Color32>,
+                         bg: Option<Color32>,
+                         underline: bool,
+                         ui: &mut egui::Ui| {
             if buf.is_empty() {
                 return;
             }
@@ -252,6 +277,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             } else {
                 egui::Stroke::NONE
             };
+            let mut job = LayoutJob::default();
             job.append(
                 buf,
                 0.0,
@@ -263,6 +289,9 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     ..Default::default()
                 },
             );
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            let run_x = row_x + run_start_col as f32 * col_stride;
+            painter.galley(Pos2::new(run_x, row_y), galley, fallback_fg);
             buf.clear();
         };
 
@@ -301,7 +330,8 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             };
             let underline = cell.flags.contains(CellFlags::UNDERLINE);
             if Some(fg) != cur_fg || Some(bg) != cur_bg || underline != cur_underline {
-                flush(&mut job, &mut buf, cur_fg, cur_bg, cur_underline);
+                flush(&mut buf, run_start_col, cur_fg, cur_bg, cur_underline, ui);
+                run_start_col = col;
                 cur_fg = Some(fg);
                 cur_bg = Some(bg);
                 cur_underline = underline;
@@ -321,20 +351,15 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             };
             buf.push(ch);
         }
-        flush(&mut job, &mut buf, cur_fg, cur_bg, cur_underline);
-
-        if !job.is_empty() {
-            let galley = ui.fonts_mut(|f| f.layout_job(job));
-            painter.galley(row_rect.min, galley, fallback_fg);
-        }
+        flush(&mut buf, run_start_col, cur_fg, cur_bg, cur_underline, ui);
     }
 
     // Snap cursor to integer pixels so it aligns with char cells. Subpixel
     // drift accumulates on long lines and makes the cursor look "off by
     // one" vs where the next character will print.
-    let cx = (origin.x + cursor_col as f32 * cell_w).round();
+    let cx = origin.x.round() + cursor_col as f32 * col_stride;
     let cy = (origin.y + cursor_line as f32 * cell_h).round();
-    let cw = cell_w.round();
+    let cw = col_stride;
     let ch = cell_h.round();
     let cursor_color = {
         let c = theme::current().terminal_fg;
@@ -416,6 +441,20 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     // all keyboard/paste input routing so key events don't leak into
     // the PTY through the backdrop.
     let input_enabled = ui.is_enabled();
+    // Image paste: on macOS an NSEvent local monitor (mac_paste.rs)
+    // catches Cmd+V before winit sees it, reads NSPasteboard for
+    // image data, writes it to a temp PNG, and enqueues the path.
+    // Drain here so it flows into the active terminal as a normal
+    // bracketed paste. egui-winit's Event::Paste path can't be used:
+    // it calls arboard.get() for text only and returns early on
+    // image clipboards without pushing any event.
+    #[cfg(target_os = "macos")]
+    if input_enabled && !other_widget_focused {
+        let mut paths = crate::mac_paste::drain_pending_image_paths();
+        if let Some(p) = paths.pop() {
+            paste_text = Some(p);
+        }
+    }
     if input_enabled { ui.input(|i| {
         for event in &i.events {
             match event {
@@ -480,6 +519,10 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                             continue;
                         }
                     if modifiers.mac_cmd || modifiers.command {
+                        // Image paste for Cmd+V is handled by
+                        // mac_paste.rs's NSEvent monitor, whose queue
+                        // is drained above. All other Cmd+key combos
+                        // are swallowed so they don't echo to the PTY.
                         continue;
                     }
                     // Alt/Option + arrow: emit word-navigation sequences

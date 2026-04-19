@@ -1,6 +1,8 @@
 #[cfg(target_os = "macos")]
 mod browser;
 mod format;
+#[cfg(target_os = "macos")]
+mod mac_paste;
 mod git;
 mod lsp;
 mod modals;
@@ -52,6 +54,8 @@ fn main() -> eframe::Result {
             // after NSApp exists. eframe's creation_context callback
             // fires right after window init, which is late enough.
             platform_menu::install();
+            #[cfg(target_os = "macos")]
+            mac_paste::install_cmd_v_monitor();
             Ok(Box::new(CraneApp::new(cc)))
         }),
     )
