@@ -34,8 +34,6 @@
 //! lines) egui's layout cost dominates regardless. That needs a
 //! viewport-culled custom editor widget, which is a separate project.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter, Style, Theme};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
@@ -58,9 +56,7 @@ pub struct LineHighlightCache {
 }
 
 fn hash_line(s: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+    crate::util::hash64(s)
 }
 
 /// Update `cache` to reflect the current `text`, running syntect only on

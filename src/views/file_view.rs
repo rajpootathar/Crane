@@ -490,14 +490,7 @@ fn render_inner(
                                   _wrap_width: f32|
               -> std::sync::Arc<egui::Galley> {
             let text = buffer.as_str();
-            let key = {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut h = DefaultHasher::new();
-                text.hash(&mut h);
-                layout_salt.hash(&mut h);
-                h.finish()
-            };
+            let key = crate::util::hash64((text, layout_salt));
 
             if let Some(cached) = ui
                 .memory(|m| m.data.get_temp::<CachedGalley>(cache_id))
@@ -511,14 +504,7 @@ fn render_inner(
             // lines below the first change), then rebuild the LayoutJob
             // from the cache. On a typical keystroke at the bottom of a
             // file this rehighlights exactly one line.
-            let context_hash = {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut h = DefaultHasher::new();
-                requested.hash(&mut h);
-                syntax.name.hash(&mut h);
-                h.finish()
-            };
+            let context_hash = crate::util::hash64((&requested, syntax.name.as_str()));
             let mut line_cache: LineHighlightCache = ui
                 .memory(|m| m.data.get_temp::<LineHighlightCache>(line_cache_id))
                 .unwrap_or_default();

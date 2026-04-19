@@ -98,22 +98,10 @@ fn has_eslint_config(start: &Path) -> bool {
         return *hit;
     }
 
-    let mut cur = key.clone();
-    let found = loop {
-        let mut hit = false;
-        for name in NAMES {
-            if cur.join(name).is_file() {
-                hit = true;
-                break;
-            }
-        }
-        if hit {
-            break true;
-        }
-        if !cur.pop() {
-            break false;
-        }
-    };
+    let found = crate::util::find_ancestor(&key, |dir| {
+        NAMES.iter().any(|n| dir.join(n).is_file())
+    })
+    .is_some();
     if let Ok(mut map) = cache.lock() {
         map.insert(key, (found, Instant::now()));
     }

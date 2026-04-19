@@ -25,7 +25,12 @@ pub struct Tab {
 
 pub struct Workspace {
     pub id: WorkspaceId,
+    /// Canonical name — the branch / worktree folder. Never mutated by
+    /// the UI; Crane only changes it if git itself renames the branch.
     pub name: String,
+    /// Optional user-set display alias. When `Some(x)`, the UI renders
+    /// "x (name)" so the original folder / branch stays visible.
+    pub display_name: Option<String>,
     pub path: PathBuf,
     pub tabs: Vec<Tab>,
     pub active_tab: Option<TabId>,
@@ -33,6 +38,16 @@ pub struct Workspace {
     pub git_status: Option<GitStatus>,
     pub last_status_refresh: Option<Instant>,
     pub git_rx: Option<std::sync::mpsc::Receiver<Option<GitStatus>>>,
+}
+
+impl Workspace {
+    /// Display form for UI rows: `alias (name)` when aliased, else name.
+    pub fn label(&self) -> String {
+        match &self.display_name {
+            Some(alias) if !alias.trim().is_empty() => format!("{alias} ({})", self.name),
+            _ => self.name.clone(),
+        }
+    }
 }
 
 pub struct Project {
@@ -165,6 +180,10 @@ pub struct App {
     /// inline rename mode. Set on double-click; committed on Enter /
     /// focus-lost, cancelled on Esc.
     pub renaming_tab: Option<(ProjectId, WorkspaceId, TabId, String)>,
+    /// Parallel slot for workspace-level rename. Commits into
+    /// `Workspace::display_name`, not `name` — the canonical folder /
+    /// branch label is preserved, the custom alias just decorates.
+    pub renaming_workspace: Option<(ProjectId, WorkspaceId, String)>,
     pub branch_picker_loading: bool,
     pub branch_picker_rx:
         Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Vec<String>, Vec<String>)>>>,
@@ -217,6 +236,7 @@ impl App {
             branch_picker_opened_at: None,
             branch_picker_error: None,
             renaming_tab: None,
+            renaming_workspace: None,
             branch_picker_loading: false,
             branch_picker_rx: None,
             branch_picker_repos: Vec::new(),
@@ -291,6 +311,7 @@ impl App {
             workspaces.push(Workspace {
                 id: wt_id,
                 name: info.branch,
+                display_name: None,
                 path: info.path,
                 tabs: vec![tab],
                 active_tab: Some(tab_id),
@@ -651,6 +672,7 @@ impl App {
                 project.workspaces.push(Workspace {
                     id: wt_id,
                     name: branch,
+                    display_name: None,
                     path: wt_path,
                     tabs: vec![tab],
                     active_tab: Some(tab_id),

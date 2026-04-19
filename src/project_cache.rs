@@ -20,8 +20,6 @@ pub fn root() -> Option<PathBuf> {
 /// hex digest of the full absolute path. Safe to use as a directory
 /// name on every platform we target.
 pub fn slug_for(project_path: &Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let name = project_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -30,9 +28,8 @@ pub fn slug_for(project_path: &Path) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
-    let mut h = DefaultHasher::new();
-    project_path.hash(&mut h);
-    format!("{sanitized}-{:08x}", h.finish() as u32)
+    let digest = crate::util::hash64(project_path) as u32;
+    format!("{sanitized}-{digest:08x}")
 }
 
 /// Returns (and creates if missing) the cache dir for `project_path`.

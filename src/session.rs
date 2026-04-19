@@ -72,6 +72,8 @@ pub struct SProject {
 pub struct SWorkspace {
     pub id: WorkspaceId,
     pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub path: PathBuf,
     pub expanded: bool,
     pub active_tab: Option<TabId>,
@@ -157,6 +159,7 @@ impl Session {
                 workspaces.push(SWorkspace {
                     id: w.id,
                     name: w.name.clone(),
+                    display_name: w.display_name.clone(),
                     path: w.path.clone(),
                     expanded: w.expanded,
                     active_tab: w.active_tab,
@@ -227,6 +230,7 @@ impl Session {
                 workspaces.push(Workspace {
                     id: sw.id,
                     name: sw.name,
+                    display_name: sw.display_name,
                     path: sw.path,
                     expanded: sw.expanded,
                     active_tab: sw.active_tab,

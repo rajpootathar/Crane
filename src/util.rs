@@ -14,9 +14,18 @@ pub fn hash64<H: Hash>(value: H) -> u64 {
 
 /// Walks up from `start`'s parent directory, invoking `matches` on each
 /// ancestor until it returns `true` or the filesystem root is reached.
-/// Replaces the four ad-hoc ancestor loops in lsp/format/eslint/git.
-pub fn find_ancestor<F: Fn(&Path) -> bool>(start: &Path, matches: F) -> Option<PathBuf> {
-    let mut cur = start.parent().unwrap_or(start).to_path_buf();
+/// If `start` is a file path, walking begins at its parent; if it's a
+/// directory, walking begins at that directory. Returns the matching
+/// directory, not any inner file name the predicate checked.
+pub fn find_ancestor<F: FnMut(&Path) -> bool>(start: &Path, mut matches: F) -> Option<PathBuf> {
+    let mut cur = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+    if cur.as_os_str().is_empty() {
+        return None;
+    }
     loop {
         if matches(&cur) {
             return Some(cur);

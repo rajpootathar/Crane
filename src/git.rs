@@ -201,22 +201,7 @@ pub fn workspace_add(repo: &Path, path: &Path, branch: &str, create_new: bool) -
 /// Workspace root.
 pub fn find_git_root(start: &Path) -> Option<PathBuf> {
     let canon = start.canonicalize().ok()?;
-    let mut cur = if canon.is_file() {
-        canon.parent()?.to_path_buf()
-    } else {
-        canon
-    };
-    if cur.as_os_str().is_empty() {
-        return None;
-    }
-    loop {
-        if cur.join(".git").exists() {
-            return Some(cur);
-        }
-        if !cur.pop() {
-            return None;
-        }
-    }
+    crate::util::find_ancestor(&canon, |dir| dir.join(".git").exists())
 }
 
 /// Discover all `.git` roots under `start`, capped by depth to avoid

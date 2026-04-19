@@ -84,9 +84,9 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut remove_project: Option<u64> = None;
     let mut remove_worktree: Option<(u64, u64)> = None;
 
-    // Snapshot rename state into a local buffer so the tree walk below
-    // only needs an immutable borrow of `app`. The buffer is flushed
-    // back into `app.renaming_tab` after the walk.
+    // Snapshot rename state into local buffers so the tree walk only
+    // needs an immutable borrow of `app`. Buffers are flushed back into
+    // `app.renaming_tab` / `app.renaming_workspace` after the walk.
     let renaming_ref: Option<(u64, u64, u64, String)> =
         app.renaming_tab.as_ref().map(|(p, w, t, b)| (*p, *w, *t, b.clone()));
     let mut rename_buffer: Option<String> =
@@ -95,6 +95,15 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut commit_rename: Option<(u64, u64, u64, String)> = None;
     let mut cancel_rename = false;
     let mut rename_focused = false;
+
+    let renaming_wt_ref: Option<(u64, u64, String)> =
+        app.renaming_workspace.as_ref().map(|(p, w, b)| (*p, *w, b.clone()));
+    let mut rename_wt_buffer: Option<String> =
+        renaming_wt_ref.as_ref().map(|(_, _, b)| b.clone());
+    let mut start_rename_wt: Option<(u64, u64, String)> = None;
+    let mut commit_rename_wt: Option<(u64, u64, String)> = None;
+    let mut cancel_rename_wt = false;
+    let mut rename_wt_focused = false;
 
     egui::ScrollArea::vertical()
         .id_salt("left_projects")
@@ -160,6 +169,47 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 None
                             }
                         });
+                        let wt_renaming = renaming_wt_ref
+                            .as_ref()
+                            .map(|(p, w, _)| *p == project.id && *w == wt.id)
+                            .unwrap_or(false);
+                        if wt_renaming {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 26.0),
+                                egui::Sense::hover(),
+                            );
+                            let mut child = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(rect.shrink2(egui::vec2(32.0, 2.0))),
+                            );
+                            let buf = rename_wt_buffer
+                                .as_mut()
+                                .expect("wt rename buffer matches renaming_wt_ref");
+                            let te_id = egui::Id::new(("rename_wt", wt.id));
+                            let resp = child.add(
+                                egui::TextEdit::singleline(buf)
+                                    .id(te_id)
+                                    .hint_text(&wt.name)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if !ui.memory(|m| m.has_focus(te_id)) && !rename_wt_focused {
+                                resp.request_focus();
+                                rename_wt_focused = true;
+                            }
+                            let is_focused = ui.memory(|m| m.has_focus(te_id));
+                            let enter = is_focused
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let esc = is_focused
+                                && ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if enter {
+                                commit_rename_wt =
+                                    Some((project.id, wt.id, buf.clone()));
+                            } else if esc || resp.lost_focus() {
+                                cancel_rename_wt = true;
+                            }
+                            continue;
+                        }
+                        let wt_label = wt.label();
                         let wt_row = draw_row(
                             ui,
                             RowConfig {
@@ -167,7 +217,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 expanded: Some(wt.expanded),
                                 leading: Some(icons::GIT_BRANCH),
                                 leading_color: if active_wt { Some(accent()) } else { None },
-                                label: &wt.name,
+                                label: &wt_label,
                                 label_color: None,
                                 is_active: active_wt,
                                 active_bar: active_wt,
@@ -183,13 +233,24 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         );
                         if wt_trailing[0] {
                             new_tab_for_worktree = Some((project.id, wt.id));
+                        } else if wt_row.response.double_clicked() {
+                            start_rename_wt = Some((
+                                project.id,
+                                wt.id,
+                                wt.display_name.clone().unwrap_or_default(),
+                            ));
                         } else if wt_row.main_clicked {
                             toggle_worktree = Some((project.id, wt.id));
                         }
                         let wt_pid = project.id;
                         let wt_id = wt.id;
                         let wt_path = wt.path.clone();
+                        let wt_display_seed = wt.display_name.clone().unwrap_or_default();
                         wt_row.response.context_menu(|ui| {
+                            if ui.button(format!("{}  Rename", icons::PENCIL_SIMPLE)).clicked() {
+                                start_rename_wt = Some((wt_pid, wt_id, wt_display_seed.clone()));
+                                ui.close();
+                            }
                             if ui.button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN)).clicked() {
                                 reveal_in_file_manager(&wt_path);
                                 ui.close();
@@ -310,7 +371,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         });
 
 
-    // Flush rename edits back into App.
+    // Flush tab rename edits back into App.
     if let (Some(buf), Some(slot)) = (rename_buffer.as_ref(), app.renaming_tab.as_mut()) {
         slot.3 = buf.clone();
     }
@@ -328,6 +389,27 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         app.renaming_tab = None;
     } else if let Some(start) = start_rename {
         app.renaming_tab = Some(start);
+    }
+
+    // Flush workspace rename edits back into App. Empty trimmed input
+    // clears the alias (reverting to folder / branch name only).
+    if let (Some(buf), Some(slot)) =
+        (rename_wt_buffer.as_ref(), app.renaming_workspace.as_mut())
+    {
+        slot.2 = buf.clone();
+    }
+    if let Some((pid, wid, new_alias)) = commit_rename_wt {
+        let trimmed = new_alias.trim().to_string();
+        if let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
+            && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid)
+        {
+            w.display_name = if trimmed.is_empty() { None } else { Some(trimmed) };
+        }
+        app.renaming_workspace = None;
+    } else if cancel_rename_wt {
+        app.renaming_workspace = None;
+    } else if let Some(start) = start_rename_wt {
+        app.renaming_workspace = Some(start);
     }
 
     if let Some(pid) = toggle_project

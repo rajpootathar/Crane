@@ -51,29 +51,29 @@ const FILE_NAMES: &[&str] = &[
 /// parsed; YAML configs are recognized but fall back to defaults (we
 /// avoid pulling serde_yaml in for one feature).
 pub fn discover(file: &Path) -> FormatStyle {
-    let mut cur: PathBuf = file.parent().unwrap_or(file).to_path_buf();
-    loop {
+    let mut found: Option<FormatStyle> = None;
+    crate::util::find_ancestor(file, |dir| {
         for name in FILE_NAMES {
-            let candidate = cur.join(name);
+            let candidate = dir.join(name);
             if candidate.is_file()
                 && let Some(mut s) = parse_rc(&candidate)
             {
                 s.source = Some(candidate);
-                return s;
+                found = Some(s);
+                return true;
             }
         }
-        let pkg = cur.join("package.json");
+        let pkg = dir.join("package.json");
         if pkg.is_file()
             && let Some(mut s) = parse_pkg_field(&pkg)
         {
             s.source = Some(pkg);
-            return s;
+            found = Some(s);
+            return true;
         }
-        if !cur.pop() {
-            break;
-        }
-    }
-    FormatStyle::default()
+        false
+    });
+    found.unwrap_or_default()
 }
 
 /// Run the language-appropriate formatter over `content`, piping through
