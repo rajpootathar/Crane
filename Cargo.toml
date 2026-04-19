@@ -50,6 +50,13 @@ flate2 = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Native application menu (macOS menu bar, Windows/Linux menubar).
+# We only wire it up on macOS — gives us a real `Crane → Settings…`
+# item + Preferences keyboard shortcut integration. muda is the
+# de-facto winit-era replacement for the older tao menu API.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.15"
+
 [profile.dev]
 opt-level = 1
 

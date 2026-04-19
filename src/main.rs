@@ -2,6 +2,7 @@ mod format;
 mod git;
 mod lsp;
 mod modals;
+mod platform_menu;
 mod state;
 mod terminal;
 mod theme;
@@ -44,7 +45,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Crane",
         options,
-        Box::new(|cc| Ok(Box::new(CraneApp::new(cc)))),
+        Box::new(|cc| {
+            // macOS menu bar must be installed from the main thread
+            // after NSApp exists. eframe's creation_context callback
+            // fires right after window init, which is late enough.
+            platform_menu::install();
+            Ok(Box::new(CraneApp::new(cc)))
+        }),
     )
 }
 
@@ -580,6 +587,15 @@ impl CraneApp {
 impl eframe::App for CraneApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Native menu events (macOS). On other platforms this returns
+        // an empty Vec and does nothing.
+        for id in platform_menu::drain_events() {
+            match id.as_str() {
+                platform_menu::ID_SETTINGS => self.app.show_settings = true,
+                platform_menu::ID_SHORTCUTS => self.app.show_help = true,
+                _ => {}
+            }
+        }
         self.app.ensure_initial(&ctx);
         self.handle_shortcuts(&ctx);
         self.app.refresh_active_git_status(&ctx);
