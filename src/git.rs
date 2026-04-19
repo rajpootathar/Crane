@@ -312,6 +312,15 @@ pub fn list_remote_branches(repo: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Switch the working tree of `repo` to `branch` without creating a
+/// new worktree. Fails (returns Err) on dirty tree or unknown branch —
+/// git's own messages surface to the user.
+pub fn checkout_branch(repo: &Path, branch: &str) -> Result<(), String> {
+    // `git switch` is the unambiguous modern form — won't confuse a
+    // dash-prefixed branch name with a flag the way `checkout` can.
+    run(repo, &["switch", branch])
+}
+
 pub fn list_local_branches(repo: &Path) -> Vec<String> {
     let out = match Command::new("git")
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])

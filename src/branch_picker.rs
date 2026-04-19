@@ -300,6 +300,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         if let Some(modal) = app.new_workspace_modal.as_mut() {
             modal.branch = b;
             modal.create_new_branch = false;
+            modal.branch_locked = true;
         }
         app.branch_picker_open = false;
     }

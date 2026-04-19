@@ -104,6 +104,12 @@ pub struct NewWorkspaceModal {
     pub custom_path: String,
     pub mode: LocationMode,
     pub create_new_branch: bool,
+    /// True when the modal is opened from the branch picker with an
+    /// existing branch: the branch name is known and the "Create new
+    /// branch" choice is fixed. We hide the checkbox and lock the
+    /// branch text field to avoid letting the user flip into a state
+    /// that git would reject (e.g. `-b` on a branch that already exists).
+    pub branch_locked: bool,
     pub error: Option<String>,
 }
 
@@ -592,6 +598,7 @@ impl App {
             custom_path: format!("{home}/.crane-worktrees/{safe}"),
             mode: LocationMode::Global,
             create_new_branch: true,
+            branch_locked: false,
             error: None,
         });
     }

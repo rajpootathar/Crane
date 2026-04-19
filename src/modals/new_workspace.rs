@@ -28,12 +28,25 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
             if let Some(modal) = app.new_workspace_modal.as_mut() {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Branch").strong());
-                ui.add(
+                ui.add_enabled(
+                    !modal.branch_locked,
                     egui::TextEdit::singleline(&mut modal.branch)
                         .hint_text("feature/my-branch")
                         .desired_width(input_width),
                 );
-                ui.checkbox(&mut modal.create_new_branch, "Create new branch");
+                if modal.branch_locked {
+                    // Opened from the branch picker with an existing
+                    // branch — action is unambiguous (check out into new
+                    // worktree). Hide the checkbox so the user can't
+                    // flip into an invalid `git worktree add -b <existing>`.
+                    ui.label(
+                        egui::RichText::new("Checking out existing branch into a new worktree")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(130, 136, 150)),
+                    );
+                } else {
+                    ui.checkbox(&mut modal.create_new_branch, "Create new branch");
+                }
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Location").strong());
                 ui.horizontal(|ui| {
