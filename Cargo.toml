@@ -1,6 +1,6 @@
 [package]
 name = "crane"
-version = "0.1.59"
+version = "0.1.60"
 edition = "2024"
 description = "Native GPU-rendered terminal + IDE environment"
 authors = ["rajpootathar"]

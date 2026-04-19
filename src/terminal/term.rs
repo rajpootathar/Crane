@@ -29,19 +29,22 @@ impl Dimensions for TermSize {
 #[derive(Clone)]
 pub struct WakeListener {
     ctx: egui::Context,
-    /// Bytes alacritty wants us to write back to the PTY (cursor
-    /// position / device-status replies, title ack, etc.). Drained
-    /// by the Terminal each frame and forwarded to the PTY writer.
-    /// Without this, ZSH's RPROMPT uses `ESC[6n` to measure cursor
-    /// position and, getting no reply, guesses a garbage offset —
-    /// that was the "prompts stacked diagonally" bug.
-    pty_replies: Arc<Mutex<Vec<u8>>>,
+    /// PTY writer shared with the Terminal so VT replies go out *now*,
+    /// not on the next render frame. ZSH's prompt logic issues `ESC[6n`
+    /// (cursor-position query) synchronously and uses a short timeout
+    /// to read the reply; a one-frame delay (~16ms) lands right on the
+    /// edge of that timeout and causes the RPROMPT column math to be
+    /// computed against a fallback value, leaving the cursor a few
+    /// columns short of where it should be.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
 impl EventListener for WakeListener {
     fn send_event(&self, event: TermEvent) {
         if let TermEvent::PtyWrite(s) = event {
-            self.pty_replies.lock().extend_from_slice(s.as_bytes());
+            let mut w = self.writer.lock();
+            let _ = w.write_all(s.as_bytes());
+            let _ = w.flush();
         }
         self.ctx.request_repaint();
     }
@@ -51,7 +54,7 @@ const HISTORY_MAX: usize = 256 * 1024;
 
 pub struct Terminal {
     pub term: Arc<Mutex<Term<WakeListener>>>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub cols: usize,
     pub rows: usize,
     pub cwd: std::path::PathBuf,
@@ -60,27 +63,11 @@ pub struct Terminal {
     pub click_count: u8,
     master: Box<dyn MasterPty + Send>,
     shell_pid: Option<u32>,
-    /// Bytes alacritty's VT parser has queued for the shell (replies
-    /// to CSI 6n / DA / DSR queries). Drained + forwarded by
-    /// `flush_pty_replies` each frame.
-    pty_replies: Arc<Mutex<Vec<u8>>>,
-}
-
-impl Terminal {
-    /// Forward any queued VT replies to the shell. Must be called every
-    /// frame (cheap when the queue is empty). Without this, ZSH's
-    /// RPROMPT + any shell feature relying on cursor-position-query
-    /// misbehaves.
-    pub fn flush_pty_replies(&mut self) {
-        let mut q = self.pty_replies.lock();
-        if q.is_empty() {
-            return;
-        }
-        let bytes = std::mem::take(&mut *q);
-        drop(q);
-        let _ = self.writer.write_all(&bytes);
-        let _ = self.writer.flush();
-    }
+    /// Plain-text snapshot of the previous session's grid, shown as a
+    /// read-only panel above the live alacritty grid. None after the
+    /// user dismisses it or on first-run terminals. Lives outside
+    /// alacritty entirely — no escape replay, no cursor interference.
+    pub transcript: Option<String>,
 }
 
 impl Terminal {
@@ -98,7 +85,7 @@ impl Terminal {
         cols: usize,
         rows: usize,
         cwd: Option<&Path>,
-        pre_reader_text: Option<&str>,
+        transcript: Option<String>,
     ) -> std::io::Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -125,10 +112,19 @@ impl Terminal {
         let shell_pid = child.process_id();
         drop(pair.slave);
 
-        let pty_replies = Arc::new(Mutex::new(Vec::<u8>::with_capacity(64)));
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let writer = Arc::new(Mutex::new(
+            pair.master
+                .take_writer()
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        ));
+
         let listener = WakeListener {
             ctx: ctx.clone(),
-            pty_replies: pty_replies.clone(),
+            writer: writer.clone(),
         };
         let term = Arc::new(Mutex::new(Term::new(
             Config::default(),
@@ -139,43 +135,11 @@ impl Terminal {
             listener,
         )));
 
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
         let history = Arc::new(Mutex::new(Vec::<u8>::with_capacity(HISTORY_MAX / 2)));
 
-        // Pre-reader history injection: write the saved text snapshot
-        // into the grid BEFORE the reader thread starts, so there is
-        // no race with the shell's startup output. The text is pure
-        // printable chars + CRLF (no escapes), so it flows into the
-        // grid predictably — filling the visible rows first, scrolling
-        // earlier rows into alacritty's scrollback buffer. When the
-        // reader thread starts and the shell prints its first prompt,
-        // it lands below our replayed history. If the shell clears
-        // the visible screen, our history still lives in scrollback
-        // (Ctrl+Wheel / scrollbar to view).
-        if let Some(text) = pre_reader_text
-            && !text.is_empty()
-        {
-            let mut processor: Processor<StdSyncHandler> = Processor::new();
-            let mut guard = term.lock();
-            processor.advance(&mut *guard, text.as_bytes());
-            // Append a final CRLF so the shell's own first prompt
-            // starts on its own line rather than concatenating.
-            processor.advance(&mut *guard, b"\r\n");
-            drop(guard);
-            // Any PtyWrite events that accumulated during replay are
-            // replies to stale queries from the prior session — they
-            // mustn't reach the new shell.
-            pty_replies.lock().clear();
-        }
-
+        // Transcript (if any) renders as a separate read-only panel in
+        // terminal/view.rs, NOT into alacritty's grid — keeps the
+        // live shell's cursor / RPROMPT logic isolated.
         let term_clone = term.clone();
         let history_clone = history.clone();
         let ctx_clone = ctx.clone();
@@ -218,7 +182,7 @@ impl Terminal {
             click_count: 0,
             master: pair.master,
             shell_pid,
-            pty_replies,
+            transcript,
         })
     }
 
@@ -258,7 +222,7 @@ impl Terminal {
         cwd: Option<&Path>,
         history_text: &str,
     ) -> std::io::Result<Self> {
-        Self::spawn_inner(ctx, cols, rows, cwd, Some(history_text))
+        Self::spawn_inner(ctx, cols, rows, cwd, Some(history_text.to_string()))
     }
 
     /// Raw PTY byte log. Retained on `Terminal` for future features
@@ -303,8 +267,9 @@ impl Terminal {
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
-        let _ = self.writer.write_all(data);
-        let _ = self.writer.flush();
+        let mut w = self.writer.lock();
+        let _ = w.write_all(data);
+        let _ = w.flush();
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
