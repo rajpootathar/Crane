@@ -39,19 +39,33 @@ fn point_in_selection(point: Point, range: &alacritty_terminal::selection::Selec
     }
 }
 
-fn pixel_to_point(pos: Pos2, origin: Pos2, cell_w: f32, cell_h: f32, cols: usize, rows: usize) -> (Point, Side) {
+fn pixel_to_point(
+    pos: Pos2,
+    origin: Pos2,
+    cell_w: f32,
+    cell_h: f32,
+    cols: usize,
+    rows: usize,
+    display_offset: usize,
+) -> (Point, Side) {
     let rel_x = (pos.x - origin.x).max(0.0);
     let rel_y = (pos.y - origin.y).max(0.0);
     let col_f = rel_x / cell_w;
     let line_f = rel_y / cell_h;
     let col = (col_f.floor() as usize).min(cols.saturating_sub(1));
-    let line = (line_f.floor() as usize).min(rows.saturating_sub(1));
+    let viewport_line = (line_f.floor() as usize).min(rows.saturating_sub(1));
+    // Alacritty's Selection wants grid-absolute Line: negative into
+    // scrollback, 0..screen_lines-1 for the current screen. At
+    // display_offset=0 the viewport IS the current screen; as the
+    // user scrolls up each display_offset step shifts what's visible
+    // by one row into history.
+    let grid_line = viewport_line as i32 - display_offset as i32;
     let side = if col_f - col_f.floor() < 0.5 {
         Side::Left
     } else {
         Side::Right
     };
-    (Point::new(Line(line as i32), Column(col)), side)
+    (Point::new(Line(grid_line), Column(col)), side)
 }
 
 pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f32, has_focus: bool) {
@@ -96,17 +110,22 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         }
     }
 
-    // Drag: plain range select.
+    // Drag: plain range select. pixel_to_point needs the current
+    // display_offset so clicks on scrollback content resolve to the
+    // right (negative) grid line rather than landing on the current
+    // screen.
     if response.drag_started()
         && let Some(pos) = response.interact_pointer_pos() {
-            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
             let mut guard = terminal.term.lock();
+            let off = guard.grid().display_offset();
+            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off);
             guard.selection = Some(Selection::new(SelectionType::Simple, point, side));
         }
     if response.dragged()
         && let Some(pos) = response.interact_pointer_pos() {
-            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
             let mut guard = terminal.term.lock();
+            let off = guard.grid().display_offset();
+            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off);
             if let Some(sel) = guard.selection.as_mut() {
                 sel.update(point, side);
             }
@@ -116,7 +135,8 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     // Shift+click → extend existing selection to click point.
     if response.clicked()
         && let Some(pos) = response.interact_pointer_pos() {
-            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows);
+            let off = terminal.term.lock().grid().display_offset();
+            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off);
             let shift_held = ui.input(|i| i.modifiers.shift);
             let now = std::time::Instant::now();
             let is_multi = terminal

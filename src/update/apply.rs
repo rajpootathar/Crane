@@ -56,16 +56,22 @@ impl Updater {
         cfg!(target_os = "macos")
     }
 
-    /// Kick off a background download-and-stage for a DMG url. Must be a
-    /// macOS build for the full flow to succeed; other platforms flip to
-    /// `Failed` immediately so the UI can fall back to opening a browser.
-    pub fn start(&self, url: String, ctx: egui::Context) {
+    /// Kick off a background download-and-stage for a list of candidate
+    /// DMG urls. Tries each in order, stops at the first 200. Accepting
+    /// a list lets callers supply arch-specific + universal URLs and
+    /// fall through whichever the release actually shipped.
+    pub fn start(&self, urls: Vec<String>, ctx: egui::Context) {
         if !Self::is_supported_platform() {
             *self.state.lock() = UpdateState::Failed(
                 "In-app update supported on macOS only today. Open the Releases \
                 page to download the installer for your platform."
                     .to_string(),
             );
+            return;
+        }
+        if urls.is_empty() {
+            *self.state.lock() =
+                UpdateState::Failed("No download URL available for this build.".into());
             return;
         }
         {
@@ -83,14 +89,24 @@ impl Updater {
         let state = self.state.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
-            match do_download_and_stage(&url, &state, &ctx2) {
-                Ok(path) => {
-                    *state.lock() = UpdateState::Ready { staged_bundle: path };
-                }
-                Err(e) => {
-                    *state.lock() = UpdateState::Failed(e.to_string());
+            let mut last_err: Option<String> = None;
+            for url in &urls {
+                match do_download_and_stage(url, &state, &ctx2) {
+                    Ok(path) => {
+                        *state.lock() = UpdateState::Ready { staged_bundle: path };
+                        ctx2.request_repaint();
+                        return;
+                    }
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        // Reset to Downloading for the next candidate.
+                        *state.lock() = UpdateState::Downloading { bytes: 0 };
+                    }
                 }
             }
+            *state.lock() = UpdateState::Failed(
+                last_err.unwrap_or_else(|| "no candidate URL succeeded".into()),
+            );
             ctx2.request_repaint();
         });
     }

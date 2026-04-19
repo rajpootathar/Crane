@@ -1,12 +1,27 @@
 use crate::state::App;
 
-fn dmg_url_for(version: &str) -> Option<String> {
+/// Candidate release-asset URLs for this build, in the order the
+/// updater should try them. Arch-specific DMG first (matches how we
+/// actually publish today), universal second (what cargo-bundle's
+/// Makefile target names them when run with release-universal), and
+/// a bare arm64 fallback for older builds. The first URL that returns
+/// 200 wins.
+fn dmg_urls_for(version: &str) -> Vec<String> {
     if !cfg!(target_os = "macos") {
-        return None;
+        return Vec::new();
     }
-    Some(format!(
-        "https://github.com/rajpootathar/Crane/releases/download/v{version}/Crane-{version}-universal.dmg"
-    ))
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    let base = format!(
+        "https://github.com/rajpootathar/Crane/releases/download/v{version}/Crane-{version}"
+    );
+    vec![
+        format!("{base}-{arch}.dmg"),
+        format!("{base}-universal.dmg"),
+    ]
 }
 
 fn human_bytes(n: u64) -> String {
@@ -78,9 +93,9 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                         });
                     });
                     ui.add_space(10.0);
-                    let dmg_url = dmg_url_for(&version);
+                    let dmg_urls = dmg_urls_for(&version);
                     let supports_in_app = crate::update::apply::Updater::is_supported_platform()
-                        && dmg_url.is_some();
+                        && !dmg_urls.is_empty();
                     use crate::update::apply::UpdateState;
                     match app.updater.state() {
                         UpdateState::Downloading { bytes } => {
@@ -144,9 +159,9 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                                             .strong(),
                                         )
                                         .clicked()
-                                        && let Some(u) = dmg_url.clone()
+                                        && !dmg_urls.is_empty()
                                     {
-                                        app.updater.start(u, ctx.clone());
+                                        app.updater.start(dmg_urls.clone(), ctx.clone());
                                     }
                                 } else if ui
                                     .button(
