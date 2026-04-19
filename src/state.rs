@@ -56,6 +56,14 @@ pub struct Project {
     pub path: PathBuf,
     pub workspaces: Vec<Workspace>,
     pub expanded: bool,
+    /// Most recently active workspace within this project. Restored on
+    /// next launch so re-opening a project lands on where you left it.
+    pub last_active_workspace: Option<WorkspaceId>,
+    /// Remembered "new workspace" modal preferences, so the modal
+    /// preloads the same mode + custom path you used last time for
+    /// this project (instead of resetting to Global + ~/.crane-worktrees/<name>).
+    pub preferred_location_mode: Option<LocationMode>,
+    pub preferred_custom_path: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -106,11 +114,29 @@ impl SettingsSection {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LocationMode {
     Global,
     ProjectLocal,
     Custom,
+}
+
+impl LocationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocationMode::Global => "Global",
+            LocationMode::ProjectLocal => "ProjectLocal",
+            LocationMode::Custom => "Custom",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Global" => Some(Self::Global),
+            "ProjectLocal" => Some(Self::ProjectLocal),
+            "Custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
 }
 
 pub struct NewWorkspaceModal {
@@ -358,6 +384,9 @@ impl App {
             path,
             workspaces,
             expanded: true,
+            last_active_workspace: first_active.map(|(wt, _)| wt),
+            preferred_location_mode: None,
+            preferred_custom_path: None,
         });
         if let Some((wt, tab)) = first_active {
             self.active = Some((id, wt, tab));
@@ -459,10 +488,12 @@ impl App {
     pub fn set_active(&mut self, pid: ProjectId, wid: WorkspaceId, tid: TabId) {
         self.active = Some((pid, wid, tid));
         self.last_workspace = Some((pid, wid));
-        if let Some(p) = self.projects.iter_mut().find(|p| p.id == pid)
-            && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
+        if let Some(p) = self.projects.iter_mut().find(|p| p.id == pid) {
+            p.last_active_workspace = Some(wid);
+            if let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
                 w.active_tab = Some(tid);
             }
+        }
     }
 
     pub fn new_tab_in_active_workspace(&mut self, ctx: &egui::Context) {
@@ -661,11 +692,22 @@ impl App {
             .collect();
         let safe = safe.trim_start_matches('.').trim_start_matches('_');
         let safe = if safe.is_empty() { "project" } else { safe };
+        // Seed the modal from this project's remembered preferences so
+        // the second + N-th worktree for a project defaults to the
+        // mode + path the user picked the first time.
+        let default_custom = format!("{home}/.crane-worktrees/{safe}");
+        let custom_path = project
+            .preferred_custom_path
+            .clone()
+            .unwrap_or(default_custom);
+        let mode = project
+            .preferred_location_mode
+            .unwrap_or(LocationMode::Global);
         self.new_workspace_modal = Some(NewWorkspaceModal {
             project_id: pid,
             branch: String::new(),
-            custom_path: format!("{home}/.crane-worktrees/{safe}"),
-            mode: LocationMode::Global,
+            custom_path,
+            mode,
             create_new_branch: true,
             branch_locked: false,
             error: None,
@@ -692,6 +734,8 @@ impl App {
         let parent = modal.resolved_parent(&project_path, &project_name);
         let wt_path = parent.join(&branch);
         let _ = std::fs::create_dir_all(&parent);
+        let picked_mode = modal.mode;
+        let picked_custom = modal.custom_path.clone();
         match git::workspace_add(&project_path, &wt_path, &branch, modal.create_new_branch) {
             Ok(()) => {
                 let _ = project_name;
@@ -699,6 +743,13 @@ impl App {
                     Some(p) => p,
                     None => return,
                 };
+                // Remember the choice for the next "+ new worktree" on
+                // this project. Only capture Custom path when the user
+                // actually chose Custom mode.
+                project.preferred_location_mode = Some(picked_mode);
+                if picked_mode == LocationMode::Custom {
+                    project.preferred_custom_path = Some(picked_custom);
+                }
                 let wt_id = self.next_workspace;
                 self.next_workspace += 1;
                 let tab_id = self.next_tab;

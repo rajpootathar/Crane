@@ -66,6 +66,12 @@ pub struct SProject {
     pub path: PathBuf,
     pub expanded: bool,
     pub workspaces: Vec<SWorkspace>,
+    #[serde(default)]
+    pub last_active_workspace: Option<WorkspaceId>,
+    #[serde(default)]
+    pub preferred_location_mode: Option<String>,
+    #[serde(default)]
+    pub preferred_custom_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,6 +178,9 @@ impl Session {
                 path: p.path.clone(),
                 expanded: p.expanded,
                 workspaces,
+                last_active_workspace: p.last_active_workspace,
+                preferred_location_mode: p.preferred_location_mode.map(|m| m.as_str().to_string()),
+                preferred_custom_path: p.preferred_custom_path.clone(),
             });
         }
 
@@ -246,6 +255,12 @@ impl Session {
                 path: sp.path,
                 expanded: sp.expanded,
                 workspaces,
+                last_active_workspace: sp.last_active_workspace,
+                preferred_location_mode: sp
+                    .preferred_location_mode
+                    .as_deref()
+                    .and_then(crate::state::LocationMode::parse),
+                preferred_custom_path: sp.preferred_custom_path,
             });
         }
 

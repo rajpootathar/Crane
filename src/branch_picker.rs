@@ -583,8 +583,6 @@ fn row(
     } else {
         t.text_muted.to_color32()
     };
-    // Measure badge text width so we can place the in-place action
-    // icon just to its left without overlapping.
     let badge_font = egui::FontId::proportional(10.5);
     let badge_w = ui
         .fonts_mut(|f| f.layout_no_wrap(badge_text.to_string(), badge_font.clone(), badge_color))
@@ -598,59 +596,75 @@ fn row(
         badge_color,
     );
 
-    // In-place switch icon — only offered when the branch isn't the
-    // active one. Hidden on hover-zero so it doesn't clutter the row.
-    let mut in_place_clicked = false;
-    if !is_active {
-        let icon_size = 18.0;
-        let icon_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                rect.max.x - 16.0 - badge_w - icon_size,
-                rect.center().y - icon_size / 2.0,
-            ),
-            egui::vec2(icon_size, icon_size),
-        );
-        // Row itself is already scoped via ui.push_id by the caller, so
-        // a constant local salt is enough to disambiguate body vs icon.
-        let icon_resp = ui.interact(
-            icon_rect,
-            ui.id().with("in_place_icon"),
-            egui::Sense::click(),
-        );
-        let icon_color = if icon_resp.hovered() {
-            t.accent.to_color32()
-        } else if hovered {
-            t.text_muted.to_color32()
+    // In-place switch pill. The arrow was too subtle; using a labeled
+    // "Switch" pill shown on row hover so users clearly see a second
+    // action is available. Click resolution is by pointer position
+    // against this sub-rect (ui.interact overlapping the row's own
+    // click-sense would double-fire and was the bug the user hit).
+    let pill_text = "Switch";
+    let pill_font = egui::FontId::proportional(10.5);
+    let pill_w = ui
+        .fonts_mut(|f| f.layout_no_wrap(pill_text.to_string(), pill_font.clone(), Color32::WHITE))
+        .size()
+        .x;
+    let pill_padding = 6.0;
+    let pill_width = pill_w + pill_padding * 2.0;
+    let pill_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.max.x - 16.0 - badge_w - pill_width,
+            rect.center().y - 9.0,
+        ),
+        egui::vec2(pill_width, 18.0),
+    );
+    let pointer_pos = ui.ctx().input(|i| i.pointer.interact_pos());
+    let pointer_over_pill = !is_active
+        && pointer_pos.map(|p| pill_rect.contains(p)).unwrap_or(false);
+    if !is_active && hovered {
+        let fill = if pointer_over_pill {
+            let a = t.accent;
+            Color32::from_rgba_unmultiplied(a.r, a.g, a.b, 70)
         } else {
-            Color32::TRANSPARENT
+            Color32::from_rgba_unmultiplied(255, 255, 255, 18)
         };
-        if icon_color != Color32::TRANSPARENT {
-            ui.painter().text(
-                icon_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                icons::ARROW_RIGHT,
-                egui::FontId::proportional(13.0),
-                icon_color,
-            );
-        }
-        if icon_resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            icon_resp.clone().on_hover_text(
+        let stroke = if pointer_over_pill {
+            egui::Stroke::new(1.0, t.accent.to_color32())
+        } else {
+            egui::Stroke::new(1.0, t.divider.to_color32())
+        };
+        ui.painter().rect(
+            pill_rect,
+            egui::CornerRadius::same(4),
+            fill,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            pill_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            pill_text,
+            pill_font,
+            t.text.to_color32(),
+        );
+        if pointer_over_pill {
+            resp.clone().on_hover_text(
                 "Switch in place (git switch) — requires a clean tree",
             );
         }
-        if icon_resp.clicked() {
-            in_place_clicked = true;
-        }
     }
 
-    if hovered && !in_place_clicked {
+    if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    if in_place_clicked {
-        RowAction::InPlace
-    } else if resp.clicked() && !is_active {
-        RowAction::Primary
+    // Single click-source (the row's allocate_exact_size response).
+    // Dispatch by pointer position: pill rect → InPlace, elsewhere on
+    // the row → Primary. Avoids the double-fire that ui.interact +
+    // overlapping rect caused before.
+    if resp.clicked() && !is_active {
+        if pointer_over_pill {
+            RowAction::InPlace
+        } else {
+            RowAction::Primary
+        }
     } else {
         RowAction::None
     }
