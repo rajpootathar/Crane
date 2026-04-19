@@ -167,7 +167,21 @@ pub fn commit(repo: &Path, message: &str) -> Result<(), String> {
 }
 
 pub fn push(repo: &Path) -> Result<(), String> {
-    run(repo, &["push"])
+    // Run non-interactively: without these, an HTTPS remote that
+    // wants credentials will block the background thread forever
+    // waiting on a tty, with zero UI feedback.
+    let out = Command::new("git")
+        .args(["push"])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).to_string())
+    }
 }
 
 pub fn pull(repo: &Path) -> Result<(), String> {

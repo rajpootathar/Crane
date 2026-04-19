@@ -142,7 +142,14 @@ fn do_download_and_stage(
     std::fs::create_dir_all(&dir)?;
     let dmg_path = dir.join("crane.dmg");
 
-    let resp = ureq::get(url)
+    // Explicit timeouts so a stalled TCP / slow server doesn't freeze
+    // the update worker thread indefinitely.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(300))
+        .build();
+    let resp = agent
+        .get(url)
         .call()
         .map_err(|e| std::io::Error::other(format!("GET failed: {e}")))?;
     let mut reader = resp.into_reader();
@@ -210,6 +217,30 @@ fn do_download_and_stage(
         return Err(std::io::Error::other(format!(
             "cp .app failed: {}",
             String::from_utf8_lossy(&cp_out.stderr)
+        )));
+    }
+
+    // Verify the staged bundle's code signature. Our builds are only
+    // ad-hoc signed (no Developer ID), but codesign --verify will still
+    // detect any tampering between our build and the user's download —
+    // flipped bits, MITM, partial download that got unzipped. We
+    // explicitly use `--deep --strict` so every nested library gets
+    // checked, not just the top-level bundle.
+    let verify = std::process::Command::new("codesign")
+        .args([
+            "--verify",
+            "--deep",
+            "--strict",
+            dest_app.to_string_lossy().as_ref(),
+        ])
+        .output()?;
+    if !verify.status.success() {
+        // Clean up so a bad download doesn't sit around. Returning an
+        // error lets the updater UI surface what went wrong.
+        let _ = std::fs::remove_dir_all(&dest_app);
+        return Err(std::io::Error::other(format!(
+            "signature verify failed: {}",
+            String::from_utf8_lossy(&verify.stderr)
         )));
     }
 

@@ -155,8 +155,25 @@ pub fn session_file() -> PathBuf {
 }
 
 pub fn load() -> Option<Session> {
-    let bytes = std::fs::read(session_file()).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let path = session_file();
+    // Try the live file first, then the last-known-good .bak (written
+    // by maybe_save before each atomic replace). Without the fallback,
+    // a corrupt or partial session.json silently wipes every project
+    // the user has added.
+    let candidates = [path.clone(), path.with_extension("json.bak")];
+    for candidate in candidates {
+        let Ok(bytes) = std::fs::read(&candidate) else {
+            continue;
+        };
+        if let Ok(session) = serde_json::from_slice::<Session>(&bytes) {
+            return Some(session);
+        }
+        eprintln!(
+            "[session] failed to parse {} — trying fallback",
+            candidate.display()
+        );
+    }
+    None
 }
 
 impl Session {

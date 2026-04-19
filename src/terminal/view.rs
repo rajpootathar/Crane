@@ -284,12 +284,15 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             } else {
                 (&default_cell, false)
             };
-            // Skip the spacer half of a wide char — alacritty emits a
-            // WIDE_CHAR cell followed by a WIDE_CHAR_SPACER for east-
-            // asian glyphs; rendering both doubles them up visually.
-            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                continue;
-            }
+            // Wide-char second cell: alacritty emits a WIDE_CHAR on
+            // col N and a WIDE_CHAR_SPACER on col N+1 (CJK, emoji,
+            // Nerd Font icons marked wide). We MUST contribute
+            // something at col N+1 — if we `continue` here, `buf`
+            // ends up one char short per spacer, left-shifting every
+            // cell right of the wide char by one cell_w. Emit a space
+            // with the same style so the visible spacing stays
+            // 1-cell-per-column.
+            let is_wide_spacer = cell.flags.contains(CellFlags::WIDE_CHAR_SPACER);
             let fg = color_to_egui(cell.fg, true);
             let bg = if in_selection {
                 selection_bg()
@@ -308,9 +311,13 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             // the "ls rows appear continuous" bug — egui wraps internally
             // on a newline, which collapses our row stride. `\t` / `\r`
             // are equally wrong to emit verbatim; treat all as spaces.
-            let ch = match cell.c {
-                '\0' | '\n' | '\r' | '\t' => ' ',
-                c => c,
+            let ch = if is_wide_spacer {
+                ' '
+            } else {
+                match cell.c {
+                    '\0' | '\n' | '\r' | '\t' => ' ',
+                    c => c,
+                }
             };
             buf.push(ch);
         }
@@ -513,18 +520,25 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         ui.ctx().copy_text(t);
     }
     if let Some(t) = paste_text {
-        // Bracketed paste: wrap with ESC[200~ … ESC[201~ so the shell
-        // treats multi-line clipboard content as literal input instead
-        // of executing each line as a command. Modern zsh / bash
-        // enable bracketed-paste mode automatically (the `\x1b[?2004h`
-        // sequence in their prompt init); if the running app doesn't
-        // support it, it'll just see the markers as stray text — not
-        // worse than the unwrapped paste.
-        let mut bytes = Vec::with_capacity(t.len() + 12);
-        bytes.extend_from_slice(b"\x1b[200~");
-        bytes.extend_from_slice(t.as_bytes());
-        bytes.extend_from_slice(b"\x1b[201~");
-        terminal.write_input(&bytes);
+        // Only wrap in bracketed-paste markers when the running shell
+        // / TUI has actually asked for it (DECSET 2004 — alacritty
+        // tracks this as TermMode::BRACKETED_PASTE). If we wrap
+        // unconditionally, shells/apps that haven't enabled the mode
+        // see "200~…201~" as literal command text.
+        let bracketed = terminal
+            .term
+            .lock()
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        if bracketed {
+            let mut bytes = Vec::with_capacity(t.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(t.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            terminal.write_input(&bytes);
+        } else {
+            terminal.write_input(t.as_bytes());
+        }
     }
     if clear_requested {
         // \x1b[H → cursor home, \x1b[2J → erase display, \x1b[3J → erase

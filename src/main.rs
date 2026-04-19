@@ -433,12 +433,37 @@ impl CraneApp {
         }
         let path = state::session::session_file();
         std::thread::spawn(move || {
+            use std::io::Write;
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            // Keep a .bak of the previous good session.json so a
+            // corrupt-or-truncated write doesn't wipe every project the
+            // user has registered. Rotation: last-known-good stays in
+            // .bak; anything older is overwritten.
+            if path.exists() {
+                let bak = path.with_extension("json.bak");
+                let _ = std::fs::copy(&path, &bak);
+            }
+            // Atomic write: open + write + fsync(tmp) + rename +
+            // fsync(parent). Without the fsyncs a crash between the
+            // write and the kernel's periodic flush can leave the
+            // renamed file zero-length or holding the previous
+            // version's data — either way the user loses their
+            // session silently.
             let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
+            let written = (|| -> std::io::Result<()> {
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(&bytes)?;
+                f.sync_all()?;
+                Ok(())
+            })();
+            if written.is_ok()
+                && std::fs::rename(&tmp, &path).is_ok()
+                && let Some(parent) = path.parent()
+                && let Ok(dir) = std::fs::File::open(parent)
+            {
+                let _ = dir.sync_all();
             }
         });
         self.last_saved_snapshot = snapshot;
