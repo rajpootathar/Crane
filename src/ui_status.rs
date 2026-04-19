@@ -1,16 +1,18 @@
-//! Status bar pinned to the bottom of the window. Shows the active
-//! file's diagnostics summary, language, and the relative path under
-//! the worktree — the app-wide equivalent of VSCode's status bar.
+//! Global status bar pinned to the bottom of the window. Bound to the
+//! active Workspace: shows the worktree's git branch on the left and the
+//! workspace-relative path of the active file on the right. Per-file
+//! concerns (diagnostics, cursor, indent, language) live in the Files
+//! pane's own status strip — this bar is Workspace chrome.
 
 use crate::layout::PaneContent;
 use crate::state::App;
 use crate::theme;
-use egui::{Color32, RichText};
+use egui::RichText;
 use egui_phosphor::regular as icons;
 
 pub const HEIGHT: f32 = 24.0;
 
-pub fn render(ui: &mut egui::Ui, app: &App) {
+pub fn render(ui: &mut egui::Ui, app: &mut App) {
     let t = theme::current();
     let rect = ui.available_rect_before_wrap();
     ui.painter()
@@ -23,135 +25,126 @@ pub fn render(ui: &mut egui::Ui, app: &App) {
         egui::Stroke::new(1.0, t.divider.to_color32()),
     );
 
-    let (active_path, active_lang) = active_file_info(app);
-    let counts = active_path
-        .as_deref()
-        .map(|p| diag_counts(app, p))
-        .unwrap_or((0, 0, 0));
+    let branch = app.active_repo_branch();
+    let active_path = active_file_path(app);
 
-    // All file-related info is right-aligned and grouped: diagnostics →
-    // language → path. Reads from right-to-left visually since that's
-    // where the user's attention lands for the active file.
     ui.allocate_ui_with_layout(
         rect.size(),
-        egui::Layout::right_to_left(egui::Align::Center),
+        egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.add_space(10.0);
-            if let Some(path) = &active_path {
-                let shown = relative_to_workspace(app, path);
-                ui.label(
-                    RichText::new(shown)
-                        .size(11.0)
-                        .color(t.text_muted.to_color32()),
+            if let Some(b) = branch {
+                let resp = ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{}  {}", icons::GIT_BRANCH, b))
+                            .size(11.0)
+                            .color(t.text.to_color32()),
+                    )
+                    .sense(egui::Sense::click()),
                 );
-                ui.add_space(12.0);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    app.branch_picker_open = !app.branch_picker_open;
+                    app.branch_picker_query.clear();
+                    if app.branch_picker_open {
+                        load_branch_picker(app, ui.ctx());
+                        app.branch_picker_opened_at = Some(std::time::Instant::now());
+                    } else {
+                        app.branch_picker_opened_at = None;
+                    }
+                }
             }
-            if let Some(lang) = active_lang {
-                ui.label(
-                    RichText::new(lang)
-                        .size(11.0)
-                        .color(t.text_muted.to_color32())
-                        .monospace(),
-                );
-                ui.add_space(12.0);
-            }
-            let (errs, warns, infos) = counts;
-            // Order when laid out right-to-left: info, warning, error
-            // (so on-screen it reads error, warning, info — matching the
-            // inline diag strip's ordering).
-            ui.label(
-                RichText::new(format!("{}  {infos}", icons::INFO))
-                    .size(11.5)
-                    .color(if infos > 0 {
-                        t.accent.to_color32()
-                    } else {
-                        t.text_muted.to_color32()
-                    }),
-            );
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(format!("{}  {warns}", icons::WARNING))
-                    .size(11.5)
-                    .color(if warns > 0 {
-                        Color32::from_rgb(226, 192, 80)
-                    } else {
-                        t.text_muted.to_color32()
-                    }),
-            );
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(format!("{}  {errs}", icons::X_CIRCLE))
-                    .size(11.5)
-                    .color(if errs > 0 {
-                        t.error.to_color32()
-                    } else {
-                        t.text_muted.to_color32()
-                    }),
+
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.add_space(10.0);
+                    if let Some(path) = &active_path {
+                        let shown = relative_to_workspace(app, path);
+                        ui.label(
+                            RichText::new(shown)
+                                .size(11.0)
+                                .color(t.text_muted.to_color32()),
+                        );
+                    }
+                },
             );
         },
     );
 }
 
-fn active_file_info(app: &App) -> (Option<String>, Option<String>) {
-    let layout = app.active_layout_ref();
-    let Some(layout) = layout else {
-        return (None, None);
+/// Spawn a worker to discover repos + list their branches off the UI
+/// thread. Results flow back via `App::branch_picker_rx`, which the
+/// picker drains each frame. A monorepo with many submodules means
+/// 1 + 2·N git subprocesses — this used to hitch the UI noticeably.
+pub fn load_branch_picker(app: &mut App, ctx: &egui::Context) {
+    let Some(ws) = app.active_workspace_path().map(|p| p.to_path_buf()) else {
+        return;
     };
+    app.branch_picker_loading = true;
+    app.branch_picker_repos.clear();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.branch_picker_rx = Some(rx);
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let roots = crate::git::discover_repos(&ws, 5);
+        let data: Vec<_> = roots
+            .into_iter()
+            .map(|r| {
+                let locals = crate::git::list_local_branches(&r);
+                let remotes = crate::git::list_remote_branches(&r);
+                (r, locals, remotes)
+            })
+            .collect();
+        let _ = tx.send(data);
+        ctx.request_repaint();
+    });
+}
+
+/// Drain the worker's result once it finishes. Called once per picker
+/// frame — non-blocking.
+pub fn poll_branch_picker(app: &mut App) {
+    let Some(rx) = app.branch_picker_rx.as_ref() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(data) => {
+            let active = app.active_repo_root();
+            app.branch_picker_repos = data;
+            app.branch_picker_filter = active.filter(|a| {
+                app.branch_picker_repos.iter().any(|(r, _, _)| r == a)
+            });
+            app.branch_picker_loading = false;
+            app.branch_picker_rx = None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            app.branch_picker_loading = false;
+            app.branch_picker_rx = None;
+        }
+    }
+}
+
+fn active_file_path(app: &App) -> Option<String> {
+    let layout = app.active_layout_ref()?;
     let focus = layout.focus;
-    // Prefer the focused pane; fall back to the first Files pane with an
-    // active tab.
     if let Some(id) = focus
         && let Some(p) = layout.panes.get(&id)
         && let PaneContent::Files(files) = &p.content
         && let Some(t) = files.tabs.get(files.active)
     {
-        return (Some(t.path.clone()), language_for_path(&t.path));
+        return Some(t.path.clone());
     }
     for (_, p) in &layout.panes {
         if let PaneContent::Files(files) = &p.content
             && let Some(t) = files.tabs.get(files.active)
         {
-            return (Some(t.path.clone()), language_for_path(&t.path));
+            return Some(t.path.clone());
         }
     }
-    (None, None)
-}
-
-fn language_for_path(path: &str) -> Option<String> {
-    let ext = std::path::Path::new(path).extension()?.to_str()?;
-    Some(match ext.to_ascii_lowercase().as_str() {
-        "rs" => "Rust",
-        "ts" | "mts" | "cts" => "TypeScript",
-        "tsx" => "TSX",
-        "js" | "mjs" | "cjs" => "JavaScript",
-        "jsx" => "JSX",
-        "py" => "Python",
-        "go" => "Go",
-        "css" => "CSS",
-        "scss" => "SCSS",
-        "html" | "htm" => "HTML",
-        "vue" => "Vue",
-        "svelte" => "Svelte",
-        "md" | "markdown" => "Markdown",
-        "json" => "JSON",
-        "yaml" | "yml" => "YAML",
-        "toml" => "TOML",
-        _ => ext,
-    }.to_string())
-}
-
-fn diag_counts(app: &App, path: &str) -> (usize, usize, usize) {
-    let mut e = 0usize;
-    let mut w = 0usize;
-    let mut i = 0usize;
-    for d in app.lsp.diagnostics(std::path::Path::new(path)) {
-        match d.severity {
-            1 => e += 1,
-            2 => w += 1,
-            _ => i += 1,
-        }
-    }
-    (e, w, i)
+    None
 }
 
 fn relative_to_workspace(app: &App, path: &str) -> String {

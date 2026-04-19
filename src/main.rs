@@ -1,9 +1,11 @@
+mod branch_picker;
 mod format;
 mod git;
 mod layout;
 mod lsp;
 mod modals;
 mod pane_view;
+mod project_cache;
 mod session;
 mod settings;
 mod state;
@@ -833,7 +835,8 @@ impl eframe::App for CraneApp {
         // Global status bar — active file's diagnostics, language, path.
         let mut status_ui = ui.new_child(egui::UiBuilder::new().max_rect(status_bar_rect));
         status_ui.set_clip_rect(status_bar_rect);
-        ui_status::render(&mut status_ui, &self.app);
+        ui_status::render(&mut status_ui, &mut self.app);
+        branch_picker::render(&ctx, &mut self.app);
         self.app.sync_lsp_changes(&ctx);
         self.maybe_save();
     }

@@ -148,6 +148,21 @@ pub struct App {
     pub editor_trim_on_save: bool,
     pub lsp: crate::lsp::LspManager,
     pub language_configs: crate::lsp::LanguageConfigs,
+    pub branch_picker_open: bool,
+    pub branch_picker_query: String,
+    pub branch_picker_collapsed: std::collections::HashSet<String>,
+    pub branch_picker_width: f32,
+    pub branch_picker_height: f32,
+    pub branch_picker_opened_at: Option<Instant>,
+    pub branch_picker_loading: bool,
+    pub branch_picker_rx:
+        Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Vec<String>, Vec<String>)>>>,
+    /// Per-repo branch data loaded when the picker opens:
+    /// repo_root → (local branches, remote branches in `remote/branch` form).
+    pub branch_picker_repos: Vec<(PathBuf, Vec<String>, Vec<String>)>,
+    /// None = "All repos" aggregate view; Some(root) = filter to one repo.
+    pub branch_picker_filter: Option<PathBuf>,
+    pub repo_branch_cache: std::collections::HashMap<PathBuf, (String, Instant)>,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -183,6 +198,17 @@ impl App {
             right_panel_w: 300.0,
             lsp: crate::lsp::LspManager::new(),
             language_configs: crate::lsp::LanguageConfigs::default(),
+            branch_picker_open: false,
+            branch_picker_query: String::new(),
+            branch_picker_collapsed: std::collections::HashSet::new(),
+            branch_picker_width: 420.0,
+            branch_picker_height: 360.0,
+            branch_picker_opened_at: None,
+            branch_picker_loading: false,
+            branch_picker_rx: None,
+            branch_picker_repos: Vec::new(),
+            branch_picker_filter: None,
+            repo_branch_cache: std::collections::HashMap::new(),
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,
@@ -274,6 +300,67 @@ impl App {
             self.last_workspace = Some((id, wt));
         }
         Some(id)
+    }
+
+    /// Nearest `.git` root for the active file's path, falling back to
+    /// the active Workspace path if no file is open (or no nested repo
+    /// is found). This is what branch picker / commit tree / branch
+    /// label bind to, so nested submodules "just work".
+    pub fn active_repo_root(&self) -> Option<PathBuf> {
+        if let Some(path) = self.active_file_path_str()
+            && let Some(root) = crate::git::find_git_root(Path::new(&path))
+        {
+            return Some(root);
+        }
+        self.active_workspace_path().map(|p| p.to_path_buf())
+    }
+
+    /// Branch for the repo containing the active file. Cached 2s to
+    /// avoid spawning git-subprocesses every frame. Falls back to the
+    /// cached Workspace status when the active repo == Workspace root.
+    pub fn active_repo_branch(&mut self) -> Option<String> {
+        let root = self.active_repo_root()?;
+        if let Some(ws) = self.active_workspace_path()
+            && ws == root.as_path()
+        {
+            let (pid, wid, _) = self.active?;
+            let project = self.projects.iter().find(|p| p.id == pid)?;
+            let wt = project.workspaces.iter().find(|w| w.id == wid)?;
+            if let Some(s) = &wt.git_status
+                && !s.branch.is_empty()
+            {
+                return Some(s.branch.clone());
+            }
+        }
+        if let Some((b, t)) = self.repo_branch_cache.get(&root)
+            && t.elapsed().as_secs() < 2
+        {
+            return Some(b.clone());
+        }
+        let b = crate::git::current_branch(&root)?;
+        self.repo_branch_cache
+            .insert(root, (b.clone(), Instant::now()));
+        Some(b)
+    }
+
+    fn active_file_path_str(&self) -> Option<String> {
+        use crate::layout::PaneContent;
+        let layout = self.active_layout_ref()?;
+        if let Some(id) = layout.focus
+            && let Some(p) = layout.panes.get(&id)
+            && let PaneContent::Files(files) = &p.content
+            && let Some(t) = files.tabs.get(files.active)
+        {
+            return Some(t.path.clone());
+        }
+        for (_, p) in &layout.panes {
+            if let PaneContent::Files(files) = &p.content
+                && let Some(t) = files.tabs.get(files.active)
+            {
+                return Some(t.path.clone());
+            }
+        }
+        None
     }
 
     pub fn active_workspace_path(&self) -> Option<&Path> {

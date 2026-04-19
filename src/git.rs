@@ -176,19 +176,141 @@ pub fn pull(repo: &Path) -> Result<(), String> {
 
 pub fn workspace_add(repo: &Path, path: &Path, branch: &str, create_new: bool) -> Result<(), String> {
     let path_str = path.to_string_lossy();
+    // `--` before positional args so branches like "-foo" aren't parsed
+    // as flags.
     let mut args: Vec<&str> = vec!["worktree", "add"];
     if create_new {
         args.push("-b");
         args.push(branch);
+        args.push("--");
         args.push(&path_str);
     } else {
+        args.push("--");
         args.push(&path_str);
         args.push(branch);
     }
     run(repo, &args)
 }
 
-#[allow(dead_code)] // staged for #45 branch-switch UI
+/// Walks up from `start` looking for the nearest `.git` directory or
+/// gitfile. In a monorepo with nested repos / submodules this returns
+/// the *innermost* repo containing the path — so features that bind to
+/// "current repo" (branch picker, commit tree, status bar branch label)
+/// track the file the user is actually looking at, not the outer
+/// Workspace root.
+pub fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let canon = start.canonicalize().ok()?;
+    let mut cur = if canon.is_file() {
+        canon.parent()?.to_path_buf()
+    } else {
+        canon
+    };
+    if cur.as_os_str().is_empty() {
+        return None;
+    }
+    loop {
+        if cur.join(".git").exists() {
+            return Some(cur);
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
+}
+
+/// Discover all `.git` roots under `start`, capped by depth to avoid
+/// walking into `node_modules` / `target` / huge submodule trees.
+/// Always includes `start` itself if it's a repo.
+pub fn discover_repos(start: &Path, max_depth: usize) -> Vec<PathBuf> {
+    fn skip(name: &str) -> bool {
+        matches!(
+            name,
+            "node_modules" | "target" | "dist" | "build" | ".next" | "vendor"
+                | ".venv" | "venv" | ".cache" | ".turbo" | ".cargo"
+        )
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(start.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let is_repo = dir.join(".git").exists();
+        if is_repo {
+            out.push(dir.clone());
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        // Recurse into every directory (including repos, so nested
+        // submodules are found). `skip()` filters node_modules / target
+        // / etc. below.
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(n) = name.to_str() else { continue };
+            if n.starts_with('.') && n != ".git" || skip(n) {
+                continue;
+            }
+            stack.push((entry.path(), depth + 1));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn current_branch(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    // Detached HEAD: surface the short hash so the status bar + picker
+    // still show something clickable instead of silently disappearing.
+    let short = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !short.status.success() {
+        return None;
+    }
+    let h = String::from_utf8_lossy(&short.stdout).trim().to_string();
+    if h.is_empty() {
+        None
+    } else {
+        Some(format!("(detached {h})"))
+    }
+}
+
+pub fn list_remote_branches(repo: &Path) -> Vec<String> {
+    let out = match Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/remotes/",
+        ])
+        .current_dir(repo)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.ends_with("/HEAD"))
+        .collect()
+}
+
 pub fn list_local_branches(repo: &Path) -> Vec<String> {
     let out = match Command::new("git")
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
