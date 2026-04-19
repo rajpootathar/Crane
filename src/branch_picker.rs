@@ -51,6 +51,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     let mut close = false;
     let mut switch_to: Option<(crate::state::WorkspaceId, crate::state::TabId)> = None;
     let mut create_branch: Option<String> = None;
+    let mut in_place: Option<(PathBuf, String)> = None;
     let mut new_filter: Option<Option<PathBuf>> = None;
 
     let ws_root = app
@@ -164,6 +165,25 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
 
                     ui.add_space(6.0);
 
+                    // Surface the last in-place switch error (typically
+                    // "please commit or stash first"). Dismissible by
+                    // clicking it. No auto-stash — by design.
+                    if let Some(err) = app.branch_picker_error.clone() {
+                        let resp = ui.add(
+                            egui::Label::new(
+                                RichText::new(err)
+                                    .size(11.0)
+                                    .color(t.error.to_color32()),
+                            )
+                            .sense(egui::Sense::click())
+                            .wrap(),
+                        );
+                        if resp.clicked() {
+                            app.branch_picker_error = None;
+                        }
+                        ui.add_space(4.0);
+                    }
+
                     let query = app.branch_picker_query.trim().to_lowercase();
                     let visible_repos: Vec<&(PathBuf, Vec<String>, Vec<String>)> =
                         repos_snapshot
@@ -214,6 +234,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                                         &mut app.branch_picker_collapsed,
                                         &mut switch_to,
                                         &mut create_branch,
+                                        &mut in_place,
                                         &t,
                                     );
                                 }
@@ -304,6 +325,20 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         }
         app.branch_picker_open = false;
     }
+    if let Some((repo, branch)) = in_place {
+        // Synchronous shell-out — git switch is fast when the tree is
+        // clean; when it's dirty the call returns in milliseconds with
+        // the refusal we want to surface. No worker thread needed.
+        match crate::git::checkout_branch(&repo, &branch) {
+            Ok(()) => {
+                app.branch_picker_error = None;
+                app.refresh_active_git_status(ctx);
+            }
+            Err(msg) => {
+                app.branch_picker_error = Some(msg);
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -320,6 +355,7 @@ fn render_repo_section(
     collapsed: &mut std::collections::HashSet<String>,
     switch_to: &mut Option<(crate::state::WorkspaceId, crate::state::TabId)>,
     create_branch: &mut Option<String>,
+    in_place: &mut Option<(PathBuf, String)>,
     t: &theme::Theme,
 ) {
     // `existing` maps outer-Project worktree names to Workspace ids. A
@@ -374,7 +410,7 @@ fn render_repo_section(
         for b in &local_filtered {
             let existing_wt = if match_existing { existing.get(*b).copied() } else { None };
             let is_active = existing_wt.map(|(w, _)| w == active_wid).unwrap_or(false);
-            if row(
+            match row(
                 ui,
                 b,
                 is_active,
@@ -382,11 +418,17 @@ fn render_repo_section(
                 if multi_repo { 2 } else { 1 },
                 t,
             ) {
-                if let Some((w, tab)) = existing_wt {
-                    *switch_to = Some((w, tab));
-                } else {
-                    *create_branch = Some(b.to_string());
+                RowAction::Primary => {
+                    if let Some((w, tab)) = existing_wt {
+                        *switch_to = Some((w, tab));
+                    } else {
+                        *create_branch = Some(b.to_string());
+                    }
                 }
+                RowAction::InPlace => {
+                    *in_place = Some((repo_root.to_path_buf(), b.to_string()));
+                }
+                RowAction::None => {}
             }
         }
     }
@@ -410,7 +452,7 @@ fn render_repo_section(
         for b in branches {
             let existing_wt = if match_existing { existing.get(b.as_str()).copied() } else { None };
             let is_active = existing_wt.map(|(w, _)| w == active_wid).unwrap_or(false);
-            if row(
+            match row(
                 ui,
                 b,
                 is_active,
@@ -418,11 +460,17 @@ fn render_repo_section(
                 if multi_repo { 2 } else { 1 },
                 t,
             ) {
-                if let Some((w, tab)) = existing_wt {
-                    *switch_to = Some((w, tab));
-                } else {
-                    *create_branch = Some(b.clone());
+                RowAction::Primary => {
+                    if let Some((w, tab)) = existing_wt {
+                        *switch_to = Some((w, tab));
+                    } else {
+                        *create_branch = Some(b.clone());
+                    }
                 }
+                RowAction::InPlace => {
+                    *in_place = Some((repo_root.to_path_buf(), b.clone()));
+                }
+                RowAction::None => {}
             }
         }
     }
@@ -463,6 +511,19 @@ fn chip(ui: &mut egui::Ui, label: &str, selected: bool, t: &theme::Theme) -> boo
     ui.add(btn.min_size(egui::vec2(0.0, 22.0))).clicked()
 }
 
+/// What the user clicked on a branch row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    None,
+    /// The row body — open an existing worktree if present, else
+    /// open the "new worktree from this branch" modal.
+    Primary,
+    /// The small right-side icon — in-place `git switch`. Respects
+    /// git's dirty-tree refusal (error bubbles via
+    /// `App::branch_picker_error`); does no auto-stash.
+    InPlace,
+}
+
 fn row(
     ui: &mut egui::Ui,
     branch: &str,
@@ -470,7 +531,7 @@ fn row(
     has_worktree: bool,
     indent: u8,
     t: &theme::Theme,
-) -> bool {
+) -> RowAction {
     let height = 24.0;
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
@@ -508,17 +569,75 @@ fn row(
     } else {
         t.text_muted.to_color32()
     };
+    // Measure badge text width so we can place the in-place action
+    // icon just to its left without overlapping.
+    let badge_font = egui::FontId::proportional(10.5);
+    let badge_w = ui
+        .fonts_mut(|f| f.layout_no_wrap(badge_text.to_string(), badge_font.clone(), badge_color))
+        .size()
+        .x;
     ui.painter().text(
         egui::pos2(rect.max.x - 8.0, rect.center().y),
         egui::Align2::RIGHT_CENTER,
         badge_text,
-        egui::FontId::proportional(10.5),
+        badge_font,
         badge_color,
     );
-    if hovered {
+
+    // In-place switch icon — only offered when the branch isn't the
+    // active one. Hidden on hover-zero so it doesn't clutter the row.
+    let mut in_place_clicked = false;
+    if !is_active {
+        let icon_size = 18.0;
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.max.x - 16.0 - badge_w - icon_size,
+                rect.center().y - icon_size / 2.0,
+            ),
+            egui::vec2(icon_size, icon_size),
+        );
+        let icon_resp = ui.interact(
+            icon_rect,
+            ui.id().with(("in_place", branch)),
+            egui::Sense::click(),
+        );
+        let icon_color = if icon_resp.hovered() {
+            t.accent.to_color32()
+        } else if hovered {
+            t.text_muted.to_color32()
+        } else {
+            Color32::TRANSPARENT
+        };
+        if icon_color != Color32::TRANSPARENT {
+            ui.painter().text(
+                icon_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icons::ARROW_RIGHT,
+                egui::FontId::proportional(13.0),
+                icon_color,
+            );
+        }
+        if icon_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            icon_resp.clone().on_hover_text(
+                "Switch in place (git switch) — requires a clean tree",
+            );
+        }
+        if icon_resp.clicked() {
+            in_place_clicked = true;
+        }
+    }
+
+    if hovered && !in_place_clicked {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    resp.clicked() && !is_active
+    if in_place_clicked {
+        RowAction::InPlace
+    } else if resp.clicked() && !is_active {
+        RowAction::Primary
+    } else {
+        RowAction::None
+    }
 }
 
 fn section_header(

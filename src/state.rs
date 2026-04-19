@@ -160,6 +160,7 @@ pub struct App {
     pub branch_picker_width: f32,
     pub branch_picker_height: f32,
     pub branch_picker_opened_at: Option<Instant>,
+    pub branch_picker_error: Option<String>,
     pub branch_picker_loading: bool,
     pub branch_picker_rx:
         Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Vec<String>, Vec<String>)>>>,
@@ -210,6 +211,7 @@ impl App {
             branch_picker_width: 420.0,
             branch_picker_height: 360.0,
             branch_picker_opened_at: None,
+            branch_picker_error: None,
             branch_picker_loading: false,
             branch_picker_rx: None,
             branch_picker_repos: Vec::new(),
