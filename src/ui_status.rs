@@ -29,33 +29,36 @@ pub fn render(ui: &mut egui::Ui, app: &App) {
         .map(|p| diag_counts(app, p))
         .unwrap_or((0, 0, 0));
 
+    // All file-related info is right-aligned and grouped: diagnostics →
+    // language → path. Reads from right-to-left visually since that's
+    // where the user's attention lands for the active file.
     ui.allocate_ui_with_layout(
         rect.size(),
-        egui::Layout::left_to_right(egui::Align::Center),
+        egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
             ui.add_space(10.0);
-            // Diagnostics (errors / warnings / infos).
+            if let Some(path) = &active_path {
+                let shown = relative_to_workspace(app, path);
+                ui.label(
+                    RichText::new(shown)
+                        .size(11.0)
+                        .color(t.text_muted.to_color32()),
+                );
+                ui.add_space(12.0);
+            }
+            if let Some(lang) = active_lang {
+                ui.label(
+                    RichText::new(lang)
+                        .size(11.0)
+                        .color(t.text_muted.to_color32())
+                        .monospace(),
+                );
+                ui.add_space(12.0);
+            }
             let (errs, warns, infos) = counts;
-            ui.label(
-                RichText::new(format!("{}  {errs}", icons::X_CIRCLE))
-                    .size(11.5)
-                    .color(if errs > 0 {
-                        t.error.to_color32()
-                    } else {
-                        t.text_muted.to_color32()
-                    }),
-            );
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new(format!("{}  {warns}", icons::WARNING))
-                    .size(11.5)
-                    .color(if warns > 0 {
-                        Color32::from_rgb(226, 192, 80)
-                    } else {
-                        t.text_muted.to_color32()
-                    }),
-            );
-            ui.add_space(10.0);
+            // Order when laid out right-to-left: info, warning, error
+            // (so on-screen it reads error, warning, info — matching the
+            // inline diag strip's ordering).
             ui.label(
                 RichText::new(format!("{}  {infos}", icons::INFO))
                     .size(11.5)
@@ -65,27 +68,26 @@ pub fn render(ui: &mut egui::Ui, app: &App) {
                         t.text_muted.to_color32()
                     }),
             );
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(10.0);
-                if let Some(lang) = active_lang {
-                    ui.label(
-                        RichText::new(lang)
-                            .size(11.0)
-                            .color(t.text_muted.to_color32())
-                            .monospace(),
-                    );
-                    ui.add_space(14.0);
-                }
-                if let Some(path) = active_path {
-                    let shown = relative_to_workspace(app, &path);
-                    ui.label(
-                        RichText::new(shown)
-                            .size(11.0)
-                            .color(t.text_muted.to_color32()),
-                    );
-                }
-            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("{}  {warns}", icons::WARNING))
+                    .size(11.5)
+                    .color(if warns > 0 {
+                        Color32::from_rgb(226, 192, 80)
+                    } else {
+                        t.text_muted.to_color32()
+                    }),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("{}  {errs}", icons::X_CIRCLE))
+                    .size(11.5)
+                    .color(if errs > 0 {
+                        t.error.to_color32()
+                    } else {
+                        t.text_muted.to_color32()
+                    }),
+            );
         },
     );
 }
