@@ -429,28 +429,28 @@ impl SPane {
 
     fn into_pane(self, ctx: &egui::Context, cwd: &Path) -> (PaneId, Pane) {
         let content = match self.content {
-            SPaneContent::Terminal { cwd: saved_cwd, history_b64 } => {
+            SPaneContent::Terminal { cwd: saved_cwd, history_b64: _ } => {
                 let spawn_cwd = if saved_cwd.as_os_str().is_empty() {
                     cwd
                 } else {
                     saved_cwd.as_path()
                 };
-                // Replay the saved scrollback if we have it — decoding
-                // failures fall back to a fresh terminal rather than
-                // blocking the whole session restore.
-                let history = base64_decode(&history_b64).unwrap_or_default();
-                let spawned = if history.is_empty() {
-                    crate::terminal::Terminal::spawn(ctx.clone(), 80, 24, Some(spawn_cwd))
-                } else {
-                    crate::terminal::Terminal::spawn_with_history(
-                        ctx.clone(),
-                        80,
-                        24,
-                        Some(spawn_cwd),
-                        &history,
-                    )
-                };
-                match spawned {
+                // Skip replaying saved scrollback bytes into alacritty.
+                // Raw VT streams contain absolute-column escapes (CSI C
+                // / CSI G / RPROMPT cursor positioning) that were baked
+                // against the original terminal width. Replaying them
+                // into a fresh 80×24 grid and then resizing to the real
+                // width produces the staggered / gibberish spacing users
+                // hit on reload. Shell history is in ~/.zsh_history
+                // anyway; losing scroll-back is the lesser evil.
+                // (The encode path stays so sessions written by newer
+                // versions remain forward-compatible.)
+                match crate::terminal::Terminal::spawn(
+                    ctx.clone(),
+                    80,
+                    24,
+                    Some(spawn_cwd),
+                ) {
                     Ok(t) => PaneContent::Terminal(t),
                     Err(_) => PaneContent::Files(FilesPane::empty()),
                 }

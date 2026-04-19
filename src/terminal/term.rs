@@ -29,10 +29,20 @@ impl Dimensions for TermSize {
 #[derive(Clone)]
 pub struct WakeListener {
     ctx: egui::Context,
+    /// Bytes alacritty wants us to write back to the PTY (cursor
+    /// position / device-status replies, title ack, etc.). Drained
+    /// by the Terminal each frame and forwarded to the PTY writer.
+    /// Without this, ZSH's RPROMPT uses `ESC[6n` to measure cursor
+    /// position and, getting no reply, guesses a garbage offset —
+    /// that was the "prompts stacked diagonally" bug.
+    pty_replies: Arc<Mutex<Vec<u8>>>,
 }
 
 impl EventListener for WakeListener {
-    fn send_event(&self, _event: TermEvent) {
+    fn send_event(&self, event: TermEvent) {
+        if let TermEvent::PtyWrite(s) = event {
+            self.pty_replies.lock().extend_from_slice(s.as_bytes());
+        }
         self.ctx.request_repaint();
     }
 }
@@ -50,6 +60,27 @@ pub struct Terminal {
     pub click_count: u8,
     master: Box<dyn MasterPty + Send>,
     shell_pid: Option<u32>,
+    /// Bytes alacritty's VT parser has queued for the shell (replies
+    /// to CSI 6n / DA / DSR queries). Drained + forwarded by
+    /// `flush_pty_replies` each frame.
+    pty_replies: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Terminal {
+    /// Forward any queued VT replies to the shell. Must be called every
+    /// frame (cheap when the queue is empty). Without this, ZSH's
+    /// RPROMPT + any shell feature relying on cursor-position-query
+    /// misbehaves.
+    pub fn flush_pty_replies(&mut self) {
+        let mut q = self.pty_replies.lock();
+        if q.is_empty() {
+            return;
+        }
+        let bytes = std::mem::take(&mut *q);
+        drop(q);
+        let _ = self.writer.write_all(&bytes);
+        let _ = self.writer.flush();
+    }
 }
 
 impl Terminal {
@@ -84,7 +115,11 @@ impl Terminal {
         let shell_pid = child.process_id();
         drop(pair.slave);
 
-        let listener = WakeListener { ctx: ctx.clone() };
+        let pty_replies = Arc::new(Mutex::new(Vec::<u8>::with_capacity(64)));
+        let listener = WakeListener {
+            ctx: ctx.clone(),
+            pty_replies: pty_replies.clone(),
+        };
         let term = Arc::new(Mutex::new(Term::new(
             Config::default(),
             &TermSize {
@@ -146,6 +181,7 @@ impl Terminal {
             click_count: 0,
             master: pair.master,
             shell_pid,
+            pty_replies,
         })
     }
 

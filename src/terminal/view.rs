@@ -63,6 +63,10 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let cols = ((available.x / cell_w).floor() as usize).max(20);
     let rows = ((available.y / cell_h).floor() as usize).max(5);
     terminal.resize(cols, rows);
+    // Forward VT replies alacritty queued (CSI 6n cursor position, DSR,
+    // etc.) back to the shell. Without this, ZSH's RPROMPT position
+    // queries time out and it computes a garbage column offset.
+    terminal.flush_pty_replies();
 
     let (response, painter) = ui.allocate_painter(
         Vec2::new(cols as f32 * cell_w, rows as f32 * cell_h),
