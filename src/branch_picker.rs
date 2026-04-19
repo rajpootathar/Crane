@@ -59,6 +59,23 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
 
+    // Proactive dirty-tree warning: if the active Workspace has staged
+    // or unstaged changes, surface that before the user attempts an
+    // in-place switch (which git itself would reject). git's own
+    // message still shows up in the red error banner if they go
+    // through anyway — this is the up-front hint.
+    let dirty_warning = app
+        .projects
+        .iter()
+        .find(|p| p.id == pid)
+        .and_then(|p| p.workspaces.iter().find(|w| w.id == wid))
+        .and_then(|w| w.git_status.as_ref())
+        .map(|s| {
+            let n = s.changes.len() + s.added + s.deleted;
+            if n > 0 { Some(n) } else { None }
+        })
+        .unwrap_or(None);
+
     let repos_snapshot: Vec<(PathBuf, Vec<String>, Vec<String>)> =
         app.branch_picker.repos.clone();
     let filter_snapshot: Option<PathBuf> = app.branch_picker.filter.clone();
@@ -121,6 +138,31 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                         );
                     });
                     ui.add_space(4.0);
+
+                    if let Some(n) = dirty_warning {
+                        let amber_bg = Color32::from_rgba_unmultiplied(226, 192, 80, 36);
+                        let amber_stroke = egui::Stroke::new(
+                            1.0,
+                            Color32::from_rgb(226, 192, 80),
+                        );
+                        egui::Frame::NONE
+                            .fill(amber_bg)
+                            .stroke(amber_stroke)
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}  {n} uncommitted change{} — in-place switch (Switch) will be refused. Worktree switching is fine.",
+                                        icons::WARNING,
+                                        if n == 1 { "" } else { "s" },
+                                    ))
+                                    .size(10.5)
+                                    .color(t.text.to_color32()),
+                                );
+                            });
+                        ui.add_space(4.0);
+                    }
 
                     if repos_snapshot.len() > 1 {
                         ScrollArea::horizontal()
@@ -332,8 +374,20 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         // the refusal we want to surface. No worker thread needed.
         match crate::git::checkout_branch(&repo, &branch) {
             Ok(()) => {
+                // Update the active Workspace's canonical name
+                // immediately so status bar + picker reflect the new
+                // branch before the next git status poll lands. Without
+                // this, the picker row for the just-switched-to branch
+                // still didn't show as "current", making users click
+                // twice to confirm the action worked.
+                if let Some(wt) = app.active_workspace_mut() {
+                    wt.name = branch.clone();
+                }
                 app.branch_picker.error = None;
                 app.refresh_active_git_status(ctx);
+                // Close the picker on success — user sees the status
+                // bar flip to the new branch and knows it worked.
+                app.branch_picker.open = false;
             }
             Err(msg) => {
                 app.branch_picker.error = Some(msg);
@@ -583,11 +637,15 @@ fn row(
     } else {
         t.text_muted.to_color32()
     };
+    // Both badge and pill widths are constant-character-count strings
+    // ("current"/"open"/"create", "Switch") at a known font size. We
+    // used to call `ui.fonts_mut(...)` for each — the write-locked font
+    // atlas access from inside a deep (Area → Frame → Resize → Scroll →
+    // row) layout context intermittently tripped a 10 s RwLock deadlock.
+    // Estimate from the 10.5px proportional font: ~5.5 px/char is close
+    // enough for alignment; nothing here is load-bearing for hit-testing.
     let badge_font = egui::FontId::proportional(10.5);
-    let badge_w = ui
-        .fonts_mut(|f| f.layout_no_wrap(badge_text.to_string(), badge_font.clone(), badge_color))
-        .size()
-        .x;
+    let badge_w = badge_text.len() as f32 * 5.5;
     ui.painter().text(
         egui::pos2(rect.max.x - 8.0, rect.center().y),
         egui::Align2::RIGHT_CENTER,
@@ -596,17 +654,10 @@ fn row(
         badge_color,
     );
 
-    // In-place switch pill. The arrow was too subtle; using a labeled
-    // "Switch" pill shown on row hover so users clearly see a second
-    // action is available. Click resolution is by pointer position
-    // against this sub-rect (ui.interact overlapping the row's own
-    // click-sense would double-fire and was the bug the user hit).
+    // In-place switch pill.
     let pill_text = "Switch";
     let pill_font = egui::FontId::proportional(10.5);
-    let pill_w = ui
-        .fonts_mut(|f| f.layout_no_wrap(pill_text.to_string(), pill_font.clone(), Color32::WHITE))
-        .size()
-        .x;
+    let pill_w = pill_text.len() as f32 * 5.8;
     let pill_padding = 6.0;
     let pill_width = pill_w + pill_padding * 2.0;
     let pill_rect = egui::Rect::from_min_size(

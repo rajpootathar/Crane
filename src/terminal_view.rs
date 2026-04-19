@@ -316,12 +316,11 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     if !has_focus {
         return;
     }
-    // Don't grab keyboard when another egui widget (e.g. the tab-rename
-    // TextEdit in the Left Panel) has keyboard focus. Without this the
-    // user's rename keystrokes also get written to the PTY.
-    if ui.memory(|m| m.focused().is_some()) {
-        return;
-    }
+    // True when another egui widget (e.g. tab-rename TextEdit) owns
+    // keyboard focus. We still want terminal-level command shortcuts
+    // (Cmd+K, Cmd+A, Copy, Paste) to work globally — only the raw-key
+    // fall-through that writes to the PTY must skip in this case.
+    let other_widget_focused = ui.memory(|m| m.focused().is_some());
 
     let mut copy_text: Option<String> = None;
     let mut paste_text: Option<String> = None;
@@ -384,6 +383,12 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     modifiers,
                     ..
                 } => {
+                    // Another widget (rename TextEdit, branch-picker
+                    // filter, etc.) owns keyboard focus — swallow the
+                    // key so it doesn't also echo into the PTY.
+                    if other_widget_focused {
+                        continue;
+                    }
                     if modifiers.ctrl
                         && let Some(letter) = key_letter(*key) {
                             terminal.write_input(&[letter - b'a' + 1]);
