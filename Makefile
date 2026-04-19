@@ -63,6 +63,13 @@ dmg: bundle
 	mkdir -p target/release/dmg-staging
 	cp -R "$(APP)" target/release/dmg-staging/
 	ln -s /Applications target/release/dmg-staging/Applications
+	# Ad-hoc-signed builds get flagged by Gatekeeper on first launch.
+	# Ship a one-click quarantine-strip helper + README alongside the
+	# .app so the first-run UX is "right-click → Open" on a .command
+	# file instead of five clicks through System Settings → Privacy.
+	cp "scripts/dmg-assets/Fix Gatekeeper.command" target/release/dmg-staging/
+	cp "scripts/dmg-assets/README - First Run.txt" target/release/dmg-staging/
+	chmod +x "target/release/dmg-staging/Fix Gatekeeper.command"
 	rm -f "$(DMG)"
 	hdiutil create -volname "$(APP_NAME)" \
 		-srcfolder target/release/dmg-staging \
@@ -96,6 +103,9 @@ dmg-universal: bundle-universal
 	mkdir -p target/release/dmg-staging-universal
 	cp -R "$(UNIVERSAL_APP)" target/release/dmg-staging-universal/
 	ln -s /Applications target/release/dmg-staging-universal/Applications
+	cp "scripts/dmg-assets/Fix Gatekeeper.command" target/release/dmg-staging-universal/
+	cp "scripts/dmg-assets/README - First Run.txt" target/release/dmg-staging-universal/
+	chmod +x "target/release/dmg-staging-universal/Fix Gatekeeper.command"
 	rm -f "$(UNIVERSAL_DMG)"
 	hdiutil create -volname "$(APP_NAME)" \
 		-srcfolder target/release/dmg-staging-universal \
