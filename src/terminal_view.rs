@@ -324,6 +324,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
 
     let mut copy_text: Option<String> = None;
     let mut paste_text: Option<String> = None;
+    let mut clear_requested = false;
     ui.input(|i| {
         for event in &i.events {
             match event {
@@ -340,21 +341,14 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     modifiers,
                     ..
                 } if modifiers.mac_cmd || modifiers.command => {
-                    // iTerm-style Cmd+K: wipe screen + scrollback.
-                    // Drive the ANSI parser directly so the PTY stays
-                    // idle; then send Ctrl+L (form-feed) so the shell
-                    // redraws its prompt on the now-empty screen.
-                    let mut processor: Processor<StdSyncHandler> = Processor::new();
-                    {
-                        let mut guard = terminal.term.lock();
-                        // \x1b[H       → cursor home
-                        // \x1b[2J      → erase entire display
-                        // \x1b[3J      → erase saved (scrollback) lines
-                        processor.advance(&mut *guard, b"\x1b[H\x1b[2J\x1b[3J");
-                        guard.scroll_display(Scroll::Bottom);
-                    }
-                    terminal.write_input(b"\x0c");
-                    terminal.history.lock().clear();
+                    // Queue; actual work happens after the input
+                    // closure unlocks Context. Driving the ANSI parser
+                    // inside `ui.input` used to deadlock because
+                    // alacritty's WakeListener calls
+                    // ctx.request_repaint() on certain escape events,
+                    // and that call takes a Context write lock while
+                    // our ui.input closure still holds its read lock.
+                    clear_requested = true;
                 }
                 egui::Event::Key {
                     key: egui::Key::A,
@@ -440,6 +434,20 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     }
     if let Some(t) = paste_text {
         terminal.write_input(t.as_bytes());
+    }
+    if clear_requested {
+        // \x1b[H → cursor home, \x1b[2J → erase display, \x1b[3J → erase
+        // scrollback. Safe to run here because ui.input's read lock on
+        // Context has been released, so alacritty's WakeListener calling
+        // ctx.request_repaint() won't deadlock.
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+        {
+            let mut guard = terminal.term.lock();
+            processor.advance(&mut *guard, b"\x1b[H\x1b[2J\x1b[3J");
+            guard.scroll_display(Scroll::Bottom);
+        }
+        terminal.write_input(b"\x0c");
+        terminal.history.lock().clear();
     }
 }
 
