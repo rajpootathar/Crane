@@ -139,8 +139,20 @@ pub enum SPaneContent {
         right_path: String,
     },
     Browser {
+        /// Legacy single-URL field — populated for old session files.
+        /// Newer writes use `tabs` + `active` below.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         url: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tabs: Vec<SBrowserTab>,
+        #[serde(default)]
+        active: usize,
     },
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SBrowserTab {
+    pub url: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -468,7 +480,13 @@ impl SPane {
                 right_path: d.right_path.clone(),
             },
             PaneContent::Browser(b) => SPaneContent::Browser {
-                url: b.url.clone(),
+                url: String::new(),
+                tabs: b
+                    .tabs
+                    .iter()
+                    .map(|t| SBrowserTab { url: t.url.clone() })
+                    .collect(),
+                active: b.active,
             },
         };
         SPane {
@@ -584,10 +602,24 @@ impl SPane {
                     error: None,
                 })
             }
-            SPaneContent::Browser { url } => PaneContent::Browser(BrowserPane {
-                url: url.clone(),
-                input_buf: url,
-            }),
+            SPaneContent::Browser { url, tabs, active } => {
+                if tabs.is_empty() {
+                    PaneContent::Browser(BrowserPane::new_with(
+                        url.clone(),
+                        url,
+                    ))
+                } else {
+                    let mut bp = BrowserPane::new_with(
+                        tabs[0].url.clone(),
+                        tabs[0].url.clone(),
+                    );
+                    for extra in tabs.iter().skip(1) {
+                        bp.new_tab_with(extra.url.clone());
+                    }
+                    bp.active = active.min(bp.tabs.len().saturating_sub(1));
+                    PaneContent::Browser(bp)
+                }
+            }
         };
         (
             self.id,

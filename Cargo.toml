@@ -1,6 +1,6 @@
 [package]
 name = "crane"
-version = "0.1.67"
+version = "0.1.69"
 edition = "2024"
 description = "Native GPU-rendered terminal + IDE environment"
 authors = ["rajpootathar"]
@@ -56,6 +56,11 @@ libc = "0.2"
 # de-facto winit-era replacement for the older tao menu API.
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.15"
+# Embedded browser pane (task #38). WKWebView wrapper that accepts a
+# raw window handle as parent and lets us reposition it per frame to
+# stay glued under the Browser pane's rect in egui.
+wry = "0.55"
+raw-window-handle = "0.6"
 
 [profile.dev]
 opt-level = 1

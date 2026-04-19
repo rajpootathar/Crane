@@ -19,19 +19,38 @@ pub fn render(
     if !app.show_settings {
         return SettingsEffect::None;
     }
-    let mut open = true;
     let mut theme_change: Option<String> = None;
     let mut effect = SettingsEffect::None;
 
-    egui::Window::new("Settings")
-        .collapsible(false)
-        .resizable(true)
-        .default_size(egui::vec2(WIN_W, WIN_H))
-        .min_width(720.0)
-        .min_height(460.0)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .open(&mut open)
-        .show(ctx, |ui| {
+    // Paint a dimmed click-absorbing backdrop so clicks outside the
+    // dialog don't fall through to panes underneath. egui::Modal
+    // handles Esc + background-click dismiss + focus ordering.
+    let mut close_clicked = false;
+    let modal_resp = egui::Modal::new(egui::Id::new("settings_modal")).show(ctx, |ui| {
+        ui.set_width(WIN_W);
+        ui.set_height(WIN_H);
+            ui.horizontal(|ui| {
+                ui.heading("Settings");
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(egui_phosphor::regular::X).size(13.0),
+                                )
+                                .frame(false)
+                                .min_size(egui::vec2(22.0, 22.0)),
+                            )
+                            .on_hover_text("Close")
+                            .clicked()
+                        {
+                            close_clicked = true;
+                        }
+                    },
+                );
+            });
+            ui.separator();
             let content_h = ui.available_height();
             ui.horizontal_top(|ui| {
                 render_sidebar(ui, app, content_h);
@@ -60,9 +79,10 @@ pub fn render(
                         });
                 });
             });
-        });
+    });
 
-    if !open {
+    // Click on the dimmed backdrop, or Esc, closes the modal.
+    if modal_resp.should_close() || close_clicked {
         app.show_settings = false;
     }
     if let Some(name) = theme_change

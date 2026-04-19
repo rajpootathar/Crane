@@ -721,6 +721,83 @@ fn render_scoped(
                                 state.store(ui.ctx(), te_id);
                             }
                         }
+                        // Cmd+X on an empty selection cuts the whole line
+                        // (trailing newline included). Matches VS Code /
+                        // JetBrains behavior. Intercepted before TextEdit
+                        // runs so its default no-op path doesn't swallow
+                        // the shortcut.
+                        // macOS: egui synthesizes Event::Cut from Cmd+X
+                        // without emitting a Key event, so `consume_key`
+                        // never fires. Detect the Cut event directly and
+                        // strip it from the queue when we handle it.
+                        let cut_line = ui.memory(|m| m.has_focus(te_id))
+                            && ui.input_mut(|i| {
+                                let idx = i.events.iter().position(|e| {
+                                    matches!(e, egui::Event::Cut)
+                                });
+                                if let Some(idx) = idx {
+                                    i.events.remove(idx);
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        if cut_line
+                            && let Some(mut state) =
+                                egui::TextEdit::load_state(ui.ctx(), te_id)
+                        {
+                            let range = state
+                                .cursor
+                                .char_range()
+                                .unwrap_or_else(|| egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(0),
+                                ));
+                            let empty = range.primary.index == range.secondary.index;
+                            if empty {
+                                let cursor = range.primary.index;
+                                let byte = crate::format::char_idx_to_byte(
+                                    &tab.content,
+                                    cursor,
+                                );
+                                let bytes = tab.content.as_bytes();
+                                let line_start = bytes[..byte]
+                                    .iter()
+                                    .rposition(|b| *b == b'\n')
+                                    .map(|i| i + 1)
+                                    .unwrap_or(0);
+                                let line_end = bytes[byte..]
+                                    .iter()
+                                    .position(|b| *b == b'\n')
+                                    .map(|i| byte + i + 1)
+                                    .unwrap_or(bytes.len());
+                                let cut = tab.content[line_start..line_end].to_string();
+                                if !cut.is_empty() {
+                                    // Push pre-cut state onto the TextEdit's
+                                    // undo stack as its own entry so each
+                                    // Cmd+X is one discrete Cmd+Z step
+                                    // (otherwise egui's time-debounced
+                                    // feed_state merges rapid cuts).
+                                    let mut undoer = state.undoer();
+                                    undoer.add_undo(&(range, tab.content.clone()));
+                                    state.set_undoer(undoer);
+
+                                    ui.ctx().copy_text(cut);
+                                    tab.content.replace_range(line_start..line_end, "");
+                                    let line_start_char = tab.content[..line_start]
+                                        .chars()
+                                        .count();
+                                    let new_cc = egui::text::CCursor::new(line_start_char);
+                                    state.cursor.set_char_range(Some(
+                                        egui::text::CCursorRange::one(new_cc),
+                                    ));
+                                    state.store(ui.ctx(), te_id);
+                                }
+                            } else {
+                                // Non-empty selection — forward a normal Cut
+                                // event so the TextEdit performs a standard cut.
+                                ui.input_mut(|i| i.events.push(egui::Event::Cut));
+                            }
+                        }
                         let editor = egui::TextEdit::multiline(&mut tab.content)
                             .id(te_id)
                             .code_editor()

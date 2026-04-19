@@ -46,6 +46,7 @@ pub enum PaneAction {
     ResizeSplit { path: Vec<usize>, ratio: f32 },
     SwapPanes { a: PaneId, b: PaneId },
     DockPane { src: PaneId, target: PaneId, edge: DockEdge },
+    ToggleMaximize(PaneId),
 }
 
 fn dock_zone(rect: Rect, pos: Pos2) -> DockEdge {
@@ -113,6 +114,32 @@ pub fn render_layout(
     prefs: crate::views::file_view::EditorPrefs,
 ) -> PaneAction {
     let mut action = PaneAction::None;
+    // When a pane is maximized we bypass the layout tree entirely and
+    // render that single pane at the full rect. Esc restores.
+    let maximized_id = layout.maximized.and_then(|id| {
+        if layout.panes.contains_key(&id) { Some(id) } else { None }
+    });
+    if let Some(id) = maximized_id {
+        render_pane(
+            ui,
+            layout,
+            id,
+            rect,
+            font_size,
+            &mut action,
+            syntax_theme_override,
+            diagnostics_for,
+            notify_saved,
+            format_before_save,
+            goto_request,
+            workspace_root,
+            prefs,
+        );
+        if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            action = PaneAction::ToggleMaximize(id);
+        }
+        return action;
+    }
     let root = layout.root.take();
     if let Some(root) = root {
         render_node(
@@ -385,7 +412,7 @@ fn render_pane(
             diff_view::render(child, diff, font_size, &mut pane.title);
         }
         PaneContent::Browser(browser) => {
-            browser_view::render(child, browser, &mut pane.title);
+            browser_view::render(child, id, browser, &mut pane.title);
         }
     });
 
@@ -436,10 +463,10 @@ fn render_header(
         None => return,
     };
 
-    let close_size = rect.height();
+    let btn_size = rect.height();
     let close_rect = Rect::from_min_size(
-        Pos2::new(rect.max.x - close_size, rect.min.y),
-        Vec2::splat(close_size),
+        Pos2::new(rect.max.x - btn_size, rect.min.y),
+        Vec2::splat(btn_size),
     );
     let close_response = ui.interact(close_rect, egui::Id::new(("close", id)), Sense::click());
     if close_response.hovered() {
@@ -456,9 +483,41 @@ fn render_header(
         *action = PaneAction::Close(id);
     }
 
+    // Maximize / restore button, pinned just left of close.
+    let max_rect = Rect::from_min_size(
+        Pos2::new(close_rect.min.x - btn_size, rect.min.y),
+        Vec2::splat(btn_size),
+    );
+    let max_response = ui.interact(max_rect, egui::Id::new(("maximize", id)), Sense::click());
+    if max_response.hovered() {
+        ui.painter().rect_filled(
+            max_rect,
+            0.0,
+            theme::current().row_hover.to_color32(),
+        );
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let is_max = layout.maximized == Some(id);
+    let glyph = if is_max {
+        icons::ARROWS_IN_SIMPLE
+    } else {
+        icons::ARROWS_OUT_SIMPLE
+    };
+    ui.painter().text(
+        max_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        header_fg(),
+    );
+    let _ = max_response.clone().on_hover_text(if is_max { "Restore (Esc)" } else { "Maximize" });
+    if max_response.clicked() {
+        *action = PaneAction::ToggleMaximize(id);
+    }
+
     let title_rect = Rect::from_min_max(
         Pos2::new(rect.min.x + 10.0, rect.min.y),
-        Pos2::new(close_rect.min.x - 6.0, rect.max.y),
+        Pos2::new(max_rect.min.x - 6.0, rect.max.y),
     );
     let title_response = ui.interact(
         title_rect,

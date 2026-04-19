@@ -1,3 +1,7 @@
+# Pull local, gitignored overrides (DEVELOPER_ID, NOTARY_PROFILE, etc).
+# Safe when absent — `-include` never errors on a missing file.
+-include .env.local
+
 APP_NAME  := Crane
 VERSION   := $(shell awk -F'"' '/^version/ { print $$2; exit }' Cargo.toml)
 BIN_NAME  := crane
@@ -12,7 +16,21 @@ UNIVERSAL_DMG := $(TARGET_DIR)/$(APP_NAME)-$(VERSION)-universal.dmg
 
 .PHONY: help build test run release bundle dmg icns clean \
         release-universal bundle-universal dmg-universal \
-        install-cargo-bundle upload
+        install-cargo-bundle upload \
+        sign sign-universal notarize notarize-universal \
+        staple staple-universal signed-dmg signed-dmg-universal \
+        setup-notary
+
+# Developer ID signing + notarization.
+#
+#   DEVELOPER_ID  — exact keychain identity name, e.g.
+#                   "Developer ID Application: Your Name (TEAMID)"
+#   NOTARY_PROFILE — keychain-profile name used by `xcrun notarytool`.
+#                    Set up once via: make setup-notary
+#   ENTITLEMENTS  — plist path (defaults to scripts/entitlements.plist)
+DEVELOPER_ID   ?=
+NOTARY_PROFILE ?= crane-notary
+ENTITLEMENTS   ?= scripts/entitlements.plist
 
 help:
 	@echo "Crane — make targets"
@@ -52,7 +70,7 @@ install-cargo-bundle:
 
 bundle: icns install-cargo-bundle
 	cargo bundle --release
-	@if [ "$$(uname)" = "Darwin" ]; then \
+	@if [ "$$(uname)" = "Darwin" ] && [ -z "$(DEVELOPER_ID)" ]; then \
 		codesign --force --deep --sign - "$(APP)" && \
 		echo "ad-hoc signed: $(APP)"; \
 	fi
@@ -94,8 +112,10 @@ bundle-universal: icns install-cargo-bundle
 		"target/aarch64-apple-darwin/release/$(BIN_NAME)" \
 		"target/x86_64-apple-darwin/release/$(BIN_NAME)" \
 		-output "$(UNIVERSAL_APP)/Contents/MacOS/$(BIN_NAME)"
-	@codesign --force --deep --sign - "$(UNIVERSAL_APP)" && \
-		echo "ad-hoc signed: $(UNIVERSAL_APP)"
+	@if [ -z "$(DEVELOPER_ID)" ]; then \
+		codesign --force --deep --sign - "$(UNIVERSAL_APP)" && \
+		echo "ad-hoc signed: $(UNIVERSAL_APP)"; \
+	fi
 	@echo "universal bundle ready: $(UNIVERSAL_APP)"
 
 dmg-universal: bundle-universal
@@ -129,3 +149,72 @@ clean:
 	rm -rf target/release/bundle target/*/release/bundle \
 		target/release/bundle-universal \
 		target/release/*.dmg
+
+# ---------------------------------------------------------------------------
+# Signing / notarization
+# ---------------------------------------------------------------------------
+
+# One-time: store an app-specific password in keychain under $(NOTARY_PROFILE).
+# You'll be prompted for Apple ID, Team ID, and the app-specific password
+# generated at appleid.apple.com → Sign-In and Security → App-Specific Passwords.
+setup-notary:
+	@command -v xcrun >/dev/null 2>&1 || { echo "xcrun not found — install Xcode CLT"; exit 1; }
+	xcrun notarytool store-credentials "$(NOTARY_PROFILE)" \
+		--apple-id "$${APPLE_ID:-$$(read -p 'Apple ID: ' v; echo $$v)}" \
+		--team-id  "$${TEAM_ID:-$$(read -p  'Team ID:  ' v; echo $$v)}"
+
+# Deep-sign a bundle with the Developer ID cert + hardened runtime +
+# secure timestamp. Required for notarization.
+define _sign_bundle
+	@test -n "$(DEVELOPER_ID)" || { echo "DEVELOPER_ID is not set — see 'make help'"; exit 1; }
+	@test -f "$(ENTITLEMENTS)" || { echo "entitlements plist missing: $(ENTITLEMENTS)"; exit 1; }
+	@# Sign nested binaries/frameworks first, outward to the app.
+	find "$(1)/Contents" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +111 \) \
+		! -path "$(1)/Contents/MacOS/*" \
+		-exec codesign --force --timestamp --options runtime --sign "$(DEVELOPER_ID)" {} \; || true
+	codesign --force --timestamp --options runtime \
+		--entitlements "$(ENTITLEMENTS)" \
+		--sign "$(DEVELOPER_ID)" "$(1)/Contents/MacOS"/* || true
+	codesign --force --timestamp --options runtime \
+		--entitlements "$(ENTITLEMENTS)" \
+		--sign "$(DEVELOPER_ID)" "$(1)"
+	codesign --verify --deep --strict --verbose=2 "$(1)"
+	@echo "signed: $(1)"
+endef
+
+sign: bundle
+	$(call _sign_bundle,$(APP))
+
+sign-universal: bundle-universal
+	$(call _sign_bundle,$(UNIVERSAL_APP))
+
+# Submit a DMG for notarization and wait for the ticket. The DMG itself
+# must be built from an already-signed .app. On success, stapler-staple
+# so the ticket travels with the DMG (offline install works).
+define _notarize_dmg
+	@test -f "$(1)" || { echo "missing DMG: $(1) — run the matching signed-dmg target first"; exit 1; }
+	xcrun notarytool submit "$(1)" \
+		--keychain-profile "$(NOTARY_PROFILE)" \
+		--wait
+	xcrun stapler staple "$(1)"
+	xcrun stapler validate "$(1)"
+	spctl --assess --type open --context context:primary-signature -v "$(1)" || true
+	@echo "notarized + stapled: $(1)"
+endef
+
+notarize:
+	$(call _notarize_dmg,$(DMG))
+
+notarize-universal:
+	$(call _notarize_dmg,$(UNIVERSAL_DMG))
+
+staple:
+	xcrun stapler staple "$(DMG)"
+
+staple-universal:
+	xcrun stapler staple "$(UNIVERSAL_DMG)"
+
+# End-to-end: build → sign app → build DMG from signed app → notarize → staple.
+signed-dmg: sign dmg notarize
+
+signed-dmg-universal: sign-universal dmg-universal notarize-universal

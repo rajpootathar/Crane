@@ -2,3 +2,5 @@
 .DS_Store
 Cargo.lock
 /icons/crane.iconset/
+# Local signing env (DEVELOPER_ID, NOTARY_PROFILE). Never committed.
+.env.local

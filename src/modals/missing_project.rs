@@ -26,14 +26,10 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
 
     let mut relocate = false;
     let mut close = false;
-    egui::Window::new("Project Not Found")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .fixed_size(egui::vec2(480.0, 180.0))
-        .show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.add_space(4.0);
+    let _modal = egui::Modal::new(egui::Id::new("missing_project_modal")).show(ctx, |ui| {
+        ui.set_min_width(460.0);
+        ui.heading("Project Not Found");
+        ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(format!("“{name}” was opened from:"))
                     .size(12.5),
@@ -69,7 +65,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                     close = true;
                 }
             });
-        });
+    });
 
     if relocate {
         let start = path.parent().unwrap_or(&path).to_path_buf();

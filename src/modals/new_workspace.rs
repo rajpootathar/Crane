@@ -1,8 +1,7 @@
 use crate::state::{self, App};
 
 pub fn render(ctx: &egui::Context, app: &mut App) {
-    let mut open = app.new_workspace_modal.is_some();
-    if !open {
+    if app.new_workspace_modal.is_none() {
         return;
     }
     let mut create = false;
@@ -16,15 +15,11 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
             .map(|p| (p.path.clone(), p.name.clone()))
     });
 
-    egui::Window::new("New Worktree")
-        .collapsible(false)
-        .resizable(false)
-        .fixed_size(egui::vec2(modal_width, 280.0))
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.set_width(modal_width - 20.0);
-            let input_width = modal_width - 40.0;
+    let modal_resp = egui::Modal::new(egui::Id::new("new_workspace_modal")).show(ctx, |ui| {
+        ui.set_min_width(modal_width - 20.0);
+        ui.heading("New Worktree");
+        ui.add_space(4.0);
+        let input_width = modal_width - 40.0;
             if let Some(modal) = app.new_workspace_modal.as_mut() {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Branch").strong());
@@ -108,8 +103,8 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                     }
                 });
             }
-        });
-    if !open || cancel {
+    });
+    if modal_resp.should_close() || cancel {
         app.new_workspace_modal = None;
     } else if let Some(current) = browse {
         let start = std::path::PathBuf::from(if current.is_empty() {

@@ -142,9 +142,73 @@ pub struct DiffPane {
     pub error: Option<String>,
 }
 
-pub struct BrowserPane {
+pub struct BrowserTab {
+    /// Pane-scoped id used to key into the native webview host.
+    /// Stable for the lifetime of the tab; starts at 1.
+    pub id: u32,
     pub url: String,
     pub input_buf: String,
+    pub title: String,
+}
+
+pub struct BrowserPane {
+    pub tabs: Vec<BrowserTab>,
+    pub active: usize,
+    next_tab_id: u32,
+}
+
+impl BrowserPane {
+    pub fn new_with(url: String, input_buf: String) -> Self {
+        Self {
+            tabs: vec![BrowserTab {
+                id: 1,
+                url,
+                input_buf,
+                title: String::new(),
+            }],
+            active: 0,
+            next_tab_id: 2,
+        }
+    }
+
+    pub fn new_tab(&mut self) -> u32 {
+        self.new_tab_with(String::new())
+    }
+
+    pub fn new_tab_with(&mut self, url: String) -> u32 {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let input_buf = if url.is_empty() {
+            "https://".into()
+        } else {
+            url.clone()
+        };
+        self.tabs.push(BrowserTab {
+            id,
+            url,
+            input_buf,
+            title: String::new(),
+        });
+        self.active = self.tabs.len() - 1;
+        id
+    }
+
+    pub fn close_tab(&mut self, idx: usize) -> Option<u32> {
+        if idx >= self.tabs.len() || self.tabs.len() <= 1 {
+            return None;
+        }
+        let removed = self.tabs.remove(idx).id;
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if self.active > idx {
+            self.active -= 1;
+        }
+        Some(removed)
+    }
+
+    pub fn active_tab_mut(&mut self) -> Option<&mut BrowserTab> {
+        self.tabs.get_mut(self.active)
+    }
 }
 
 pub enum PaneContent {
@@ -180,6 +244,9 @@ pub struct Layout {
     pub focus: Option<PaneId>,
     pub cwd: PathBuf,
     next_id: PaneId,
+    /// When Some, the referenced pane is rendered full-size over its
+    /// layout. Purely runtime state — never serialized to the session.
+    pub maximized: Option<PaneId>,
 }
 
 impl Layout {
@@ -190,6 +257,7 @@ impl Layout {
             focus: None,
             cwd,
             next_id: 1,
+            maximized: None,
         }
     }
 

@@ -412,7 +412,11 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let mut copy_text: Option<String> = None;
     let mut paste_text: Option<String> = None;
     let mut clear_requested = false;
-    ui.input(|i| {
+    // When a modal overlay is open the parent ui is disabled — skip
+    // all keyboard/paste input routing so key events don't leak into
+    // the PTY through the backdrop.
+    let input_enabled = ui.is_enabled();
+    if input_enabled { ui.input(|i| {
         for event in &i.events {
             match event {
                 egui::Event::Copy => {
@@ -515,7 +519,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                 _ => {}
             }
         }
-    });
+    }); }
     if let Some(t) = copy_text {
         ui.ctx().copy_text(t);
     }

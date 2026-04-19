@@ -10,7 +10,7 @@ use crate::theme;
 use egui::RichText;
 use egui_phosphor::regular as icons;
 
-pub const HEIGHT: f32 = 24.0;
+pub const HEIGHT: f32 = 28.0;
 
 pub fn render(ui: &mut egui::Ui, app: &mut App) {
     let t = theme::current();
@@ -37,7 +37,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut App) {
                 let resp = ui.add(
                     egui::Label::new(
                         RichText::new(format!("{}  {}", icons::GIT_BRANCH, b))
-                            .size(11.0)
+                            .size(13.0)
                             .color(t.text.to_color32()),
                     )
                     .sense(egui::Sense::click()),
@@ -66,11 +66,11 @@ pub fn render(ui: &mut egui::Ui, app: &mut App) {
                     let mk = |glyph: &'static str| {
                         egui::Button::new(
                             RichText::new(glyph)
-                                .size(13.0)
+                                .size(15.0)
                                 .color(t.text_muted.to_color32()),
                         )
                         .frame(false)
-                        .min_size(egui::vec2(22.0, 20.0))
+                        .min_size(egui::vec2(26.0, 24.0))
                     };
                     if ui
                         .add(mk(icons::QUESTION))
@@ -101,7 +101,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut App) {
                         let shown = relative_to_workspace(app, path);
                         ui.label(
                             RichText::new(shown)
-                                .size(11.0)
+                                .size(13.0)
                                 .color(t.text_muted.to_color32()),
                         );
                     }

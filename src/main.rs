@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+mod browser;
 mod format;
 mod git;
 mod lsp;
@@ -236,6 +238,8 @@ struct CraneApp {
     last_saved_settings_snapshot: String,
     last_save_at: std::time::Instant,
     pending_close: Option<state::layout::PaneId>,
+    #[cfg(target_os = "macos")]
+    browser_host: browser::BrowserHost,
 }
 
 fn terminal_is_running(app: &App, id: state::layout::PaneId) -> bool {
@@ -316,6 +320,8 @@ impl CraneApp {
             last_saved_settings_snapshot: String::new(),
             last_save_at: std::time::Instant::now(),
             pending_close: None,
+            #[cfg(target_os = "macos")]
+            browser_host: browser::BrowserHost::new(),
         }
     }
 
@@ -610,7 +616,7 @@ impl CraneApp {
 }
 
 impl eframe::App for CraneApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // Native menu events (macOS). On other platforms this returns
         // an empty Vec and does nothing.
@@ -624,6 +630,28 @@ impl eframe::App for CraneApp {
         self.app.ensure_initial(&ctx);
         self.handle_shortcuts(&ctx);
         self.app.refresh_active_git_status(&ctx);
+        #[cfg(target_os = "macos")]
+        {
+            // Fold any URL changes the WKWebView reported (redirects,
+            // link clicks, history manipulation) back into each tab's
+            // state so the URL bar tracks in-page navigation.
+            let updates = self.browser_host.drain_url_updates();
+            if !updates.is_empty() {
+                browser::apply_url_updates_to_app(&mut self.app, &updates);
+            }
+            // Seed per-frame loading snapshot so the egui tab chips can
+            // show a spinner on tabs whose WKWebView is mid-load.
+            browser::set_loading_snapshot(self.browser_host.loading_set());
+            // Also surface the current WebKit memory usage so the
+            // Browser pane can warn the user about heavy tabs.
+            browser::set_memory_snapshot(self.browser_host.memory.snapshot());
+            // Page-load callbacks fire on a background thread; without
+            // an explicit repaint the spinner wouldn't animate until
+            // the next user event.
+            if !self.browser_host.loading_set().is_empty() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
 
         let full = ui.available_rect_before_wrap();
         let t = theme::current();
@@ -793,6 +821,16 @@ impl eframe::App for CraneApp {
             word_wrap: self.app.editor_word_wrap,
             trim_on_save: self.app.editor_trim_on_save,
         };
+        // When any modal is open, disable the panes underneath so
+        // clicks/keys don't leak through to terminals or editors.
+        let modal_open = self.app.show_settings
+            || self.app.show_help
+            || self.app.new_workspace_modal.is_some()
+            || !self.app.missing_project_modals.is_empty()
+            || self.pending_close.is_some();
+        if modal_open {
+            center_ui.disable();
+        }
         if self.app.active_layout().is_some() {
             if let Some(ws) = self.app.active_layout() {
                 let action = ui::pane_view::render_layout(
@@ -831,6 +869,14 @@ impl eframe::App for CraneApp {
                     }
                     PaneAction::DockPane { src, target, edge } => {
                         ws.dock_pane(src, target, edge);
+                    }
+                    PaneAction::ToggleMaximize(id) => {
+                        ws.maximized = if ws.maximized == Some(id) {
+                            None
+                        } else {
+                            ws.focus = Some(id);
+                            Some(id)
+                        };
                     }
                 }
             }
@@ -906,6 +952,44 @@ impl eframe::App for CraneApp {
         ui::status::render(&mut status_ui, &mut self.app);
         ui::branch_picker::render(&ctx, &mut self.app);
         self.app.sync_lsp_changes(&ctx);
+
+        // Drive embedded WKWebViews: drain whatever the Browser panes
+        // reported during render_layout, then reconcile webview
+        // positions / creations / destructions against the NSWindow.
+        #[cfg(target_os = "macos")]
+        {
+            let bridge = browser::take_bridge();
+            // WKWebView always paints above egui. Any overlay (modal,
+            // tooltip, popup, combo menu, drag ghost) would render
+            // behind the webview — hide the webviews while any non-
+            // background egui layer is visible this frame.
+            let overlay_visible = self.app.show_settings
+                || self.app.show_help
+                || self.app.new_workspace_modal.is_some()
+                || !self.app.missing_project_modals.is_empty()
+                || self.pending_close.is_some()
+                || ctx.memory(|m| {
+                    // Only count overlays that actually painted this
+                    // frame — top_layer_id alone picks up stale, hidden
+                    // Areas and would keep the webview forever hidden.
+                    let areas = m.areas();
+                    let check = |order: egui::Order| {
+                        areas
+                            .top_layer_id(order)
+                            .map(|lid| areas.visible_last_frame(&lid))
+                            .unwrap_or(false)
+                    };
+                    check(egui::Order::Tooltip) || check(egui::Order::Foreground)
+                });
+            let all_keys = browser::collect_all_keys(&self.app);
+            self.browser_host
+                .sync(frame, &ctx, bridge, overlay_visible, &all_keys);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = frame;
+        }
+
         self.maybe_save();
     }
 }

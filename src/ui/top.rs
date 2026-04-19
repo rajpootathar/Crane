@@ -69,10 +69,10 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             .on_hover_text("Split active pane with browser")
             .clicked()
         {
-            split_content = Some(PaneContent::Browser(BrowserPane {
-                url: String::new(),
-                input_buf: "https://".into(),
-            }));
+            split_content = Some(PaneContent::Browser(BrowserPane::new_with(
+                String::new(),
+                "https://".into(),
+            )));
         }
         let split_terminal = ui
             .button(
