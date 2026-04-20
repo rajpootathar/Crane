@@ -23,6 +23,8 @@ use std::sync::OnceLock;
 static PENDING: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static PENDING_SHIFT_TAB: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+static PENDING_TAB: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 static TERMINAL_FOCUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Net pending Cmd+Backtick presses: +1 per Cmd+` (forward, no
@@ -55,6 +57,10 @@ pub fn drain_pending_image_paths() -> Vec<String> {
 /// captured since the last call. Each count maps to one CSI Z write.
 pub fn drain_pending_shift_tab() -> usize {
     PENDING_SHIFT_TAB.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn drain_pending_tab() -> usize {
+    PENDING_TAB.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Consume the net Cmd+Backtick delta. Positive = forward cycle count,
@@ -143,6 +149,27 @@ pub fn install_cmd_v_monitor() {
                 && TERMINAL_FOCUSED.load(std::sync::atomic::Ordering::Relaxed)
             {
                 PENDING_SHIFT_TAB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return std::ptr::null_mut();
+            }
+
+            // --- Plain Tab path -------------------------------------
+            // egui's focus navigator eats plain Tab to cycle between
+            // interactive widgets — which means terminal autocomplete
+            // (zsh, fzf, Claude Code) never sees the key. Same fix as
+            // Shift+Tab: intercept at NSEvent level when the terminal
+            // pane owns focus, queue it, and write `\t` from the
+            // terminal view's drain. Gated on TERMINAL_FOCUSED so Tab
+            // inside a TextEdit (rename, find bar) behaves normally.
+            if key_code == TAB_KEY_CODE
+                && !flags.intersects(
+                    NSEventModifierFlags::NSEventModifierFlagShift
+                        | NSEventModifierFlags::NSEventModifierFlagCommand
+                        | NSEventModifierFlags::NSEventModifierFlagControl
+                        | NSEventModifierFlags::NSEventModifierFlagOption,
+                )
+                && TERMINAL_FOCUSED.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                PENDING_TAB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return std::ptr::null_mut();
             }
 

@@ -204,8 +204,16 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             if enter {
                                 commit_rename_wt =
                                     Some((project.id, wt.id, buf.clone()));
-                            } else if esc || resp.lost_focus() {
+                            } else if esc {
                                 cancel_rename_wt = true;
+                            } else if resp.lost_focus() {
+                                let trimmed = buf.trim();
+                                if trimmed.is_empty() {
+                                    cancel_rename_wt = true;
+                                } else {
+                                    commit_rename_wt =
+                                        Some((project.id, wt.id, buf.clone()));
+                                }
                             }
                             continue;
                         }
@@ -318,9 +326,19 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                         cancel_rename = true;
                                     } else if resp.lost_focus() {
                                         // Clicked away without Enter —
-                                        // cancel (preserves the current
-                                        // tab name).
-                                        cancel_rename = true;
+                                        // commit the rename if the buffer
+                                        // is non-empty, otherwise cancel.
+                                        let trimmed = buf.trim();
+                                        if trimmed.is_empty() {
+                                            cancel_rename = true;
+                                        } else {
+                                            commit_rename = Some((
+                                                project.id,
+                                                wt.id,
+                                                tab.id,
+                                                buf.clone(),
+                                            ));
+                                        }
                                     }
                                     continue;
                                 }

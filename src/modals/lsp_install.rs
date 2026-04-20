@@ -14,6 +14,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     let info = describe(key);
     let mut accept = false;
     let mut decline = false;
+    let mut never_ask = false;
 
     egui::Window::new("Install language server?")
         .collapsible(false)
@@ -47,10 +48,13 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                 if ui.button("Not now").clicked() {
                     decline = true;
                 }
+                if ui.button("Never ask again").clicked() {
+                    never_ask = true;
+                }
             });
             ui.add_space(8.0);
             ui.label(
-                RichText::new("Won't prompt again this session. Re-enable from Settings > Language Servers.")
+                RichText::new("\"Not now\" hides for this session. \"Never ask again\" disables this language server — re-enable from Settings > Language Servers.")
                     .size(10.5)
                     .italics()
                     .color(theme::current().text_muted.to_color32()),
@@ -61,6 +65,12 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         app.lsp.accept_install(ctx);
     } else if decline {
         app.lsp.decline_install();
+    } else if never_ask {
+        app.lsp.decline_install();
+        let mut cfg = app.language_configs.get_or_default(key);
+        cfg.enabled = false;
+        app.language_configs.set(key, cfg);
+        let _ = crate::state::settings::Settings::from_app(app).save();
     }
 }
 

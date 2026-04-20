@@ -484,6 +484,10 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         for _ in 0..count {
             terminal.write_input(b"\x1b[Z");
         }
+        let tab_count = crate::mac_keys::drain_pending_tab();
+        for _ in 0..tab_count {
+            terminal.write_input(b"\t");
+        }
     }
 
     // Plain Tab still goes through the normal event path (egui doesn't
