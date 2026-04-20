@@ -268,13 +268,23 @@ tag:
 	git push origin main "$$t" && \
 	echo "pushed tag $$t"
 
-# One-shot release. Bumps patch → builds DMG → tags → pushes tag →
-# uploads DMG as a GitHub release. Abort anywhere and fix, then re-run.
-ship: bump-patch release tag
+# One-shot release. `VERSION := $(shell …)` is captured at Makefile
+# parse time, so after `bump-patch` rewrites Cargo.toml the current
+# invocation still sees the OLD version — `release` then builds a DMG
+# with the pre-bump filename and `upload` can't find it. Work around
+# by recursing into a fresh sub-make once the bump is committed, so
+# VERSION is re-evaluated against the new Cargo.toml.
+ship: bump-patch
+	@$(MAKE) _ship_post_bump
+
+_ship_post_bump: release tag
 	@v=$$(awk -F'"' '/^version/ { print $$2; exit }' Cargo.toml) ; \
 	$(MAKE) upload TAG="v$$v"
 
-ship-universal: bump-patch release-universal tag
+ship-universal: bump-patch
+	@$(MAKE) _ship_universal_post_bump
+
+_ship_universal_post_bump: release-universal tag
 	@v=$$(awk -F'"' '/^version/ { print $$2; exit }' Cargo.toml) ; \
 	test -f "$(UNIVERSAL_DMG)" || { echo "universal DMG missing"; exit 1; } ; \
 	gh release create "v$$v" "$(UNIVERSAL_DMG)" \
