@@ -11,12 +11,28 @@ const ADD: Color32 = Color32::from_rgb(120, 210, 140);
 const DEL: Color32 = Color32::from_rgb(220, 110, 110);
 
 fn reveal_in_file_manager(path: &std::path::Path) {
+    // Resolve symlinks and expand any relative segments so `open`
+    // receives a concrete on-disk path. Worktrees can live under
+    // symlinked paths (e.g. `/var` → `/private/var` on macOS) and a
+    // stale `~` prefix would also silently drop the command here.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(path).spawn();
+    {
+        // `open <dir>` opens the folder in a new Finder window —
+        // matches what users expect when they say "reveal". We
+        // prefer that over `open -R <dir>` (which highlights the
+        // folder in its parent) since worktrees' parents are usually
+        // `~/.crane-worktrees/<project>` which isn't meaningful UI.
+        let _ = std::process::Command::new("open").arg(&resolved).spawn();
+    }
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&resolved).spawn();
+    }
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    {
+        let _ = std::process::Command::new("explorer").arg(&resolved).spawn();
+    }
 }
 
 pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
