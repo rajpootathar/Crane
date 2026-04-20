@@ -128,7 +128,8 @@ pub struct RowResult {
 
 pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let hovered = response.hovered();
 

@@ -221,6 +221,21 @@ impl Default for BranchPickerState {
     }
 }
 
+pub struct TabSwitcherState {
+    /// Flattened list of every tab, pre-sorted by MRU (front = most
+    /// recent). Frozen for the lifetime of the overlay so rapid cycling
+    /// doesn't reshuffle under the user's fingers.
+    pub entries: Vec<(ProjectId, WorkspaceId, TabId)>,
+    /// Index into `entries` currently highlighted. Wraps.
+    pub highlight: usize,
+    /// True on the frame the overlay opened — suppresses a stray
+    /// release-commit when the user only tapped Cmd+~ once. (egui
+    /// reports modifiers per-frame; without this, the same-frame
+    /// check would treat "Cmd+~ down" and its immediate "Cmd still
+    /// held" as a cycle+commit.)
+    pub cmd_was_held: bool,
+}
+
 pub struct PendingRemoveWorktree {
     pub project_id: ProjectId,
     pub workspace_id: WorkspaceId,
@@ -280,6 +295,18 @@ pub struct App {
     /// worktree has unpushed commits or modified files. `None` while no
     /// modal is open.
     pub pending_remove_worktree: Option<PendingRemoveWorktree>,
+    /// Pending "Close workspace tab" awaiting user confirmation.
+    /// Populated by the × button or middle-click on a tab row in the
+    /// projects pane — closing a tab drops its terminal / pane
+    /// contents, so we always confirm first.
+    pub pending_close_tab: Option<(ProjectId, WorkspaceId, TabId)>,
+    /// MRU (most-recently-used) list of tabs across all projects /
+    /// workspaces, front = most recent. Updated when `active` changes.
+    /// Drives the Cmd+~ tab switcher — just like alt+tab, the first
+    /// tap after opening lands you on the previously-focused tab.
+    pub tab_mru: Vec<(ProjectId, WorkspaceId, TabId)>,
+    /// Active tab-switcher overlay state. `None` = closed.
+    pub tab_switcher: Option<TabSwitcherState>,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -322,6 +349,9 @@ impl App {
             pending_gotos: Vec::new(),
             repo_branch_cache: std::collections::HashMap::new(),
             pending_remove_worktree: None,
+            pending_close_tab: None,
+            tab_mru: Vec::new(),
+            tab_switcher: None,
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,
@@ -332,6 +362,24 @@ impl App {
         // Intentionally empty. First launch shows an empty state — the user
         // picks a project via "Add Project…" in the Left Panel footer.
         // Subsequent launches restore via session::load().
+    }
+
+    /// Maintain the tab MRU: whenever `active` is Some and isn't
+    /// already at MRU front, push it to front (dedup). Called once
+    /// per frame from the main render loop so every code path that
+    /// mutates `active` is covered without plumbing a setter through
+    /// dozens of call sites.
+    pub fn sync_tab_mru(&mut self) {
+        let Some(cur) = self.active else { return };
+        if self.tab_mru.first() == Some(&cur) {
+            return;
+        }
+        self.tab_mru.retain(|e| e != &cur);
+        self.tab_mru.insert(0, cur);
+        // Cap — unlikely to exceed, but keep the list bounded.
+        if self.tab_mru.len() > 256 {
+            self.tab_mru.truncate(256);
+        }
     }
 
     pub fn next_project_id(&self) -> ProjectId {

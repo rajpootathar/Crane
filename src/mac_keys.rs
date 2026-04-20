@@ -25,6 +25,20 @@ static PENDING_SHIFT_TAB: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static TERMINAL_FOCUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Net pending Cmd+Backtick presses: +1 per Cmd+` (forward, no
+/// shift), -1 per Cmd+~ (backward, shift). Signed so rapid
+/// double-taps cancel cleanly. Drained each frame by the
+/// tab-switcher dispatch.
+static PENDING_TAB_CYCLE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+/// Live Cmd modifier state, tracked off `flagsChanged` NSEvents.
+/// egui's own `i.modifiers.command` can miss a release when no other
+/// key event wakes the frame loop between hold and release, leaving
+/// the tab switcher hanging open. This atomic plus a forced
+/// `request_repaint()` on every flagsChanged gives us a reliable
+/// commit-on-release.
+static CMD_HELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn pending() -> &'static Mutex<Vec<String>> {
     PENDING.get_or_init(|| Mutex::new(Vec::new()))
@@ -41,6 +55,22 @@ pub fn drain_pending_image_paths() -> Vec<String> {
 /// captured since the last call. Each count maps to one CSI Z write.
 pub fn drain_pending_shift_tab() -> usize {
     PENDING_SHIFT_TAB.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Consume the net Cmd+Backtick delta. Positive = forward cycle count,
+/// negative = backward. Caller loops the absolute value, picking
+/// direction by sign. Macos-only because winit/egui on macOS routes
+/// this chord to the native "switch app windows" handler before the
+/// app ever sees it.
+pub fn drain_pending_tab_cycle() -> i32 {
+    PENDING_TAB_CYCLE.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// True while the Command modifier is currently pressed. Sourced
+/// from NSEvent `flagsChanged` so the transition is observed even
+/// when no other key event is driving the frame loop.
+pub fn is_cmd_held() -> bool {
+    CMD_HELD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Must be called every render frame from the terminal view with
@@ -70,10 +100,28 @@ pub fn install_cmd_v_monitor() {
         let event = unsafe { event.as_ref() };
         let passthrough = event as *const NSEvent as *mut NSEvent;
         unsafe {
-            if event.r#type() != NSEventType::KeyDown {
+            let etype = event.r#type();
+            // Track Cmd state from flagsChanged so the tab switcher's
+            // commit-on-release never gets stuck waiting for another
+            // key event to wake egui. Pass the event through either
+            // way — we're only observing, not blocking.
+            if etype == NSEventType::FlagsChanged {
+                let f = event.modifierFlags();
+                let cmd =
+                    f.contains(NSEventModifierFlags::NSEventModifierFlagCommand);
+                CMD_HELD.store(cmd, std::sync::atomic::Ordering::Relaxed);
+                return passthrough;
+            }
+            if etype != NSEventType::KeyDown {
                 return passthrough;
             }
             let flags = event.modifierFlags();
+            // Keep CMD_HELD in sync on keyDown too, in case we missed
+            // a flagsChanged (first keypress after focus change, etc.).
+            CMD_HELD.store(
+                flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand),
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             // --- Shift+Tab path -------------------------------------
             // egui's focus navigator eats Shift+Tab (back-focus) before
@@ -84,6 +132,7 @@ pub fn install_cmd_v_monitor() {
             // TextEdit we want egui's normal back-focus behavior.
             let key_code = event.keyCode();
             const TAB_KEY_CODE: u16 = 0x30;
+            const BACKTICK_KEY_CODE: u16 = 0x32;
             if key_code == TAB_KEY_CODE
                 && flags.contains(NSEventModifierFlags::NSEventModifierFlagShift)
                 && !flags.intersects(
@@ -94,6 +143,29 @@ pub fn install_cmd_v_monitor() {
                 && TERMINAL_FOCUSED.load(std::sync::atomic::Ordering::Relaxed)
             {
                 PENDING_SHIFT_TAB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return std::ptr::null_mut();
+            }
+
+            // --- Cmd+Backtick tab-switcher path ---------------------
+            // macOS routes Cmd+` / Cmd+~ to its native "cycle windows
+            // in app" handler before winit/egui ever sees the key.
+            // We intercept at NSEvent, queue the signed cycle count,
+            // and swallow so macOS doesn't also steal the focus.
+            // Cmd+~ (shift held) = forward (+1). Cmd+` (no shift) =
+            // backward (-1). No Ctrl / Alt allowed.
+            if key_code == BACKTICK_KEY_CODE
+                && flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand)
+                && !flags.intersects(
+                    NSEventModifierFlags::NSEventModifierFlagControl
+                        | NSEventModifierFlags::NSEventModifierFlagOption,
+                )
+            {
+                // Match native macOS cycling direction: plain Cmd+`
+                // is forward, Cmd+~ (shift held) is backward.
+                let backward =
+                    flags.contains(NSEventModifierFlags::NSEventModifierFlagShift);
+                let delta: i32 = if backward { -1 } else { 1 };
+                PENDING_TAB_CYCLE.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
                 return std::ptr::null_mut();
             }
 
@@ -132,7 +204,7 @@ pub fn install_cmd_v_monitor() {
     unsafe {
         let _monitor: Option<Retained<objc2::runtime::AnyObject>> =
             NSEvent::addLocalMonitorForEventsMatchingMask_handler(
-                NSEventMask::KeyDown,
+                NSEventMask::KeyDown | NSEventMask::FlagsChanged,
                 &handler,
             );
         // The returned token is kept alive by the NSApp; we

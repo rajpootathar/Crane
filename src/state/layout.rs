@@ -82,6 +82,9 @@ pub struct FilesPane {
     pub input_buf: String,
     #[allow(dead_code)] // kept for session schema compat
     pub error: Option<String>,
+    /// Index of a tab awaiting close confirmation (× or middle-click
+    /// on a dirty tab). `None` means no modal open. Not persisted.
+    pub pending_close: Option<usize>,
 }
 
 impl FilesPane {
@@ -91,6 +94,7 @@ impl FilesPane {
             active: 0,
             input_buf: String::new(),
             error: None,
+            pending_close: None,
         }
     }
 

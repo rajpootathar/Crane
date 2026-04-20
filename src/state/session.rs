@@ -589,6 +589,7 @@ impl SPane {
                     active: if len == 0 { 0 } else { active.min(len - 1) },
                     input_buf: String::new(),
                     error: None,
+                    pending_close: None,
                 })
             }
             SPaneContent::Markdown { path } => {

@@ -1,3 +1,4 @@
+pub mod confirm_close_tab;
 pub mod confirm_remove_worktree;
 pub mod empty_state;
 pub mod help;
@@ -6,8 +7,10 @@ pub mod missing_project;
 pub mod new_workspace;
 pub mod settings;
 pub mod settings_lsp;
+pub mod tab_switcher;
 pub mod update_toast;
 
+pub use confirm_close_tab::render as render_confirm_close_tab;
 pub use confirm_remove_worktree::render as render_confirm_remove_worktree;
 pub use empty_state::render as render_empty_state;
 pub use help::render as render_help_modal;

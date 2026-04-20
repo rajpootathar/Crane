@@ -357,9 +357,16 @@ fn render_tab_bar(ui: &mut egui::Ui, pane: &mut DiffPane) {
                 let label_btn = egui::Button::new(
                     RichText::new(&tab.title).size(11.5).color(color),
                 )
-                .min_size(egui::vec2(0.0, 22.0));
-                if ui.add(label_btn).clicked() {
+                .min_size(egui::vec2(0.0, 22.0))
+                .sense(egui::Sense::click());
+                let resp = ui.add(label_btn);
+                if resp.clicked() {
                     focus_idx = Some(i);
+                }
+                // Middle-click on the tab label closes it (browser
+                // convention). Saves a trip to the tiny × button.
+                if resp.middle_clicked() {
+                    close_idx = Some(i);
                 }
                 let close_btn = egui::Button::new(
                     RichText::new(icons::X).size(10.0).color(MUTED),

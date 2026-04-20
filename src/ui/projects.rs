@@ -345,7 +345,13 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                     tab_row.hovered,
                                     &[(icons::X, "Close tab", 0)],
                                 );
-                                if tab_trailing[0] {
+                                // × button or middle-click → confirm-close
+                                // instead of immediate removal. Tabs hold
+                                // terminals / editors; silent close on a
+                                // stray click has cost the user work.
+                                let close_requested =
+                                    tab_trailing[0] || tab_row.response.middle_clicked();
+                                if close_requested {
                                     close_tab = Some((project.id, wt.id, tab.id));
                                 } else if tab_row.response.double_clicked() {
                                     start_rename = Some((project.id, wt.id, tab.id, tab.name.clone()));
@@ -498,15 +504,9 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             }
         }
     }
-    if let Some((pid, wid, tid)) = close_tab
-        && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
-            && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid) {
-                w.tabs.retain(|t| t.id != tid);
-                w.active_tab = w.tabs.first().map(|t| t.id);
-                if app.active.map(|(_, _, t)| t == tid).unwrap_or(false) {
-                    app.active = w.active_tab.map(|nt| (pid, wid, nt));
-                }
-                app.last_workspace = Some((pid, wid));
-            }
+    if let Some(target) = close_tab {
+        // Stage the close — the confirm modal handles the actual drop.
+        app.pending_close_tab = Some(target);
+    }
 }
 

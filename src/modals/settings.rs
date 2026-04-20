@@ -407,6 +407,8 @@ fn render_shortcuts(ui: &mut egui::Ui) {
         ("Cmd+0", "Reset font size"),
         ("Cmd+S", "Save file (Files Pane)"),
         ("F2 / Cmd+R", "Rename active Tab"),
+        ("Cmd+`", "Tab switcher — next (release Cmd to commit)"),
+        ("Cmd+~", "Tab switcher — previous"),
         ("Cmd+K", "Terminal: clear screen + scrollback"),
         ("Shift+Tab", "Terminal: back-tab (CSI Z) for TUIs"),
         ("Ctrl+C / Ctrl+D", "Terminal: interrupt / EOF"),

@@ -62,6 +62,34 @@ fn main() -> eframe::Result {
     )
 }
 
+/// Tab-switcher key dispatch. Cmd+Backtick = next, Cmd+Shift+Backtick
+/// = previous. Consumes the key when fired so it doesn't bleed into
+/// other shortcut handlers. Opens the overlay or advances the
+/// highlight if already open. Returns true if we should skip the
+/// generic shortcut handler this frame (i.e. the overlay is active
+/// or was just opened).
+fn handle_tab_switcher_keys(_ctx: &egui::Context, app: &mut state::App) -> bool {
+    // macOS routes Cmd+` / Cmd+~ to its native "cycle windows in app"
+    // handler before winit/egui sees the key, so we can't observe it
+    // via `ctx.input`. An NSEvent local monitor catches it at the OS
+    // level and queues a signed delta here. +N = N forward taps, -N =
+    // N backward taps. Sign cancels when the user rocks back-and-
+    // forth quickly — the net intent is what ends up on screen.
+    #[cfg(target_os = "macos")]
+    {
+        let delta = mac_keys::drain_pending_tab_cycle();
+        if delta != 0 {
+            let steps = delta.unsigned_abs() as usize;
+            let backward = delta < 0;
+            for _ in 0..steps {
+                modals::tab_switcher::advance_or_open(app, backward);
+            }
+            return true;
+        }
+    }
+    app.tab_switcher.is_some()
+}
+
 struct CraneApp {
     app: App,
     last_saved_snapshot: String,
@@ -282,7 +310,14 @@ impl eframe::App for CraneApp {
             }
         }
         self.app.ensure_initial(&ctx);
-        shortcuts::handle(&ctx, &mut self.app, &mut self.pending_close);
+        self.app.sync_tab_mru();
+        // Tab switcher (Cmd+~ / Cmd+Shift+~) runs before the generic
+        // shortcut handler — the overlay owns the key while it's open
+        // so no other Cmd-chord fires during cycling.
+        let switcher_consumed = handle_tab_switcher_keys(&ctx, &mut self.app);
+        if !switcher_consumed {
+            shortcuts::handle(&ctx, &mut self.app, &mut self.pending_close);
+        }
         self.app.refresh_active_git_status(&ctx);
         #[cfg(target_os = "macos")]
         {
@@ -547,6 +582,8 @@ impl eframe::App for CraneApp {
         }
         self.render_confirm_close(&ctx);
         modals::render_confirm_remove_worktree(&ctx, &mut self.app);
+        modals::render_confirm_close_tab(&ctx, &mut self.app);
+        let _ = modals::tab_switcher::render(&ctx, &mut self.app);
         render_lsp_install_prompt(&ctx, &mut self.app);
         render_lsp_download_toast(&ctx, &self.app);
         self.app.update_check.drain();

@@ -151,6 +151,59 @@ pub fn render(
     });
 }
 
+/// Confirm modal for closing a dirty file tab. "Discard" drops the
+/// unsaved edits; "Cancel" leaves the tab open. Save-then-close isn't
+/// offered here because saving runs formatters / notify_saved / disk
+/// I/O that the render_scoped closure wires up — we don't thread
+/// those into the tab bar. The user can click Cancel, Cmd+S, then
+/// close cleanly.
+fn render_close_confirm(ui: &mut egui::Ui, pane: &mut crate::state::layout::FilesPane) {
+    let Some(idx) = pane.pending_close else {
+        return;
+    };
+    let Some(tab) = pane.tabs.get(idx) else {
+        pane.pending_close = None;
+        return;
+    };
+    let name = tab.name.clone();
+    let mut cancel = false;
+    let mut confirm = false;
+    egui::Window::new("Unsaved changes")
+        .id(egui::Id::new(("file_close_confirm", idx)))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ui.ctx(), |ui| {
+            ui.set_min_width(340.0);
+            ui.add_space(4.0);
+            ui.label(format!("\"{name}\" has unsaved changes."));
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Discard them and close the tab?")
+                    .color(theme::current().text_muted.to_color32())
+                    .size(11.5),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui.button("Discard").clicked() {
+                    confirm = true;
+                }
+            });
+        });
+    if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        cancel = true;
+    }
+    if cancel {
+        pane.pending_close = None;
+    } else if confirm {
+        pane.close(idx);
+        pane.pending_close = None;
+    }
+}
+
 fn render_scoped(
     ui: &mut egui::Ui,
     pane: &mut FilesPane,
@@ -217,10 +270,21 @@ fn render_scoped(
         pane.active = idx;
     }
     if let Some(idx) = close_idx {
-        pane.close(idx);
-        if pane.tabs.is_empty() {
-            return;
+        // Dirty tab: route through a confirm modal so the user isn't
+        // a stray click away from losing unsaved work. Clean tabs
+        // close immediately.
+        if pane.tabs.get(idx).map(|t| t.dirty()).unwrap_or(false) {
+            pane.pending_close = Some(idx);
+        } else {
+            pane.close(idx);
+            if pane.tabs.is_empty() {
+                return;
+            }
         }
+    }
+    render_close_confirm(ui, pane);
+    if pane.tabs.is_empty() {
+        return;
     }
     ui.add_space(2.0);
 
@@ -959,7 +1023,10 @@ fn draw_file_tab(
     let height = 24.0;
     let width = padding_x + text_w + gap + close_size + padding_x - 2.0;
 
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, height),
+        egui::Sense::click_and_drag(),
+    );
     let close_rect = egui::Rect::from_min_size(
         egui::pos2(
             rect.max.x - padding_x - close_size + 2.0,
@@ -1012,8 +1079,12 @@ fn draw_file_tab(
     if response.hovered() || close_response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    // Middle-click anywhere on the tab closes it — browser convention.
+    // Counts as a close whether the pointer is over the × button or
+    // the label body, so the user doesn't need to aim.
+    let closed = close_response.clicked() || response.middle_clicked();
     (
         response.clicked() && !close_response.hovered(),
-        close_response.clicked(),
+        closed,
     )
 }
