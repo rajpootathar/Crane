@@ -300,6 +300,14 @@ impl CraneApp {
 impl eframe::App for CraneApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Reset the NSEvent Tab-swallowing gate each frame. The terminal
+        // view re-sets it to true later if it still owns focus; otherwise
+        // plain Tab / Shift+Tab reach egui normally (file editor indent,
+        // focus navigation, etc.). Without this reset, a frame where the
+        // terminal pane isn't rendered leaves the previous frame's
+        // `true` value stuck and Tab gets eaten in the file editor.
+        #[cfg(target_os = "macos")]
+        crate::mac_keys::set_terminal_focused(false);
         // Native menu events (macOS). On other platforms this returns
         // an empty Vec and does nothing.
         for id in platform_menu::drain_events() {
