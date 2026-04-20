@@ -60,9 +60,44 @@ src/
 cargo build           # debug build (opt-level=1 for first-party, 3 for deps — fast enough to iterate)
 cargo run             # run debug build
 cargo build --release # release build for actual use
+make test             # cargo test --bin crane
 ```
 
 Keep `opt-level = 1` for `[profile.dev]` and `opt-level = 3` for `[profile.dev.package."*"]` — without these the GUI is noticeably laggy.
+
+## Release workflow
+
+**Always use the Makefile targets — never hand-roll `sed` / raw `git tag` / raw `gh release create`.** Hand-rolling has caused versions to ship without a DMG or without a git tag, which silently breaks the update checker and the “download latest” link.
+
+One-shot release (recommended):
+
+```bash
+make ship                  # bumps patch, builds DMG, tags vX.Y.Z, pushes, uploads to GitHub
+make ship-universal        # same but builds a universal (arm64 + x86_64) DMG
+```
+
+Step-by-step when you want to inspect between phases:
+
+```bash
+make bump-patch            # 0.1.72 → 0.1.73 in Cargo.toml; commits "chore(crane): v0.1.73"
+make release               # bundle → DMG (ad-hoc signed if DEVELOPER_ID unset)
+make tag                   # tags vX.Y.Z from Cargo.toml, pushes main + tag to origin
+make upload TAG=v0.1.73    # attaches the DMG to a new GitHub release
+```
+
+Bump discipline:
+
+- `bump-patch` for UX fixes / additions / small features — the common case
+- `bump-minor` when a feature is big enough that users should notice (`0.1.x → 0.2.0`)
+- Refuse to release on a dirty tree — `bump-*` aborts if `git status` isn’t clean. Commit or stash first.
+
+Notarized builds (Developer ID + Apple notary):
+
+```bash
+make setup-notary          # one-time: stores app-specific password in keychain
+DEVELOPER_ID="..."  make signed-dmg             # sign → DMG → notarize → staple
+DEVELOPER_ID="..."  make signed-dmg-universal
+```
 
 ## Dependency rules
 

@@ -19,7 +19,8 @@ UNIVERSAL_DMG := $(TARGET_DIR)/$(APP_NAME)-$(VERSION)-universal.dmg
         install-cargo-bundle upload \
         sign sign-universal notarize notarize-universal \
         staple staple-universal signed-dmg signed-dmg-universal \
-        setup-notary
+        setup-notary \
+        bump-patch bump-minor tag ship ship-universal
 
 # Developer ID signing + notarization.
 #
@@ -49,6 +50,13 @@ help:
 	@echo "  release-universal  == dmg-universal"
 	@echo ""
 	@echo "  upload TAG=v0.1.0  create a GitHub release and attach the DMG"
+	@echo ""
+	@echo "  bump-patch         bump Cargo.toml patch (0.1.72 → 0.1.73) and commit"
+	@echo "  bump-minor         bump Cargo.toml minor (0.1.72 → 0.2.0)  and commit"
+	@echo "  tag                create & push the git tag vX.Y.Z for the current Cargo.toml"
+	@echo "  ship               bump-patch + release + tag + upload  (one-shot release)"
+	@echo "  ship-universal     bump-patch + release-universal + tag + upload (universal)"
+	@echo ""
 	@echo "  clean              remove bundles and DMGs"
 
 build:
@@ -218,3 +226,57 @@ staple-universal:
 signed-dmg: sign dmg notarize
 
 signed-dmg-universal: sign-universal dmg-universal notarize-universal
+
+# ---------------------------------------------------------------------------
+# Release workflow
+# ---------------------------------------------------------------------------
+# `make ship` is the one-button release: bump patch, build DMG, tag, push,
+# attach DMG to a GitHub release. Use this instead of hand-rolling
+# `sed s/version/ + cargo build + git push + gh release create`.
+
+# Refuse to release on a dirty tree — uncommitted work would ship as
+# part of the tag but never land on main.
+_check_clean:
+	@git diff-index --quiet HEAD -- || \
+		{ echo "working tree is dirty; commit or stash before releasing"; exit 1; }
+
+_bump_%:
+	@cur=$$(awk -F'"' '/^version/ { print $$2; exit }' Cargo.toml) ; \
+	case "$*" in \
+	  patch) next=$$(awk -F. '{ printf "%d.%d.%d", $$1,$$2,$$3+1 }' <<<"$$cur");; \
+	  minor) next=$$(awk -F. '{ printf "%d.%d.0",  $$1,$$2+1     }' <<<"$$cur");; \
+	  *)     echo "unknown bump kind: $*"; exit 1;; \
+	esac ; \
+	echo "bump: $$cur → $$next" ; \
+	sed -i '' -E "s/^version = \"$$cur\"/version = \"$$next\"/" Cargo.toml ; \
+	cargo build --quiet ; \
+	git add Cargo.toml Cargo.lock 2>/dev/null || git add Cargo.toml ; \
+	git commit -m "chore(crane): v$$next"
+
+bump-patch: _check_clean _bump_patch
+bump-minor: _check_clean _bump_minor
+
+# Tag the current Cargo.toml version and push it. Idempotent-ish —
+# errors cleanly if the tag already exists locally.
+tag:
+	@v=$$(awk -F'"' '/^version/ { print $$2; exit }' Cargo.toml) ; \
+	t="v$$v" ; \
+	if git rev-parse -q --verify "refs/tags/$$t" >/dev/null ; then \
+		echo "tag $$t already exists locally"; exit 1 ; \
+	fi ; \
+	git tag -a "$$t" -m "Crane $$t" && \
+	git push origin main "$$t" && \
+	echo "pushed tag $$t"
+
+# One-shot release. Bumps patch → builds DMG → tags → pushes tag →
+# uploads DMG as a GitHub release. Abort anywhere and fix, then re-run.
+ship: bump-patch release tag
+	@v=$$(awk -F'"' '/^version/ { print $$2; exit }' Cargo.toml) ; \
+	$(MAKE) upload TAG="v$$v"
+
+ship-universal: bump-patch release-universal tag
+	@v=$$(awk -F'"' '/^version/ { print $$2; exit }' Cargo.toml) ; \
+	test -f "$(UNIVERSAL_DMG)" || { echo "universal DMG missing"; exit 1; } ; \
+	gh release create "v$$v" "$(UNIVERSAL_DMG)" \
+		--title "Crane v$$v" \
+		--notes "Crane $$v — universal (arm64 + x86_64) build."
