@@ -20,7 +20,8 @@ UNIVERSAL_DMG := $(TARGET_DIR)/$(APP_NAME)-$(VERSION)-universal.dmg
         sign sign-universal notarize notarize-universal \
         staple staple-universal signed-dmg signed-dmg-universal \
         setup-notary \
-        bump-patch bump-minor tag ship ship-universal
+        bump-patch bump-minor bump-major tag \
+        ship ship-minor ship-major ship-universal
 
 # Developer ID signing + notarization.
 #
@@ -53,8 +54,11 @@ help:
 	@echo ""
 	@echo "  bump-patch         bump Cargo.toml patch (0.1.72 → 0.1.73) and commit"
 	@echo "  bump-minor         bump Cargo.toml minor (0.1.72 → 0.2.0)  and commit"
+	@echo "  bump-major         bump Cargo.toml major (0.1.72 → 1.0.0)  and commit"
 	@echo "  tag                create & push the git tag vX.Y.Z for the current Cargo.toml"
-	@echo "  ship               bump-patch + release + tag + upload  (one-shot release)"
+	@echo "  ship               bump-patch + release + tag + upload  (daily UX fixes)"
+	@echo "  ship-minor         bump-minor + release + tag + upload  (user-noticeable features)"
+	@echo "  ship-major         bump-major + release + tag + upload  (breaking / milestone)"
 	@echo "  ship-universal     bump-patch + release-universal + tag + upload (universal)"
 	@echo ""
 	@echo "  clean              remove bundles and DMGs"
@@ -245,6 +249,7 @@ _bump_%:
 	case "$*" in \
 	  patch) next=$$(awk -F. '{ printf "%d.%d.%d", $$1,$$2,$$3+1 }' <<<"$$cur");; \
 	  minor) next=$$(awk -F. '{ printf "%d.%d.0",  $$1,$$2+1     }' <<<"$$cur");; \
+	  major) next=$$(awk -F. '{ printf "%d.0.0",   $$1+1          }' <<<"$$cur");; \
 	  *)     echo "unknown bump kind: $*"; exit 1;; \
 	esac ; \
 	echo "bump: $$cur → $$next" ; \
@@ -255,6 +260,7 @@ _bump_%:
 
 bump-patch: _check_clean _bump_patch
 bump-minor: _check_clean _bump_minor
+bump-major: _check_clean _bump_major
 
 # Tag the current Cargo.toml version and push it. Idempotent-ish —
 # errors cleanly if the tag already exists locally.
@@ -275,6 +281,12 @@ tag:
 # by recursing into a fresh sub-make once the bump is committed, so
 # VERSION is re-evaluated against the new Cargo.toml.
 ship: bump-patch
+	@$(MAKE) _ship_post_bump
+
+ship-minor: bump-minor
+	@$(MAKE) _ship_post_bump
+
+ship-major: bump-major
 	@$(MAKE) _ship_post_bump
 
 _ship_post_bump: release tag

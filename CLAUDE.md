@@ -72,24 +72,30 @@ Keep `opt-level = 1` for `[profile.dev]` and `opt-level = 3` for `[profile.dev.p
 One-shot release (recommended):
 
 ```bash
-make ship                  # bumps patch, builds DMG, tags vX.Y.Z, pushes, uploads to GitHub
-make ship-universal        # same but builds a universal (arm64 + x86_64) DMG
+make ship                  # patch bump (0.1.x → 0.1.x+1)   — daily UX fixes
+make ship-minor            # minor bump (0.1.x → 0.2.0)     — user-noticeable features
+make ship-major            # major bump (0.1.x → 1.0.0)     — breaking / milestone
+make ship-universal        # patch bump, universal (arm64 + x86_64) DMG
 ```
+
+Each target: bump Cargo.toml → commit → release DMG → tag vX.Y.Z → push main + tag → upload DMG to GitHub. No hand-steps.
 
 Step-by-step when you want to inspect between phases:
 
 ```bash
-make bump-patch            # 0.1.72 → 0.1.73 in Cargo.toml; commits "chore(crane): v0.1.73"
+make bump-patch            # or bump-minor / bump-major
 make release               # bundle → DMG (ad-hoc signed if DEVELOPER_ID unset)
-make tag                   # tags vX.Y.Z from Cargo.toml, pushes main + tag to origin
+make tag                   # tags vX.Y.Z from Cargo.toml, pushes main + tag
 make upload TAG=v0.1.73    # attaches the DMG to a new GitHub release
 ```
 
 Bump discipline:
 
-- `bump-patch` for UX fixes / additions / small features — the common case
-- `bump-minor` when a feature is big enough that users should notice (`0.1.x → 0.2.0`)
-- Refuse to release on a dirty tree — `bump-*` aborts if `git status` isn’t clean. Commit or stash first.
+- `bump-patch` — UX fixes / small additions — the common case
+- `bump-minor` — features users notice (e.g. new shortcut, new pane) — `0.1.x → 0.2.0`
+- `bump-major` — breaking change or a milestone — `0.x → 1.0.0`
+- All three refuse to release on a dirty tree. Commit or stash first.
+- **Never** hand-edit Cargo.toml + run `cargo build + gh release create`. The Makefile targets handle version evaluation via recursive make so the DMG filename and tag stay consistent. Hand-rolling has silently landed versions without a tag or DMG.
 
 Notarized builds (Developer ID + Apple notary):
 
