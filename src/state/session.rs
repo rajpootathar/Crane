@@ -578,6 +578,7 @@ impl SPane {
                             find_query: None,
                             disk_mtime,
                             external_change: false,
+                            last_cursor_idx: 0,
                             content,
                         }
                     })

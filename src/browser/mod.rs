@@ -232,6 +232,26 @@ impl BrowserHost {
         // webviews whose (pane_id, tab_id) is truly gone — otherwise
         // switching workspace tabs would rebuild the webview every
         // time and reload the page.
+        //
+        // Before removing, navigate the webview to `about:blank` and
+        // flush its caches via a small JS shim. Without this, WKWebView
+        // keeps the last page's JS heap, image cache, and service
+        // workers alive in the WebContent process even after `drop` —
+        // visibly so on heavy sites (Twitter, YouTube), where the
+        // "WebKit.WebContent" processes don't shrink after a pane close.
+        // Doing it here catches both "pane removed from layout" and
+        // "last tab in pane closed" paths.
+        let to_drop: Vec<SlotKey> = self
+            .slots
+            .keys()
+            .copied()
+            .filter(|k| !all_keys.contains(k))
+            .collect();
+        for key in &to_drop {
+            if let Some(slot) = self.slots.get(key) {
+                release_webview_memory(&slot.webview);
+            }
+        }
         self.slots.retain(|k, _| all_keys.contains(k));
         self.pending.retain(|k, _| all_keys.contains(k));
         {
@@ -242,6 +262,9 @@ impl BrowserHost {
         // we'd otherwise try to resize/reload them.
         for (key, action) in bridge.actions {
             if matches!(action, Action::Close) {
+                if let Some(slot) = self.slots.get(&key) {
+                    release_webview_memory(&slot.webview);
+                }
                 self.slots.remove(&key);
                 self.pending.remove(&key);
                 self.loading.lock().remove(&key);
@@ -448,6 +471,27 @@ fn build_slot<W: HasWindowHandle>(
             None
         }
     }
+}
+
+/// Best-effort flush of a webview's in-memory state right before the
+/// WebView is dropped. `about:blank` detaches the active document so
+/// its JS heap / decoded images / service worker can be reclaimed; the
+/// JS clears sessionStorage / localStorage for the origin (for session
+/// work — persistent site data is out of scope here). WKWebView still
+/// keeps its WebContent process pooled, but the per-tab footprint
+/// drops immediately rather than lingering.
+fn release_webview_memory(webview: &WebView) {
+    // Run cache-clearing JS first so it executes against the live page
+    // before navigation wipes the script context. Silent errors are
+    // expected (about: / chrome: pages don't expose storage, cross-
+    // origin iframes refuse, etc.) — we just try.
+    let _ = webview.evaluate_script(
+        "try { sessionStorage.clear(); } catch(e) {} \
+         try { localStorage.clear(); } catch(e) {} \
+         try { if (window.caches) caches.keys().then(ks => ks.forEach(k => caches.delete(k))); } catch(e) {}",
+    );
+    let _ = webview.load_url("about:blank");
+    let _ = webview.set_visible(false);
 }
 
 fn egui_placeholder_rect() -> Rect {

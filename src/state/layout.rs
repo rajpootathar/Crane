@@ -59,6 +59,14 @@ pub struct FileTab {
     /// we last read it. The UI surfaces a banner with Reload /
     /// Overwrite / Cancel; cleared when the user picks one.
     pub external_change: bool,
+    /// Primary-cursor char index captured off the TextEdit's output on
+    /// the most recent render. Transient — the status strip reads it
+    /// to show `Ln/Col`. Not persisted. Loading the same value via
+    /// `TextEdit::load_state(te_id)` from an outer scope is unreliable
+    /// when the id path depends on ancestor `push_id` scopes, so we
+    /// stash it explicitly here.
+    #[allow(dead_code)]
+    pub last_cursor_idx: usize,
 }
 
 impl FileTab {
@@ -105,6 +113,7 @@ impl FilesPane {
             find_query: None,
             disk_mtime,
             external_change: false,
+            last_cursor_idx: 0,
             content,
             name,
         });

@@ -5,6 +5,7 @@ pub mod lsp_install;
 pub mod missing_project;
 pub mod new_workspace;
 pub mod settings;
+pub mod settings_lsp;
 pub mod update_toast;
 
 pub use confirm_remove_worktree::render as render_confirm_remove_worktree;

@@ -4,7 +4,7 @@ use crate::theme;
 use crate::views::diagnostics_overlay;
 use crate::views::file_util::{
     char_idx_to_line_col, is_image_path, line_col_to_char, reveal_in_file_manager,
-    short_path, trim_trailing_whitespace,
+    short_path,
 };
 use crate::views::highlight::{rehighlight, LineHighlightCache};
 use egui::text::{LayoutJob, TextFormat};
@@ -28,7 +28,7 @@ struct CachedGalley {
 
 
 
-fn syntaxes() -> &'static SyntaxSet {
+pub fn syntaxes() -> &'static SyntaxSet {
     SYNTAXES.get_or_init(|| {
         // two-face ships ~250 Sublime-grade syntaxes: TypeScript, TSX, JSX,
         // Dockerfile, Astro, Svelte, GraphQL, Prisma, Nix, Zig, etc. — a
@@ -78,7 +78,7 @@ pub fn available_syntax_themes() -> Vec<String> {
     out
 }
 
-fn themes() -> &'static ThemeSet {
+pub fn themes() -> &'static ThemeSet {
     THEMES.get_or_init(|| {
         let mut set = ThemeSet::load_defaults();
         let extras = two_face::theme::extra();
@@ -92,7 +92,7 @@ fn themes() -> &'static ThemeSet {
 
 /// Map file extension to a syntax name, with sensible fallbacks for flavours
 /// (TSX→TypeScript, JSX→JavaScript, etc.) when a dedicated syntax isn't loaded.
-fn find_syntax_for_ext(ext: &str) -> &'static syntect::parsing::SyntaxReference {
+pub fn find_syntax_for_ext(ext: &str) -> &'static syntect::parsing::SyntaxReference {
     let ss = syntaxes();
     if let Some(syn) = ss.find_syntax_by_extension(ext) {
         return syn;
@@ -248,7 +248,7 @@ fn render_scoped(
 
     {
         let tab = &mut pane.tabs[active_idx];
-        poll_external_change(tab);
+        crate::views::file_save::poll_external_change(tab);
         let name_label = if tab.dirty() {
             format!("{}  {}", icons::CIRCLE, tab.name)
         } else {
@@ -287,7 +287,7 @@ fn render_scoped(
                                         .ok();
                                 }
                                 if ui.small_button("Overwrite").clicked() {
-                                    save_tab(
+                                    crate::views::file_save::save_tab(
                                         tab,
                                         prefs,
                                         format_before_save,
@@ -296,7 +296,7 @@ fn render_scoped(
                                     );
                                 }
                                 if ui.small_button("Reload").clicked() {
-                                    reload_tab(tab);
+                                    crate::views::file_save::reload_tab(tab);
                                 }
                             },
                         );
@@ -332,7 +332,7 @@ fn render_scoped(
                         .min_size(egui::vec2(0.0, 24.0)),
                     );
                     if save_btn.clicked() || (save_pressed && tab.dirty()) {
-                        save_tab(tab, prefs, format_before_save, notify_saved, false);
+                        crate::views::file_save::save_tab(tab, prefs, format_before_save, notify_saved, false);
                     }
                     if is_md {
                         let label = if tab.preview_mode {
@@ -354,8 +354,11 @@ fn render_scoped(
         ui.add_space(2.0);
 
         // Find bar — rendered above the editor when open. Enter jumps to
-        let FindBarOutcome { close: find_close, next: find_next, prev: find_prev } =
-            render_find_bar(ui, tab);
+        let crate::views::file_find::FindBarOutcome {
+            close: find_close,
+            next: find_next,
+            prev: find_prev,
+        } = crate::views::file_find::render_find_bar(ui, tab);
         if find_close {
             tab.find_query = None;
         }
@@ -811,6 +814,16 @@ fn render_scoped(
                             .desired_rows(30)
                             .layouter(&mut layouter);
                         let out = editor.show(ui);
+                        // Stash the current primary cursor so the
+                        // status strip below renders up-to-date
+                        // Ln/Col. `TextEdit::load_state` from the
+                        // outer scope returns state whose id path
+                        // depends on ancestor push_id layering —
+                        // subtle to match, so we just read from the
+                        // output here where the id is known correct.
+                        if let Some(range) = out.state.cursor.char_range() {
+                            tab.last_cursor_idx = range.primary.index;
+                        }
                         diagnostics_overlay::paint(
                             ui,
                             &out.galley,
@@ -822,7 +835,7 @@ fn render_scoped(
                         if let Some(q) = tab.find_query.as_deref()
                             && !q.is_empty()
                         {
-                            paint_find_matches(
+                            crate::views::file_find::paint_find_matches(
                                 ui,
                                 &out.galley,
                                 out.galley_pos,
@@ -904,7 +917,7 @@ fn render_scoped(
                             }
                         });
                         if ctx_save.get() {
-                            save_tab(tab, prefs, format_before_save, notify_saved, false);
+                            crate::views::file_save::save_tab(tab, prefs, format_before_save, notify_saved, false);
                         }
                         if ctx_reveal.get() {
                             reveal_in_file_manager(&tab.path);
@@ -914,500 +927,19 @@ fn render_scoped(
                 });
             });
 
-        paint_scrollbar_diag_markers(
+        crate::views::file_status::paint_scrollbar_diag_markers(
             ui,
             scroll_out.inner_rect,
             line_count,
             &diagnostics,
         );
 
-        render_file_status_strip(ui, tab, &diagnostics, status_h);
+        crate::views::file_status::render_status_strip(ui, tab, &diagnostics, status_h);
     }
 }
 
-/// Per-file status strip at the bottom of the Files pane.
-/// Left: diagnostics counts (click = jump to next of that severity).
-/// Right: Ln/Col · indent · language.
-fn render_file_status_strip(
-    ui: &mut egui::Ui,
-    tab: &mut crate::state::layout::FileTab,
-    diagnostics: &[Diagnostic],
-    height: f32,
-) {
-    let t = theme::current();
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), height),
-        egui::Sense::hover(),
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(rect.min.x, rect.min.y),
-            egui::pos2(rect.max.x, rect.min.y),
-        ],
-        egui::Stroke::new(1.0, t.divider.to_color32()),
-    );
-
-    let (e, w, i) = count_by_severity(diagnostics);
-
-    let te_id = ui
-        .id()
-        .with(("file_editor", &tab.path))
-        .with("body");
-    let cursor_idx = egui::TextEdit::load_state(ui.ctx(), te_id)
-        .and_then(|s| s.cursor.char_range().map(|r| r.primary.index))
-        .unwrap_or(0);
-    let (cur_line, cur_col) = char_idx_to_line_col(&tab.content, cursor_idx);
-
-    let style = crate::format::discover(Path::new(&tab.path));
-    let indent_label = if style.use_tabs {
-        "Tabs".to_string()
-    } else {
-        format!("Spaces: {}", style.tab_width)
-    };
-    let lang = language_label(&tab.path);
-
-    let mut clicked_sev: Option<u8> = None;
-    let pills: [(&str, usize, Color32, u8); 3] = [
-        (icons::X_CIRCLE, e, t.error.to_color32(), 1),
-        (icons::WARNING, w, Color32::from_rgb(226, 192, 80), 2),
-        (icons::INFO, i, t.accent.to_color32(), 3),
-    ];
-    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-        ui.horizontal_centered(|ui| {
-            for (icon, count, active_color, sev) in pills {
-                ui.add_space(8.0);
-                if sev_button(ui, icon, count, active_color, t.text_muted.to_color32()) {
-                    clicked_sev = Some(sev);
-                }
-            }
-
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(lang)
-                            .size(11.0)
-                            .color(t.text_muted.to_color32())
-                            .monospace(),
-                    );
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new(indent_label)
-                            .size(11.0)
-                            .color(t.text_muted.to_color32()),
-                    );
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new(format!("Ln {}, Col {}", cur_line + 1, cur_col + 1))
-                            .size(11.0)
-                            .color(t.text_muted.to_color32()),
-                    );
-                },
-            );
-        });
-    });
-
-    if let Some(sev) = clicked_sev {
-        jump_to_next_diagnostic(tab, diagnostics, sev, cur_line);
-    }
-}
-
-fn sev_button(
-    ui: &mut egui::Ui,
-    icon: &str,
-    count: usize,
-    active_color: Color32,
-    muted_color: Color32,
-) -> bool {
-    let color = if count > 0 { active_color } else { muted_color };
-    let resp = ui.add(
-        egui::Label::new(
-            RichText::new(format!("{icon}  {count}"))
-                .size(11.5)
-                .color(color),
-        )
-        .sense(egui::Sense::click()),
-    );
-    if resp.hovered() && count > 0 {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    resp.clicked() && count > 0
-}
-
-fn count_by_severity(diags: &[Diagnostic]) -> (usize, usize, usize) {
-    let mut e = 0;
-    let mut w = 0;
-    let mut i = 0;
-    for d in diags {
-        match d.severity {
-            1 => e += 1,
-            2 => w += 1,
-            _ => i += 1,
-        }
-    }
-    (e, w, i)
-}
-
-fn jump_to_next_diagnostic(
-    tab: &mut crate::state::layout::FileTab,
-    diags: &[Diagnostic],
-    sev: u8,
-    from_line: u32,
-) {
-    let matching: Vec<&Diagnostic> = diags
-        .iter()
-        .filter(|d| match sev {
-            1 => d.severity == 1,
-            2 => d.severity == 2,
-            _ => d.severity == 0 || d.severity >= 3,
-        })
-        .collect();
-    if matching.is_empty() {
-        return;
-    }
-    let next = matching
-        .iter()
-        .find(|d| d.line > from_line)
-        .or_else(|| matching.first());
-    if let Some(d) = next {
-        tab.pending_cursor = Some((d.line, d.col_start));
-    }
-}
-
-fn language_label(path: &str) -> String {
-    // Extensionless files with a well-known basename (Dockerfile, Makefile, …).
-    if let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) {
-        match name.to_ascii_lowercase().as_str() {
-            "dockerfile" | "containerfile" => return "Dockerfile".to_string(),
-            "makefile" | "gnumakefile" => return "Makefile".to_string(),
-            "cmakelists.txt" => return "CMake".to_string(),
-            "jenkinsfile" => return "Groovy".to_string(),
-            "rakefile" | "gemfile" | "podfile" => return "Ruby".to_string(),
-            "cargo.lock" => return "TOML".to_string(),
-            _ => {}
-        }
-    }
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    match ext.to_ascii_lowercase().as_str() {
-        "rs" => "Rust",
-        "ts" | "mts" | "cts" => "TypeScript",
-        "tsx" => "TSX",
-        "js" | "mjs" | "cjs" => "JavaScript",
-        "jsx" => "JSX",
-        "py" | "pyi" => "Python",
-        "go" => "Go",
-        "java" => "Java",
-        "kt" | "kts" => "Kotlin",
-        "scala" | "sc" => "Scala",
-        "c" | "h" => "C",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "C++",
-        "cs" => "C#",
-        "swift" => "Swift",
-        "m" | "mm" => "Objective-C",
-        "rb" => "Ruby",
-        "php" => "PHP",
-        "lua" => "Lua",
-        "pl" | "pm" => "Perl",
-        "r" => "R",
-        "dart" => "Dart",
-        "zig" => "Zig",
-        "nim" => "Nim",
-        "hs" => "Haskell",
-        "elm" => "Elm",
-        "ex" | "exs" => "Elixir",
-        "erl" | "hrl" => "Erlang",
-        "clj" | "cljs" | "cljc" | "edn" => "Clojure",
-        "ml" | "mli" => "OCaml",
-        "fs" | "fsx" | "fsi" => "F#",
-        "sh" | "bash" | "zsh" | "fish" => "Shell",
-        "ps1" | "psm1" => "PowerShell",
-        "sql" => "SQL",
-        "css" => "CSS",
-        "scss" | "sass" => "SCSS",
-        "less" => "Less",
-        "html" | "htm" => "HTML",
-        "xml" | "xsl" | "xslt" => "XML",
-        "vue" => "Vue",
-        "svelte" => "Svelte",
-        "astro" => "Astro",
-        "md" | "markdown" | "mdx" => "Markdown",
-        "json" | "jsonc" => "JSON",
-        "yaml" | "yml" => "YAML",
-        "toml" => "TOML",
-        "ini" | "cfg" | "conf" => "INI",
-        "env" => "Dotenv",
-        "dockerfile" => "Dockerfile",
-        "makefile" | "mk" => "Makefile",
-        "graphql" | "gql" => "GraphQL",
-        "proto" => "Protobuf",
-        "tf" | "tfvars" => "Terraform",
-        "nix" => "Nix",
-        "prisma" => "Prisma",
-        "tex" | "latex" => "LaTeX",
-        "vim" => "Vim",
-        "diff" | "patch" => "Diff",
-        "log" => "Log",
-        "txt" => "Plain",
-        "" => "Plain",
-        other => return other.to_string(),
-    }
-    .to_string()
-}
 
 
-/// Paints colored ticks along the right edge of the scroll viewport,
-/// one per diagnostic, proportional to its line. Minimap-lite: gives the
-/// user a visual overview of where issues sit without opening a panel.
-fn paint_scrollbar_diag_markers(
-    ui: &egui::Ui,
-    scroll_rect: egui::Rect,
-    total_lines: usize,
-    diagnostics: &[Diagnostic],
-) {
-    if diagnostics.is_empty() || total_lines == 0 {
-        return;
-    }
-    let t = theme::current();
-    let painter = ui.painter_at(scroll_rect);
-    // Strip sits just inside the right edge of the viewport.
-    let strip_w = 3.0;
-    let x1 = scroll_rect.max.x - 2.0;
-    let x0 = x1 - strip_w;
-    let h = scroll_rect.height();
-    let total = total_lines.max(1) as f32;
-    for d in diagnostics {
-        let color = match d.severity {
-            1 => t.error.to_color32(),
-            2 => Color32::from_rgb(226, 192, 80),
-            _ => t.accent.to_color32(),
-        };
-        let y = scroll_rect.min.y + (d.line as f32 / total) * h;
-        let rect = egui::Rect::from_min_max(
-            egui::pos2(x0, y - 1.0),
-            egui::pos2(x1, y + 1.0),
-        );
-        painter.rect_filled(rect, 0.5, color);
-    }
-}
-
-struct FindBarOutcome {
-    close: bool,
-    next: bool,
-    prev: bool,
-}
-
-/// Renders the Cmd+F find bar when `tab.find_query` is Some. Returns
-/// which navigation action was triggered this frame (close / next /
-/// prev). Mutates only the editable query string; the caller is
-/// responsible for clearing `tab.find_query` on close.
-fn render_find_bar(ui: &mut egui::Ui, tab: &mut crate::state::layout::FileTab) -> FindBarOutcome {
-    let mut close = false;
-    let mut next = false;
-    let mut prev = false;
-    let Some(query) = tab.find_query.as_mut() else {
-        // Bar just closed — reset the one-shot focus flag so the next
-        // Cmd+F will refocus cleanly.
-        let focus_flag = egui::Id::new(("find_focused", &tab.path));
-        ui.memory_mut(|m| {
-            m.data.remove::<bool>(focus_flag);
-        });
-        return FindBarOutcome { close, next, prev };
-    };
-    ui.horizontal(|ui| {
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!("{}  Find", icons::MAGNIFYING_GLASS))
-                .size(11.0)
-                .color(theme::current().text_muted.to_color32()),
-        );
-        let input_id = egui::Id::new(("find_input", &tab.path));
-        let resp = ui.add(
-            egui::TextEdit::singleline(query)
-                .id(input_id)
-                .desired_width(ui.available_width() - 180.0)
-                .hint_text("type to search…"),
-        );
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            next = true;
-        }
-        // Focus ONCE when the bar opens — per-frame request_focus was
-        // stealing clicks from the nav/close buttons.
-        let focus_flag = egui::Id::new(("find_focused", &tab.path));
-        let already_focused = ui
-            .memory(|m| m.data.get_temp::<bool>(focus_flag))
-            .unwrap_or(false);
-        if !already_focused {
-            resp.request_focus();
-            ui.memory_mut(|m| m.data.insert_temp(focus_flag, true));
-        }
-        let hits = if query.is_empty() {
-            0
-        } else {
-            tab.content.matches(query.as_str()).count()
-        };
-        ui.label(
-            RichText::new(format!("{hits} hits"))
-                .size(10.5)
-                .color(theme::current().text_muted.to_color32()),
-        );
-        let btn = |glyph: &str| {
-            egui::Button::new(
-                RichText::new(glyph)
-                    .size(14.0)
-                    .color(theme::current().text.to_color32()),
-            )
-            .min_size(egui::vec2(22.0, 22.0))
-        };
-        if ui
-            .add(btn(icons::ARROW_UP))
-            .on_hover_text("Previous (Shift+Enter)")
-            .clicked()
-        {
-            prev = true;
-        }
-        if ui
-            .add(btn(icons::ARROW_DOWN))
-            .on_hover_text("Next (Enter)")
-            .clicked()
-        {
-            next = true;
-        }
-        ui.with_layout(
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                ui.add_space(6.0);
-                if ui
-                    .add(btn(icons::X_CIRCLE))
-                    .on_hover_text("Close (Esc)")
-                    .clicked()
-                {
-                    close = true;
-                }
-            },
-        );
-    });
-    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        close = true;
-    }
-    if ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.shift) {
-        prev = true;
-    }
-    ui.add_space(2.0);
-    FindBarOutcome { close, next, prev }
-}
-
-/// Write `tab.content` to disk. When `force` is false and `tab.external_change`
-/// is set, the save is refused — the caller is expected to surface the
-/// banner that lets the user pick Reload / Overwrite (force) / Cancel.
-fn save_tab(
-    tab: &mut crate::state::layout::FileTab,
-    prefs: EditorPrefs,
-    format_before_save: &dyn Fn(&str, &str) -> Option<String>,
-    notify_saved: &dyn Fn(&str, &str),
-    force: bool,
-) {
-    if tab.external_change && !force {
-        return;
-    }
-    if prefs.trim_on_save {
-        tab.content = trim_trailing_whitespace(&tab.content);
-    }
-    if let Some(formatted) = format_before_save(&tab.content, &tab.path) {
-        tab.content = formatted;
-    }
-    if let Err(e) = std::fs::write(&tab.path, &tab.content) {
-        eprintln!("save failed: {e}");
-        return;
-    }
-    tab.original_content = tab.content.clone();
-    tab.disk_mtime = std::fs::metadata(&tab.path)
-        .and_then(|m| m.modified())
-        .ok();
-    tab.external_change = false;
-    notify_saved(&tab.path, &tab.content);
-}
-
-/// Poll the filesystem for external edits to the active tab. Sets
-/// `tab.external_change` when the mtime advanced AND the disk bytes
-/// differ from what we'd write. Called once per render for the active
-/// tab — cheap on SSDs and gated by the mtime check.
-fn poll_external_change(tab: &mut crate::state::layout::FileTab) {
-    if tab.external_change {
-        return;
-    }
-    let Ok(meta) = std::fs::metadata(&tab.path) else {
-        return;
-    };
-    let Ok(disk_mtime) = meta.modified() else {
-        return;
-    };
-    let stale = match tab.disk_mtime {
-        Some(prev) => disk_mtime > prev,
-        None => true,
-    };
-    if !stale {
-        return;
-    }
-    // mtime advanced — compare bytes before alarming (some editors
-    // rewrite without changing content).
-    let Ok(disk_content) = std::fs::read_to_string(&tab.path) else {
-        return;
-    };
-    if disk_content == tab.original_content {
-        // Content matches our baseline: silently catch up the mtime.
-        tab.disk_mtime = Some(disk_mtime);
-        return;
-    }
-    tab.external_change = true;
-}
-
-/// Reload the active tab from disk, discarding any unsaved edits.
-fn reload_tab(tab: &mut crate::state::layout::FileTab) {
-    let Ok(disk_content) = std::fs::read_to_string(&tab.path) else {
-        return;
-    };
-    tab.content = disk_content.clone();
-    tab.original_content = disk_content;
-    tab.disk_mtime = std::fs::metadata(&tab.path)
-        .and_then(|m| m.modified())
-        .ok();
-    tab.external_change = false;
-}
-
-fn paint_find_matches(
-    ui: &egui::Ui,
-    galley: &std::sync::Arc<egui::Galley>,
-    origin: egui::Pos2,
-    text: &str,
-    query: &str,
-) {
-    let amber = Color32::from_rgba_unmultiplied(220, 180, 50, 90);
-    let painter = ui.painter();
-    let mut byte = 0usize;
-    while let Some(offset) = text[byte..].find(query) {
-        let abs = byte + offset;
-        let end = abs + query.len();
-        let char_start = text[..abs].chars().count();
-        let char_end = char_start + text[abs..end].chars().count();
-        let r_start = galley.pos_from_cursor(egui::text::CCursor::new(char_start));
-        let r_end = galley.pos_from_cursor(egui::text::CCursor::new(char_end));
-        // Only paint matches that fit on a single visual line (the common
-        // case for a user-typed query; skipping multi-line avoids ugly
-        // cross-row rectangles).
-        if (r_start.max.y - r_end.max.y).abs() < 1.0 {
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(origin.x + r_start.min.x, origin.y + r_start.min.y),
-                egui::pos2(origin.x + r_end.max.x, origin.y + r_start.max.y),
-            );
-            painter.rect_filled(rect, 2.0, amber);
-        }
-        byte = end;
-    }
-}
 
 fn draw_file_tab(
     ui: &mut egui::Ui,

@@ -7,6 +7,8 @@ mod git;
 mod lsp;
 mod modals;
 mod platform_menu;
+mod shortcuts;
+mod startup;
 mod state;
 mod terminal;
 mod theme;
@@ -23,18 +25,17 @@ use modals::{
 
 use eframe::egui;
 use state::App;
-use state::layout::Dir;
 use ui::pane_view::PaneAction;
 
 fn main() -> eframe::Result {
     env_logger::init();
-    fix_path_for_gui_launch();
+    startup::fix_path_for_gui_launch();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1480.0, 920.0])
         .with_min_inner_size([800.0, 500.0])
         .with_title("Crane");
-    if let Some(icon) = load_app_icon() {
+    if let Some(icon) = startup::load_app_icon() {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions {
@@ -61,181 +62,6 @@ fn main() -> eframe::Result {
     )
 }
 
-/// When a macOS .app is double-clicked from Finder, the process gets a stripped
-/// PATH (typically just `/usr/bin:/bin:/usr/sbin:/sbin`). This means LSP
-/// servers installed via cargo / brew / npm are not found, and terminals feel
-/// broken. Mirror what VSCode does: run the user's login shell once and
-/// copy its PATH + common env vars.
-fn fix_path_for_gui_launch() {
-    // Only do the shell dance when launched from a GUI context. A quick
-    // heuristic: PATH lacks `/usr/local/bin` AND `HOME` is set.
-    let current = std::env::var("PATH").unwrap_or_default();
-    let looks_gui = !current.contains("/usr/local/bin")
-        && !current.contains("/opt/homebrew/bin")
-        && !current.contains(".cargo/bin")
-        && std::env::var("HOME").is_ok();
-    if !looks_gui {
-        return;
-    }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    // Login-only (`-l`) — `-i` used to be here, but interactive shells
-    // source `.zshrc`/`.bashrc` which triggers nvm/brew-shellenv/banners
-    // and can add several seconds to startup. Login mode sources the
-    // profile files (`.zprofile`, `.bash_profile`), which is the
-    // standard place to set PATH.
-    let output = std::process::Command::new(&shell)
-        .arg("-l")
-        .arg("-c")
-        .arg("echo __CRANE_PATH__:$PATH")
-        .output();
-    if let Ok(out) = output {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if let Some(line) = s.lines().find(|l| l.starts_with("__CRANE_PATH__:")) {
-            let path = line.trim_start_matches("__CRANE_PATH__:").to_string();
-            if !path.is_empty() {
-                // SAFETY: called from main() before any threads spawn.
-                unsafe { std::env::set_var("PATH", &path) };
-                return;
-            }
-        }
-    }
-    // Fallback: sprinkle the usual suspects onto whatever PATH we have.
-    let home = std::env::var("HOME").unwrap_or_default();
-    let extras = [
-        format!("{home}/.cargo/bin"),
-        format!("{home}/.local/bin"),
-        format!("{home}/go/bin"),
-        format!("{home}/.volta/bin"),
-        format!("{home}/.fnm/aliases/default/bin"),
-        "/opt/homebrew/bin".to_string(),
-        "/opt/homebrew/sbin".to_string(),
-        "/usr/local/bin".to_string(),
-    ];
-    let mut parts: Vec<String> = extras.into_iter().collect();
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    // SAFETY: called from main() before any threads spawn.
-    unsafe { std::env::set_var("PATH", parts.join(":")) };
-}
-
-fn apply_style(ctx: &egui::Context) {
-    let t = theme::current();
-    let light = t.bg.r as u32 + t.bg.g as u32 + t.bg.b as u32 > 128 * 3;
-    ctx.set_visuals(if light {
-        egui::Visuals::light()
-    } else {
-        egui::Visuals::dark()
-    });
-
-    let mut style = (*ctx.global_style()).clone();
-    let surface_1 = t.surface.to_color32();
-    let surface_2 = t.surface_alt.to_color32();
-    let surface_3 = t.surface_hi.to_color32();
-    let border_subtle = t.border.to_color32();
-    let border_strong = t.border_strong.to_color32();
-    let text_primary = t.text.to_color32();
-    let text_hover = t.text_hover.to_color32();
-    let accent = t.accent.to_color32();
-
-    let corner = egui::CornerRadius::same(6);
-    for w in [
-        &mut style.visuals.widgets.noninteractive,
-        &mut style.visuals.widgets.inactive,
-        &mut style.visuals.widgets.hovered,
-        &mut style.visuals.widgets.active,
-        &mut style.visuals.widgets.open,
-    ] {
-        w.corner_radius = corner;
-    }
-
-    style.visuals.widgets.inactive.weak_bg_fill = surface_1;
-    style.visuals.widgets.inactive.bg_fill = surface_1;
-    style.visuals.widgets.inactive.bg_stroke =
-        egui::Stroke::new(1.0, border_subtle);
-    style.visuals.widgets.inactive.fg_stroke =
-        egui::Stroke::new(1.0, text_primary);
-
-    style.visuals.widgets.hovered.weak_bg_fill = surface_2;
-    style.visuals.widgets.hovered.bg_fill = surface_2;
-    style.visuals.widgets.hovered.bg_stroke =
-        egui::Stroke::new(1.0, border_strong);
-    style.visuals.widgets.hovered.fg_stroke =
-        egui::Stroke::new(1.0, text_hover);
-
-    style.visuals.widgets.active.weak_bg_fill = surface_3;
-    style.visuals.widgets.active.bg_fill = surface_3;
-    style.visuals.widgets.active.bg_stroke =
-        egui::Stroke::new(1.0, border_strong);
-    style.visuals.widgets.active.fg_stroke =
-        egui::Stroke::new(1.0, text_hover);
-
-    style.visuals.selection.bg_fill =
-        egui::Color32::from_rgba_unmultiplied(t.accent.r, t.accent.g, t.accent.b, 70);
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
-
-    style.visuals.window_corner_radius = egui::CornerRadius::same(10);
-    style.visuals.window_fill = t.surface.to_color32();
-    style.visuals.window_stroke = egui::Stroke::new(1.0, border_subtle);
-    style.visuals.menu_corner_radius = egui::CornerRadius::same(8);
-
-    // These are the colours TextEdit, ScrollArea and inline code rely on.
-    // Without them, the Files Pane's editor background ignored the theme.
-    style.visuals.panel_fill = t.bg.to_color32();
-    style.visuals.extreme_bg_color = t.bg.to_color32();
-    style.visuals.code_bg_color = t.surface.to_color32();
-    style.visuals.faint_bg_color = t.row_hover.to_color32();
-    style.visuals.override_text_color = Some(text_primary);
-
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    style.spacing.item_spacing = egui::vec2(8.0, 5.0);
-    style.spacing.menu_margin = egui::Margin::symmetric(6, 6);
-
-    // egui exposes debug paint flags only in debug builds. Release builds
-    // never show them anyway, so we just zero them when available.
-    #[cfg(debug_assertions)]
-    {
-        style.debug = egui::style::DebugOptions::default();
-        style.debug.debug_on_hover = false;
-        style.debug.debug_on_hover_with_all_modifiers = false;
-        style.debug.show_expand_width = false;
-        style.debug.show_expand_height = false;
-        style.debug.show_resize = false;
-        style.debug.show_interactive_widgets = false;
-        style.debug.show_widget_hits = false;
-    }
-
-    ctx.set_global_style(style);
-}
-
-/// One-shot migration: if the old `~/.config/crane/` dir exists and the new
-/// `~/.crane/` doesn't, move it over so users on earlier builds don't lose
-/// their session or custom themes.
-fn migrate_config_dir() {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let old_dir = std::path::PathBuf::from(format!("{home}/.config/crane"));
-    let new_dir = std::path::PathBuf::from(format!("{home}/.crane"));
-    if old_dir.is_dir() && !new_dir.exists() {
-        let _ = std::fs::rename(&old_dir, &new_dir);
-    }
-}
-
-fn load_app_icon() -> Option<egui::IconData> {
-    let bytes = include_bytes!("../crane.png");
-    let image = image::load_from_memory(bytes).ok()?;
-    let rgba = image.to_rgba8();
-    let width = rgba.width();
-    let height = rgba.height();
-    Some(egui::IconData {
-        rgba: rgba.into_raw(),
-        width,
-        height,
-    })
-}
-
 struct CraneApp {
     app: App,
     last_saved_snapshot: String,
@@ -246,63 +72,11 @@ struct CraneApp {
     browser_host: browser::BrowserHost,
 }
 
-fn terminal_is_running(app: &App, id: state::layout::PaneId) -> bool {
-    let Some(layout) = app.active_layout_ref() else {
-        return false;
-    };
-    let Some(pane) = layout.panes.get(&id) else {
-        return false;
-    };
-    match &pane.content {
-        state::layout::PaneContent::Terminal(t) => t.has_foreground_process(),
-        _ => false,
-    }
-}
-
-/// JetBrains Mono Regular — bundled (~264 KB). OFL 1.1 licensed. Used as the
-/// default Monospace font because egui's built-in Hack doesn't cover braille
-/// patterns (U+2800–U+28FF) or block elements, which breaks TUI apps like
-/// nvitop / btop / htop that draw with those glyphs.
-const JETBRAINS_MONO_TTF: &[u8] =
-    include_bytes!("../assets/JetBrainsMono-Regular.ttf");
-
-pub fn load_fonts(ctx: &egui::Context, custom_mono: Option<&str>) {
-    let mut fonts = egui::FontDefinitions::default();
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-
-    // Always install JetBrains Mono as a Monospace entry ahead of egui
-    // defaults. Gives us braille + box-drawing + block-element glyphs for
-    // free, so nvitop / btop render correctly out of the box.
-    fonts.font_data.insert(
-        "jetbrains_mono".to_string(),
-        std::sync::Arc::new(egui::FontData::from_static(JETBRAINS_MONO_TTF)),
-    );
-    if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-        mono.insert(0, "jetbrains_mono".to_string());
-    }
-
-    // A user-selected font takes priority over the bundled default.
-    if let Some(path) = custom_mono
-        && let Ok(bytes) = std::fs::read(path)
-    {
-        let name = "user_mono".to_string();
-        fonts.font_data.insert(
-            name.clone(),
-            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-        );
-        if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            mono.insert(0, name);
-        }
-    }
-
-    ctx.set_fonts(fonts);
-}
-
 impl CraneApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx
             .request_repaint_after(std::time::Duration::from_millis(1500));
-        migrate_config_dir();
+        startup::migrate_config_dir();
         let mut app = match state::session::load() {
             Some(s) => s.restore(&cc.egui_ctx),
             None => App::new(),
@@ -314,9 +88,9 @@ impl CraneApp {
         let initial = theme::find_by_name(&app.selected_theme)
             .unwrap_or_else(theme::Theme::dark);
         theme::init(initial);
-        load_fonts(&cc.egui_ctx, app.custom_mono_font.as_deref());
+        startup::load_fonts(&cc.egui_ctx, app.custom_mono_font.as_deref());
         cc.egui_ctx.set_zoom_factor(app.ui_scale);
-        apply_style(&cc.egui_ctx);
+        startup::apply_style(&cc.egui_ctx);
         app.update_check.spawn_check(cc.egui_ctx.clone());
         Self {
             app,
@@ -493,130 +267,6 @@ impl CraneApp {
         }
     }
 
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // When any modal is open, Cmd+W closes the modal instead of the
-        // pane underneath. Also absorb Escape. Everything else falls
-        // through so Cmd+S etc. still work inside modals.
-        let modal_open = self.app.show_settings
-            || self.app.show_help
-            || self.app.new_workspace_modal.is_some()
-            || self.pending_close.is_some();
-        if modal_open {
-            let (cmd_w, esc) = ctx.input(|i| {
-                let cmd = i.modifiers.command || i.modifiers.mac_cmd;
-                (cmd && i.key_pressed(egui::Key::W), i.key_pressed(egui::Key::Escape))
-            });
-            if cmd_w || esc {
-                if self.app.show_settings {
-                    self.app.show_settings = false;
-                }
-                if self.app.show_help {
-                    self.app.show_help = false;
-                }
-                if esc && self.app.new_workspace_modal.is_some() {
-                    self.app.new_workspace_modal = None;
-                }
-                if esc && self.pending_close.is_some() {
-                    self.pending_close = None;
-                }
-                return;
-            }
-        }
-
-        let (split_terminal, new_tab, split_h, split_v, close_pane, next_pane, prev_pane,
-             zoom_in, zoom_out, zoom_reset, toggle_left, toggle_right, close_tab) =
-            ctx.input(|i| {
-                let cmd = i.modifiers.command;
-                let shift = i.modifiers.shift;
-                (
-                    cmd && !shift && i.key_pressed(egui::Key::T),
-                    cmd && shift && i.key_pressed(egui::Key::T),
-                    cmd && !shift && i.key_pressed(egui::Key::D),
-                    cmd && shift && i.key_pressed(egui::Key::D),
-                    cmd && !shift && i.key_pressed(egui::Key::W),
-                    cmd && i.key_pressed(egui::Key::CloseBracket),
-                    cmd && i.key_pressed(egui::Key::OpenBracket),
-                    cmd && (i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus)),
-                    cmd && i.key_pressed(egui::Key::Minus),
-                    cmd && i.key_pressed(egui::Key::Num0),
-                    cmd && i.key_pressed(egui::Key::B),
-                    cmd && i.key_pressed(egui::Key::Slash),
-                    cmd && shift && i.key_pressed(egui::Key::W),
-                )
-            });
-
-        if split_terminal
-            && let Some(ws) = self.app.active_layout() {
-                ws.split_focused_with_terminal(ctx, Dir::Horizontal);
-            }
-        if new_tab {
-            self.app.new_tab_in_active_workspace(ctx);
-        }
-        if split_h
-            && let Some(ws) = self.app.active_layout() {
-                ws.split_focused_with_terminal(ctx, Dir::Horizontal);
-            }
-        if split_v
-            && let Some(ws) = self.app.active_layout() {
-                ws.split_focused_with_terminal(ctx, Dir::Vertical);
-            }
-        if close_pane {
-            let focus = self
-                .app
-                .active_layout_ref()
-                .and_then(|l| l.focus);
-            if let Some(id) = focus {
-                // Special case: in a Files pane with multiple open tabs,
-                // Cmd+W closes the active file tab instead of the whole
-                // pane. The pane-close still fires when it's the last
-                // (or only) tab — user's expectation.
-                let closed_file_tab = if let Some(ws) = self.app.active_layout()
-                    && let Some(pane) = ws.panes.get_mut(&id)
-                    && let state::layout::PaneContent::Files(files) = &mut pane.content
-                    && files.tabs.len() > 1
-                {
-                    let idx = files.active.min(files.tabs.len() - 1);
-                    files.close(idx);
-                    true
-                } else {
-                    false
-                };
-                if !closed_file_tab {
-                    if terminal_is_running(&self.app, id) {
-                        self.pending_close = Some(id);
-                    } else if let Some(ws) = self.app.active_layout() {
-                        ws.close_focused();
-                    }
-                }
-            }
-        }
-        if close_tab {
-            self.app.close_active_tab();
-        }
-        if next_pane
-            && let Some(ws) = self.app.active_layout() {
-                ws.focus_next();
-            }
-        if prev_pane
-            && let Some(ws) = self.app.active_layout() {
-                ws.focus_prev();
-            }
-        if zoom_in {
-            self.app.font_size = (self.app.font_size + 1.0).min(40.0);
-        }
-        if zoom_out {
-            self.app.font_size = (self.app.font_size - 1.0).max(8.0);
-        }
-        if zoom_reset {
-            self.app.font_size = 14.0;
-        }
-        if toggle_left {
-            self.app.show_left = !self.app.show_left;
-        }
-        if toggle_right {
-            self.app.show_right = !self.app.show_right;
-        }
-    }
 }
 
 impl eframe::App for CraneApp {
@@ -632,7 +282,7 @@ impl eframe::App for CraneApp {
             }
         }
         self.app.ensure_initial(&ctx);
-        self.handle_shortcuts(&ctx);
+        shortcuts::handle(&ctx, &mut self.app, &mut self.pending_close);
         self.app.refresh_active_git_status(&ctx);
         #[cfg(target_os = "macos")]
         {
@@ -891,9 +541,9 @@ impl eframe::App for CraneApp {
         render_missing_project_modal(&ctx, &mut self.app);
         render_new_workspace_modal(&ctx, &mut self.app);
         render_help_modal(&ctx, &mut self.app);
-        let settings_effect = render_settings_modal(&ctx, &mut self.app, apply_style);
+        let settings_effect = render_settings_modal(&ctx, &mut self.app, startup::apply_style);
         if matches!(settings_effect, modals::settings::SettingsEffect::ReloadFonts) {
-            load_fonts(&ctx, self.app.custom_mono_font.as_deref());
+            startup::load_fonts(&ctx, self.app.custom_mono_font.as_deref());
         }
         self.render_confirm_close(&ctx);
         modals::render_confirm_remove_worktree(&ctx, &mut self.app);
