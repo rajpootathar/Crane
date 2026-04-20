@@ -196,72 +196,23 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
     ui.add_space(4.0);
     ui.separator();
 
-    // Layout: scroll body on the left, narrow minimap strip pinned to
-    // the right (VSCode/JetBrains style). Minimap shows a 2-px colored
-    // dash per changed line at its proportional Y position, so the
-    // user sees at a glance where adds/removes sit without scrolling.
+    // Layout: body takes the full pane; the minimap strip is drawn
+    // AFTER the scroll area paints, pinned to the *inner* edge of the
+    // scrollbar gutter. This matches the files pane's marker strip —
+    // markers on the inner side, egui scrollbar at the outer edge —
+    // so the two panes read as the same component family.
     const MINIMAP_W: f32 = 10.0;
     let row_h = (font_size * 1.25).ceil();
     let total_rows = tags.len().max(1);
     let total_body_h = total_rows as f32 * row_h;
-    let full_rect = ui.available_rect_before_wrap();
-    let minimap_rect = egui::Rect::from_min_max(
-        egui::pos2(full_rect.max.x - MINIMAP_W, full_rect.min.y),
-        full_rect.max,
-    );
-    let body_rect = egui::Rect::from_min_max(
-        full_rect.min,
-        egui::pos2(full_rect.max.x - MINIMAP_W - 2.0, full_rect.max.y),
-    );
+    let body_rect = ui.available_rect_before_wrap();
 
-    // Minimap — paint first at absolute coords so it always shows,
-    // independent of the scroll area's internal sizing.
-    let minimap_bg = Color32::from_rgba_premultiplied(0, 0, 0, 60);
-    ui.painter().rect_filled(minimap_rect, 0.0, minimap_bg);
-    if total_rows > 0 {
-        let track_h = minimap_rect.height();
-        let px_per_row = (track_h / total_rows as f32).max(1.0);
-        for (i, tag) in tags.iter().enumerate() {
-            let color = match tag {
-                ChangeTag::Insert => ADD_FG,
-                ChangeTag::Delete => DEL_FG,
-                ChangeTag::Equal => continue,
-            };
-            let y = minimap_rect.min.y + i as f32 * track_h / total_rows as f32;
-            let h = px_per_row.max(2.0);
-            let marker = egui::Rect::from_min_size(
-                egui::pos2(minimap_rect.min.x + 1.0, y),
-                egui::vec2(MINIMAP_W - 2.0, h),
-            );
-            ui.painter().rect_filled(marker, 1.0, color);
-        }
-    }
+    // Arrow-click jump is known up front. Minimap click becomes a
+    // next-frame jump because we only know the inner rect after the
+    // scroll area renders — acceptable for a mouse gesture.
+    let jump_y: Option<f32> = jump_to_row
+        .map(|row| (row as f32 * row_h - row_h * 2.0).max(0.0));
 
-    // Click on the minimap jumps the body scroll to that fraction.
-    let minimap_resp = ui.interact(
-        minimap_rect,
-        ui.id().with("diff_minimap"),
-        egui::Sense::click_and_drag(),
-    );
-    let jump_y: Option<f32> = if let Some(row) = jump_to_row {
-        // Prev/Next arrow click — center the target hunk vertically
-        // with a small offset so the first line isn't flush-top.
-        let y = (row as f32 * row_h - row_h * 2.0).max(0.0);
-        Some(y)
-    } else if (minimap_resp.clicked() || minimap_resp.dragged())
-        && let Some(p) = minimap_resp.interact_pointer_pos()
-    {
-        let frac = ((p.y - minimap_rect.min.y) / minimap_rect.height()).clamp(0.0, 1.0);
-        Some(frac * (total_body_h - body_rect.height()).max(0.0))
-    } else {
-        None
-    };
-    if minimap_resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-
-    // Constrain the scroll body to the reserved rect so it doesn't
-    // draw under the minimap strip.
     let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body_rect));
     // `ScrollArea::show_rows` snapshots `item_spacing.y` BEFORE the
     // body closure runs to compute its virtual row stride. Zero it on
@@ -313,6 +264,53 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
             );
         }
     });
+
+    // Paint the minimap strip on the INNER side of the scrollbar
+    // gutter (inside `inner_rect.max.x`). Markers overlay the body's
+    // right edge; the egui scrollbar itself sits outside and stays at
+    // the outer edge — same pattern as the files pane diag markers.
+    let inner = scroll_out.inner_rect;
+    let minimap_rect = egui::Rect::from_min_max(
+        egui::pos2(inner.max.x - MINIMAP_W, inner.min.y),
+        egui::pos2(inner.max.x, inner.max.y),
+    );
+    if total_rows > 0 {
+        let track_h = minimap_rect.height();
+        let px_per_row = (track_h / total_rows as f32).max(1.0);
+        for (i, tag) in tags.iter().enumerate() {
+            let color = match tag {
+                ChangeTag::Insert => ADD_FG,
+                ChangeTag::Delete => DEL_FG,
+                ChangeTag::Equal => continue,
+            };
+            let y = minimap_rect.min.y + i as f32 * track_h / total_rows as f32;
+            let h = px_per_row.max(2.0);
+            let marker = egui::Rect::from_min_size(
+                egui::pos2(minimap_rect.min.x + 1.0, y),
+                egui::vec2(MINIMAP_W - 2.0, h),
+            );
+            ui.painter().rect_filled(marker, 1.0, color);
+        }
+    }
+    // Click on the minimap jumps to that fraction. jump applies next
+    // frame — the scroll area has already drawn this frame.
+    let minimap_resp = ui.interact(
+        minimap_rect,
+        ui.id().with("diff_minimap"),
+        egui::Sense::click_and_drag(),
+    );
+    if minimap_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if (minimap_resp.clicked() || minimap_resp.dragged())
+        && let Some(p) = minimap_resp.interact_pointer_pos()
+    {
+        let frac = ((p.y - minimap_rect.min.y) / minimap_rect.height()).clamp(0.0, 1.0);
+        let pending = frac * (total_body_h - inner.height()).max(0.0);
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new(("diff_pending_jump", hunk_state_id)), pending));
+        ui.ctx().request_repaint();
+    }
 
     // Sync the counter + step reference with manual scrolling (wheel,
     // minimap drag, scrollbar). Derive the "current" hunk from the

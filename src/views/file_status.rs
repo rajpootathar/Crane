@@ -255,18 +255,12 @@ pub fn paint_scrollbar_diag_markers(
     }
     let t = theme::current();
     let painter = ui.painter_at(scroll_rect);
-    let strip_w = 10.0;
-    let x1 = scroll_rect.max.x;
-    let x0 = x1 - strip_w;
-    let strip_rect = egui::Rect::from_min_max(
-        egui::pos2(x0, scroll_rect.min.y),
-        egui::pos2(x1, scroll_rect.max.y),
-    );
-    painter.rect_filled(
-        strip_rect,
-        0.0,
-        Color32::from_rgba_premultiplied(0, 0, 0, 60),
-    );
+    // No backdrop strip here — files pane is edit surface, a full
+    // translucent band reads as padding and competes with egui's
+    // scrollbar gutter. Just paint the marker dashes, pinned just
+    // inside the right edge so they sit alongside the scrollbar.
+    let x1 = scroll_rect.max.x - 2.0;
+    let x0 = x1 - 6.0;
     let h = scroll_rect.height();
     let total = total_lines.max(1) as f32;
     for d in diagnostics {
@@ -277,8 +271,8 @@ pub fn paint_scrollbar_diag_markers(
         };
         let y = scroll_rect.min.y + (d.line as f32 / total) * h;
         let rect = egui::Rect::from_min_max(
-            egui::pos2(x0 + 1.0, y - 2.0),
-            egui::pos2(x1 - 1.0, y + 2.0),
+            egui::pos2(x0, y - 2.0),
+            egui::pos2(x1, y + 2.0),
         );
         painter.rect_filled(rect, 1.0, color);
     }
