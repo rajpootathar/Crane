@@ -574,6 +574,7 @@ fn render_change_node(
                 active_bar: false,
                 badge: None,
                 trailing_count: 1,
+                        tree_guides: false,
             },
         );
         // Folder-level stage / unstage — applies to every changed file
@@ -653,6 +654,7 @@ fn render_change_node(
                 active_bar: false,
                 badge: None,
                 trailing_count: 1,
+                        tree_guides: false,
             },
         );
         let trailing_icon = if staged { icons::MINUS } else { icons::PLUS };
@@ -786,6 +788,7 @@ fn render_fs_dir(
                 active_bar: false,
                 badge: None,
                 trailing_count: 0,
+                        tree_guides: false,
             },
         );
         if row.main_clicked {

@@ -134,6 +134,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             active_bar: false,
                             badge: None,
                             trailing_count: 0,
+                            tree_guides: false,
                         },
                     );
                 }
@@ -152,6 +153,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         active_bar: false,
                         badge: None,
                         trailing_count: 2,
+                        tree_guides: in_group,
                     },
                 );
                 let project_trailing = draw_trailing(
@@ -247,10 +249,11 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             continue;
                         }
                         let wt_label = wt.label();
+                        let wt_depth = if in_group { 2 } else { 1 };
                         let wt_row = draw_row(
                             ui,
                             RowConfig {
-                                depth: 1,
+                                depth: wt_depth,
                                 expanded: Some(wt.expanded),
                                 leading: Some(icons::GIT_BRANCH),
                                 leading_color: if active_wt { Some(accent()) } else { None },
@@ -260,6 +263,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 active_bar: active_wt,
                                 badge,
                                 trailing_count: 1,
+                                tree_guides: in_group,
                             },
                         );
                         let wt_trailing = draw_trailing(
@@ -371,10 +375,11 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                     }
                                     continue;
                                 }
+                                let tab_depth = if in_group { 3 } else { 2 };
                                 let tab_row = draw_row(
                                     ui,
                                     RowConfig {
-                                        depth: 2,
+                                        depth: tab_depth,
                                         expanded: None,
                                         leading: Some(icons::TERMINAL_WINDOW),
                                         leading_color: if is_active { Some(accent()) } else { None },
@@ -384,6 +389,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                         active_bar: is_active,
                                         badge: None,
                                         trailing_count: 1,
+                                        tree_guides: in_group,
                                     },
                                 );
                                 let tab_trailing = draw_trailing(

@@ -11,7 +11,7 @@ pub const BTN_TEXT_SIZE: f32 = 12.5;
 pub const ICON_BTN_SIZE: Vec2 = Vec2::new(28.0, 24.0);
 
 pub const ROW_H: f32 = 26.0;
-pub const INDENT_W: f32 = 14.0;
+pub const INDENT_W: f32 = 10.0;
 pub const CHEVRON_W: f32 = 14.0;
 
 // Colour accessors — read from the active theme every call.
@@ -115,6 +115,10 @@ pub struct RowConfig<'a> {
     /// Number of trailing icon buttons that will be drawn on this row.
     /// Used to reserve right-edge space so badges don't collide with them.
     pub trailing_count: usize,
+    /// Draw vertical tree-guide lines at each ancestor depth. Used to
+    /// give the multi-repo Project tree a file-explorer feel without
+    /// affecting flat lists elsewhere. Default off.
+    pub tree_guides: bool,
 }
 
 pub struct RowResult {
@@ -152,6 +156,20 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
             1.0,
             accent(),
         );
+    }
+
+    if cfg.tree_guides && cfg.depth > 0 {
+        let guide_color = crate::theme::current().divider.to_color32();
+        for d in 0..cfg.depth {
+            let x = rect.min.x + 12.0 + (d as f32 * INDENT_W) + CHEVRON_W / 2.0;
+            painter.line_segment(
+                [
+                    Pos2::new(x, rect.min.y),
+                    Pos2::new(x, rect.max.y),
+                ],
+                Stroke::new(1.0, guide_color),
+            );
+        }
     }
 
     let mut cursor_x = rect.min.x + 12.0 + (cfg.depth as f32 * INDENT_W);
