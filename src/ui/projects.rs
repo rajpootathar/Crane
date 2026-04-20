@@ -352,6 +352,22 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 } else if tab_row.main_clicked {
                                     set_active = Some((project.id, wt.id, tab.id));
                                 }
+                                // F2 / Cmd+R on the active tab starts
+                                // rename. Scoped to the active tab so
+                                // the keys only affect the tab you're
+                                // working on. Cmd+R is a macOS-friendly
+                                // alias — F2 feels foreign on a Mac
+                                // keyboard.
+                                let rename_chord = ctx.input(|i| {
+                                    i.key_pressed(egui::Key::F2)
+                                        || ((i.modifiers.mac_cmd || i.modifiers.command)
+                                            && !i.modifiers.shift
+                                            && i.key_pressed(egui::Key::R))
+                                });
+                                if is_active && rename_chord && app.renaming_tab.is_none() {
+                                    start_rename =
+                                        Some((project.id, wt.id, tab.id, tab.name.clone()));
+                                }
                                 tab_row.response.context_menu(|ui| {
                                     if ui.button(format!("{}  Rename", icons::PENCIL_SIMPLE)).clicked() {
                                         start_rename = Some((
@@ -439,11 +455,47 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         app.remove_project(pid);
     }
     if let Some((pid, wid)) = remove_worktree
-        && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
+        && let Some(p) = app.projects.iter().find(|p| p.id == pid)
     {
-        p.workspaces.retain(|w| w.id != wid);
-        if app.active.map(|(_, w, _)| w == wid).unwrap_or(false) {
-            app.active = None;
+        // If the worktree has unpushed commits or modified files, stage
+        // a confirmation modal instead of removing immediately — the
+        // `--force` path below would otherwise discard local work
+        // silently. Main checkout (path == project path) always goes
+        // through the plain in-memory removal because we never call
+        // `git worktree remove` on it.
+        let repo = p.path.clone();
+        let ws = p.workspaces.iter().find(|w| w.id == wid);
+        let is_main = ws.map(|w| w.path == repo).unwrap_or(true);
+        let dirty = ws
+            .filter(|_| !is_main)
+            .map(|w| crate::git::worktree_dirty(&w.path))
+            .unwrap_or_default();
+        let needs_confirm = dirty.unpushed_commits > 0 || dirty.modified_files > 0;
+
+        if needs_confirm
+            && let Some(w) = ws
+        {
+            app.pending_remove_worktree = Some(crate::state::PendingRemoveWorktree {
+                project_id: pid,
+                workspace_id: wid,
+                label: w.label(),
+                path: w.path.clone(),
+                unpushed_commits: dirty.unpushed_commits,
+                modified_files: dirty.modified_files,
+                has_upstream: dirty.has_upstream,
+            });
+        } else {
+            if !is_main
+                && let Some(w) = ws
+            {
+                let _ = crate::git::workspace_remove(&repo, &w.path);
+            }
+            if let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
+                p.workspaces.retain(|w| w.id != wid);
+            }
+            if app.active.map(|(_, w, _)| w == wid).unwrap_or(false) {
+                app.active = None;
+            }
         }
     }
     if let Some((pid, wid, tid)) = close_tab

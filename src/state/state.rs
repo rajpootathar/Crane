@@ -221,6 +221,16 @@ impl Default for BranchPickerState {
     }
 }
 
+pub struct PendingRemoveWorktree {
+    pub project_id: ProjectId,
+    pub workspace_id: WorkspaceId,
+    pub label: String,
+    pub path: PathBuf,
+    pub unpushed_commits: usize,
+    pub modified_files: usize,
+    pub has_upstream: bool,
+}
+
 pub struct App {
     pub projects: Vec<Project>,
     pub active: Option<(ProjectId, WorkspaceId, TabId)>,
@@ -266,6 +276,10 @@ pub struct App {
     /// drops any request that never comes back so we don't leak ids.
     pub pending_gotos: Vec<PendingGoto>,
     pub repo_branch_cache: std::collections::HashMap<PathBuf, (String, Instant)>,
+    /// Pending "Remove Worktree" awaiting user confirmation because the
+    /// worktree has unpushed commits or modified files. `None` while no
+    /// modal is open.
+    pub pending_remove_worktree: Option<PendingRemoveWorktree>,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -307,6 +321,7 @@ impl App {
             missing_project_modals: Vec::new(),
             pending_gotos: Vec::new(),
             repo_branch_cache: std::collections::HashMap::new(),
+            pending_remove_worktree: None,
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,

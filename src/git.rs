@@ -52,7 +52,13 @@ pub enum ChangeStatus {
 
 #[derive(Clone, Debug)]
 pub struct FileChange {
+    /// For renames, this is the NEW path. The UI groups and sorts by
+    /// this, so renamed files land in their destination folder instead
+    /// of being split across both sides of the arrow.
     pub path: String,
+    /// Source side of a rename, if any. Only set when `status` is
+    /// `Renamed` — `path` holds the new name, `old_path` the old name.
+    pub old_path: Option<String>,
     pub staged: bool,
     pub status: ChangeStatus,
 }
@@ -87,7 +93,14 @@ pub fn status(repo: &Path) -> Option<GitStatus> {
         }
         let x = line.as_bytes()[0] as char;
         let y = line.as_bytes()[1] as char;
-        let path = line[3..].to_string();
+        let raw = line[3..].to_string();
+        // porcelain v1 formats renames as `old -> new`. Split so the
+        // tree groups renamed rows under their destination folder and
+        // the row itself can render "old → new" on one leaf.
+        let (path, old_path) = match raw.split_once(" -> ") {
+            Some((old, new)) => (new.to_string(), Some(old.to_string())),
+            None => (raw, None),
+        };
         let map = |c: char| match c {
             'A' => ChangeStatus::Added,
             'M' => ChangeStatus::Modified,
@@ -98,23 +111,33 @@ pub fn status(repo: &Path) -> Option<GitStatus> {
         if x == '?' && y == '?' {
             changes.push(FileChange {
                 path,
+                old_path,
                 staged: false,
                 status: ChangeStatus::Untracked,
             });
             continue;
         }
+        // `old_path` only belongs to the Renamed status — the rename
+        // itself is always on the staged (X) side. If Y is also set
+        // (e.g. "RM": renamed and then modified in worktree), the
+        // unstaged row is a plain Modified against the new path and
+        // must not render the `old -> new` label.
         if x != ' ' && x != '?' {
+            let sx = map(x);
             changes.push(FileChange {
                 path: path.clone(),
+                old_path: if sx == ChangeStatus::Renamed { old_path.clone() } else { None },
                 staged: true,
-                status: map(x),
+                status: sx,
             });
         }
         if y != ' ' && y != '?' {
+            let sy = map(y);
             changes.push(FileChange {
                 path,
+                old_path: if sy == ChangeStatus::Renamed { old_path } else { None },
                 staged: false,
-                status: map(y),
+                status: sy,
             });
         }
     }
@@ -186,6 +209,67 @@ pub fn push(repo: &Path) -> Result<(), String> {
 
 pub fn pull(repo: &Path) -> Result<(), String> {
     run(repo, &["pull", "--ff-only"])
+}
+
+/// Summary of what would be lost if a worktree were removed right now.
+/// `unpushed_commits` counts commits on the current branch that aren't
+/// on its upstream; `None` for upstream means no upstream is configured,
+/// in which case every local commit on the branch is effectively
+/// unpushed — we return `Some(n)` for "ahead of main" via `main..HEAD`
+/// as a best-effort floor, or 0 if that comparison also fails.
+/// `modified_files` counts anything `git status --porcelain` reports
+/// (staged, unstaged, untracked).
+#[derive(Clone, Debug, Default)]
+pub struct WorktreeDirty {
+    pub unpushed_commits: usize,
+    pub modified_files: usize,
+    pub has_upstream: bool,
+}
+
+pub fn worktree_dirty(worktree: &Path) -> WorktreeDirty {
+    let modified_files = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+        .unwrap_or(0);
+
+    let upstream = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .current_dir(worktree)
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    let has_upstream = upstream.is_some();
+
+    let range = if has_upstream { "@{u}..HEAD" } else { "main..HEAD" };
+    let unpushed_commits = Command::new("git")
+        .args(["rev-list", "--count", range])
+        .current_dir(worktree)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    WorktreeDirty {
+        unpushed_commits,
+        modified_files,
+        has_upstream,
+    }
+}
+
+/// Remove a worktree via `git worktree remove --force <path>`. Force is
+/// used because this is invoked from an explicit "Remove Worktree" UI
+/// action — the user has already decided to discard local state, and
+/// non-force would refuse on any uncommitted change and leave the
+/// directory on disk, blocking future `worktree add` of the same branch
+/// (which is the exact regression being fixed here).
+pub fn workspace_remove(repo: &Path, path: &Path) -> Result<(), String> {
+    let path_str = path.to_string_lossy();
+    run(repo, &["worktree", "remove", "--force", &path_str])
 }
 
 pub fn workspace_add(repo: &Path, path: &Path, branch: &str, create_new: bool) -> Result<(), String> {

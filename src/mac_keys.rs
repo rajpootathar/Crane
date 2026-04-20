@@ -21,6 +21,10 @@ use parking_lot::Mutex;
 use std::sync::OnceLock;
 
 static PENDING: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static PENDING_SHIFT_TAB: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static TERMINAL_FOCUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn pending() -> &'static Mutex<Vec<String>> {
     PENDING.get_or_init(|| Mutex::new(Vec::new()))
@@ -31,6 +35,21 @@ fn pending() -> &'static Mutex<Vec<String>> {
 pub fn drain_pending_image_paths() -> Vec<String> {
     let mut q = pending().lock();
     std::mem::take(&mut *q)
+}
+
+/// Consume the count of Shift+Tab presses the NSEvent monitor has
+/// captured since the last call. Each count maps to one CSI Z write.
+pub fn drain_pending_shift_tab() -> usize {
+    PENDING_SHIFT_TAB.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Must be called every render frame from the terminal view with
+/// `true` when the terminal pane owns focus, `false` otherwise. The
+/// NSEvent monitor only swallows Shift+Tab when this is `true` —
+/// without the gate, pressing Shift+Tab inside a TextEdit (tab rename,
+/// find bar, commit message) would silently disappear.
+pub fn set_terminal_focused(focused: bool) {
+    TERMINAL_FOCUSED.store(focused, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Register the NSEvent local monitor. Must be called on the main
@@ -49,29 +68,52 @@ pub fn install_cmd_v_monitor() {
     // through to the app; None → swallow (winit never sees it).
     let handler = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
         let event = unsafe { event.as_ref() };
+        let passthrough = event as *const NSEvent as *mut NSEvent;
         unsafe {
             if event.r#type() != NSEventType::KeyDown {
-                return event as *const NSEvent as *mut NSEvent;
+                return passthrough;
             }
             let flags = event.modifierFlags();
-            // Cmd must be held; if any of Shift / Alt / Ctrl are also
-            // held we bail — users press those combos for other things.
+
+            // --- Shift+Tab path -------------------------------------
+            // egui's focus navigator eats Shift+Tab (back-focus) before
+            // our terminal handler can see it, even with `consume_key`
+            // in the same frame. Catch it at NSEvent level so TUIs
+            // (zsh reverse menu, Claude Code, fzf) actually get CSI Z.
+            // Only swallow when the terminal pane owns focus; in a
+            // TextEdit we want egui's normal back-focus behavior.
+            let key_code = event.keyCode();
+            const TAB_KEY_CODE: u16 = 0x30;
+            if key_code == TAB_KEY_CODE
+                && flags.contains(NSEventModifierFlags::NSEventModifierFlagShift)
+                && !flags.intersects(
+                    NSEventModifierFlags::NSEventModifierFlagCommand
+                        | NSEventModifierFlags::NSEventModifierFlagControl
+                        | NSEventModifierFlags::NSEventModifierFlagOption,
+                )
+                && TERMINAL_FOCUSED.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                PENDING_SHIFT_TAB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return std::ptr::null_mut();
+            }
+
+            // --- Cmd+V image paste path -----------------------------
             if !flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand) {
-                return event as *const NSEvent as *mut NSEvent;
+                return passthrough;
             }
             if flags.intersects(
                 NSEventModifierFlags::NSEventModifierFlagShift
                     | NSEventModifierFlags::NSEventModifierFlagOption
                     | NSEventModifierFlags::NSEventModifierFlagControl,
             ) {
-                return event as *const NSEvent as *mut NSEvent;
+                return passthrough;
             }
             let chars = match event.charactersIgnoringModifiers() {
                 Some(s) => s.to_string(),
-                None => return event as *const NSEvent as *mut NSEvent,
+                None => return passthrough,
             };
             if chars != "v" && chars != "V" {
-                return event as *const NSEvent as *mut NSEvent;
+                return passthrough;
             }
 
             // Cmd+V with no other modifiers. Check NSPasteboard for
@@ -82,7 +124,7 @@ pub fn install_cmd_v_monitor() {
                     pending().lock().push(path);
                     std::ptr::null_mut()
                 }
-                None => event as *const NSEvent as *mut NSEvent,
+                None => passthrough,
             }
         }
     });

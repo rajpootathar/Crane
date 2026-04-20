@@ -142,6 +142,17 @@ src/
 
 See [CLAUDE.md](CLAUDE.md) for project conventions + the canonical naming glossary (Left Panel / Main Panel / Right Panel; Project → Workspace → Tab → Layout → Pane).
 
+## Known issues
+
+- **Cursor drifts a few columns short of `%` with certain custom zsh prompts.**
+  Some prompt frameworks (observed with the Forge theme; also older
+  Powerlevel10k versions) compute their RPROMPT cursor-back escape
+  against UTF-8 byte width instead of column width for Nerd-Font / PUA
+  icons. Each 3-byte icon over-counts by 2 cells, so the cursor lands
+  `2 × icon_count` columns short of the prompt end. Crane's VT grid is
+  correct — the shell is writing the wrong `\e[<n>D`. Workaround:
+  disable the offending theme or switch its icon set to ASCII.
+
 ## Tests
 
 ```bash

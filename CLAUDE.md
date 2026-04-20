@@ -113,6 +113,19 @@ Agent memory lives at `~/.claude/projects/-Users-rajpootathar-ideaProjects-super
 
 User-facing persistence: `~/.crane/` (planned for config, sessions, themes). Not yet implemented.
 
+## Known issues
+
+- **Cursor drifts a few columns short of `%` with certain custom prompts.**
+  Root cause is external: some zsh prompt frameworks (observed with
+  Forge theme; also known to affect older Powerlevel10k) compute their
+  RPROMPT cursor-back escape against UTF-8 **byte width** instead of
+  **column width** for Nerd-Font / PUA glyphs. Each 3-byte icon
+  over-counts by 2 cells, so the cursor lands `2 × icon_count` cells
+  short of the prompt end. Crane's VT grid is correct; the shell is
+  writing the wrong `\e[<n>D`. Workaround: disable the offending
+  prompt theme or switch its icon set to ASCII. Crane cannot repair
+  this from the terminal side without lying about grid width.
+
 ## Pending major work
 
 - Rename `Workspace` → `Layout`, `Worktree` → `Workspace` throughout the code

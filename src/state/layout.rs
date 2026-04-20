@@ -130,16 +130,86 @@ pub struct MarkdownPane {
     pub error: Option<String>,
 }
 
-pub struct DiffPane {
+pub struct DiffTab {
+    pub title: String,
     pub left_path: String,
     pub right_path: String,
     pub left_text: String,
     pub right_text: String,
-    #[allow(dead_code)] // kept for session schema compat
-    pub left_buf: String,
-    #[allow(dead_code)] // kept for session schema compat
-    pub right_buf: String,
     pub error: Option<String>,
+}
+
+pub struct DiffPane {
+    pub tabs: Vec<DiffTab>,
+    pub active: usize,
+}
+
+impl DiffPane {
+    pub fn empty() -> Self {
+        Self {
+            tabs: Vec::new(),
+            active: 0,
+        }
+    }
+
+    /// Open a diff tab. If one already exists for the same
+    /// `(left_path, right_path)` pair, refresh its contents and focus
+    /// it instead of adding a duplicate — so reopening a file's diff
+    /// doesn't spawn an endless stack of tabs.
+    pub fn open(
+        &mut self,
+        title: String,
+        left_path: String,
+        right_path: String,
+        left_text: String,
+        right_text: String,
+    ) {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| t.left_path == left_path && t.right_path == right_path)
+        {
+            let t = &mut self.tabs[idx];
+            t.title = title;
+            t.left_text = left_text;
+            t.right_text = right_text;
+            t.error = None;
+            self.active = idx;
+            return;
+        }
+        self.tabs.push(DiffTab {
+            title,
+            left_path,
+            right_path,
+            left_text,
+            right_text,
+            error: None,
+        });
+        self.active = self.tabs.len() - 1;
+    }
+
+    pub fn close(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if self.active > idx {
+            self.active -= 1;
+        }
+    }
+
+    pub fn active_tab(&self) -> Option<&DiffTab> {
+        self.tabs.get(self.active)
+    }
+
+    #[allow(dead_code)]
+    pub fn active_tab_mut(&mut self) -> Option<&mut DiffTab> {
+        self.tabs.get_mut(self.active)
+    }
 }
 
 pub struct BrowserTab {
@@ -331,7 +401,7 @@ impl Layout {
         self.next_id = id.max(self.next_id);
     }
 
-    pub fn open_or_replace_diff(
+    pub fn open_or_focus_diff(
         &mut self,
         left_path: String,
         right_path: String,
@@ -347,30 +417,29 @@ impl Layout {
         match existing {
             Some(pid) => {
                 if let Some(pane) = self.panes.get_mut(&pid) {
-                    pane.title = title;
                     if let PaneContent::Diff(diff) = &mut pane.content {
-                        diff.left_path = left_path;
-                        diff.right_path = right_path;
-                        diff.left_text = left_text;
-                        diff.right_text = right_text;
-                        diff.error = None;
+                        diff.open(
+                            title.clone(),
+                            left_path,
+                            right_path,
+                            left_text,
+                            right_text,
+                        );
                     }
+                    pane.title = title;
                 }
                 self.focus = Some(pid);
             }
             None => {
-                self.add_pane(
-                    PaneContent::Diff(DiffPane {
-                        left_path,
-                        right_path,
-                        left_text,
-                        right_text,
-                        left_buf: String::new(),
-                        right_buf: String::new(),
-                        error: None,
-                    }),
-                    Some(Dir::Horizontal),
+                let mut diff = DiffPane::empty();
+                diff.open(
+                    title.clone(),
+                    left_path,
+                    right_path,
+                    left_text,
+                    right_text,
                 );
+                self.add_pane(PaneContent::Diff(diff), Some(Dir::Horizontal));
                 if let Some(focus) = self.focus
                     && let Some(pane) = self.panes.get_mut(&focus) {
                         pane.title = title;

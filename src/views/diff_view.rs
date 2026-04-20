@@ -1,5 +1,6 @@
 use crate::state::layout::DiffPane;
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
+use egui_phosphor::regular as icons;
 use similar::{ChangeTag, TextDiff};
 
 const ADD_BG: Color32 = Color32::from_rgb(25, 55, 35);
@@ -9,16 +10,16 @@ const ADD_FG: Color32 = Color32::from_rgb(140, 220, 150);
 const DEL_FG: Color32 = Color32::from_rgb(230, 130, 130);
 const MUTED: Color32 = Color32::from_rgb(140, 146, 160);
 const HEADER: Color32 = Color32::from_rgb(200, 204, 220);
+const TAB_ACTIVE_BG: Color32 = Color32::from_rgb(32, 36, 48);
 
 pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &mut String) {
-    if pane.left_text.is_empty() && pane.right_text.is_empty() {
+    // Tab bar — one tab per open diff. Click to focus, × to close.
+    render_tab_bar(ui, pane);
+
+    let Some(tab) = pane.active_tab() else {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
-            ui.label(
-                RichText::new("No diff loaded")
-                    .size(14.0)
-                    .color(HEADER),
-            );
+            ui.label(RichText::new("No diff loaded").size(14.0).color(HEADER));
             ui.add_space(4.0);
             ui.label(
                 RichText::new("Click a changed file in the Changes sidebar to view its diff here.")
@@ -26,25 +27,21 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
                     .color(MUTED),
             );
         });
-        if let Some(err) = &pane.error {
-            ui.add_space(8.0);
-            ui.colored_label(DEL_FG, err);
-        }
         return;
-    }
+    };
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(6.0);
         ui.label(
-            RichText::new(&pane.left_path)
+            RichText::new(&tab.left_path)
                 .size(11.0)
                 .color(DEL_FG)
                 .monospace(),
         );
         ui.label(RichText::new("→").size(11.0).color(MUTED));
         ui.label(
-            RichText::new(&pane.right_path)
+            RichText::new(&tab.right_path)
                 .size(11.0)
                 .color(ADD_FG)
                 .monospace(),
@@ -53,10 +50,10 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
     ui.add_space(4.0);
     ui.separator();
 
-    let diff = TextDiff::from_lines(&pane.left_text, &pane.right_text);
+    let diff = TextDiff::from_lines(&tab.left_text, &tab.right_text);
     let font = FontId::new(font_size, FontFamily::Monospace);
-    let left_lines = pane.left_text.lines().count().max(1);
-    let right_lines = pane.right_text.lines().count().max(1);
+    let left_lines = tab.left_text.lines().count().max(1);
+    let right_lines = tab.right_text.lines().count().max(1);
     let ldigits = left_lines.to_string().len().max(3);
     let rdigits = right_lines.to_string().len().max(3);
     let char_w = ui
@@ -101,6 +98,51 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
                 );
             }
         });
+}
+
+fn render_tab_bar(ui: &mut egui::Ui, pane: &mut DiffPane) {
+    if pane.tabs.is_empty() {
+        return;
+    }
+    let mut close_idx: Option<usize> = None;
+    let mut focus_idx: Option<usize> = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (i, tab) in pane.tabs.iter().enumerate() {
+            let is_active = i == pane.active;
+            let bg = if is_active { TAB_ACTIVE_BG } else { Color32::TRANSPARENT };
+            ui.scope(|ui| {
+                let v = ui.visuals_mut();
+                v.widgets.inactive.weak_bg_fill = bg;
+                v.widgets.inactive.bg_fill = bg;
+                v.widgets.hovered.bg_fill = TAB_ACTIVE_BG;
+                v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                let color = if is_active { HEADER } else { MUTED };
+                let label_btn = egui::Button::new(
+                    RichText::new(&tab.title).size(11.5).color(color),
+                )
+                .min_size(egui::vec2(0.0, 22.0));
+                if ui.add(label_btn).clicked() {
+                    focus_idx = Some(i);
+                }
+                let close_btn = egui::Button::new(
+                    RichText::new(icons::X).size(10.0).color(MUTED),
+                )
+                .min_size(egui::vec2(18.0, 22.0));
+                if ui.add(close_btn).clicked() {
+                    close_idx = Some(i);
+                }
+            });
+        }
+    });
+    if let Some(i) = focus_idx {
+        pane.active = i;
+    }
+    if let Some(i) = close_idx {
+        pane.close(i);
+    }
+    ui.separator();
 }
 
 #[allow(clippy::too_many_arguments)]

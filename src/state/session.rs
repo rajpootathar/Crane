@@ -135,8 +135,10 @@ pub enum SPaneContent {
         path: String,
     },
     Diff {
-        left_path: String,
-        right_path: String,
+        #[serde(default)]
+        tabs: Vec<SDiffTab>,
+        #[serde(default)]
+        active: usize,
     },
     Browser {
         /// Legacy single-URL field — populated for old session files.
@@ -159,6 +161,13 @@ pub struct SBrowserTab {
 pub struct SFile {
     pub path: String,
     pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SDiffTab {
+    pub title: String,
+    pub left_path: String,
+    pub right_path: String,
 }
 
 pub fn session_file() -> PathBuf {
@@ -476,8 +485,16 @@ impl SPane {
                 path: m.path.clone(),
             },
             PaneContent::Diff(d) => SPaneContent::Diff {
-                left_path: d.left_path.clone(),
-                right_path: d.right_path.clone(),
+                tabs: d
+                    .tabs
+                    .iter()
+                    .map(|t| SDiffTab {
+                        title: t.title.clone(),
+                        left_path: t.left_path.clone(),
+                        right_path: t.right_path.clone(),
+                    })
+                    .collect(),
+                active: d.active,
             },
             PaneContent::Browser(b) => SPaneContent::Browser {
                 url: String::new(),
@@ -582,25 +599,21 @@ impl SPane {
                     error: None,
                 })
             }
-            SPaneContent::Diff {
-                left_path,
-                right_path,
-            } => {
-                let right_text = std::fs::read_to_string(&right_path).unwrap_or_default();
-                let left_text = if let Some(rel) = left_path.strip_prefix("HEAD:") {
-                    crate::git::head_content(cwd, rel)
-                } else {
-                    std::fs::read_to_string(&left_path).unwrap_or_default()
-                };
-                PaneContent::Diff(DiffPane {
-                    left_path,
-                    right_path,
-                    left_text,
-                    right_text,
-                    left_buf: String::new(),
-                    right_buf: String::new(),
-                    error: None,
-                })
+            SPaneContent::Diff { tabs, active } => {
+                let mut pane = DiffPane::empty();
+                for st in tabs {
+                    let right_text = std::fs::read_to_string(&st.right_path).unwrap_or_default();
+                    let left_text = if let Some(rel) = st.left_path.strip_prefix("HEAD:") {
+                        crate::git::head_content(cwd, rel)
+                    } else {
+                        std::fs::read_to_string(&st.left_path).unwrap_or_default()
+                    };
+                    pane.open(st.title, st.left_path, st.right_path, left_text, right_text);
+                }
+                if !pane.tabs.is_empty() {
+                    pane.active = active.min(pane.tabs.len() - 1);
+                }
+                PaneContent::Diff(pane)
             }
             SPaneContent::Browser { url, tabs, active } => {
                 if tabs.is_empty() {

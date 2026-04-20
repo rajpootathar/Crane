@@ -117,8 +117,8 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     });
     ui.add_space(4.0);
 
-    let mut stage_path: Option<String> = None;
-    let mut unstage_path: Option<String> = None;
+    let mut stage_paths: Vec<String> = Vec::new();
+    let mut unstage_paths: Vec<String> = Vec::new();
     let mut open_diff: Option<String> = None;
     let mut toggle_dir: Option<String> = None;
     let collapsed = app.collapsed_change_dirs.clone();
@@ -148,8 +148,8 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                     &staged,
                     true,
                     &collapsed,
-                    &mut unstage_path,
-                    &mut stage_path,
+                    &mut unstage_paths,
+                    &mut stage_paths,
                     &mut open_diff,
                     &mut toggle_dir,
                 );
@@ -162,8 +162,8 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                     &unstaged,
                     false,
                     &collapsed,
-                    &mut unstage_path,
-                    &mut stage_path,
+                    &mut unstage_paths,
+                    &mut stage_paths,
                     &mut open_diff,
                     &mut toggle_dir,
                 );
@@ -176,8 +176,8 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                     &untracked,
                     false,
                     &collapsed,
-                    &mut unstage_path,
-                    &mut stage_path,
+                    &mut unstage_paths,
+                    &mut stage_paths,
                     &mut open_diff,
                     &mut toggle_dir,
                 );
@@ -303,22 +303,36 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
         && !app.collapsed_change_dirs.remove(&dir) {
             app.collapsed_change_dirs.insert(dir);
         }
-    if let Some(path) = stage_path {
-        match git::stage(&repo_path, &path) {
-            Ok(()) => {
+    if !stage_paths.is_empty() {
+        let mut err: Option<String> = None;
+        for path in &stage_paths {
+            if let Err(e) = git::stage(&repo_path, path) {
+                err = Some(e);
+                break;
+            }
+        }
+        match err {
+            Some(e) => app.git_error = Some(e),
+            None => {
                 app.git_error = None;
                 force_status_refresh(app);
             }
-            Err(e) => app.git_error = Some(e),
         }
     }
-    if let Some(path) = unstage_path {
-        match git::unstage(&repo_path, &path) {
-            Ok(()) => {
+    if !unstage_paths.is_empty() {
+        let mut err: Option<String> = None;
+        for path in &unstage_paths {
+            if let Err(e) = git::unstage(&repo_path, path) {
+                err = Some(e);
+                break;
+            }
+        }
+        match err {
+            Some(e) => app.git_error = Some(e),
+            None => {
                 app.git_error = None;
                 force_status_refresh(app);
             }
-            Err(e) => app.git_error = Some(e),
         }
     }
     if let Some(path) = open_diff {
@@ -388,7 +402,7 @@ fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
             .unwrap_or(rel_path)
     );
     if let Some(ws) = app.active_layout() {
-        ws.open_or_replace_diff(
+        ws.open_or_focus_diff(
             format!("HEAD:{rel_path}"),
             rel_path.to_string(),
             left_text,
@@ -412,6 +426,18 @@ struct DirNode {
     files: Vec<(String, FileChange)>,
 }
 
+/// Walk a DirNode subtree and collect every file's path — used by the
+/// folder-level stage/unstage action to apply a single click across
+/// the whole subtree.
+fn collect_paths(node: &DirNode, out: &mut Vec<String>) {
+    for (_, change) in &node.files {
+        out.push(change.path.clone());
+    }
+    for (_, child) in &node.dirs {
+        collect_paths(child, out);
+    }
+}
+
 fn build_tree(changes: &[&FileChange]) -> DirNode {
     let mut root = DirNode::default();
     for c in changes {
@@ -433,8 +459,8 @@ fn render_change_tree(
     changes: &[&FileChange],
     staged: bool,
     collapsed: &std::collections::HashSet<String>,
-    unstage_path: &mut Option<String>,
-    stage_path: &mut Option<String>,
+    unstage_paths: &mut Vec<String>,
+    stage_paths: &mut Vec<String>,
     open_diff: &mut Option<String>,
     toggle_dir: &mut Option<String>,
 ) {
@@ -447,8 +473,8 @@ fn render_change_tree(
         0,
         staged,
         collapsed,
-        unstage_path,
-        stage_path,
+        unstage_paths,
+        stage_paths,
         open_diff,
         toggle_dir,
     );
@@ -463,8 +489,8 @@ fn render_change_node(
     depth: usize,
     staged: bool,
     collapsed: &std::collections::HashSet<String>,
-    unstage_path: &mut Option<String>,
-    stage_path: &mut Option<String>,
+    unstage_paths: &mut Vec<String>,
+    stage_paths: &mut Vec<String>,
     open_diff: &mut Option<String>,
     toggle_dir: &mut Option<String>,
 ) {
@@ -483,8 +509,8 @@ fn render_change_node(
                 depth,
                 staged,
                 collapsed,
-                unstage_path,
-                stage_path,
+                unstage_paths,
+                stage_paths,
                 open_diff,
                 toggle_dir,
             );
@@ -504,10 +530,33 @@ fn render_change_node(
                 is_active: false,
                 active_bar: false,
                 badge: None,
-                trailing_count: 0,
+                trailing_count: 1,
             },
         );
-        if row.main_clicked {
+        // Folder-level stage / unstage — applies to every changed file
+        // under this subtree. Saves a click per file when the user
+        // wants to stage an entire module at once.
+        let folder_icon = if staged { icons::MINUS } else { icons::PLUS };
+        let folder_tip = if staged {
+            "Unstage all in folder"
+        } else {
+            "Stage all in folder"
+        };
+        let folder_flags = draw_trailing(
+            ui,
+            row.rect,
+            row.hovered,
+            &[(folder_icon, folder_tip, 0)],
+        );
+        if folder_flags[0] {
+            let mut paths = Vec::new();
+            collect_paths(child, &mut paths);
+            if staged {
+                unstage_paths.extend(paths);
+            } else {
+                stage_paths.extend(paths);
+            }
+        } else if row.main_clicked {
             *toggle_dir = Some(key.clone());
         }
         if !is_collapsed {
@@ -519,8 +568,8 @@ fn render_change_node(
                 depth + 1,
                 staged,
                 collapsed,
-                unstage_path,
-                stage_path,
+                unstage_paths,
+                stage_paths,
                 open_diff,
                 toggle_dir,
             );
@@ -534,6 +583,20 @@ fn render_change_node(
             git::ChangeStatus::Renamed => ("R", accent()),
             git::ChangeStatus::Untracked => ("?", WARN),
         };
+        // For renames show "oldName → newName" on a single leaf so the
+        // destination folder groups the row but the move is still
+        // visible. Pure filename for everything else.
+        let rename_label;
+        let label: &str = if let Some(old) = change.old_path.as_ref() {
+            let old_name = std::path::Path::new(old)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(old);
+            rename_label = format!("{old_name} -> {file_name}");
+            &rename_label
+        } else {
+            file_name
+        };
         let row = draw_row(
             ui,
             RowConfig {
@@ -541,7 +604,7 @@ fn render_change_node(
                 expanded: None,
                 leading: Some(glyph),
                 leading_color: Some(glyph_color),
-                label: file_name,
+                label,
                 label_color: None,
                 is_active: false,
                 active_bar: false,
@@ -559,9 +622,9 @@ fn render_change_node(
         );
         if flags[0] {
             if staged {
-                *unstage_path = Some(change.path.clone());
+                unstage_paths.push(change.path.clone());
             } else {
-                *stage_path = Some(change.path.clone());
+                stage_paths.push(change.path.clone());
             }
         } else if row.main_clicked {
             *open_diff = Some(change.path.clone());
@@ -572,12 +635,12 @@ fn render_change_node(
         row.response.context_menu(|ui| {
             if staged_here {
                 if ui.button(format!("{}  Unstage", icons::MINUS)).clicked() {
-                    *unstage_path = Some(change_path.clone());
+                    unstage_paths.push(change_path.clone());
                     ui.close();
                 }
             } else {
                 if ui.button(format!("{}  Stage", icons::PLUS)).clicked() {
-                    *stage_path = Some(change_path.clone());
+                    stage_paths.push(change_path.clone());
                     ui.close();
                 }
             }

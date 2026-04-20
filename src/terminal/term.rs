@@ -1,5 +1,5 @@
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use parking_lot::Mutex;
@@ -45,7 +45,27 @@ pub struct WakeListener {
 impl EventListener for WakeListener {
     fn send_event(&self, event: TermEvent) {
         if let TermEvent::PtyWrite(s) = event {
-            self.pty_replies.lock().extend_from_slice(s.as_bytes());
+            let bytes = s.as_bytes();
+            // Suppress CSI 6n / DSR cursor-position reports (CPR).
+            // Powerlevel10k computes RPROMPT cursor-back math against
+            // byte-width instead of column-width for Nerd-Font icons;
+            // when we reply with a correct CPR it lands the cursor a
+            // few columns short of the prompt end, so typed chars
+            // overwrite the prompt. The in-place "queue then drain per
+            // frame" delay isn't long enough at 60fps to beat P10k's
+            // ~20ms internal timeout. Dropping CPRs lets P10k always
+            // fall through to its absolute-positioning fallback that
+            // doesn't rely on width counting. Other replies (DA, title
+            // ack, etc.) still pass through.
+            // CPR format: `\x1b[<row>;<col>R` or `\x1b[<row>R`.
+            let is_cpr = bytes.starts_with(b"\x1b[")
+                && bytes.ends_with(b"R")
+                && bytes[2..bytes.len() - 1]
+                    .iter()
+                    .all(|&b| b.is_ascii_digit() || b == b';');
+            if !is_cpr {
+                self.pty_replies.lock().extend_from_slice(bytes);
+            }
         }
         self.ctx.request_repaint();
     }
@@ -67,6 +87,10 @@ pub struct Terminal {
     /// Shared with WakeListener; flushed once per render frame via
     /// `flush_pty_replies`.
     pty_replies: Arc<Mutex<Vec<u8>>>,
+    /// Set by `write_input` when the user types; drained by
+    /// `flush_scroll_to_bottom` after ui.input releases to avoid a
+    /// deadlock against egui's Context lock.
+    pending_scroll_to_bottom: std::sync::atomic::AtomicBool,
 }
 
 impl Terminal {
@@ -228,6 +252,7 @@ impl Terminal {
             master: pair.master,
             shell_pid,
             pty_replies,
+            pending_scroll_to_bottom: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -315,6 +340,25 @@ impl Terminal {
         let mut w = self.writer.lock();
         let _ = w.write_all(data);
         let _ = w.flush();
+        // Set a flag instead of driving scroll_display here. Most
+        // write_input callers execute inside a `ui.input(…)` closure
+        // (which holds a read lock on egui's Context), and
+        // `scroll_display` can wake the alacritty listener, which
+        // calls `ctx.request_repaint()` → write lock → deadlock. The
+        // render loop drains this flag after ui.input releases.
+        self.pending_scroll_to_bottom
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Called by the render loop after `ui.input` closes, to snap the
+    /// viewport back to the live screen if the user typed this frame.
+    pub fn flush_scroll_to_bottom(&mut self) {
+        if self
+            .pending_scroll_to_bottom
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.term.lock().scroll_display(Scroll::Bottom);
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {

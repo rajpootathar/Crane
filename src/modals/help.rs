@@ -42,6 +42,9 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
             ("Cmd+/", "Toggle Right Panel"),
             ("Cmd+= / Cmd+-", "Increase / decrease font size"),
             ("Cmd+0", "Reset font size"),
+            ("F2 / Cmd+R", "Rename active Tab"),
+            ("Cmd+K", "Terminal: clear screen + scrollback"),
+            ("Shift+Tab", "Terminal: back-tab (CSI Z) for TUIs"),
             ("Ctrl+C / Ctrl+D", "Terminal: interrupt / EOF"),
         ];
         egui::Grid::new("shortcuts_grid")

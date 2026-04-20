@@ -336,11 +336,6 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                 cur_bg = Some(bg);
                 cur_underline = underline;
             }
-            // Sanitize control characters that would otherwise break
-            // galley layout. `\n` in particular was the smoking gun for
-            // the "ls rows appear continuous" bug — egui wraps internally
-            // on a newline, which collapses our row stride. `\t` / `\r`
-            // are equally wrong to emit verbatim; treat all as spaces.
             let ch = if is_wide_spacer {
                 ' '
             } else {
@@ -349,7 +344,27 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     c => c,
                 }
             };
-            buf.push(ch);
+            // Batched runs advance chars at egui's internal per-glyph
+            // stride, not `col_stride`. For plain ASCII those match (all
+            // glyphs are the same width as 'M'), but a non-ASCII cell
+            // (wide-char second half, Nerd-Font icons, □/▎/tofu fallback)
+            // renders via font-fallback with a different advance and
+            // shifts every subsequent char in the run. The cursor uses
+            // `col_stride * cursor_col`, so typed text lands at a
+            // different column than the cursor block. Fix: flush the run
+            // around the odd glyph and paint it in its own single-char
+            // galley pinned to `col * col_stride`, so only that one cell
+            // is potentially off (visually) while grid alignment resumes
+            // at col+1.
+            if ch.is_ascii() {
+                buf.push(ch);
+            } else {
+                flush(&mut buf, run_start_col, cur_fg, cur_bg, cur_underline, ui);
+                let mut tmp = String::new();
+                tmp.push(ch);
+                flush(&mut tmp, col, cur_fg, cur_bg, cur_underline, ui);
+                run_start_col = col + 1;
+            }
         }
         flush(&mut buf, run_start_col, cur_fg, cur_bg, cur_underline, ui);
     }
@@ -441,7 +456,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     // all keyboard/paste input routing so key events don't leak into
     // the PTY through the backdrop.
     let input_enabled = ui.is_enabled();
-    // Image paste: on macOS an NSEvent local monitor (mac_paste.rs)
+    // Image paste: on macOS an NSEvent local monitor (mac_keys.rs)
     // catches Cmd+V before winit sees it, reads NSPasteboard for
     // image data, writes it to a temp PNG, and enqueues the path.
     // Drain here so it flows into the active terminal as a normal
@@ -450,11 +465,30 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     // image clipboards without pushing any event.
     #[cfg(target_os = "macos")]
     if input_enabled && !other_widget_focused {
-        let mut paths = crate::mac_paste::drain_pending_image_paths();
+        let mut paths = crate::mac_keys::drain_pending_image_paths();
         if let Some(p) = paths.pop() {
             paste_text = Some(p);
         }
     }
+    // Tell the NSEvent monitor that the terminal has focus so it will
+    // swallow Shift+Tab (CSI Z). egui's focus navigator eats the key
+    // before our handler runs in-frame, so we intercept at the OS
+    // level. See `mac_keys.rs::set_terminal_focused`.
+    #[cfg(target_os = "macos")]
+    crate::mac_keys::set_terminal_focused(input_enabled && !other_widget_focused);
+
+    // Drain and write any Shift+Tab presses the NSEvent monitor caught.
+    #[cfg(target_os = "macos")]
+    if input_enabled && !other_widget_focused {
+        let count = crate::mac_keys::drain_pending_shift_tab();
+        for _ in 0..count {
+            terminal.write_input(b"\x1b[Z");
+        }
+    }
+
+    // Plain Tab still goes through the normal event path (egui doesn't
+    // eat plain Tab the way it eats Shift+Tab), handled in the main
+    // key-event loop below via `named_key_bytes`.
     if input_enabled { ui.input(|i| {
         for event in &i.events {
             match event {
@@ -497,6 +531,11 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     guard.selection = Some(sel);
                 }
                 egui::Event::Paste(text) => {
+                    // Another widget (tab-rename TextEdit, find bar, etc.)
+                    // owns focus — don't also paste into the PTY.
+                    if other_widget_focused {
+                        continue;
+                    }
                     if !text.is_empty() {
                         paste_text = Some(text.clone());
                     }
@@ -520,7 +559,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                         }
                     if modifiers.mac_cmd || modifiers.command {
                         // Image paste for Cmd+V is handled by
-                        // mac_paste.rs's NSEvent monitor, whose queue
+                        // mac_keys.rs's NSEvent monitor, whose queue
                         // is drained above. All other Cmd+key combos
                         // are swallowed so they don't echo to the PTY.
                         continue;
@@ -557,12 +596,25 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     }
                 }
                 egui::Event::Text(text) => {
+                    // Don't echo into the PTY while another widget
+                    // (tab-rename TextEdit, find bar, etc.) owns focus.
+                    // Without this guard, every typed char ends up in
+                    // both the rename box AND the terminal.
+                    if other_widget_focused {
+                        continue;
+                    }
                     terminal.write_input(text.as_bytes());
                 }
                 _ => {}
             }
         }
     }); }
+    // Safe to drive scroll_display now that ui.input's read lock on
+    // Context has released. write_input accumulates into a flag —
+    // drain it here so typing snaps the viewport back to the live
+    // screen without racing the alacritty listener → request_repaint
+    // → Context write-lock path.
+    terminal.flush_scroll_to_bottom();
     if let Some(t) = copy_text {
         ui.ctx().copy_text(t);
     }

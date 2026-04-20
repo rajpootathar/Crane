@@ -2,7 +2,7 @@
 mod browser;
 mod format;
 #[cfg(target_os = "macos")]
-mod mac_paste;
+mod mac_keys;
 mod git;
 mod lsp;
 mod modals;
@@ -55,7 +55,7 @@ fn main() -> eframe::Result {
             // fires right after window init, which is late enough.
             platform_menu::install();
             #[cfg(target_os = "macos")]
-            mac_paste::install_cmd_v_monitor();
+            mac_keys::install_cmd_v_monitor();
             Ok(Box::new(CraneApp::new(cc)))
         }),
     )
@@ -707,7 +707,7 @@ impl eframe::App for CraneApp {
             );
             let mut left_ui = ui.new_child(egui::UiBuilder::new().max_rect(left_rect));
             left_ui.set_clip_rect(left_rect);
-            ui::left::render(&mut left_ui, &mut self.app, &ctx);
+            ui::projects::render(&mut left_ui, &mut self.app, &ctx);
 
             // 6 px drag handle straddling the right edge of the Left Panel.
             let handle = egui::Rect::from_min_max(
@@ -742,7 +742,7 @@ impl eframe::App for CraneApp {
             );
             let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(right_rect));
             right_ui.set_clip_rect(right_rect);
-            ui::right::render(&mut right_ui, &mut self.app);
+            ui::explorer::render(&mut right_ui, &mut self.app);
 
             let handle = egui::Rect::from_min_max(
                 egui::pos2(right_rect.min.x - 3.0, right_rect.min.y),
@@ -896,6 +896,7 @@ impl eframe::App for CraneApp {
             load_fonts(&ctx, self.app.custom_mono_font.as_deref());
         }
         self.render_confirm_close(&ctx);
+        modals::render_confirm_remove_worktree(&ctx, &mut self.app);
         render_lsp_install_prompt(&ctx, &mut self.app);
         render_lsp_download_toast(&ctx, &self.app);
         self.app.update_check.drain();
