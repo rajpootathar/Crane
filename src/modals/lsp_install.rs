@@ -7,6 +7,14 @@ use egui::RichText;
 /// "Install" triggers an auto-download into `~/.crane/lsp/<name>/`, "Not now"
 /// suppresses the prompt for this session.
 pub fn render(ctx: &egui::Context, app: &mut App) {
+    // Global opt-out: if the user previously clicked "Never ask for any
+    // language", clear any queued prompt and don't render anything.
+    if app.lsp_install_prompts_disabled {
+        if app.lsp.prompt_install.is_some() {
+            app.lsp.decline_install();
+        }
+        return;
+    }
     let Some(key) = app.lsp.prompt_install else {
         return;
     };
@@ -15,6 +23,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     let mut accept = false;
     let mut decline = false;
     let mut never_ask = false;
+    let mut never_ask_all = false;
 
     egui::Window::new("Install language server?")
         .collapsible(false)
@@ -51,10 +60,13 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                 if ui.button("Never ask again").clicked() {
                     never_ask = true;
                 }
+                if ui.button("Never ask for any language").clicked() {
+                    never_ask_all = true;
+                }
             });
             ui.add_space(8.0);
             ui.label(
-                RichText::new("\"Not now\" hides for this session. \"Never ask again\" disables this language server — re-enable from Settings > Language Servers.")
+                RichText::new("\"Not now\" hides for this session. \"Never ask again\" disables this one language server. \"Never ask for any language\" suppresses the prompt for all of them. Re-enable from Settings > Language Servers.")
                     .size(10.5)
                     .italics()
                     .color(theme::current().text_muted.to_color32()),
@@ -70,6 +82,10 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         let mut cfg = app.language_configs.get_or_default(key);
         cfg.enabled = false;
         app.language_configs.set(key, cfg);
+        let _ = crate::state::settings::Settings::from_app(app).save();
+    } else if never_ask_all {
+        app.lsp.decline_install();
+        app.lsp_install_prompts_disabled = true;
         let _ = crate::state::settings::Settings::from_app(app).save();
     }
 }

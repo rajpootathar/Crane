@@ -274,6 +274,9 @@ pub struct App {
     pub editor_trim_on_save: bool,
     pub lsp: crate::lsp::LspManager,
     pub language_configs: crate::lsp::LanguageConfigs,
+    /// Global opt-out for the LSP install prompt. Set by "Never ask for
+    /// any language" in the install modal; persisted in settings.json.
+    pub lsp_install_prompts_disabled: bool,
     pub branch_picker: BranchPickerState,
     /// (project, workspace, tab, edit buffer) of the tab currently in
     /// inline rename mode. Set on double-click; committed on Enter /
@@ -342,6 +345,7 @@ impl App {
             right_panel_w: 300.0,
             lsp: crate::lsp::LspManager::new(),
             language_configs: crate::lsp::LanguageConfigs::default(),
+            lsp_install_prompts_disabled: false,
             branch_picker: BranchPickerState::default(),
             renaming_tab: None,
             renaming_workspace: None,

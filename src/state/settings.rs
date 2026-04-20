@@ -37,6 +37,8 @@ pub struct Settings {
     pub right_tab_files: bool, // serialized as bool to stay stable across enum changes
     #[serde(default)]
     pub language_configs: LanguageConfigs,
+    #[serde(default)]
+    pub lsp_install_prompts_disabled: bool,
 }
 
 fn default_theme_name() -> String {
@@ -74,6 +76,7 @@ impl Default for Settings {
             show_right: true,
             right_tab_files: false,
             language_configs: LanguageConfigs::default(),
+            lsp_install_prompts_disabled: false,
         }
     }
 }
@@ -120,6 +123,7 @@ impl Settings {
             show_right: app.show_right,
             right_tab_files: matches!(app.right_tab, RightTab::Files),
             language_configs: app.language_configs.clone(),
+            lsp_install_prompts_disabled: app.lsp_install_prompts_disabled,
         }
     }
 
@@ -142,5 +146,6 @@ impl Settings {
             RightTab::Changes
         };
         app.language_configs = self.language_configs;
+        app.lsp_install_prompts_disabled = self.lsp_install_prompts_disabled;
     }
 }
