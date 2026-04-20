@@ -464,6 +464,9 @@ fn render_about(ui: &mut egui::Ui, app: &mut App) {
             let _ = webbrowser::open("https://github.com/rajpootathar/Crane/releases");
         }
         if ui.button("Check for updates").clicked() {
+            app.update_check.dismissed_this_session = None;
+            app.update_check.available = None;
+            app.update_check.manual_check = true;
             app.update_check.spawn_check(ui.ctx().clone());
         }
     });

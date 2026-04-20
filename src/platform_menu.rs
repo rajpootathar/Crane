@@ -14,6 +14,7 @@ mod mac {
     /// Stable ids we match against in the poll loop.
     pub const ID_SETTINGS: &str = "crane.settings";
     pub const ID_SHORTCUTS: &str = "crane.shortcuts";
+    pub const ID_CHECK_UPDATES: &str = "crane.check_updates";
 
     // muda::Menu wraps an Rc internally and isn't Sync — can't live in
     // a static. We Box::leak after init (menu must outlive the app
@@ -38,6 +39,12 @@ mod mac {
                     version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     ..Default::default()
                 }),
+            ),
+            &MenuItem::with_id(
+                MenuId::new(ID_CHECK_UPDATES),
+                "Check for Updates…",
+                true,
+                None,
             ),
             &PredefinedMenuItem::separator(),
             // `Settings…` with the canonical Cmd+, shortcut so macOS
@@ -123,3 +130,6 @@ pub const ID_SETTINGS: &str = "crane.settings";
 
 #[cfg(not(target_os = "macos"))]
 pub const ID_SHORTCUTS: &str = "crane.shortcuts";
+
+#[cfg(not(target_os = "macos"))]
+pub const ID_CHECK_UPDATES: &str = "crane.check_updates";

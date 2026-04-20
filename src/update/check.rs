@@ -25,6 +25,8 @@ pub struct UpdateCheck {
     pub available: Option<AvailableUpdate>,
     pub prompts: HashMap<String, PromptState>,
     pub dismissed_this_session: Option<String>,
+    pub manual_check: bool,
+    pub manual_result_seen: bool,
     rx: Option<Receiver<Option<AvailableUpdate>>>,
 }
 
@@ -34,6 +36,8 @@ impl UpdateCheck {
             available: None,
             prompts,
             dismissed_this_session: None,
+            manual_check: false,
+            manual_result_seen: true,
             rx: None,
         }
     }
@@ -56,6 +60,9 @@ impl UpdateCheck {
             && let Ok(result) = rx.try_recv() {
                 self.available = result;
                 self.rx = None;
+                if self.manual_check {
+                    self.manual_result_seen = false;
+                }
             }
     }
 
@@ -63,6 +70,9 @@ impl UpdateCheck {
         let Some(update) = &self.available else {
             return false;
         };
+        if self.manual_check {
+            return true;
+        }
         if self
             .dismissed_this_session
             .as_deref()

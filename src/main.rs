@@ -306,6 +306,12 @@ impl eframe::App for CraneApp {
             match id.as_str() {
                 platform_menu::ID_SETTINGS => self.app.show_settings = true,
                 platform_menu::ID_SHORTCUTS => self.app.show_help = true,
+                platform_menu::ID_CHECK_UPDATES => {
+                    self.app.update_check.dismissed_this_session = None;
+                    self.app.update_check.available = None;
+                    self.app.update_check.manual_check = true;
+                    self.app.update_check.spawn_check(ctx.clone());
+                }
                 _ => {}
             }
         }

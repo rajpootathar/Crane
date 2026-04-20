@@ -38,6 +38,9 @@ fn human_bytes(n: u64) -> String {
 
 pub fn render(ctx: &egui::Context, app: &mut App) {
     if !app.update_check.should_show() {
+        if app.update_check.manual_check && !app.update_check.manual_result_seen {
+            render_up_to_date(ctx, app);
+        }
         return;
     }
     let version = app
@@ -189,4 +192,54 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                     }
                 });
         });
+}
+
+fn render_up_to_date(ctx: &egui::Context, app: &mut App) {
+    let theme = crate::theme::current();
+    let screen = ctx.content_rect();
+    let toast_w = 320.0_f32.min(screen.width() - 40.0);
+    egui::Area::new(egui::Id::new("update_toast_uptodate"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(egui::pos2(
+            screen.max.x - toast_w - 20.0,
+            screen.max.y - 90.0,
+        ))
+        .show(ctx, |ui| {
+            egui::Frame::default()
+                .fill(theme.surface.to_color32())
+                .stroke(egui::Stroke::new(1.0, theme.border.to_color32()))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_width(toast_w - 24.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(egui_phosphor::regular::CHECK_CIRCLE)
+                                .size(16.0)
+                                .color(theme.success.to_color32()),
+                        );
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "You're up to date (v{})",
+                                    env!("CARGO_PKG_VERSION")
+                                ))
+                                .size(12.5)
+                                .color(theme.text.to_color32())
+                                .strong(),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button(egui::RichText::new(egui_phosphor::regular::X).size(11.0))
+                                .clicked()
+                            {
+                                app.update_check.manual_result_seen = true;
+                                app.update_check.manual_check = false;
+                            }
+                        });
+                    });
+                });
+        });
+    ctx.request_repaint_after(std::time::Duration::from_secs(6));
 }
