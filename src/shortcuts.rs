@@ -14,17 +14,25 @@ pub fn handle(
     // When any modal is open, Cmd+W closes the modal instead of the
     // pane underneath. Also absorb Escape. Everything else falls
     // through so Cmd+S etc. still work inside modals.
+    //
+    // Consume the key (not just peek) — otherwise the raw keypress
+    // leaks down to the terminal view's event handler, which turns
+    // Escape into `\x1b` (killing e.g. a running `claude` CLI) and
+    // Cmd+W into a literal character, all while the user thinks they
+    // just dismissed a modal.
     let modal_open = app.show_settings
         || app.show_help
         || app.new_workspace_modal.is_some()
+        || app.pending_remove_worktree.is_some()
+        || app.pending_close_tab.is_some()
+        || !app.missing_project_modals.is_empty()
         || pending_close.is_some();
     if modal_open {
-        let (cmd_w, esc) = ctx.input(|i| {
-            let cmd = i.modifiers.command || i.modifiers.mac_cmd;
-            (
-                cmd && i.key_pressed(egui::Key::W),
-                i.key_pressed(egui::Key::Escape),
-            )
+        let (cmd_w, esc) = ctx.input_mut(|i| {
+            let cmd_w = i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)
+                || i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::W);
+            let esc = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+            (cmd_w, esc)
         });
         if cmd_w || esc {
             if app.show_settings {
@@ -35,6 +43,15 @@ pub fn handle(
             }
             if esc && app.new_workspace_modal.is_some() {
                 app.new_workspace_modal = None;
+            }
+            if esc && app.pending_remove_worktree.is_some() {
+                app.pending_remove_worktree = None;
+            }
+            if esc && app.pending_close_tab.is_some() {
+                app.pending_close_tab = None;
+            }
+            if esc && !app.missing_project_modals.is_empty() {
+                app.missing_project_modals.clear();
             }
             if esc && pending_close.is_some() {
                 *pending_close = None;

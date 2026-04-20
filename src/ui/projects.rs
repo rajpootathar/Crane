@@ -150,7 +150,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             active_bar: false,
                             badge: None,
                             trailing_count: 0,
-                            tree_guides: false,
+                            tree_guides: false, checkbox: None,
                         },
                     );
                 }
@@ -169,7 +169,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         active_bar: false,
                         badge: None,
                         trailing_count: 2,
-                        tree_guides: in_group,
+                        tree_guides: in_group, checkbox: None,
                     },
                 );
                 let project_trailing = draw_trailing(
@@ -304,7 +304,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 active_bar: active_wt,
                                 badge,
                                 trailing_count: 1,
-                                tree_guides: in_group,
+                                tree_guides: in_group, checkbox: None,
                             },
                         );
                         let wt_trailing = draw_trailing(
@@ -445,7 +445,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                         active_bar: is_active,
                                         badge: None,
                                         trailing_count: 1,
-                                        tree_guides: in_group,
+                                        tree_guides: in_group, checkbox: None,
                                     },
                                 );
                                 let tab_trailing = draw_trailing(

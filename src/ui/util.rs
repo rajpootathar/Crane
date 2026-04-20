@@ -119,12 +119,23 @@ pub struct RowConfig<'a> {
     /// give the multi-repo Project tree a file-explorer feel without
     /// affecting flat lists elsewhere. Default off.
     pub tree_guides: bool,
+    /// When `Some(checked)`, render a persistent checkbox just after the
+    /// expand chevron. Click on the checkbox is reported in
+    /// `RowResult::checkbox_clicked`; click anywhere else still fires
+    /// `main_clicked`. Used by the Changes tree for JetBrains-style
+    /// stage / unstage toggles.
+    pub checkbox: Option<bool>,
 }
 
 pub struct RowResult {
     pub rect: Rect,
     pub main_clicked: bool,
     pub hovered: bool,
+    /// True when the user clicked the checkbox rendered by
+    /// `RowConfig::checkbox`. `main_clicked` stays false in that case so
+    /// callers can dispatch stage/unstage without also triggering the
+    /// row's primary action (e.g. open diff).
+    pub checkbox_clicked: bool,
     /// Response for the row's click-sense rect. Used by callers that need
     /// `.context_menu(...)` for right-click actions.
     pub response: Response,
@@ -137,15 +148,22 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     let painter = ui.painter_at(rect);
     let hovered = response.hovered();
 
-    let bg = if cfg.is_active {
-        row_active()
-    } else if hovered {
-        row_hover()
-    } else {
-        Color32::TRANSPARENT
-    };
-    if bg != Color32::TRANSPARENT {
-        painter.rect_filled(rect.shrink2(Vec2::new(4.0, 1.0)), 4.0, bg);
+    // Smooth hover fade — 90 ms ease so the tint doesn't flicker as the
+    // pointer sweeps through the list. `animate_bool_with_time` returns
+    // 0..1, which we use as alpha multiplier on the hover tint.
+    let hover_id = response.id.with("row_hover_t");
+    let hover_t = ui.ctx().animate_bool_with_time(hover_id, hovered, 0.09);
+    if cfg.is_active {
+        painter.rect_filled(rect.shrink2(Vec2::new(4.0, 1.0)), 4.0, row_active());
+    } else if hover_t > 0.01 {
+        let base = row_hover();
+        let faded = Color32::from_rgba_unmultiplied(
+            base.r(),
+            base.g(),
+            base.b(),
+            (base.a() as f32 * hover_t) as u8,
+        );
+        painter.rect_filled(rect.shrink2(Vec2::new(4.0, 1.0)), 4.0, faded);
     }
     if cfg.active_bar {
         painter.rect_filled(
@@ -175,20 +193,105 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     let mut cursor_x = rect.min.x + 12.0 + (cfg.depth as f32 * INDENT_W);
 
     if let Some(expanded) = cfg.expanded {
-        let glyph = if expanded {
-            icons::CARET_DOWN
-        } else {
-            icons::CARET_RIGHT
+        // Animate the caret glyph swap with a ~110 ms cross-fade so
+        // expand/collapse feels continuous instead of jumping.
+        let chev_id = response.id.with("row_chev_t");
+        let t = ui.ctx().animate_bool_with_time(chev_id, expanded, 0.11);
+        let col_base = if cfg.is_active { text() } else { muted() };
+        let fade = |c: Color32, alpha: f32| -> Color32 {
+            Color32::from_rgba_unmultiplied(
+                c.r(),
+                c.g(),
+                c.b(),
+                (c.a() as f32 * alpha.clamp(0.0, 1.0)) as u8,
+            )
         };
-        painter.text(
-            Pos2::new(cursor_x + CHEVRON_W / 2.0, rect.center().y),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            if cfg.is_active { text() } else { muted() },
-        );
+        if t < 0.999 {
+            painter.text(
+                Pos2::new(cursor_x + CHEVRON_W / 2.0, rect.center().y),
+                egui::Align2::CENTER_CENTER,
+                icons::CARET_RIGHT,
+                egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                fade(col_base, 1.0 - t),
+            );
+        }
+        if t > 0.001 {
+            painter.text(
+                Pos2::new(cursor_x + CHEVRON_W / 2.0, rect.center().y),
+                egui::Align2::CENTER_CENTER,
+                icons::CARET_DOWN,
+                egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                fade(col_base, t),
+            );
+        }
     }
     cursor_x += CHEVRON_W + 2.0;
+
+    // Optional persistent checkbox. The row itself was already
+    // allocated with `click_and_drag`, so a fresh `ui.interact` here
+    // loses to the row for hover + click. Use `rect_contains_pointer`
+    // + primary-click detection so the checkbox can paint its own
+    // hover state and steal the click from the row reliably.
+    let mut checkbox_clicked = false;
+    if let Some(checked) = cfg.checkbox {
+        let cb_rect = Rect::from_min_size(
+            Pos2::new(cursor_x, rect.center().y - 9.0),
+            Vec2::splat(18.0),
+        );
+        let pointer_over = ui.rect_contains_pointer(cb_rect);
+        // Hover background fades in over 80 ms — same feel as the row
+        // tint, just scoped to the checkbox square.
+        let cb_hover_id = response.id.with("row_cb_hover_t");
+        let cb_hover_t = ui.ctx().animate_bool_with_time(cb_hover_id, pointer_over, 0.08);
+        if cb_hover_t > 0.01 {
+            let base = trailing_hover();
+            let faded = Color32::from_rgba_unmultiplied(
+                base.r(), base.g(), base.b(),
+                (base.a() as f32 * cb_hover_t) as u8,
+            );
+            painter.rect_filled(cb_rect, 4.0, faded);
+        }
+        if pointer_over {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            if ui.input(|i| i.pointer.primary_clicked()) {
+                checkbox_clicked = true;
+            }
+        }
+        // Cross-fade between the empty box and the filled check so the
+        // state change reads as a transition, not a glyph swap. 130 ms
+        // is long enough to notice, short enough to feel responsive.
+        let cb_state_id = response.id.with("row_cb_state_t");
+        let state_t = ui.ctx().animate_bool_with_time(cb_state_id, checked, 0.13);
+        let fade = |c: Color32, a: f32| -> Color32 {
+            Color32::from_rgba_unmultiplied(
+                c.r(), c.g(), c.b(),
+                (c.a() as f32 * a.clamp(0.0, 1.0)) as u8,
+            )
+        };
+        // A tiny scale pop when state_t is mid-transition — peaks at
+        // 0.5 and returns to 1.0 at both ends.
+        let pop = 1.0 + (state_t * std::f32::consts::PI).sin() * 0.12;
+        let font_size = 14.0 * pop;
+        if state_t < 0.999 {
+            painter.text(
+                cb_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icons::SQUARE,
+                egui::FontId::new(font_size, egui::FontFamily::Proportional),
+                fade(muted(), 1.0 - state_t),
+            );
+        }
+        if state_t > 0.001 {
+            painter.text(
+                cb_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icons::CHECK_SQUARE,
+                egui::FontId::new(font_size, egui::FontFamily::Proportional),
+                fade(accent(), state_t),
+            );
+        }
+        cursor_x += 20.0;
+    }
 
     if let Some(leading) = cfg.leading {
         let color = cfg.leading_color.unwrap_or(muted());
@@ -248,11 +351,14 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
-    let main_clicked = response.clicked();
+    // Swallow the main click when it landed on the checkbox so the row
+    // doesn't fire its default action at the same time.
+    let main_clicked = response.clicked() && !checkbox_clicked;
     RowResult {
         rect,
         main_clicked,
         hovered,
+        checkbox_clicked,
         response,
     }
 }

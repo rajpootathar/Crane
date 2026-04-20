@@ -1,7 +1,7 @@
 use crate::git::{self, FileChange};
 use crate::state::{App, RightTab};
 use crate::ui::util::{
-    draw_row, draw_trailing, section_header,
+    draw_row, section_header,
     RowConfig, accent, muted, text,
 };
 use egui::{Color32, RichText};
@@ -580,6 +580,10 @@ fn render_change_node(
         }
         let key = format!("{section}:{child_prefix}");
         let is_collapsed = collapsed.contains(&key);
+        // Folder checkbox mirrors the section: in a STAGED tree it's
+        // always checked (since every file under it is staged), in an
+        // UNSTAGED / UNTRACKED tree it's always unchecked. Click flips
+        // every file in the subtree.
         let row = draw_row(
             ui,
             RowConfig {
@@ -592,26 +596,12 @@ fn render_change_node(
                 is_active: false,
                 active_bar: false,
                 badge: None,
-                trailing_count: 1,
-                        tree_guides: false,
+                trailing_count: 0,
+                tree_guides: false,
+                checkbox: Some(staged),
             },
         );
-        // Folder-level stage / unstage — applies to every changed file
-        // under this subtree. Saves a click per file when the user
-        // wants to stage an entire module at once.
-        let folder_icon = if staged { icons::MINUS } else { icons::PLUS };
-        let folder_tip = if staged {
-            "Unstage all in folder"
-        } else {
-            "Stage all in folder"
-        };
-        let folder_flags = draw_trailing(
-            ui,
-            row.rect,
-            row.hovered,
-            &[(folder_icon, folder_tip, 0)],
-        );
-        if folder_flags[0] {
+        if row.checkbox_clicked {
             let mut paths = Vec::new();
             collect_paths(child, &mut paths);
             if staged {
@@ -672,19 +662,12 @@ fn render_change_node(
                 is_active: false,
                 active_bar: false,
                 badge: None,
-                trailing_count: 1,
-                        tree_guides: false,
+                trailing_count: 0,
+                tree_guides: false,
+                checkbox: Some(staged),
             },
         );
-        let trailing_icon = if staged { icons::MINUS } else { icons::PLUS };
-        let trailing_tip = if staged { "Unstage" } else { "Stage" };
-        let flags = draw_trailing(
-            ui,
-            row.rect,
-            row.hovered,
-            &[(trailing_icon, trailing_tip, 0)],
-        );
-        if flags[0] {
+        if row.checkbox_clicked {
             if staged {
                 unstage_paths.push(change.path.clone());
             } else {
@@ -807,7 +790,7 @@ fn render_fs_dir(
                 active_bar: false,
                 badge: None,
                 trailing_count: 0,
-                        tree_guides: false,
+                        tree_guides: false, checkbox: None,
             },
         );
         if row.main_clicked {

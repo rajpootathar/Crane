@@ -58,7 +58,9 @@ pub fn render(ctx: &egui::Context, app: &mut App) -> bool {
     let cmd_held = crate::mac_keys::is_cmd_held();
     #[cfg(not(target_os = "macos"))]
     let cmd_held = ctx.input(|i| i.modifiers.mac_cmd || i.modifiers.command);
-    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    // Consume so Escape doesn't leak past the overlay into the
+    // terminal (where \x1b would cancel whatever's running).
+    let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     // Keep the frame loop ticking while the overlay is open so Cmd
     // release is observed promptly even if the user isn't moving the
     // mouse.
