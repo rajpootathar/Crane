@@ -305,6 +305,59 @@ pub fn find_git_root(start: &Path) -> Option<PathBuf> {
 /// Discover all `.git` roots under `start`, capped by depth to avoid
 /// walking into `node_modules` / `target` / huge submodule trees.
 /// Always includes `start` itself if it's a repo.
+/// True when `path` is tracked by `repo` as a git submodule. Uses
+/// `git submodule status --recursive` and matches against the absolute
+/// submodule paths. Submodules share commits with the parent repo, so
+/// treating them as separate Projects would show them twice in the UI.
+pub fn is_submodule(repo: &Path, path: &Path) -> bool {
+    let out = match Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["submodule", "status", "--recursive"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        // Format: " <sha> <path> (<describe>)"; leading char may be
+        // '-' (uninit), '+' (different sha), 'U' (merge conflict).
+        let rest = line.get(1..).unwrap_or("").trim_start();
+        let mut parts = rest.splitn(3, ' ');
+        let _sha = parts.next();
+        let sub_path = match parts.next() {
+            Some(p) => p,
+            None => continue,
+        };
+        let abs = repo.join(sub_path);
+        if abs == path || abs.canonicalize().ok() == path.canonicalize().ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `path` is ignored by `repo`'s gitignore rules. Uses
+/// `git check-ignore`, which exits 0 when ignored, 1 when not. Used to
+/// decide whether a nested `.git` inside a parent repo should surface
+/// as its own Sub-project: submodules stay hidden, but gitignored
+/// siblings (e.g. cloned external repos dropped into a monorepo) get
+/// promoted.
+pub fn is_path_ignored(repo: &Path, path: &Path) -> bool {
+    let rel = path.strip_prefix(repo).unwrap_or(path);
+    let Some(rel_str) = rel.to_str() else {
+        return false;
+    };
+    let out = Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["check-ignore", "-q", "--"])
+        .arg(rel_str)
+        .output();
+    matches!(out, Ok(o) if o.status.code() == Some(0))
+}
+
 pub fn discover_repos(start: &Path, max_depth: usize) -> Vec<PathBuf> {
     fn skip(name: &str) -> bool {
         matches!(

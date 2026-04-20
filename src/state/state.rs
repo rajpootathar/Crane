@@ -414,34 +414,65 @@ impl App {
             return None;
         }
 
-        // If the added folder isn't itself a git repo but contains nested
-        // repos, create one Project per discovered repo and group them
-        // under the original folder. This lets users add a monorepo root
-        // or a workspace directory and get every sub-repo as a peer
-        // Sub-project with its own branches / worktrees / tabs.
+        // Auto-discover nested git repos under `path`. The discovery
+        // rules differ based on whether `path` itself is a repo:
+        //
+        // * `path` is NOT a repo: promote every discovered `.git` root
+        //   as a Sub-project. Matches the monorepo-of-clones case.
+        // * `path` IS a repo: only promote nested `.git` roots that are
+        //   gitignored AND not submodules — those are user-cloned
+        //   siblings the parent doesn't track. Submodules share history
+        //   with the parent so we keep them invisible here.
         let path_is_repo = path.join(".git").exists();
-        if !path_is_repo {
-            let roots = git::discover_repos(&path, 5);
-            if !roots.is_empty() {
-                let group_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("group")
-                    .to_string();
-                let mut first_id: Option<ProjectId> = None;
-                for root in roots {
-                    let id = self.add_single_project(
-                        root,
-                        Some(path.clone()),
-                        Some(group_name.clone()),
-                        ctx,
-                    );
-                    if first_id.is_none() {
-                        first_id = id;
-                    }
-                }
-                return first_id;
+        let all_roots = git::discover_repos(&path, 5);
+        let nested: Vec<_> = all_roots
+            .iter()
+            .filter(|r| r.as_path() != path.as_path())
+            .cloned()
+            .collect();
+
+        let siblings: Vec<std::path::PathBuf> = if path_is_repo {
+            nested
+                .into_iter()
+                .filter(|nr| {
+                    git::is_path_ignored(&path, nr) && !git::is_submodule(&path, nr)
+                })
+                .collect()
+        } else {
+            nested
+        };
+
+        if !siblings.is_empty() {
+            let group_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("group")
+                .to_string();
+            let mut first_id: Option<ProjectId> = None;
+            // Include the parent itself as a Sub-project sibling when
+            // it's a real repo, so its own branches / Commit UI still
+            // work alongside the ignored children.
+            if path_is_repo {
+                let id = self.add_single_project(
+                    path.clone(),
+                    Some(path.clone()),
+                    Some(group_name.clone()),
+                    ctx,
+                );
+                first_id = id;
             }
+            for root in siblings {
+                let id = self.add_single_project(
+                    root,
+                    Some(path.clone()),
+                    Some(group_name.clone()),
+                    ctx,
+                );
+                if first_id.is_none() {
+                    first_id = id;
+                }
+            }
+            return first_id;
         }
 
         self.add_single_project(path, None, None, ctx)
