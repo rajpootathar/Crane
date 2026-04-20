@@ -72,6 +72,10 @@ pub struct SProject {
     pub preferred_location_mode: Option<String>,
     #[serde(default)]
     pub preferred_custom_path: Option<String>,
+    #[serde(default)]
+    pub group_path: Option<PathBuf>,
+    #[serde(default)]
+    pub group_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -226,6 +230,8 @@ impl Session {
                 last_active_workspace: p.last_active_workspace,
                 preferred_location_mode: p.preferred_location_mode.map(|m| m.as_str().to_string()),
                 preferred_custom_path: p.preferred_custom_path.clone(),
+                group_path: p.group_path.clone(),
+                group_name: p.group_name.clone(),
             });
         }
 
@@ -312,6 +318,8 @@ impl Session {
                     .as_deref()
                     .and_then(crate::state::LocationMode::parse),
                 preferred_custom_path: sp.preferred_custom_path,
+                group_path: sp.group_path,
+                group_name: sp.group_name,
             });
             if missing {
                 app.missing_project_modals.push(sp.id);

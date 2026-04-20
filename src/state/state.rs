@@ -54,6 +54,14 @@ pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub path: PathBuf,
+    /// When the user added a folder that wasn't a git repo but
+    /// contained nested repos, Crane creates one Project per discovered
+    /// `.git` root and groups them under the original folder. These
+    /// fields identify the shared parent so the Left Panel can render a
+    /// single collapsible group header above the sibling Projects.
+    /// `None` for top-level Projects added directly.
+    pub group_path: Option<PathBuf>,
+    pub group_name: Option<String>,
     /// True when the folder on disk was missing the last time we
     /// looked. Git / LSP / new-tab / worktree-add all no-op on missing
     /// projects; the user sees a "Project Not Found" modal offering
@@ -405,6 +413,47 @@ impl App {
         if !path.is_dir() {
             return None;
         }
+
+        // If the added folder isn't itself a git repo but contains nested
+        // repos, create one Project per discovered repo and group them
+        // under the original folder. This lets users add a monorepo root
+        // or a workspace directory and get every sub-repo as a peer
+        // Sub-project with its own branches / worktrees / tabs.
+        let path_is_repo = path.join(".git").exists();
+        if !path_is_repo {
+            let roots = git::discover_repos(&path, 5);
+            if !roots.is_empty() {
+                let group_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("group")
+                    .to_string();
+                let mut first_id: Option<ProjectId> = None;
+                for root in roots {
+                    let id = self.add_single_project(
+                        root,
+                        Some(path.clone()),
+                        Some(group_name.clone()),
+                        ctx,
+                    );
+                    if first_id.is_none() {
+                        first_id = id;
+                    }
+                }
+                return first_id;
+            }
+        }
+
+        self.add_single_project(path, None, None, ctx)
+    }
+
+    fn add_single_project(
+        &mut self,
+        path: PathBuf,
+        group_path: Option<PathBuf>,
+        group_name: Option<String>,
+        ctx: &egui::Context,
+    ) -> Option<ProjectId> {
         let id = self.next_project;
         self.next_project += 1;
         let name = path
@@ -458,6 +507,8 @@ impl App {
             id,
             name,
             path,
+            group_path,
+            group_name,
             missing: false,
             workspaces,
             expanded: true,
@@ -465,7 +516,9 @@ impl App {
             preferred_location_mode: None,
             preferred_custom_path: None,
         });
-        if let Some((wt, tab)) = first_active {
+        if let Some((wt, tab)) = first_active
+            && self.active.is_none()
+        {
             self.active = Some((id, wt, tab));
             self.last_workspace = Some((id, wt));
         }

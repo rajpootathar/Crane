@@ -1,6 +1,6 @@
 use crate::state::App;
 use crate::ui::util::{
-    accent, draw_row, draw_trailing, full_width_primary_button, RowConfig,
+    accent, draw_row, draw_trailing, full_width_primary_button, muted, RowConfig,
 };
 use egui::{Color32, Pos2, Rect, RichText, Stroke};
 use egui_phosphor::regular as icons;
@@ -109,11 +109,40 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         .id_salt("left_projects")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let mut last_group: Option<std::path::PathBuf> = None;
             for project in &app.projects {
+                // Render a group header row whenever we enter a new
+                // group. Projects without a group render flush-left as
+                // before; grouped Projects nest one level deeper under
+                // their shared folder name.
+                let in_group = project.group_path.is_some();
+                if in_group && project.group_path != last_group {
+                    let group_name = project
+                        .group_name
+                        .clone()
+                        .unwrap_or_else(|| "group".into());
+                    draw_row(
+                        ui,
+                        RowConfig {
+                            depth: 0,
+                            expanded: Some(true),
+                            leading: Some(icons::FOLDER),
+                            leading_color: Some(muted()),
+                            label: &group_name,
+                            label_color: Some(muted()),
+                            is_active: false,
+                            active_bar: false,
+                            badge: None,
+                            trailing_count: 0,
+                        },
+                    );
+                }
+                last_group = project.group_path.clone();
+                let project_depth = if in_group { 1 } else { 0 };
                 let row = draw_row(
                     ui,
                     RowConfig {
-                        depth: 0,
+                        depth: project_depth,
                         expanded: Some(project.expanded),
                         leading: Some(icons::CUBE),
                         leading_color: Some(accent()),
