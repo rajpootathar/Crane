@@ -332,6 +332,28 @@ impl eframe::App for CraneApp {
         if !switcher_consumed {
             shortcuts::handle(&ctx, &mut self.app, &mut self.pending_close);
         }
+        // Shell exited (user typed `exit`, Ctrl-D, kill, etc.) — close
+        // any Terminal panes whose PTY reader hit EOF. No confirm prompt:
+        // the process is already gone.
+        if let Some(ws) = self.app.active_layout() {
+            let dead: Vec<_> = ws
+                .panes
+                .iter()
+                .filter_map(|(id, pane)| {
+                    if let state::layout::PaneContent::Terminal(t) = &pane.content
+                        && !t.is_alive()
+                    {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for id in dead {
+                ws.focus = Some(id);
+                ws.close_focused();
+            }
+        }
         self.app.refresh_active_git_status(&ctx);
         #[cfg(target_os = "macos")]
         {

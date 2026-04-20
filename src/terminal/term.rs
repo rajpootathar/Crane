@@ -91,6 +91,16 @@ pub struct Terminal {
     /// `flush_scroll_to_bottom` after ui.input releases to avoid a
     /// deadlock against egui's Context lock.
     pending_scroll_to_bottom: std::sync::atomic::AtomicBool,
+    /// False once the PTY reader has hit EOF / error — i.e. the shell
+    /// process exited (user typed `exit`, Ctrl-D, was killed, etc.).
+    /// UI polls this each frame and closes the owning Pane.
+    alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Terminal {
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Terminal {
@@ -209,9 +219,11 @@ impl Terminal {
             guard.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
         }
 
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let term_clone = term.clone();
         let history_clone = history.clone();
         let ctx_clone = ctx.clone();
+        let alive_clone = alive.clone();
         thread::spawn(move || {
             let mut reader = reader;
             let mut processor: Processor<StdSyncHandler> = Processor::new();
@@ -238,6 +250,8 @@ impl Terminal {
                     Err(_) => break,
                 }
             }
+            alive_clone.store(false, std::sync::atomic::Ordering::Relaxed);
+            ctx_clone.request_repaint();
         });
 
         Ok(Self {
@@ -253,6 +267,7 @@ impl Terminal {
             shell_pid,
             pty_replies,
             pending_scroll_to_bottom: std::sync::atomic::AtomicBool::new(false),
+            alive,
         })
     }
 

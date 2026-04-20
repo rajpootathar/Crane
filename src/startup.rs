@@ -87,24 +87,40 @@ pub fn load_app_icon() -> Option<egui::IconData> {
 }
 
 /// JetBrains Mono Regular — bundled (~264 KB). OFL 1.1 licensed.
-/// Default Monospace font because egui's built-in Hack doesn't cover
-/// braille patterns (U+2800–U+28FF) or block elements, which breaks
-/// TUI apps like nvitop / btop / htop that draw with those glyphs.
+/// Primary Monospace font for aesthetics.
 const JETBRAINS_MONO_TTF: &[u8] =
     include_bytes!("../assets/JetBrainsMono-Regular.ttf");
+
+/// Cascadia Mono Regular — bundled (~562 KB). OFL 1.1 licensed.
+/// Registered as a fallback AFTER JetBrains Mono so egui's per-glyph
+/// lookup falls through to it for codepoints JBM lacks. Crucially,
+/// JBM has no Braille patterns (U+2800–U+28FF), which breaks sparkline
+/// rendering in TUI apps like nvitop / btop. Cascadia Mono covers
+/// Braille, block elements, shade, and box-drawing — filling the gap
+/// without changing the default look of ASCII code / UI text.
+const CASCADIA_MONO_TTF: &[u8] =
+    include_bytes!("../assets/CascadiaMono-Regular.ttf");
 
 pub fn load_fonts(ctx: &egui::Context, custom_mono: Option<&str>) {
     let mut fonts = egui::FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
 
-    // Install JetBrains Mono first — braille / box-drawing / blocks
-    // give us correct TUI rendering out of the box.
     fonts.font_data.insert(
         "jetbrains_mono".to_string(),
         std::sync::Arc::new(egui::FontData::from_static(JETBRAINS_MONO_TTF)),
     );
+    fonts.font_data.insert(
+        "cascadia_mono".to_string(),
+        std::sync::Arc::new(egui::FontData::from_static(CASCADIA_MONO_TTF)),
+    );
     if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
         mono.insert(0, "jetbrains_mono".to_string());
+        mono.insert(1, "cascadia_mono".to_string());
+    }
+    // Proportional family also gets Cascadia as a fallback so labels
+    // that happen to contain Braille / block glyphs don't render tofu.
+    if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        prop.push("cascadia_mono".to_string());
     }
 
     if let Some(path) = custom_mono

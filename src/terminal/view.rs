@@ -269,14 +269,30 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                 return;
             }
             let color = fg.unwrap_or(fallback_fg);
-            let background = bg
-                .filter(|&b| b != bg_theme)
-                .unwrap_or(Color32::TRANSPARENT);
+            let bg_visible = bg.filter(|&b| b != bg_theme);
             let stroke = if underline {
                 egui::Stroke::new(1.0, color)
             } else {
                 egui::Stroke::NONE
             };
+            let char_cols = buf.chars().count();
+            let run_x = row_x + run_start_col as f32 * col_stride;
+            // Paint cell background across the full run rect BEFORE
+            // drawing the glyphs. egui's TextFormat::background only
+            // fills behind the glyph path, so space-only cells in a
+            // highlighted row lose the bar (visible in nvitop row
+            // selection, TUI dividers, etc.). A rect_filled spanning
+            // `char_cols * col_stride × cell_h` restores the full bar.
+            if let Some(bg_color) = bg_visible {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        Pos2::new(run_x, row_y),
+                        Vec2::new(char_cols as f32 * col_stride, cell_h),
+                    ),
+                    0.0,
+                    bg_color,
+                );
+            }
             let mut job = LayoutJob::default();
             job.append(
                 buf,
@@ -284,13 +300,12 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                 TextFormat {
                     font_id: font_id.clone(),
                     color,
-                    background,
+                    background: Color32::TRANSPARENT,
                     underline: stroke,
                     ..Default::default()
                 },
             );
             let galley = ui.fonts_mut(|f| f.layout_job(job));
-            let run_x = row_x + run_start_col as f32 * col_stride;
             painter.galley(Pos2::new(run_x, row_y), galley, fallback_fg);
             buf.clear();
         };
@@ -322,12 +337,25 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             // with the same style so the visible spacing stays
             // 1-cell-per-column.
             let is_wide_spacer = cell.flags.contains(CellFlags::WIDE_CHAR_SPACER);
-            let fg = color_to_egui(cell.fg, true);
-            let bg = if in_selection {
-                selection_bg()
-            } else {
-                color_to_egui(cell.bg, false)
-            };
+            let mut fg = color_to_egui(cell.fg, true);
+            let mut bg = color_to_egui(cell.bg, false);
+            // SGR 7 (reverse video) — TUIs like nvitop / htop use this
+            // to highlight the selected row. alacritty tags cells with
+            // CellFlags::INVERSE; the renderer must swap fg and bg at
+            // paint time. Without this the row looks unhighlighted.
+            if cell.flags.contains(CellFlags::INVERSE) {
+                // If bg was the default (terminal bg), swapping gives us
+                // the theme bg as the text color — unreadable. Use the
+                // fallback_fg (theme text color) in that case so the
+                // inverted text stays visible against its new bg.
+                let new_bg = if fg == bg_theme { fallback_fg } else { fg };
+                let new_fg = if bg == bg_theme { bg_theme } else { bg };
+                fg = new_fg;
+                bg = new_bg;
+            }
+            if in_selection {
+                bg = selection_bg();
+            }
             let underline = cell.flags.contains(CellFlags::UNDERLINE);
             if Some(fg) != cur_fg || Some(bg) != cur_bg || underline != cur_underline {
                 flush(&mut buf, run_start_col, cur_fg, cur_bg, cur_underline, ui);
@@ -595,7 +623,12 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                             }
                         }
                     }
-                    if let Some(bytes) = named_key_bytes(*key) {
+                    let app_cursor = terminal
+                        .term
+                        .lock()
+                        .mode()
+                        .contains(alacritty_terminal::term::TermMode::APP_CURSOR);
+                    if let Some(bytes) = named_key_bytes(*key, app_cursor) {
                         terminal.write_input(&bytes);
                     }
                 }
@@ -750,17 +783,27 @@ fn key_letter(key: egui::Key) -> Option<u8> {
     }
 }
 
-fn named_key_bytes(key: egui::Key) -> Option<Vec<u8>> {
+fn named_key_bytes(key: egui::Key, app_cursor: bool) -> Option<Vec<u8>> {
     use egui::Key;
+    // DECCKM (ESC [ ? 1 h) switches arrow/home/end to SS3 prefixes
+    // (\x1bO...) instead of CSI (\x1b[...). curses-based TUIs such as
+    // nvitop / htop enable it and expect SS3 — without this branch
+    // arrow-key row selection silently does nothing.
     match key {
         Key::Enter => Some(b"\r".to_vec()),
         Key::Tab => Some(b"\t".to_vec()),
         Key::Backspace => Some(vec![0x7f]),
         Key::Escape => Some(vec![0x1b]),
+        Key::ArrowUp if app_cursor => Some(b"\x1bOA".to_vec()),
+        Key::ArrowDown if app_cursor => Some(b"\x1bOB".to_vec()),
+        Key::ArrowRight if app_cursor => Some(b"\x1bOC".to_vec()),
+        Key::ArrowLeft if app_cursor => Some(b"\x1bOD".to_vec()),
         Key::ArrowUp => Some(b"\x1b[A".to_vec()),
         Key::ArrowDown => Some(b"\x1b[B".to_vec()),
         Key::ArrowRight => Some(b"\x1b[C".to_vec()),
         Key::ArrowLeft => Some(b"\x1b[D".to_vec()),
+        Key::Home if app_cursor => Some(b"\x1bOH".to_vec()),
+        Key::End if app_cursor => Some(b"\x1bOF".to_vec()),
         Key::Home => Some(b"\x1b[H".to_vec()),
         Key::End => Some(b"\x1b[F".to_vec()),
         Key::PageUp => Some(b"\x1b[5~".to_vec()),
