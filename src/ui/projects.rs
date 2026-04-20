@@ -223,10 +223,26 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                     .hint_text(&wt.name)
                                     .desired_width(f32::INFINITY),
                             );
-                            if !ui.memory(|m| m.has_focus(te_id)) && !rename_wt_focused {
+                            // Only request focus once per opening of the
+                            // rename. A per-frame `request_focus()` steals
+                            // focus back from the click that was trying to
+                            // leave the field, so `lost_focus()` never
+                            // stays true. Gate via egui memory keyed by
+                            // the rename id; cleared when rename ends.
+                            let focus_done_id =
+                                egui::Id::new(("rename_wt_focus_done", wt.id));
+                            let focus_done = ui
+                                .ctx()
+                                .memory(|m| m.data.get_temp::<bool>(focus_done_id))
+                                .unwrap_or(false);
+                            if !focus_done {
                                 resp.request_focus();
-                                rename_wt_focused = true;
+                                ui.ctx().memory_mut(|m| {
+                                    m.data.insert_temp(focus_done_id, true)
+                                });
                             }
+                            let _ = rename_wt_focused;
+                            rename_wt_focused = true;
                             let is_focused = ui.memory(|m| m.has_focus(te_id));
                             let enter = is_focused
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -339,10 +355,22 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                             .id(te_id)
                                             .desired_width(f32::INFINITY),
                                     );
-                                    if !ui.memory(|m| m.has_focus(te_id)) && !rename_focused {
+                                    // Same per-frame focus-stealing
+                                    // issue as the workspace rename above.
+                                    let focus_done_id =
+                                        egui::Id::new(("rename_tab_focus_done", tab.id));
+                                    let focus_done = ui
+                                        .ctx()
+                                        .memory(|m| m.data.get_temp::<bool>(focus_done_id))
+                                        .unwrap_or(false);
+                                    if !focus_done {
                                         resp.request_focus();
-                                        rename_focused = true;
+                                        ui.ctx().memory_mut(|m| {
+                                            m.data.insert_temp(focus_done_id, true)
+                                        });
                                     }
+                                    let _ = rename_focused;
+                                    rename_focused = true;
                                     // Detect Enter while the TextEdit is
                                     // focused — `resp.lost_focus()` fires
                                     // the frame AFTER the key, by which
@@ -460,7 +488,16 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             t.name = trimmed;
         }
         app.renaming_tab = None;
+        ctx.memory_mut(|m| {
+            m.data.remove::<bool>(egui::Id::new(("rename_tab_focus_done", tid)));
+        });
     } else if cancel_rename {
+        if let Some((_, _, tid, _)) = &app.renaming_tab {
+            let tid = *tid;
+            ctx.memory_mut(|m| {
+                m.data.remove::<bool>(egui::Id::new(("rename_tab_focus_done", tid)));
+            });
+        }
         app.renaming_tab = None;
     } else if let Some(start) = start_rename {
         app.renaming_tab = Some(start);
@@ -481,7 +518,16 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             w.display_name = if trimmed.is_empty() { None } else { Some(trimmed) };
         }
         app.renaming_workspace = None;
+        ctx.memory_mut(|m| {
+            m.data.remove::<bool>(egui::Id::new(("rename_wt_focus_done", wid)));
+        });
     } else if cancel_rename_wt {
+        if let Some((_, wid, _)) = &app.renaming_workspace {
+            let wid = *wid;
+            ctx.memory_mut(|m| {
+                m.data.remove::<bool>(egui::Id::new(("rename_wt_focus_done", wid)));
+            });
+        }
         app.renaming_workspace = None;
     } else if let Some(start) = start_rename_wt {
         app.renaming_workspace = Some(start);
