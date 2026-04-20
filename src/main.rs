@@ -608,6 +608,12 @@ impl eframe::App for CraneApp {
                 &text,
                 &self.app.language_configs,
             );
+            // Any open Diff pane targeting this file needs its right-side
+            // text refreshed so the shown diff reflects the new content
+            // instead of the stale snapshot we read when the diff was
+            // first opened. Left side (HEAD) is re-read too in case the
+            // user committed between opens.
+            self.app.refresh_diff_panes_for_path(&path, &text);
         }
         // Dispatch any goto-definition requests queued this frame
         // without blocking on a response. The LSP reader thread will

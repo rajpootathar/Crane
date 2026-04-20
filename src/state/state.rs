@@ -617,6 +617,47 @@ impl App {
         None
     }
 
+    /// After a file save, update every open Diff pane whose right side
+    /// points at `path` so the shown diff reflects the new working-tree
+    /// text. Left side (HEAD) is re-read too in case the user committed
+    /// between opens. `new_text` is the freshly-saved buffer so we avoid
+    /// an extra disk read when the caller already has it.
+    pub fn refresh_diff_panes_for_path(&mut self, path: &str, new_text: &str) {
+        use crate::state::layout::PaneContent;
+        for project in &mut self.projects {
+            for workspace in &mut project.workspaces {
+                for tab in &mut workspace.tabs {
+                    for (_, pane) in tab.layout.panes.iter_mut() {
+                        let PaneContent::Diff(diff) = &mut pane.content else {
+                            continue;
+                        };
+                        for dt in diff.tabs.iter_mut() {
+                            if dt.right_path != path {
+                                continue;
+                            }
+                            dt.right_text = new_text.to_string();
+                            // Re-read HEAD version — cheap (`git show`)
+                            // and keeps the left side correct after a
+                            // commit lands while the diff is open.
+                            if let Some(left) = dt
+                                .left_path
+                                .strip_prefix("HEAD:")
+                                .and_then(|rel| {
+                                    crate::git::find_git_root(std::path::Path::new(path))
+                                        .map(|root| (root, rel.to_string()))
+                                })
+                            {
+                                let (root, rel) = left;
+                                dt.left_text =
+                                    crate::git::head_content(&root, &rel);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn active_workspace_path(&self) -> Option<&Path> {
         let (pid, wid, _) = self.active?;
         let project = self.projects.iter().find(|p| p.id == pid)?;
