@@ -123,11 +123,30 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     let mut toggle_dir: Option<String> = None;
     let collapsed = app.collapsed_change_dirs.clone();
 
+    // Pin the commit form to the bottom of the right panel. Reserve a
+    // footer rect now, render the scrollable changes tree into the
+    // space above it, then fill the footer with the commit UI. The
+    // footer height grows when an error is present so the message
+    // doesn't get clipped.
+    let footer_base = 128.0;
+    let err_h = if app.git_error.is_some() { 40.0 } else { 0.0 };
+    let footer_h = footer_base + err_h;
+    let outer = ui.available_rect_before_wrap();
+    let footer_rect = egui::Rect::from_min_max(
+        egui::pos2(outer.min.x, outer.max.y - footer_h),
+        outer.max,
+    );
+    let scroll_rect = egui::Rect::from_min_max(
+        outer.min,
+        egui::pos2(outer.max.x, outer.max.y - footer_h),
+    );
+
+    let mut scroll_ui = ui.new_child(egui::UiBuilder::new().max_rect(scroll_rect));
+    scroll_ui.set_clip_rect(scroll_rect);
     egui::ScrollArea::vertical()
         .id_salt("right_changes")
         .auto_shrink([false, false])
-        .max_height(ui.available_height() - 160.0)
-        .show(ui, |ui| {
+        .show(&mut scroll_ui, |ui| {
             let staged: Vec<&FileChange> = status.changes.iter().filter(|c| c.staged).collect();
             let unstaged: Vec<&FileChange> = status
                 .changes
@@ -188,62 +207,87 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
             }
         });
 
-    ui.add_space(6.0);
+    // ---- Footer: commit message + primary Commit button + more menu ----
+    let theme = crate::theme::current();
+    let footer_fill = theme.sidebar_bg.to_color32();
+    let divider_col = theme.divider.to_color32();
+    ui.painter().rect_filled(footer_rect, 0.0, footer_fill);
     ui.painter().line_segment(
-        [
-            egui::pos2(ui.min_rect().min.x, ui.cursor().min.y),
-            egui::pos2(ui.min_rect().max.x, ui.cursor().min.y),
-        ],
-        egui::Stroke::new(1.0, Color32::from_rgb(36, 40, 52)),
+        [footer_rect.left_top(), footer_rect.right_top()],
+        egui::Stroke::new(1.0, divider_col),
     );
-    ui.add_space(8.0);
 
     let staged_count = status.changes.iter().filter(|c| c.staged).count();
     let has_staged = staged_count > 0;
     let has_message = !app.commit_message.trim().is_empty();
     let can_commit = has_staged && has_message;
 
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        let text_resp = ui.add(
-            egui::TextEdit::multiline(&mut app.commit_message)
-                .hint_text("Commit message")
-                .desired_rows(2)
-                .desired_width(ui.available_width() - 20.0)
-                .font(egui::FontId::new(12.0, egui::FontFamily::Proportional)),
-        );
-        if text_resp.has_focus() {
-            let submit = ui.input(|i| {
-                i.key_pressed(egui::Key::Enter)
-                    && (i.modifiers.command || i.modifiers.mac_cmd)
-            });
-            if submit && can_commit {
-                do_commit(app, &repo_path, false);
-            }
-        }
-    });
+    let mut footer_ui = ui.new_child(
+        egui::UiBuilder::new().max_rect(footer_rect.shrink2(egui::vec2(10.0, 10.0))),
+    );
+    footer_ui.set_clip_rect(footer_rect);
 
-    ui.add_space(6.0);
+    let text_resp = footer_ui.add(
+        egui::TextEdit::multiline(&mut app.commit_message)
+            .hint_text(if has_staged {
+                "Commit message"
+            } else {
+                "Stage files to commit"
+            })
+            .desired_rows(2)
+            .desired_width(footer_ui.available_width())
+            .font(egui::FontId::new(12.5, egui::FontFamily::Proportional)),
+    );
+    if text_resp.has_focus() {
+        let submit = footer_ui.input(|i| {
+            i.key_pressed(egui::Key::Enter)
+                && (i.modifiers.command || i.modifiers.mac_cmd)
+        });
+        if submit && can_commit {
+            do_commit(app, &repo_path, false);
+        }
+    }
+
+    footer_ui.add_space(8.0);
 
     let mut action_commit = false;
     let mut action_commit_push = false;
     let mut action_push = false;
     let mut action_pull = false;
 
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        ui.spacing_mut().item_spacing.x = 1.0;
+    let row_w = footer_ui.available_width();
+    let menu_w = 32.0;
+    let gap = 6.0;
+    let primary_w = row_w - menu_w - gap;
 
-        let width = ui.available_width() - 20.0;
-        let primary_w = width - 30.0;
-
+    footer_ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
         ui.scope(|ui| {
+            let v = ui.visuals_mut();
+            v.widgets.inactive.weak_bg_fill = theme.accent.to_color32();
+            v.widgets.inactive.bg_fill = theme.accent.to_color32();
+            v.widgets.hovered.weak_bg_fill = theme.accent.to_color32().gamma_multiply(1.15);
+            v.widgets.hovered.bg_fill = theme.accent.to_color32().gamma_multiply(1.15);
+            v.widgets.active.weak_bg_fill = theme.accent.to_color32().gamma_multiply(0.9);
+            v.widgets.active.bg_fill = theme.accent.to_color32().gamma_multiply(0.9);
+            v.widgets.inactive.fg_stroke.color = Color32::WHITE;
+            v.widgets.hovered.fg_stroke.color = Color32::WHITE;
+            v.widgets.active.fg_stroke.color = Color32::WHITE;
+            v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+            v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+            v.widgets.active.bg_stroke = egui::Stroke::NONE;
+            v.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+            v.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+            v.widgets.active.corner_radius = egui::CornerRadius::same(6);
             ui.add_enabled_ui(can_commit, |ui| {
                 let r = ui.add(
                     egui::Button::new(
-                        RichText::new(format!("{}  Commit", icons::CHECK)).size(12.5),
+                        RichText::new(format!("{}  Commit", icons::CHECK))
+                            .size(13.0)
+                            .strong()
+                            .color(Color32::WHITE),
                     )
-                    .min_size(egui::vec2(primary_w, 28.0)),
+                    .min_size(egui::vec2(primary_w, 30.0)),
                 );
                 if r.clicked() {
                     action_commit = true;
@@ -253,7 +297,8 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
 
         let menu_resp = ui.add(
             egui::Button::new(RichText::new(icons::CARET_DOWN).size(12.0))
-                .min_size(egui::vec2(30.0, 28.0)),
+                .min_size(egui::vec2(menu_w, 30.0))
+                .corner_radius(egui::CornerRadius::same(6)),
         );
         egui::Popup::menu(&menu_resp).show(|ui| {
             ui.set_min_width(180.0);
@@ -291,13 +336,11 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     });
 
     if let Some(err) = &app.git_error {
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(10.0);
+        footer_ui.add_space(6.0);
+        footer_ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(err).color(DEL).size(11.0));
         });
     }
-    ui.add_space(8.0);
 
     if let Some(dir) = toggle_dir
         && !app.collapsed_change_dirs.remove(&dir) {
