@@ -39,6 +39,37 @@ fn point_in_selection(point: Point, range: &alacritty_terminal::selection::Selec
     }
 }
 
+/// Column contains a vertical box-drawing char on at least 60% of
+/// visible rows — treat as a real TUI separator.
+fn is_separator_column<T>(term: &alacritty_terminal::Term<T>, col: usize, rows: usize) -> bool {
+    use alacritty_terminal::index::{Column, Line, Point};
+    if rows == 0 {
+        return false;
+    }
+    let mut hits = 0usize;
+    for r in 0..rows {
+        let p = Point::new(Line(r as i32), Column(col));
+        let c = term.grid()[p].c;
+        // U+2502 │, U+2503 ┃, U+2551 ║, plus a few common double/heavy variants
+        if matches!(c, '│' | '┃' | '║' | '╎' | '╏' | '╽' | '╿') {
+            hits += 1;
+        }
+    }
+    hits * 5 >= rows * 3
+}
+
+fn is_inside_vertical_separators<T>(
+    term: &alacritty_terminal::Term<T>,
+    start_col: usize,
+    rows: usize,
+) -> bool {
+    use alacritty_terminal::grid::Dimensions;
+    let total_cols = term.columns();
+    let has_left = (0..start_col).any(|c| is_separator_column(term, c, rows));
+    let has_right = (start_col + 1..total_cols).any(|c| is_separator_column(term, c, rows));
+    has_left && has_right
+}
+
 fn pixel_to_point(
     pos: Pos2,
     origin: Pos2,
@@ -138,7 +169,23 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             let mut guard = terminal.term.lock();
             let off = guard.grid().display_offset();
             let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off);
-            guard.selection = Some(Selection::new(SelectionType::Simple, point, side));
+            // Ghostty-style column-aware selection: if the start cell
+            // sits between two columns that contain vertical
+            // box-drawing characters on most visible rows (i.e. the TUI
+            // has a real vertical separator on either side, like Ink's
+            // sidebar divider in llm-party / lazygit / k9s), promote
+            // the selection to Block mode so dragging down one column
+            // doesn't drag the neighboring column's text along.
+            let kind = if is_inside_vertical_separators(
+                &guard,
+                point.column.0,
+                rows,
+            ) {
+                SelectionType::Block
+            } else {
+                SelectionType::Simple
+            };
+            guard.selection = Some(Selection::new(kind, point, side));
         }
     if response.dragged()
         && let Some(pos) = response.interact_pointer_pos() {
@@ -528,7 +575,20 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     let guard = terminal.term.lock();
                     if let Some(t) = guard.selection_to_string()
                         && !t.is_empty() {
-                            copy_text = Some(t);
+                            // Trim trailing whitespace per line — TUIs
+                            // right-pad cells to a fixed width with
+                            // spaces, so a plain cell-range copy drags
+                            // that padding into the clipboard along
+                            // with the real text. iTerm2 / WezTerm /
+                            // Terminal.app all trim per-row on copy,
+                            // which is what makes "just drag and copy"
+                            // feel right in TUIs like llm-party.
+                            let trimmed: String = t
+                                .split('\n')
+                                .map(|line| line.trim_end_matches(|c: char| c == ' ' || c == '\t'))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            copy_text = Some(trimmed);
                         }
                 }
                 egui::Event::Key {
