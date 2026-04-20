@@ -84,6 +84,12 @@ pub struct Terminal {
     pub click_count: u8,
     master: Box<dyn MasterPty + Send>,
     shell_pid: Option<u32>,
+    /// Shell child handle. Kept so `Drop` can `kill()` + `wait()` it
+    /// when the Pane closes, instead of relying on SIGHUP-on-master-
+    /// close (which some shells / subprocesses ignore, leaving the
+    /// reader thread pinned and the alacritty grid resident in RAM
+    /// long after the user closed the terminal).
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// Shared with WakeListener; flushed once per render frame via
     /// `flush_pty_replies`.
     pty_replies: Arc<Mutex<Vec<u8>>>,
@@ -95,6 +101,52 @@ pub struct Terminal {
     /// process exited (user typed `exit`, Ctrl-D, was killed, etc.).
     /// UI polls this each frame and closes the owning Pane.
     alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Terminal {
+    /// Close-down order matters: kill the child first so the PTY's
+    /// slave side has no writers, then the master drops (closes its
+    /// fd), which EOFs the reader thread. Without this, shells that
+    /// ignore SIGHUP (or nested subprocesses that inherited the pty)
+    /// can keep the master fd busy, stranding the reader thread —
+    /// which holds Arc<Mutex<Term>> + Arc<Mutex<history>> and pins
+    /// the whole grid (tens of MB per terminal) in RAM long after
+    /// the Pane was closed.
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            // Reap the zombie — otherwise the child sits as defunct
+            // until the Crane process itself exits.
+            let _ = c.wait();
+        }
+        // `master` drops after this fn returns, which closes the pty
+        // fd and EOFs the detached reader thread. We don't join it;
+        // once the Arc drops the thread's closure finishes within a
+        // few ms and exits on its own.
+        #[cfg(target_os = "macos")]
+        macos_release_freed_pages();
+    }
+}
+
+/// Ask macOS's malloc to return freed pages to the kernel. Without
+/// this hint, RSS doesn't drop when a terminal closes — the grid is
+/// freed to the process's malloc arena but the arena holds the pages
+/// as "dirty-but-free" until memory pressure forces a release, so
+/// Activity Monitor keeps showing the same usage.
+///
+/// `malloc_zone_pressure_relief(NULL, 0)` walks every registered zone
+/// and madvise(MADV_FREE)s unused pages. Microseconds-cheap.
+#[cfg(target_os = "macos")]
+fn macos_release_freed_pages() {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(
+            zone: *mut libc::c_void,
+            goal: libc::size_t,
+        ) -> libc::size_t;
+    }
+    unsafe {
+        let _ = malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
 }
 
 impl Terminal {
@@ -160,6 +212,7 @@ impl Terminal {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let shell_pid = child.process_id();
         drop(pair.slave);
+        let child_handle: Option<Box<dyn portable_pty::Child + Send + Sync>> = Some(child);
 
         let reader = pair
             .master
@@ -265,6 +318,7 @@ impl Terminal {
             click_count: 0,
             master: pair.master,
             shell_pid,
+            child: child_handle,
             pty_replies,
             pending_scroll_to_bottom: std::sync::atomic::AtomicBool::new(false),
             alive,

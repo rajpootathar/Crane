@@ -1,19 +1,26 @@
-//! Background poller for total WKWebView memory.
+//! On-demand poller for total WKWebView memory.
 //!
 //! wry doesn't expose per-webview process ids, so per-tab attribution
 //! is impossible from here (would need a private WebKit KVC key).
 //! Instead we sum the resident set size of every
 //! `com.apple.WebKit.WebContent` process — Apple's per-origin content
-//! processes — and expose the total. Browser panes read this each
-//! frame to show a chip that turns orange/red above warning
-//! thresholds, nudging the user to close heavy tabs.
+//! processes — and expose the total.
+//!
+//! The previous implementation spun a background thread at app start
+//! that ran `ps -axo rss=,comm=` every 3 seconds for the entire
+//! process lifetime, regardless of whether any Browser Pane was open.
+//! That's a leaked thread + a subprocess + a full process-table scan
+//! you never asked for.
+//!
+//! Now: zero threads, zero work unless a Browser Pane actually calls
+//! `snapshot()`. Results are cached for `POLL_INTERVAL` so the hot
+//! per-frame UI path is still cheap.
 //!
 //! Warn threshold: 1.0 GB  (chip goes orange).
 //! Danger threshold: 2.0 GB (chip goes red + prompts).
 
 use parking_lot::Mutex;
-use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 pub const WARN_BYTES: u64 = 1_000_000_000;
@@ -25,28 +32,40 @@ pub struct Snapshot {
     pub process_count: u32,
 }
 
+struct Cached {
+    snap: Snapshot,
+    at: Option<Instant>,
+}
+
 pub struct Monitor {
-    state: Arc<Mutex<Snapshot>>,
+    cache: Mutex<Cached>,
 }
 
 impl Monitor {
     pub fn start() -> Self {
-        let state: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Snapshot::default()));
-        #[cfg(target_os = "macos")]
-        {
-            let state = state.clone();
-            std::thread::spawn(move || loop {
-                if let Some(snap) = sample_webkit_processes() {
-                    *state.lock() = snap;
-                }
-                std::thread::sleep(POLL_INTERVAL);
-            });
+        Self {
+            cache: Mutex::new(Cached {
+                snap: Snapshot::default(),
+                at: None,
+            }),
         }
-        Self { state }
     }
 
+    /// Called by the Browser view once per frame while visible. Returns
+    /// the cached value unless `POLL_INTERVAL` has elapsed, in which
+    /// case it samples inline (single `ps` invocation, ~5 ms). No
+    /// background thread, no work when no browser pane is visible.
     pub fn snapshot(&self) -> Snapshot {
-        self.state.lock().clone()
+        let mut c = self.cache.lock();
+        let stale = c.at.is_none_or(|t| t.elapsed() >= POLL_INTERVAL);
+        if stale {
+            #[cfg(target_os = "macos")]
+            if let Some(fresh) = sample_webkit_processes() {
+                c.snap = fresh;
+            }
+            c.at = Some(Instant::now());
+        }
+        c.snap.clone()
     }
 }
 

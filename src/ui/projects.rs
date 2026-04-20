@@ -229,9 +229,18 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 egui::UiBuilder::new()
                                     .max_rect(rect.shrink2(egui::vec2(32.0, 2.0))),
                             );
-                            let buf = rename_wt_buffer
-                                .as_mut()
-                                .expect("wt rename buffer matches renaming_wt_ref");
+                            // Defensive: `wt_renaming` is true iff
+                                // `renaming_wt_ref` points at this row, and
+                                // `rename_wt_buffer` is set alongside
+                                // `renaming_wt_ref`. A state desync here
+                                // shouldn't crash the UI — bail out of the
+                                // rename for this frame and let the next
+                                // frame re-seed, or the click handler
+                                // cancel it.
+                            let Some(buf) = rename_wt_buffer.as_mut() else {
+                                cancel_rename_wt = true;
+                                continue;
+                            };
                             let te_id = egui::Id::new(("rename_wt", wt.id));
                             let resp = child.add(
                                 egui::TextEdit::singleline(buf)
@@ -362,9 +371,12 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                         egui::UiBuilder::new()
                                             .max_rect(rect.shrink2(egui::vec2(32.0, 2.0))),
                                     );
-                                    let buf = rename_buffer
-                                        .as_mut()
-                                        .expect("rename buffer matches renaming_ref");
+                                    // Same defensive fallback as the
+                                    // worktree rename above.
+                                    let Some(buf) = rename_buffer.as_mut() else {
+                                        cancel_rename = true;
+                                        continue;
+                                    };
                                     let te_id = egui::Id::new(("rename_tab", tab.id));
                                     let resp = child.add(
                                         egui::TextEdit::singleline(buf)

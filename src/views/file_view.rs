@@ -78,6 +78,17 @@ pub fn available_syntax_themes() -> Vec<String> {
     out
 }
 
+/// Guaranteed-present fallback used when the user's requested theme
+/// (and every named fallback) is missing and the ThemeSet happens to
+/// be empty — e.g. if a future two_face version drops an embedded
+/// theme or a user strips themes via config. Returning this instead
+/// of panicking keeps the editor usable with default (uncolored)
+/// syntax output.
+pub fn fallback_theme() -> &'static syntect::highlighting::Theme {
+    static FALLBACK: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
+    FALLBACK.get_or_init(syntect::highlighting::Theme::default)
+}
+
 pub fn themes() -> &'static ThemeSet {
     THEMES.get_or_init(|| {
         let mut set = ThemeSet::load_defaults();
@@ -485,7 +496,7 @@ fn render_scoped(
                         .or_else(|| all.get("base16-ocean.dark"))
                 }
             })
-            .unwrap_or_else(|| all.values().next().expect("at least one theme"));
+            .unwrap_or_else(|| all.values().next().unwrap_or_else(|| fallback_theme()));
         let fallback_fg = theme::current().text.to_color32();
 
         // Salt the cache key on syntax-affecting inputs ONLY (text is

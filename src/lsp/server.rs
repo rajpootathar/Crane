@@ -306,7 +306,9 @@ impl LspServer {
             });
         }
 
-        let server = Self {
+        
+
+        Self {
             key,
             stdin: Arc::new(Mutex::new(stdin)),
             shared,
@@ -314,9 +316,7 @@ impl LspServer {
             doc_versions: Mutex::new(HashMap::new()),
             _child: Mutex::new(child_res.ok()),
             _ctx: ctx,
-        };
-
-        server
+        }
     }
 
     /// Walk up from a file path to find the nearest project root. Returns
@@ -385,23 +385,37 @@ impl LspServer {
     /// re-index on next open) and typescript-language-server can
     /// leak orphan node processes.
     fn graceful_shutdown(&self) {
-        if self.shared.0.lock().dead {
-            return;
+        if !self.shared.0.lock().dead {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            self.send(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "shutdown",
+                "params": null,
+            }));
+            std::thread::sleep(Duration::from_millis(200));
+            self.send(&json!({
+                "jsonrpc": "2.0",
+                "method": "exit",
+                "params": null,
+            }));
+            std::thread::sleep(Duration::from_millis(50));
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "shutdown",
-            "params": null,
-        }));
-        std::thread::sleep(Duration::from_millis(200));
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "exit",
-            "params": null,
-        }));
-        std::thread::sleep(Duration::from_millis(50));
+        // Hard-kill if the server ignored `exit` — rust-analyzer
+        // occasionally hangs during shutdown (index flush stuck on
+        // disk, proc-macro server deadlock, etc.). Without this the
+        // child process stays alive and the stdout/stderr reader
+        // threads stay blocked on pipe reads for the rest of the
+        // Crane session.
+        if let Some(mut child) = self._child.lock().take() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
     }
 
     fn send_initialize(&self, root_uri: Option<String>) {

@@ -29,25 +29,44 @@ fn reveal_in_file_manager(path: &std::path::Path) {
 }
 
 pub fn render(ui: &mut egui::Ui, app: &mut App) {
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        tab_chip(ui, "Changes", app.right_tab == RightTab::Changes, || {
-            app.right_tab = RightTab::Changes;
-        });
-        ui.add_space(4.0);
-        tab_chip(ui, "Files", app.right_tab == RightTab::Files, || {
-            app.right_tab = RightTab::Files;
-        });
-    });
-    ui.add_space(6.0);
+    // Match the Main Panel top bar (`ui::top::TOPBAR_H = 34.0`) so the
+    // Changes/Files tab strip and the Browser/Terminal button row sit
+    // on the same horizontal line across the whole window. Using
+    // `ui.add_space()` + `ui.horizontal()` produced a 40px strip that
+    // floated ~6px above the main top bar — the misalignment showed
+    // up immediately next to the Browser button.
+    const STRIP_H: f32 = crate::ui::top::TOPBAR_H;
+    let outer = ui.available_rect_before_wrap();
+    let strip_rect = egui::Rect::from_min_size(
+        outer.min,
+        egui::vec2(outer.width(), STRIP_H),
+    );
+
+    // Full-width bottom divider — previously `ui.min_rect().max.x`
+    // clipped the line to the content width (ending under "Files"),
+    // leaving the right half of the panel with no underline.
     ui.painter().line_segment(
         [
-            egui::pos2(ui.min_rect().min.x, ui.cursor().min.y),
-            egui::pos2(ui.min_rect().max.x, ui.cursor().min.y),
+            egui::pos2(strip_rect.min.x, strip_rect.max.y),
+            egui::pos2(strip_rect.max.x, strip_rect.max.y),
         ],
         egui::Stroke::new(1.0, Color32::from_rgb(36, 40, 52)),
     );
+
+    let mut strip_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(strip_rect.shrink2(egui::vec2(10.0, 4.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    tab_chip(&mut strip_ui, "Changes", app.right_tab == RightTab::Changes, || {
+        app.right_tab = RightTab::Changes;
+    });
+    strip_ui.add_space(4.0);
+    tab_chip(&mut strip_ui, "Files", app.right_tab == RightTab::Files, || {
+        app.right_tab = RightTab::Files;
+    });
+
+    ui.allocate_rect(strip_rect, egui::Sense::hover());
     ui.add_space(2.0);
 
     match app.right_tab {
@@ -476,7 +495,7 @@ fn collect_paths(node: &DirNode, out: &mut Vec<String>) {
     for (_, change) in &node.files {
         out.push(change.path.clone());
     }
-    for (_, child) in &node.dirs {
+    for child in node.dirs.values() {
         collect_paths(child, out);
     }
 }

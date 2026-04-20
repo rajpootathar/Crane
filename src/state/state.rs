@@ -607,7 +607,7 @@ impl App {
         {
             return Some(t.path.clone());
         }
-        for (_, p) in &layout.panes {
+        for p in layout.panes.values() {
             if let PaneContent::Files(files) = &p.content
                 && let Some(t) = files.tabs.get(files.active)
             {

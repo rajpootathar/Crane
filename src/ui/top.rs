@@ -4,7 +4,7 @@ use crate::state::layout::{BrowserPane, Dir, PaneContent};
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
 
-const TOPBAR_H: f32 = 34.0;
+pub const TOPBAR_H: f32 = 34.0;
 fn topbar_bg() -> Color32 {
     crate::theme::current().topbar_bg.to_color32()
 }

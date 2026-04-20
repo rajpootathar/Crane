@@ -64,7 +64,12 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
                 all_themes.get("OneHalfDark")
             }
         })
-        .unwrap_or_else(|| all_themes.values().next().expect("at least one theme"));
+        .unwrap_or_else(|| {
+            all_themes
+                .values()
+                .next()
+                .unwrap_or_else(|| crate::views::file_view::fallback_theme())
+        });
     let ldigits = left_lines.to_string().len().max(3);
     let rdigits = right_lines.to_string().len().max(3);
     let char_w = ui

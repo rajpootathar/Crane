@@ -138,7 +138,7 @@ impl CraneApp {
         let path_str = loc.path.to_string_lossy().to_string();
         let mut placed = false;
         if let Some(layout) = self.app.active_layout_ref() {
-            for (_, p) in &layout.panes {
+            for p in layout.panes.values() {
                 if matches!(&p.content, state::layout::PaneContent::Files(_)) {
                     placed = true;
                     break;
@@ -502,7 +502,7 @@ impl eframe::App for CraneApp {
         let mut diag_map: std::collections::HashMap<String, Vec<lsp::Diagnostic>> =
             std::collections::HashMap::new();
         if let Some(layout_ref) = self.app.active_layout_ref() {
-            for (_, p) in &layout_ref.panes {
+            for p in layout_ref.panes.values() {
                 if let state::layout::PaneContent::Files(f) = &p.content {
                     for t in &f.tabs {
                         diag_map.insert(

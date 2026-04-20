@@ -572,6 +572,9 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         for event in &i.events {
             match event {
                 egui::Event::Copy => {
+                    if other_widget_focused {
+                        continue;
+                    }
                     let guard = terminal.term.lock();
                     if let Some(t) = guard.selection_to_string()
                         && !t.is_empty() {
@@ -585,7 +588,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                             // feel right in TUIs like llm-party.
                             let trimmed: String = t
                                 .split('\n')
-                                .map(|line| line.trim_end_matches(|c: char| c == ' ' || c == '\t'))
+                                .map(|line| line.trim_end_matches([' ', '\t']))
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             copy_text = Some(trimmed);
@@ -597,6 +600,9 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     modifiers,
                     ..
                 } if modifiers.mac_cmd || modifiers.command => {
+                    if other_widget_focused {
+                        continue;
+                    }
                     // Queue; actual work happens after the input
                     // closure unlocks Context. Driving the ANSI parser
                     // inside `ui.input` used to deadlock because
@@ -612,6 +618,9 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                     modifiers,
                     ..
                 } if modifiers.mac_cmd || modifiers.command => {
+                    if other_widget_focused {
+                        continue;
+                    }
                     let mut guard = terminal.term.lock();
                     let start = Point::new(Line(0), Column(0));
                     let end = Point::new(

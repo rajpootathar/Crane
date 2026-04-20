@@ -12,7 +12,7 @@ pub fn is_image_path(path: &str) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| {
             let e = e.to_ascii_lowercase();
-            IMAGE_EXTS.iter().any(|x| *x == e.as_str())
+            IMAGE_EXTS.contains(&e.as_str())
         })
         .unwrap_or(false)
 }
