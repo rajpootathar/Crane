@@ -500,6 +500,14 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         }
         app.renaming_tab = None;
     } else if let Some(start) = start_rename {
+        // Clear any stale focus flag so the first frame of the rename
+        // triggers resp.request_focus(). Without this, re-opening a
+        // rename on the same tab after the flag was left set could
+        // skip the initial focus and leave the TextEdit unfocused.
+        let tid = start.2;
+        ctx.memory_mut(|m| {
+            m.data.remove::<bool>(egui::Id::new(("rename_tab_focus_done", tid)));
+        });
         app.renaming_tab = Some(start);
     }
 
@@ -530,6 +538,10 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         }
         app.renaming_workspace = None;
     } else if let Some(start) = start_rename_wt {
+        let wid = start.1;
+        ctx.memory_mut(|m| {
+            m.data.remove::<bool>(egui::Id::new(("rename_wt_focus_done", wid)));
+        });
         app.renaming_workspace = Some(start);
     }
 
