@@ -73,7 +73,25 @@ pub struct GitStatus {
 
 pub fn status(repo: &Path) -> Option<GitStatus> {
     let out = Command::new("git")
-        .args(["status", "--porcelain=v1", "--branch"])
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--branch",
+            // Without this, untracked directories collapse into a
+            // single entry (e.g. `documents/`) instead of listing each
+            // file — the Changes panel then shows one nameless `?` row
+            // while the Files panel (which walks the FS) shows the
+            // real contents. `all` makes git enumerate every untracked
+            // path.
+            "--untracked-files=all",
+            // -z = NUL-separated records with paths left as-is. Without
+            // it, porcelain v1 wraps any path containing spaces / non-
+            // ASCII / shell-specials in double quotes and C-escapes
+            // them. The Changes panel was then passing those quoted
+            // strings straight to `git add` → fatal: pathspec '"..."'
+            // did not match any files.
+            "-z",
+        ])
         .current_dir(repo)
         .output()
         .ok()?;
@@ -83,7 +101,15 @@ pub fn status(repo: &Path) -> Option<GitStatus> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut branch = String::new();
     let mut changes = Vec::new();
-    for line in stdout.lines() {
+    // With -z each record terminates in NUL. Rename entries emit two
+    // consecutive records: the new path first, then the old path with
+    // no status prefix. Iterate manually so we can peek the follow-up
+    // record when we see an R/C status.
+    let records: Vec<&str> = stdout.split('\0').filter(|s| !s.is_empty()).collect();
+    let mut i = 0;
+    while i < records.len() {
+        let line = records[i];
+        i += 1;
         if let Some(b) = line.strip_prefix("## ") {
             branch = b.split("...").next().unwrap_or("").trim().to_string();
             continue;
@@ -93,13 +119,18 @@ pub fn status(repo: &Path) -> Option<GitStatus> {
         }
         let x = line.as_bytes()[0] as char;
         let y = line.as_bytes()[1] as char;
-        let raw = line[3..].to_string();
-        // porcelain v1 formats renames as `old -> new`. Split so the
-        // tree groups renamed rows under their destination folder and
-        // the row itself can render "old → new" on one leaf.
-        let (path, old_path) = match raw.split_once(" -> ") {
-            Some((old, new)) => (new.to_string(), Some(old.to_string())),
-            None => (raw, None),
+        let path_part = line[3..].to_string();
+        // For R (rename) / C (copy) status the old path is in the next
+        // NUL-separated record, not joined with " -> " like the non-z
+        // format.
+        let (path, old_path) = if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+            let old = records.get(i).map(|s| s.to_string());
+            if old.is_some() {
+                i += 1;
+            }
+            (path_part, old)
+        } else {
+            (path_part, None)
         };
         let map = |c: char| match c {
             'A' => ChangeStatus::Added,
@@ -228,7 +259,7 @@ pub struct WorktreeDirty {
 
 pub fn worktree_dirty(worktree: &Path) -> WorktreeDirty {
     let modified_files = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(worktree)
         .output()
         .ok()
