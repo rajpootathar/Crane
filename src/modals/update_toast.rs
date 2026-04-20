@@ -53,6 +53,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         .map(|u| u.url.clone())
         .unwrap_or_default();
 
+    let theme = crate::theme::current();
     let screen = ctx.content_rect();
     let toast_w = 440.0_f32.min(screen.width() - 40.0);
     egui::Area::new(egui::Id::new("update_toast"))
@@ -63,8 +64,8 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         ))
         .show(ctx, |ui| {
             egui::Frame::default()
-                .fill(egui::Color32::from_rgb(28, 32, 44))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 86)))
+                .fill(theme.surface.to_color32())
+                .stroke(egui::Stroke::new(1.0, theme.border.to_color32()))
                 .corner_radius(egui::CornerRadius::same(10))
                 .inner_margin(egui::Margin::same(14))
                 .show(ui, |ui| {
@@ -73,13 +74,13 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                         ui.label(
                             egui::RichText::new(egui_phosphor::regular::ARROW_CIRCLE_UP)
                                 .size(18.0)
-                                .color(egui::Color32::from_rgb(96, 140, 220)),
+                                .color(theme.accent.to_color32()),
                         );
                         ui.vertical(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("Crane v{version} is available"))
                                     .size(13.0)
-                                    .color(egui::Color32::from_rgb(212, 216, 228))
+                                    .color(theme.text.to_color32())
                                     .strong(),
                             );
                             ui.label(
@@ -88,7 +89,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                                     env!("CARGO_PKG_VERSION")
                                 ))
                                 .size(11.5)
-                                .color(egui::Color32::from_rgb(150, 156, 172)),
+                                .color(theme.text_muted.to_color32()),
                             );
                         });
                     });
@@ -140,7 +141,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                             ui.label(
                                 egui::RichText::new(format!("Install failed: {err}"))
                                     .size(11.0)
-                                    .color(egui::Color32::from_rgb(220, 110, 110)),
+                                    .color(theme.error.to_color32()),
                             );
                             if ui.button(egui::RichText::new("Open in browser").size(12.0)).clicked() {
                                 let _ = webbrowser::open(&url);

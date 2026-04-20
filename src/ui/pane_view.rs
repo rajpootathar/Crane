@@ -372,7 +372,7 @@ fn render_pane(
                 .map(|p| rect.contains(p))
                 .unwrap_or(false)
     });
-    if clicked_inside && !is_focus {
+    if clicked_inside && !is_focus && matches!(action, PaneAction::None) {
         *action = PaneAction::Focus(id);
     }
 
