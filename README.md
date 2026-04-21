@@ -1,5 +1,7 @@
 # Crane
 
+![Crane](screenshot/crane-hero.png)
+
 Native, GPU-rendered desktop development environment for orchestrating terminals, file browsing, diffs, and git workflows across isolated git workspaces.
 
 Built in pure Rust on [egui](https://github.com/emilk/egui) + [wgpu](https://github.com/gfx-rs/wgpu), with [alacritty_terminal](https://github.com/alacritty/alacritty) driving the VT parser and [portable-pty](https://github.com/wez/wezterm/tree/main/pty) for cross-platform PTY.
