@@ -97,6 +97,12 @@ pub struct Terminal {
     /// `flush_scroll_to_bottom` after ui.input releases to avoid a
     /// deadlock against egui's Context lock.
     pending_scroll_to_bottom: std::sync::atomic::AtomicBool,
+    /// Sub-line wheel-delta carry. egui's `smooth_scroll_delta` arrives
+    /// in pixels; a trackpad flick commonly emits ~3–6 px per frame
+    /// and cell height is ~16 px, so rounding-per-frame silently
+    /// drops most events and scrolling feels laggy. We accumulate the
+    /// remainder here and extract whole cells once it crosses ±1.
+    pub scroll_carry: parking_lot::Mutex<f32>,
     /// False once the PTY reader has hit EOF / error — i.e. the shell
     /// process exited (user typed `exit`, Ctrl-D, was killed, etc.).
     /// UI polls this each frame and closes the owning Pane.
@@ -321,6 +327,7 @@ impl Terminal {
             child: child_handle,
             pty_replies,
             pending_scroll_to_bottom: std::sync::atomic::AtomicBool::new(false),
+            scroll_carry: parking_lot::Mutex::new(0.0),
             alive,
         })
     }

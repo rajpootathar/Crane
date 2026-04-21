@@ -151,17 +151,31 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
     }
 
-    // Scrollback: mouse wheel → alacritty Scroll::Delta. Positive delta
-    // is upward in egui (history); alacritty's convention is that a
-    // positive delta scrolls up into history. `scroll_display` is a
-    // no-op when no history is available, so no guard needed.
+    // Scrollback: mouse wheel → alacritty Scroll::Delta. Positive
+    // delta is upward in egui (history); alacritty scrolls up into
+    // history on positive delta, so the sign passes through.
+    //
+    // Trackpad flicks arrive as ~3–6 px per frame. Cell height is
+    // ~16 px, so `(wheel/cell_h).round()` drops most frames to zero
+    // and the user sees a laggy, stuttery scroll. Accumulate the
+    // sub-line remainder in `scroll_carry` and only extract whole
+    // cells when the carry crosses ±1 — then the visible motion
+    // tracks the trackpad 1:1.
     if response.hovered() {
         let wheel = ui.input(|i| i.smooth_scroll_delta.y);
-        if wheel.abs() > 0.5 {
-            let lines = (wheel / cell_h).round() as i32;
+        if wheel.abs() > 0.01 {
+            let mut carry = terminal.scroll_carry.lock();
+            *carry += wheel / cell_h;
+            let lines = carry.trunc() as i32;
             if lines != 0 {
+                *carry -= lines as f32;
                 terminal.term.lock().scroll_display(Scroll::Delta(lines));
             }
+        } else {
+            // Decay the carry when the pointer is idle so a stale
+            // fractional remainder doesn't fire a phantom scroll on
+            // the next hover frame.
+            *terminal.scroll_carry.lock() = 0.0;
         }
     }
 
