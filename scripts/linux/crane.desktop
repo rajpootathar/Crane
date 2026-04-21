@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Crane
+GenericName=Development Environment
+Comment=Native GPU-rendered terminal + IDE environment
+Exec=crane %U
+Icon=crane
+Terminal=false
+Categories=Development;IDE;TerminalEmulator;
+StartupWMClass=crane
+Keywords=IDE;Editor;Terminal;Git;

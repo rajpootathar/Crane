@@ -24,6 +24,29 @@ depends = ["libxkbcommon0", "libwayland-client0", "libgl1", "libx11-6"]
 
 [package.metadata.bundle.windows]
 
+# cargo-deb (distinct from cargo-bundle's .deb support) — drives the
+# Linux CI job. cargo-bundle produces a .deb from the .app-style
+# manifest above; cargo-deb produces a standard Debian package wired
+# directly from this metadata. We use cargo-deb in CI because it gives
+# us explicit control over install paths, desktop entry, icon, and
+# runtime deps without depending on cargo-bundle's Linux codepath.
+[package.metadata.deb]
+maintainer = "rajpootathar <info@aalasolutions.com>"
+copyright = "2026, rajpootathar"
+license-file = ["LICENSE", "0"]
+extended-description = """
+Crane is a native, GPU-rendered desktop development environment for
+orchestrating terminals, editors, and git workflows across isolated
+git worktree-backed Workspaces."""
+depends = "$auto, libxkbcommon0, libwayland-client0, libgl1, libx11-6, libxcb1, libxcb-render0, libxcb-shape0, libxcb-xfixes0"
+section = "devel"
+priority = "optional"
+assets = [
+    ["target/release/crane", "usr/bin/", "755"],
+    ["crane.png", "usr/share/icons/hicolor/512x512/apps/crane.png", "644"],
+    ["scripts/linux/crane.desktop", "usr/share/applications/", "644"],
+]
+
 
 [dependencies]
 eframe = { version = "0.34", features = ["wgpu", "persistence"] }
