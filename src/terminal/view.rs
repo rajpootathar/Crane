@@ -1,4 +1,5 @@
 use crate::terminal::Terminal;
+use super::grid_snap;
 use crate::theme;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
@@ -272,6 +273,15 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             .collect();
         // history_size lives on the Dimensions trait (Grid impls it).
         let history = guard.history_size();
+        // Opt-in grid snapshot probe. When `CRANE_GRID_SNAP=1` is set
+        // in the parent env, dump the full visible grid + the top 8
+        // history rows + cursor coords to a JSONL log each time the
+        // grid content changed since the previous frame. Meant for
+        // diagnosing the Claude Code duplicate-prompt artifact: row
+        // text is captured exactly as alacritty stores it, so we can
+        // tell whether a given "duplicate" row is in live viewport or
+        // has been promoted into scrollback history.
+        grid_snap::snap_if_enabled(&guard, cursor, offset, history);
         // Build a set of trimmed text for the bottom ~12 live rows so we
         // can dedup TUI redraw artifacts out of scrollback at paint
         // time. Claude Code (and any Ink-based TUI) uses absolute

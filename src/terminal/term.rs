@@ -301,6 +301,28 @@ impl Terminal {
         let history_clone = history.clone();
         let ctx_clone = ctx.clone();
         let alive_clone = alive.clone();
+        // Opt-in raw VT byte trace. Set CRANE_VT_TRACE=1 in the parent
+        // env to dump everything the PTY produces, exactly as the
+        // parser sees it, to ~/.crane/vt-trace-<pid>.log. Lets us diff
+        // our byte stream against what iTerm / Alacritty see for the
+        // same TUI and pin down which escape sequence our parser is
+        // mis-handling. Cheap branch when the flag is unset.
+        let trace_file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> = {
+            if std::env::var("CRANE_VT_TRACE").ok().as_deref() == Some("1") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let dir = std::path::PathBuf::from(format!("{home}/.crane"));
+                let _ = std::fs::create_dir_all(&dir);
+                let pid = std::process::id();
+                let path = dir.join(format!("vt-trace-{pid}.log"));
+                eprintln!("[crane] VT trace enabled → {}", path.display());
+                std::fs::File::create(&path)
+                    .ok()
+                    .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)))
+            } else {
+                None
+            }
+        };
+        let trace_file_clone = trace_file.clone();
         thread::spawn(move || {
             use super::sync_handler::{strip_sync_and_track, SyncAwareHandler};
             let mut reader = reader;
@@ -317,6 +339,12 @@ impl Terminal {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        if let Some(f) = trace_file_clone.as_ref()
+                            && let Ok(mut g) = f.lock()
+                        {
+                            use std::io::Write;
+                            let _ = g.write_all(&buf[..n]);
+                        }
                         // Strip `?2026h/l/$p` sequences BEFORE the
                         // parser sees them — that keeps alacritty's
                         // sync stash from activating, so our Handler
