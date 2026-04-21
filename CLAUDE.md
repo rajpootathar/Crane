@@ -167,8 +167,24 @@ User-facing persistence: `~/.crane/` (planned for config, sessions, themes). Not
   prompt theme or switch its icon set to ASCII. Crane cannot repair
   this from the terminal side without lying about grid width.
 
+- **Claude Code / Ink TUIs duplicate their prompt into scrollback.**
+  Ink wraps each redraw in `\e[?2026h…\e[?2026l` (Synchronized
+  Output) and inside the block steps through the UI region with
+  cursor-up + LF-based rewrites. alacritty_terminal 0.25 stashes
+  bytes during sync but replays them one-at-a-time at commit — the
+  replayed LFs still scroll the live grid, pushing each redraw's
+  bottom row into history. iTerm2 avoids this with a shadow-grid
+  sync (write to a snapshot, diff cells at commit, never replay LFs
+  into the live grid). Ghostty and real Alacritty have the same
+  latent bug but hide it by only waking the renderer once per sync
+  block. Proper fix: a `SyncAwareHandler` wrapping `Term` that
+  converts in-sync LFs to non-scrolling `move_down` — tracked as a
+  v0.5 milestone. Diagnostic probe: `CRANE_VT_TRACE=1` dumps raw
+  PTY bytes to `~/.crane/vt-trace-<pid>.log`.
+
 ## Pending major work
 
+- **`SyncAwareHandler` for `?2026` (Synchronized Output)** — wrap `Term<WakeListener>` in a Handler-trait adapter; track `move_up` count during sync blocks; convert that many `linefeed`/`newline`/`index` calls to non-scrolling `move_down(1)` so redraw LFs can't leak into scrollback. ~150 LOC of trait delegation. Matches what iTerm2's shadow-grid sync achieves, without the full clone. Fixes the Claude Code TUI duplicate-prompt bug.
 - Rename `Workspace` → `Layout`, `Worktree` → `Workspace` throughout the code
 - Drag-drop Pane rearrange in Layout tree
 - `wry`-backed embedded browser Pane (currently a placeholder)

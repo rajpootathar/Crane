@@ -337,29 +337,23 @@ impl Terminal {
                             use std::io::Write;
                             let _ = g.write_all(&buf[..n]);
                         }
-                        // Strip DEC private mode sequences for mode
-                        // 2026 (Synchronized Output). alacritty_terminal
-                        // 0.25 "supports" it only at the parser level —
-                        // it stashes bytes during a sync block and
-                        // replays them one-at-a-time into the grid on
-                        // commit. Each LF in that replay still scrolls
-                        // the bottom row into scrollback, so TUIs that
-                        // rely on atomic replacement (Claude Code,
-                        // modern Ink-based CLIs) see their UI duplicate
-                        // into history every redraw. Dropping these
-                        // three sequences — ?2026h / ?2026l / ?2026$p —
-                        // makes Claude Code's DECRQM probe go
-                        // unanswered; Ink then falls back to its
-                        // non-sync redraw path (cursor positioning, no
-                        // LFs), which renders correctly on every
-                        // ordinary VT100-compatible terminal.
-                        let filtered = strip_sync_output(&buf[..n]);
-                        let feed: &[u8] = match filtered.as_ref() {
-                            Some(v) => v,
-                            None => &buf[..n],
-                        };
+                        // KNOWN ISSUE: Claude Code / Ink TUIs wrap
+                        // redraws in ?2026h…?2026l (Synchronized
+                        // Output) with cursor-up + LF stepping inside.
+                        // alacritty_terminal 0.25 stashes bytes during
+                        // sync but replays them one-by-one at commit,
+                        // so LFs at the bottom row still push old
+                        // prompt rows into scrollback — visible as
+                        // duplicate prompts when you scroll up. Real
+                        // iTerm fixes this with a shadow grid (diff
+                        // cells at commit, never replay LFs into the
+                        // live grid). A matching fix here needs a
+                        // `SyncAwareHandler` wrapping Term that
+                        // converts in-sync LFs to non-scrolling
+                        // cursor-downs — ~150 lines of Handler-trait
+                        // delegation, deferred to a dedicated session.
                         let mut t = term_clone.lock();
-                        processor.advance(&mut *t, feed);
+                        processor.advance(&mut *t, &buf[..n]);
                         drop(t);
                         let mut h = history_clone.lock();
                         h.extend_from_slice(&buf[..n]);
@@ -523,33 +517,3 @@ impl Terminal {
     }
 }
 
-/// Scan for the three `?2026`-family sequences (set mode, reset mode,
-/// DECRQM query) and return a filtered copy with them removed. Returns
-/// None (the fast path) when the buffer doesn't contain any — callers
-/// can feed the original slice straight through. The sequences are
-/// short and fixed-shape, so the scan is cheap even at heavy output
-/// rates.
-fn strip_sync_output(buf: &[u8]) -> Option<Vec<u8>> {
-    const BEGIN: &[u8] = b"\x1b[?2026h";
-    const END: &[u8] = b"\x1b[?2026l";
-    const QUERY: &[u8] = b"\x1b[?2026$p";
-    let contains = |needle: &[u8]| buf.windows(needle.len()).any(|w| w == needle);
-    if !contains(BEGIN) && !contains(END) && !contains(QUERY) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(buf.len());
-    let mut i = 0;
-    while i < buf.len() {
-        if buf[i..].starts_with(BEGIN) {
-            i += BEGIN.len();
-        } else if buf[i..].starts_with(END) {
-            i += END.len();
-        } else if buf[i..].starts_with(QUERY) {
-            i += QUERY.len();
-        } else {
-            out.push(buf[i]);
-            i += 1;
-        }
-    }
-    Some(out)
-}
