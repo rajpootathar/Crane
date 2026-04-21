@@ -446,4 +446,14 @@ impl LspManager {
             .map(|(k, s)| (*k, s.status()))
             .collect()
     }
+
+    /// Last captured stderr lines for a server, if it's currently
+    /// spawned. Used by the Settings UI to show *why* a server is
+    /// dead (rustup shim missing component, spawn errno, etc.).
+    pub fn last_stderr(&self, key: ServerKey) -> Vec<String> {
+        self.servers
+            .get(&key)
+            .map(|s| s.last_stderr())
+            .unwrap_or_default()
+    }
 }

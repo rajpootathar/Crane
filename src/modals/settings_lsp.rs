@@ -127,6 +127,60 @@ fn render_lsp_row(
                 );
             }
 
+            // Dead server diagnostic panel. Instead of a bare "dead"
+            // chip with no context, surface the actual stderr lines
+            // and detect the common rustup-shim case ("Unknown binary
+            // 'rust-analyzer' in official toolchain …") so we can
+            // offer a one-click `rustup component add rust-analyzer`.
+            if matches!(status, Some(crate::lsp::server::Status::Dead)) {
+                let stderr = app.lsp.last_stderr(key);
+                if !stderr.is_empty() {
+                    ui.add_space(4.0);
+                    let combined = stderr.join("\n");
+                    ui.label(
+                        RichText::new(&combined)
+                            .size(10.5)
+                            .monospace()
+                            .color(theme::current().error.to_color32()),
+                    );
+                    let is_rustup_shim_missing = matches!(key, crate::lsp::ServerKey::RustAnalyzer)
+                        && combined.contains("Unknown binary 'rust-analyzer'");
+                    if is_rustup_shim_missing {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(
+                                "The rust-analyzer binary on PATH is a rustup shim that \
+                                 can't find its component. Install it with rustup, or \
+                                 download Crane's own copy below.",
+                            )
+                            .size(11.0)
+                            .italics()
+                            .color(theme::current().text_muted.to_color32()),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(
+                                    RichText::new("Install via rustup").strong(),
+                                )
+                                .clicked()
+                            {
+                                // Fire-and-forget: run `rustup component
+                                // add rust-analyzer` in the background.
+                                // Stderr/stdout are dropped; the user
+                                // re-opens Settings to see the new
+                                // status on the next LSP spawn.
+                                let _ = std::process::Command::new("rustup")
+                                    .args(["component", "add", "rust-analyzer"])
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn();
+                            }
+                        });
+                    }
+                }
+            }
+
             // Per-language toggles — configure diagnostics behavior without
             // a binary rebuild. Persisted in session.
             ui.add_space(6.0);

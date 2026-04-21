@@ -203,6 +203,10 @@ struct Shared {
     /// out-of-order hover/definition responses during startup.
     init_request_id: Option<i64>,
     dead: bool,
+    /// Last few stderr lines from the server, captured so the UI can
+    /// show *why* the server died instead of a bare "dead" chip.
+    /// Bounded to ~4 lines to avoid unbounded growth.
+    last_stderr: Vec<String>,
     pending_opens: Vec<PendingOpen>,
     diagnostics: HashMap<String, Vec<Diagnostic>>,
     hover_results: HashMap<i64, Option<String>>,
@@ -264,6 +268,11 @@ impl LspServer {
                 initialized: false,
                 init_request_id: None,
                 dead: child_res.is_err(),
+                last_stderr: if let Err(ref e) = child_res {
+                    vec![format!("spawn failed: {e}")]
+                } else {
+                    Vec::new()
+                },
                 pending_opens: Vec::new(),
                 diagnostics: HashMap::new(),
                 hover_results: HashMap::new(),
@@ -279,11 +288,22 @@ impl LspServer {
         };
         if let Some(stderr) = stderr {
             let key_label = format!("{key:?}");
+            let shared_err = shared.clone();
             thread::spawn(move || {
                 use std::io::{BufRead, BufReader};
                 let r = BufReader::new(stderr);
                 for line in r.lines().map_while(Result::ok) {
                     eprintln!("[lsp:{key_label}] {line}");
+                    let (m, _cv) = &*shared_err;
+                    let mut g = m.lock();
+                    g.last_stderr.push(line);
+                    // Keep only the last 4 lines — enough to fit a
+                    // typical panic or single-line error without
+                    // unbounded memory growth over long sessions.
+                    let excess = g.last_stderr.len().saturating_sub(4);
+                    if excess > 0 {
+                        g.last_stderr.drain(0..excess);
+                    }
                 }
             });
         }
@@ -356,6 +376,14 @@ impl LspServer {
 
     fn is_dead(&self) -> bool {
         self.shared.0.lock().dead
+    }
+
+    /// Most recent stderr lines from the server process. Empty when
+    /// the server started cleanly; populated when spawn failed or the
+    /// server wrote to stderr before exiting. UI surfaces this under
+    /// a dead server so the user can see the actual cause.
+    pub fn last_stderr(&self) -> Vec<String> {
+        self.shared.0.lock().last_stderr.clone()
     }
 
     pub fn status(&self) -> Status {
