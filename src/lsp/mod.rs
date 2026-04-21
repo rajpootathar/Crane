@@ -126,6 +126,39 @@ impl LspManager {
         Self::default()
     }
 
+    /// Tear down any server whose language has been disabled in
+    /// settings since the last call. Meant to be invoked once per
+    /// frame: it's a no-op when every running server is still enabled.
+    ///
+    /// Dropping the `Arc<LspServer>` from `self.servers` triggers its
+    /// `Drop` impl, which runs `graceful_shutdown` (LSP `shutdown` +
+    /// `exit` + hard-kill fallback), so the child process and its
+    /// rust-analyzer DB writer exit cleanly. We also strip the key out
+    /// of `files` / `pending_files` so a subsequent did_open after re-
+    /// enabling the server starts from a clean slate instead of
+    /// silently routing notifications into the void.
+    pub fn shutdown_disabled(&mut self, configs: &LanguageConfigs) {
+        let to_kill: Vec<ServerKey> = self
+            .servers
+            .keys()
+            .copied()
+            .filter(|k| !configs.get_or_default(*k).enabled)
+            .collect();
+        if to_kill.is_empty() {
+            return;
+        }
+        for k in &to_kill {
+            self.servers.remove(k);
+            self.pending_files.write().remove(k);
+        }
+        let kill_set: HashSet<ServerKey> = to_kill.iter().copied().collect();
+        let mut files = self.files.write();
+        files.retain(|_, keys| {
+            keys.retain(|k| !kill_set.contains(k));
+            !keys.is_empty()
+        });
+    }
+
     pub fn did_open(
         &mut self,
         ctx: &egui::Context,

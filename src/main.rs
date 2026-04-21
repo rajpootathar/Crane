@@ -355,6 +355,10 @@ impl eframe::App for CraneApp {
             }
         }
         self.app.refresh_active_git_status(&ctx);
+        // If the user just turned off a language in Settings, stop its
+        // server process now instead of waiting for app exit. Cheap no-op
+        // when every running server is still enabled.
+        self.app.lsp.shutdown_disabled(&self.app.language_configs);
         #[cfg(target_os = "macos")]
         {
             // Fold any URL changes the WKWebView reported (redirects,
