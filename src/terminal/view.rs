@@ -284,14 +284,9 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         grid_snap::snap_if_enabled(&guard, cursor, offset, history);
         // Build a set of trimmed text for the bottom ~12 live rows so we
         // can dedup TUI redraw artifacts out of scrollback at paint
-        // time. Claude Code (and any Ink-based TUI) uses absolute
-        // positioning to repaint a fixed prompt box at viewport bottom;
-        // meanwhile auto-wrap during streaming scrolls the grid up,
-        // pushing copies of the prompt into history. Result: scrolling
-        // up shows the same prompt repeated. Reading direct from the
-        // grid (rather than display_iter, which follows display_offset)
-        // always gives the *currently live* bottom rows regardless of
-        // scroll position.
+        // time. Reading direct from the grid (rather than display_iter,
+        // which follows display_offset) always gives the currently
+        // live bottom rows regardless of scroll position.
         let grid = guard.grid();
         let screen_lines = grid.screen_lines() as i32;
         let grid_cols = grid.columns();
@@ -305,9 +300,6 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                 s.push(if ch == '\0' { ' ' } else { ch });
             }
             let trimmed = s.trim_end_matches(' ').to_string();
-            // Very short rows (blanks, single separator chars) would
-            // cause false-positive dedup across genuinely distinct
-            // history rows. Require at least some content.
             if trimmed.chars().filter(|c| !c.is_whitespace()).count() >= 3 {
                 live_bottom.insert(trimmed);
             }
@@ -838,17 +830,21 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         }
     }
     if clear_requested {
-        // \x1b[H → cursor home, \x1b[2J → erase display, \x1b[3J → erase
-        // scrollback. Safe to run here because ui.input's read lock on
-        // Context has been released, so alacritty's WakeListener calling
-        // ctx.request_repaint() won't deadlock.
+        // Only erase saved lines (`\x1b[3J`) — do NOT touch the visible
+        // grid or the cursor. A running TUI (Claude Code, vim, etc.)
+        // places its widget based on absolute cursor coordinates; an
+        // `\x1b[H\x1b[2J` would move the cursor to (0,0) and wipe its
+        // UI, after which the TUI's next write lands in the wrong
+        // place and interactive features (scroll, input, etc.) break
+        // until the next full redraw. Mac Terminal / iTerm's
+        // "Clear Buffer" shortcut is scrollback-only for exactly this
+        // reason.
         let mut processor: Processor<StdSyncHandler> = Processor::new();
         {
             let mut guard = terminal.term.lock();
-            processor.advance(&mut *guard, b"\x1b[H\x1b[2J\x1b[3J");
+            processor.advance(&mut *guard, b"\x1b[3J");
             guard.scroll_display(Scroll::Bottom);
         }
-        terminal.write_input(b"\x0c");
         terminal.history.lock().clear();
     }
 }
