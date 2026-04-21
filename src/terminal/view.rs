@@ -1,5 +1,4 @@
 use crate::terminal::Terminal;
-use super::grid_snap;
 use crate::theme;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
@@ -273,18 +272,39 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             .collect();
         // history_size lives on the Dimensions trait (Grid impls it).
         let history = guard.history_size();
-        // Opt-in grid snapshot probe. When `CRANE_GRID_SNAP=1` is set
-        // in the parent env, dump the full visible grid + the top 8
-        // history rows + cursor coords to a JSONL log each time the
-        // grid content changed since the previous frame. Meant for
-        // diagnosing the Claude Code duplicate-prompt artifact: row
-        // text is captured exactly as alacritty stores it, so we can
-        // tell whether a given "duplicate" row is in live viewport or
-        // has been promoted into scrollback history.
-        grid_snap::snap_if_enabled(&guard, cursor, offset, history);
-        (cells, cursor, selection, offset, history)
+        // Build a set of trimmed text for the bottom ~12 live rows so we
+        // can dedup TUI redraw artifacts out of scrollback at paint
+        // time. Claude Code (and any Ink-based TUI) uses absolute
+        // positioning to repaint a fixed prompt box at viewport bottom;
+        // meanwhile auto-wrap during streaming scrolls the grid up,
+        // pushing copies of the prompt into history. Result: scrolling
+        // up shows the same prompt repeated. Reading direct from the
+        // grid (rather than display_iter, which follows display_offset)
+        // always gives the *currently live* bottom rows regardless of
+        // scroll position.
+        let grid = guard.grid();
+        let screen_lines = grid.screen_lines() as i32;
+        let grid_cols = grid.columns();
+        let mut live_bottom: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let probe_from = (screen_lines - 12).max(0);
+        for l in probe_from..screen_lines {
+            let mut s = String::with_capacity(grid_cols);
+            for c in 0..grid_cols {
+                let ch = grid[Point::new(Line(l), Column(c))].c;
+                s.push(if ch == '\0' { ' ' } else { ch });
+            }
+            let trimmed = s.trim_end_matches(' ').to_string();
+            // Very short rows (blanks, single separator chars) would
+            // cause false-positive dedup across genuinely distinct
+            // history rows. Require at least some content.
+            if trimmed.chars().filter(|c| !c.is_whitespace()).count() >= 3 {
+                live_bottom.insert(trimmed);
+            }
+        }
+        (cells, cursor, selection, offset, history, live_bottom)
     };
-    let (cells, (cursor_col, cursor_line), selection, display_offset, history_size) = snapshot;
+    let (cells, (cursor_col, cursor_line), selection, display_offset, history_size, live_bottom) = snapshot;
 
     // Group cells by line, then batch each line into a single LayoutJob
     // grouped by contiguous runs of same (fg, bg, flags). This cuts paint
@@ -310,6 +330,39 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             .entry(viewport_line)
             .or_default()
             .push((point.column.0, cell, in_selection));
+    }
+
+    // Render-time scrollback dedup: when the user has scrolled up into
+    // history (display_offset > 0), drop any viewport row whose original
+    // grid line is in history (< 0) AND whose text matches a live
+    // bottom row. This hides the Claude-Code-style duplicate prompt
+    // artifact without mutating grid state.
+    if display_offset > 0 && !live_bottom.is_empty() {
+        let dedup_rows: Vec<i32> = by_row
+            .iter()
+            .filter_map(|(viewport_line, cells)| {
+                let original_line = *viewport_line - display_offset;
+                if original_line >= 0 {
+                    return None;
+                }
+                let mut chars: Vec<(usize, char)> =
+                    cells.iter().map(|(c, cell, _)| (*c, cell.c)).collect();
+                chars.sort_by_key(|(c, _)| *c);
+                let mut s = String::with_capacity(chars.len());
+                for (_, ch) in chars {
+                    s.push(if ch == '\0' { ' ' } else { ch });
+                }
+                let trimmed = s.trim_end_matches(' ').to_string();
+                if live_bottom.contains(&trimmed) {
+                    Some(*viewport_line)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for l in dedup_rows {
+            by_row.remove(&l);
+        }
     }
 
     let fallback_fg = term_fg();
