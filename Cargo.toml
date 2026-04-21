@@ -29,6 +29,12 @@ depends = ["libxkbcommon0", "libwayland-client0", "libgl1", "libx11-6"]
 eframe = { version = "0.34", features = ["wgpu", "persistence"] }
 egui = "0.34"
 alacritty_terminal = "0.25"
+# Pulled in for the `CursorIcon` type that appears in vte's Handler
+# trait signature (set_mouse_cursor_icon). vte doesn't re-export it,
+# so we depend on the same crate directly. Pinned to the major
+# version vte 0.15 uses — mismatch would produce a distinct type and
+# fail to impl Handler.
+cursor-icon = "1"
 portable-pty = "0.9"
 parking_lot = "0.12"
 log = "0.4"

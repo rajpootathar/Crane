@@ -324,9 +324,17 @@ impl Terminal {
         };
         let trace_file_clone = trace_file.clone();
         thread::spawn(move || {
+            use super::sync_handler::{strip_sync_and_track, SyncAwareHandler};
             let mut reader = reader;
             let mut processor: Processor<StdSyncHandler> = Processor::new();
             let mut buf = [0u8; 8192];
+            // Persistent sync state across reads — `?2026h` may land in
+            // one read chunk and `?2026l` in the next. `move_up_pending`
+            // is reset whenever `in_sync` transitions (inside the
+            // handler's goto-path), so stale budget can't leak across
+            // blocks.
+            let mut in_sync: bool = false;
+            let mut move_up_pending: usize = 0;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -337,23 +345,31 @@ impl Terminal {
                             use std::io::Write;
                             let _ = g.write_all(&buf[..n]);
                         }
-                        // KNOWN ISSUE: Claude Code / Ink TUIs wrap
-                        // redraws in ?2026h…?2026l (Synchronized
-                        // Output) with cursor-up + LF stepping inside.
-                        // alacritty_terminal 0.25 stashes bytes during
-                        // sync but replays them one-by-one at commit,
-                        // so LFs at the bottom row still push old
-                        // prompt rows into scrollback — visible as
-                        // duplicate prompts when you scroll up. Real
-                        // iTerm fixes this with a shadow grid (diff
-                        // cells at commit, never replay LFs into the
-                        // live grid). A matching fix here needs a
-                        // `SyncAwareHandler` wrapping Term that
-                        // converts in-sync LFs to non-scrolling
-                        // cursor-downs — ~150 lines of Handler-trait
-                        // delegation, deferred to a dedicated session.
+                        // Strip `?2026h/l/$p` sequences BEFORE the
+                        // parser sees them — that keeps alacritty's
+                        // sync stash from activating, so our Handler
+                        // wrapper gets called live for every byte and
+                        // its LF-suppression heuristic can actually
+                        // run. `strip_sync_and_track` also mutates
+                        // `in_sync` at the exact boundary each stripped
+                        // marker sits at.
+                        let was_in_sync = in_sync;
+                        let feed = strip_sync_and_track(&buf[..n], &mut in_sync);
+                        // Reset the pending LF budget on a transition
+                        // into a fresh sync block — a half-consumed
+                        // budget from a previous redraw must not leak
+                        // into the next one.
+                        if in_sync && !was_in_sync {
+                            move_up_pending = 0;
+                        }
                         let mut t = term_clone.lock();
-                        processor.advance(&mut *t, &buf[..n]);
+                        let mut h = SyncAwareHandler {
+                            inner: &mut *t,
+                            in_sync,
+                            move_up_pending,
+                        };
+                        processor.advance(&mut h, &feed);
+                        move_up_pending = h.move_up_pending;
                         drop(t);
                         let mut h = history_clone.lock();
                         h.extend_from_slice(&buf[..n]);
