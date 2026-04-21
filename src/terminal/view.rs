@@ -16,8 +16,13 @@ fn term_fg() -> Color32 {
     theme::current().terminal_fg.to_color32()
 }
 fn selection_bg() -> Color32 {
+    // Subtle accent tint — previously used `from_rgba_premultiplied`
+    // with raw RGB, which over-brightens since the channels weren't
+    // actually premultiplied. Unmultiplied + lower alpha (~28%) reads
+    // as a proper text-selection highlight that leaves the glyphs
+    // underneath fully legible, matching native terminal behavior.
     let a = theme::current().accent;
-    Color32::from_rgba_premultiplied(a.r, a.g, a.b, 100)
+    Color32::from_rgba_unmultiplied(a.r, a.g, a.b, 72)
 }
 
 fn point_in_selection(point: Point, range: &alacritty_terminal::selection::SelectionRange) -> bool {
