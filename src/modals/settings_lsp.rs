@@ -164,14 +164,17 @@ fn render_lsp_row(
                 {
                     changed = true;
                 }
-            } else {
-                ui.add_enabled(
+            } else if ui
+                .add_enabled(
                     cfg.enabled,
                     egui::Checkbox::new(
                         &mut cfg.check_on_save,
                         "Notify server on save",
                     ),
-                );
+                )
+                .changed()
+            {
+                changed = true;
             }
             let fmt_label = match key {
                 crate::lsp::ServerKey::RustAnalyzer => "Format on save (rustfmt)",

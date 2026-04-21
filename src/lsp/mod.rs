@@ -199,15 +199,22 @@ impl LspManager {
             return;
         }
 
-        // Prefer a downloaded copy — user explicitly chose it. Fall back
-        // to PATH for users with a known-good global install.
+        // Prefer whatever the user installed themselves (PATH) — their
+        // toolchain manager (rustup, nvm, brew) keeps it current. Only
+        // fall back to Crane's downloaded copy when nothing is on PATH.
         let (cmd, _) = key.command();
-        let downloaded = self.downloader.resolved(key);
         let path_bin = which_on_path(cmd);
-        let resolved = downloaded.or(path_bin);
+        let downloaded = self.downloader.resolved(key);
+        let resolved = path_bin.or(downloaded);
 
         if let Some(bin) = resolved {
-            let server = Arc::new(server::LspServer::spawn(ctx.clone(), key, &bin));
+            let root = server::LspServer::detect_project_root(path);
+            let server = Arc::new(server::LspServer::spawn(
+                ctx.clone(),
+                key,
+                &bin,
+                Some(&root),
+            ));
             self.servers.insert(key, server.clone());
             server.did_open(path, text);
             return;
@@ -240,7 +247,17 @@ impl LspManager {
         let Some(bin) = self.downloader.resolved(key) else {
             return;
         };
-        let server = Arc::new(server::LspServer::spawn(ctx.clone(), key, &bin));
+        let cwd = self
+            .pending_files
+            .read()
+            .get(&key)
+            .and_then(|q| q.first().map(|(p, _)| server::LspServer::detect_project_root(p)));
+        let server = Arc::new(server::LspServer::spawn(
+            ctx.clone(),
+            key,
+            &bin,
+            cwd.as_deref(),
+        ));
         self.servers.insert(key, server.clone());
         if let Some(queue) = self.pending_files.write().remove(&key) {
             for (path, text) in queue {
@@ -303,6 +320,7 @@ impl LspManager {
                         self.downloader.state(*key),
                         DownloadState::Downloading { .. } | DownloadState::Ready(_)
                     )
+                    && which_on_path(key.command().0).is_none()
                 {
                     self.prompt_install = Some(*key);
                     break;

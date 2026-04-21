@@ -229,7 +229,7 @@ pub struct LspServer {
 }
 
 impl LspServer {
-    pub fn spawn(ctx: egui::Context, key: ServerKey, bin: &Path) -> Self {
+    pub fn spawn(ctx: egui::Context, key: ServerKey, bin: &Path, cwd: Option<&Path>) -> Self {
         let (_cmd_name, args) = key.command();
         // JS/MJS entrypoints (tsserver, pyright) need Node to launch.
         let needs_node = bin
@@ -245,6 +245,12 @@ impl LspServer {
             c.args(args);
             c
         };
+        // rust-analyzer / gopls resolve sysroot + proc-macro server from
+        // the working dir. Dock-launched Crane inherits CWD=/, which
+        // makes rust-analyzer panic on startup. Pin it to the workspace.
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -322,7 +328,7 @@ impl LspServer {
     /// Walk up from a file path to find the nearest project root. Returns
     /// the directory containing the first found marker, or the file's parent
     /// if nothing is found.
-    fn detect_project_root(path: &Path) -> PathBuf {
+    pub fn detect_project_root(path: &Path) -> PathBuf {
         let markers = [
             "Cargo.toml",
             "package.json",
