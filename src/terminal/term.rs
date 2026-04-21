@@ -206,7 +206,25 @@ impl Terminal {
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
         let mut cmd = CommandBuilder::new(shell);
+        // TUIs like Claude Code / Ink inspect these env vars to pick
+        // their redraw strategy. Without `COLORTERM` and
+        // `TERM_PROGRAM`, they fall back to a "dumb terminal" codepath
+        // that redraws the prompt by writing newlines — each keystroke
+        // then leaks the previous prompt into scrollback. Advertising
+        // truecolor + a known program name routes them onto the
+        // in-place cursor-positioning redraw path that iTerm2 / WezTerm
+        // / Alacritty get.
         cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "Crane");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        // Inherited from gnome-terminal / other VTE-based parents. If
+        // it leaks through, TUIs like neovim / Claude Code misdetect
+        // the renderer and pick feature flags meant for VTE's grid
+        // semantics (which differ subtly around scroll regions and
+        // cursor-save). Clearing it matches what Ghostty / WezTerm /
+        // kitty do — keeps detection unambiguous.
+        cmd.env_remove("VTE_VERSION");
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         } else if let Ok(home) = std::env::var("HOME") {
@@ -283,6 +301,28 @@ impl Terminal {
         let history_clone = history.clone();
         let ctx_clone = ctx.clone();
         let alive_clone = alive.clone();
+        // Opt-in raw VT byte trace. Set CRANE_VT_TRACE=1 in the parent
+        // env to dump everything the PTY produces, exactly as the
+        // parser sees it, to ~/.crane/vt-trace-<pid>.log. Lets us diff
+        // our byte stream against what iTerm / Alacritty see for the
+        // same TUI and pin down which escape sequence our parser is
+        // mis-handling. Cheap branch when the flag is unset.
+        let trace_file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> = {
+            if std::env::var("CRANE_VT_TRACE").ok().as_deref() == Some("1") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let dir = std::path::PathBuf::from(format!("{home}/.crane"));
+                let _ = std::fs::create_dir_all(&dir);
+                let pid = std::process::id();
+                let path = dir.join(format!("vt-trace-{pid}.log"));
+                eprintln!("[crane] VT trace enabled → {}", path.display());
+                std::fs::File::create(&path)
+                    .ok()
+                    .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)))
+            } else {
+                None
+            }
+        };
+        let trace_file_clone = trace_file.clone();
         thread::spawn(move || {
             let mut reader = reader;
             let mut processor: Processor<StdSyncHandler> = Processor::new();
@@ -291,8 +331,35 @@ impl Terminal {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        if let Some(f) = trace_file_clone.as_ref()
+                            && let Ok(mut g) = f.lock()
+                        {
+                            use std::io::Write;
+                            let _ = g.write_all(&buf[..n]);
+                        }
+                        // Strip DEC private mode sequences for mode
+                        // 2026 (Synchronized Output). alacritty_terminal
+                        // 0.25 "supports" it only at the parser level —
+                        // it stashes bytes during a sync block and
+                        // replays them one-at-a-time into the grid on
+                        // commit. Each LF in that replay still scrolls
+                        // the bottom row into scrollback, so TUIs that
+                        // rely on atomic replacement (Claude Code,
+                        // modern Ink-based CLIs) see their UI duplicate
+                        // into history every redraw. Dropping these
+                        // three sequences — ?2026h / ?2026l / ?2026$p —
+                        // makes Claude Code's DECRQM probe go
+                        // unanswered; Ink then falls back to its
+                        // non-sync redraw path (cursor positioning, no
+                        // LFs), which renders correctly on every
+                        // ordinary VT100-compatible terminal.
+                        let filtered = strip_sync_output(&buf[..n]);
+                        let feed: &[u8] = match filtered.as_ref() {
+                            Some(v) => v,
+                            None => &buf[..n],
+                        };
                         let mut t = term_clone.lock();
-                        processor.advance(&mut *t, &buf[..n]);
+                        processor.advance(&mut *t, feed);
                         drop(t);
                         let mut h = history_clone.lock();
                         h.extend_from_slice(&buf[..n]);
@@ -454,4 +521,35 @@ impl Terminal {
             screen_lines: rows,
         });
     }
+}
+
+/// Scan for the three `?2026`-family sequences (set mode, reset mode,
+/// DECRQM query) and return a filtered copy with them removed. Returns
+/// None (the fast path) when the buffer doesn't contain any — callers
+/// can feed the original slice straight through. The sequences are
+/// short and fixed-shape, so the scan is cheap even at heavy output
+/// rates.
+fn strip_sync_output(buf: &[u8]) -> Option<Vec<u8>> {
+    const BEGIN: &[u8] = b"\x1b[?2026h";
+    const END: &[u8] = b"\x1b[?2026l";
+    const QUERY: &[u8] = b"\x1b[?2026$p";
+    let contains = |needle: &[u8]| buf.windows(needle.len()).any(|w| w == needle);
+    if !contains(BEGIN) && !contains(END) && !contains(QUERY) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i..].starts_with(BEGIN) {
+            i += BEGIN.len();
+        } else if buf[i..].starts_with(END) {
+            i += END.len();
+        } else if buf[i..].starts_with(QUERY) {
+            i += QUERY.len();
+        } else {
+            out.push(buf[i]);
+            i += 1;
+        }
+    }
+    Some(out)
 }
