@@ -4,3 +4,9 @@ Cargo.lock
 /icons/crane.iconset/
 # Local signing env (DEVELOPER_ID, NOTARY_PROFILE). Never committed.
 .env.local
+
+# Local checkout of our alacritty fork, used as a path dep during
+# development. Tracked in the fork's own repo; referenced from
+# Cargo.toml via path so edits are picked up on cargo build without
+# a git push.
+/alacritty-fork

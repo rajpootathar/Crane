@@ -38,8 +38,17 @@ static STATE: OnceLock<Mutex<Option<State>>> = OnceLock::new();
 struct State {
     file: File,
     start: Instant,
+    // Keyed by (term_ptr, cols) so each terminal pane has its own
+    // change-gate and pane tag. Pane id is assigned on first snap.
+    panes: std::collections::HashMap<(usize, usize), PaneState>,
+    next_pane_id: u32,
+}
+
+struct PaneState {
+    id: u32,
     last_hist: usize,
-    last_bottom_row: String,
+    last_off: i32,
+    last_rows_hash: u64,
 }
 
 fn try_open() -> Option<State> {
@@ -54,8 +63,8 @@ fn try_open() -> Option<State> {
     File::create(&path).ok().map(|f| State {
         file: f,
         start: Instant::now(),
-        last_hist: 0,
-        last_bottom_row: String::new(),
+        panes: std::collections::HashMap::new(),
+        next_pane_id: 0,
     })
 }
 
@@ -116,20 +125,52 @@ pub fn snap_if_enabled<L: EventListener>(
     for line in 0..screen_lines {
         visible.push(row_to_string(term, line, cols));
     }
-    let bottom_row = visible.last().cloned().unwrap_or_default();
-    // Frame-change gate: avoid writing thousands of identical snaps
-    // during idle frames. Trigger on any history change OR on last-
-    // row text changing. Good enough to catch redraws.
-    if history == state.last_hist && bottom_row == state.last_bottom_row {
-        return;
-    }
-    state.last_hist = history;
-    state.last_bottom_row = bottom_row;
+    // Per-pane change gate. Key by (term_ptr, cols) so a reflow
+    // (cols changed) or a pane recreation gets its own state.
+    let term_ptr = (term as *const Term<L>) as usize;
+    let key = (term_ptr, cols);
+    let rows_hash = {
+        use std::hash::{Hasher, Hash};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for r in &visible {
+            r.hash(&mut h);
+        }
+        h.finish()
+    };
+    let (pane_id, is_new) = match state.panes.get_mut(&key) {
+        Some(p) => {
+            // Gate: fire on history change, offset change, or row-hash
+            // change. This catches scroll events and mid-viewport
+            // redraws that the old bottom-row gate missed.
+            if history == p.last_hist && display_offset == p.last_off && rows_hash == p.last_rows_hash {
+                return;
+            }
+            p.last_hist = history;
+            p.last_off = display_offset;
+            p.last_rows_hash = rows_hash;
+            (p.id, false)
+        }
+        None => {
+            let id = state.next_pane_id;
+            state.next_pane_id += 1;
+            state.panes.insert(key, PaneState {
+                id,
+                last_hist: history,
+                last_off: display_offset,
+                last_rows_hash: rows_hash,
+            });
+            (id, true)
+        }
+    };
 
-    let mut top_history: Vec<String> = Vec::with_capacity(8);
-    let take = 8.min(history as i32);
-    for offset in 1..=take {
-        top_history.push(row_to_string(term, -offset, cols));
+    // Capture more scrollback when the user is scrolled up — lets us
+    // see what they're actually looking at vs. what's live. 32 rows
+    // upstream of the first visible line covers a typical screenful.
+    let hist_rows_wanted: i32 = if display_offset > 0 { 32 } else { 8 };
+    let mut top_history: Vec<String> = Vec::with_capacity(hist_rows_wanted as usize);
+    let take = hist_rows_wanted.min(history as i32);
+    for off in 1..=take {
+        top_history.push(row_to_string(term, -off, cols));
     }
 
     let t_ms = state.start.elapsed().as_millis();
@@ -144,7 +185,7 @@ pub fn snap_if_enabled<L: EventListener>(
         .collect::<Vec<_>>()
         .join(",");
     let line = format!(
-        "{{\"t\":{t_ms},\"cur\":[{},{}],\"off\":{display_offset},\"hist\":{history},\"rows\":[{rows_json}],\"tophist\":[{tophist_json}]}}\n",
+        "{{\"t\":{t_ms},\"pane\":{pane_id},\"new\":{is_new},\"cols\":{cols},\"cur\":[{},{}],\"off\":{display_offset},\"hist\":{history},\"rows\":[{rows_json}],\"tophist\":[{tophist_json}]}}\n",
         cursor.1, cursor.0,
     );
     let _ = state.file.write_all(line.as_bytes());

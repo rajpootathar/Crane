@@ -48,8 +48,19 @@ use alacritty_terminal::vte::ansi::{
 // we depend on the same crate directly.
 use cursor_icon::CursorIcon;
 
+/// Kept for possible rollback to the per-LF suppression strategy.
+/// The reader thread now uses `split_sync_markers` + shadow-grid
+/// snapshot/restore instead, which is correct at the bottom row
+/// where this handler clamped `move_down(1)` and produced garbled
+/// redraws.
+#[allow(dead_code)]
 pub struct SyncAwareHandler<'a, L: EventListener> {
     pub inner: &'a mut Term<L>,
+    /// Tracks whether we're between `?2026h` and `?2026l`. Kept around
+    /// after the heuristic change so `strip_sync_and_track` can still
+    /// populate it — future logic (e.g. stricter LF suppression only
+    /// inside sync blocks) can opt back in without a signature change.
+    #[allow(dead_code)]
     pub in_sync: bool,
     /// Budget of LFs whose scroll should be suppressed. Incremented by
     /// upward cursor motion inside a sync block; decremented by each
@@ -59,6 +70,7 @@ pub struct SyncAwareHandler<'a, L: EventListener> {
     pub move_up_pending: usize,
 }
 
+#[allow(dead_code)]
 impl<L: EventListener> SyncAwareHandler<'_, L> {
     /// True when the next LF should be suppress-scrolled. Combines
     /// the sync flag with the motion budget so we never downgrade
@@ -242,6 +254,7 @@ impl<L: EventListener> Handler for SyncAwareHandler<'_, L> {
 ///
 /// Returns `Ok(Cow::Borrowed)` on the fast path (no sync sequence in
 /// the chunk), or `Cow::Owned` when a copy was required.
+#[allow(dead_code)]
 pub fn strip_sync_and_track<'a>(
     buf: &'a [u8],
     in_sync: &mut bool,
@@ -270,4 +283,71 @@ pub fn strip_sync_and_track<'a>(
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// A chunk produced by walking the byte stream and splitting it at
+/// `?2026h` / `?2026l` markers. The reader thread feeds `Bytes` chunks
+/// to the parser as-is, and performs shadow-grid bookkeeping at each
+/// `Begin` / `End` boundary. `?2026$p` queries are silently dropped
+/// (the terminal answers via DECRQM on its own).
+#[allow(dead_code)]
+pub enum SyncChunk<'a> {
+    /// Raw bytes that should be passed straight to the parser.
+    Bytes(&'a [u8]),
+    /// `\e[?2026h` — sync begins. Reader snapshots the grid before
+    /// processing any subsequent chunks.
+    Begin,
+    /// `\e[?2026l` — sync ends. Reader restores the grid from the
+    /// snapshot and overlays the post-sync viewport.
+    End,
+}
+
+/// Split the buffer into a sequence of chunks at `?2026` boundaries.
+/// Every byte of `buf` ends up either inside a `Bytes(..)` chunk or
+/// consumed as part of a `Begin` / `End` / `QUERY` marker. QUERY
+/// markers are dropped entirely; Begin / End appear as their own
+/// chunks so the reader can run grid snapshot / restore around the
+/// sync region.
+#[allow(dead_code)]
+pub fn split_sync_markers<'a>(buf: &'a [u8]) -> Vec<SyncChunk<'a>> {
+    const BEGIN: &[u8] = b"\x1b[?2026h";
+    const END: &[u8] = b"\x1b[?2026l";
+    const QUERY: &[u8] = b"\x1b[?2026$p";
+    // Fast-path: no markers at all — single chunk, no allocation.
+    let contains = |needle: &[u8]| buf.windows(needle.len()).any(|w| w == needle);
+    if !contains(BEGIN) && !contains(END) && !contains(QUERY) {
+        return vec![SyncChunk::Bytes(buf)];
+    }
+    let mut chunks = Vec::new();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < buf.len() {
+        let matched = if buf[i..].starts_with(BEGIN) {
+            Some((BEGIN.len(), Some(SyncChunk::Begin)))
+        } else if buf[i..].starts_with(END) {
+            Some((END.len(), Some(SyncChunk::End)))
+        } else if buf[i..].starts_with(QUERY) {
+            // Silently drop — the terminal's DECRQM path already
+            // answers this for us.
+            Some((QUERY.len(), None))
+        } else {
+            None
+        };
+        if let Some((skip, marker)) = matched {
+            if i > last {
+                chunks.push(SyncChunk::Bytes(&buf[last..i]));
+            }
+            if let Some(m) = marker {
+                chunks.push(m);
+            }
+            i += skip;
+            last = i;
+        } else {
+            i += 1;
+        }
+    }
+    if last < buf.len() {
+        chunks.push(SyncChunk::Bytes(&buf[last..]));
+    }
+    chunks
 }

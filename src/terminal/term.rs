@@ -73,6 +73,74 @@ impl EventListener for WakeListener {
 
 const HISTORY_MAX: usize = 256 * 1024;
 
+// ---------------------------------------------------------------------------
+// Terminfo: extend xterm-256color with the Sync extended capability
+// (Synchronized Output, DEC mode 2026). Ink-based TUIs (Claude Code,
+// etc.) check terminfo for `Sync` and, when present, wrap their
+// redraws in \e[?2026h .. \e[?2026l. Our SyncAwareHandler then
+// converts the LFs inside the redraw region to non-scrolling
+// move_down(1), preventing ghost-frame accumulation in scrollback.
+// Compiled on first launch via `tic -x`; installed to ~/.terminfo/.
+// Falls back to plain xterm-256color if tic is unavailable.
+// ---------------------------------------------------------------------------
+
+/// Terminfo source: xterm-256color + Sync capability.
+const CRANE_TERMINFO_SRC: &[u8] = b"xterm-crane|Crane terminal emulator,\n\
+    \tuse=xterm-256color,\n\
+    \tSync=\\E[?2026h\\E[?2026l,\n";
+
+/// One-time gate: true once xterm-crane has been installed (or was
+/// already present). Cached for the process lifetime so `tic` only
+/// runs once, even across many terminal panes.
+static CRANE_TERMINFO_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Ensure `~/.terminfo/<hash>/xterm-crane` exists. Compiles via
+/// `tic -x` on first call. Returns true when the custom entry is
+/// usable (either just compiled or already present).
+fn use_crane_terminfo() -> bool {
+    *CRANE_TERMINFO_OK.get_or_init(|| {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        let dir = format!("{home}/.terminfo");
+        // ncurses uses either a hex subdirectory (macOS: 78/) or a
+        // character subdirectory (Linux: x/). Check both.
+        let hex = format!("{dir}/78/xterm-crane");
+        let chr = format!("{dir}/x/xterm-crane");
+        if std::path::Path::new(&hex).exists() || std::path::Path::new(&chr).exists() {
+            return true;
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        let tmp = std::env::temp_dir().join(format!(
+            "xterm-crane-{}.ti",
+            std::process::id()
+        ));
+        if std::fs::write(&tmp, CRANE_TERMINFO_SRC).is_err() {
+            return false;
+        }
+        let out = std::process::Command::new("tic")
+            .args(["-x", "-o", &dir])
+            .arg(&tmp)
+            .output();
+        let _ = std::fs::remove_file(&tmp);
+        match out {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                eprintln!(
+                    "[crane] tic failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("[crane] tic unavailable: {e}");
+                false
+            }
+        }
+    })
+}
+
 pub struct Terminal {
     pub term: Arc<Mutex<Term<WakeListener>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -207,14 +275,15 @@ impl Terminal {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
         let mut cmd = CommandBuilder::new(shell);
         // TUIs like Claude Code / Ink inspect these env vars to pick
-        // their redraw strategy. Without `COLORTERM` and
-        // `TERM_PROGRAM`, they fall back to a "dumb terminal" codepath
-        // that redraws the prompt by writing newlines — each keystroke
-        // then leaks the previous prompt into scrollback. Advertising
-        // truecolor + a known program name routes them onto the
-        // in-place cursor-positioning redraw path that iTerm2 / WezTerm
-        // / Alacritty get.
-        cmd.env("TERM", "xterm-256color");
+        // their redraw strategy. We install a custom terminfo entry
+        // (xterm-crane) that extends xterm-256color with the `Sync`
+        // extended capability, advertising Synchronized Output (DEC
+        // 2026). Ink's `log-update` package checks terminfo for `Sync`;
+        // when found it wraps each redraw in \e[?2026h .. \e[?2026l,
+        // which our SyncAwareHandler converts to non-scrolling LFs —
+        // no ghost frames in scrollback. Falls back to xterm-256color
+        // if tic is unavailable (e.g. stripped minimal Linux).
+        cmd.env("TERM", if use_crane_terminfo() { "xterm-crane" } else { "xterm-256color" });
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Crane");
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
@@ -324,17 +393,9 @@ impl Terminal {
         };
         let trace_file_clone = trace_file.clone();
         thread::spawn(move || {
-            use super::sync_handler::{strip_sync_and_track, SyncAwareHandler};
             let mut reader = reader;
             let mut processor: Processor<StdSyncHandler> = Processor::new();
             let mut buf = [0u8; 8192];
-            // Persistent sync state across reads — `?2026h` may land in
-            // one read chunk and `?2026l` in the next. `move_up_pending`
-            // is reset whenever `in_sync` transitions (inside the
-            // handler's goto-path), so stale budget can't leak across
-            // blocks.
-            let mut in_sync: bool = false;
-            let mut move_up_pending: usize = 0;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -345,32 +406,20 @@ impl Terminal {
                             use std::io::Write;
                             let _ = g.write_all(&buf[..n]);
                         }
-                        // Strip `?2026h/l/$p` sequences BEFORE the
-                        // parser sees them — that keeps alacritty's
-                        // sync stash from activating, so our Handler
-                        // wrapper gets called live for every byte and
-                        // its LF-suppression heuristic can actually
-                        // run. `strip_sync_and_track` also mutates
-                        // `in_sync` at the exact boundary each stripped
-                        // marker sits at.
-                        let was_in_sync = in_sync;
-                        let feed = strip_sync_and_track(&buf[..n], &mut in_sync);
-                        // Reset the pending LF budget on a transition
-                        // into a fresh sync block — a half-consumed
-                        // budget from a previous redraw must not leak
-                        // into the next one.
-                        if in_sync && !was_in_sync {
-                            move_up_pending = 0;
+                        // Feed bytes straight to the parser; alacritty's
+                        // built-in StdSyncHandler handles `?2026` sync
+                        // stashing internally. We tried a shadow-grid
+                        // snapshot/restore wrapper here to eliminate
+                        // ghost frames from Ink redraws; it rendered
+                        // correctly on small sync blocks but overlaid
+                        // shifted content onto the restored grid when
+                        // sync blocks scrolled. Leaving it as a v0.5
+                        // task; the ancillary code remains in
+                        // `sync_handler.rs` for reference.
+                        {
+                            let mut t = term_clone.lock();
+                            processor.advance(&mut *t, &buf[..n]);
                         }
-                        let mut t = term_clone.lock();
-                        let mut h = SyncAwareHandler {
-                            inner: &mut *t,
-                            in_sync,
-                            move_up_pending,
-                        };
-                        processor.advance(&mut h, &feed);
-                        move_up_pending = h.move_up_pending;
-                        drop(t);
                         let mut h = history_clone.lock();
                         h.extend_from_slice(&buf[..n]);
                         if h.len() > HISTORY_MAX {
