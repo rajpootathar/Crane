@@ -125,6 +125,9 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut set_group_tint: Option<(std::path::PathBuf, Option<[u8; 3]>)> = None;
     // Pending tint change for a branch (Workspace).
     let mut set_workspace_tint: Option<(u64, u64, Option<[u8; 3]>)> = None;
+    // Pending tint change for a Tab. Project / Workspace / Tab keys
+    // together uniquely identify the target row.
+    let mut set_tab_tint: Option<(u64, u64, u64, Option<[u8; 3]>)> = None;
     // Pending "toggle folder group collapse" from a folder-header click.
     let mut toggle_group_collapsed: Option<std::path::PathBuf> = None;
 
@@ -657,15 +660,29 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                     continue;
                                 }
                                 let tab_depth = if in_group { 3 } else { 2 };
+                                let tab_tint_color = tab
+                                    .tint
+                                    .map(|[r, g, b]| egui::Color32::from_rgb(r, g, b));
+                                // Tint priority mirrors the Workspace row:
+                                // explicit user tint wins over the active
+                                // accent hint. Without this, the active
+                                // tab would always paint its icon in
+                                // accent and any tint the user picked on
+                                // the active row would be invisible.
+                                let tab_leading_color = tab_tint_color.or(if is_active {
+                                    Some(accent())
+                                } else {
+                                    None
+                                });
                                 let tab_row = draw_row(
                                     ui,
                                     RowConfig {
                                         depth: tab_depth,
                                         expanded: None,
                                         leading: Some(icons::TERMINAL_WINDOW),
-                                        leading_color: if is_active { Some(accent()) } else { None },
+                                        leading_color: tab_leading_color,
                                         label: &tab.name,
-                                        label_color: None,
+                                        label_color: tab_tint_color,
                                         is_active,
                                         active_bar: is_active,
                                         badge: None,
@@ -708,14 +725,58 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                     start_rename =
                                         Some((project.id, wt.id, tab.id, tab.name.clone()));
                                 }
+                                let tab_pid = project.id;
+                                let tab_wid = wt.id;
+                                let tab_tid = tab.id;
+                                let tab_name_snap = tab.name.clone();
                                 tab_row.response.context_menu(|ui| {
                                     if ui.button(format!("{}  Rename", icons::PENCIL_SIMPLE)).clicked() {
                                         start_rename = Some((
-                                            project.id,
-                                            wt.id,
-                                            tab.id,
-                                            tab.name.clone(),
+                                            tab_pid,
+                                            tab_wid,
+                                            tab_tid,
+                                            tab_name_snap.clone(),
                                         ));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("Highlight color")
+                                            .size(11.0)
+                                            .color(muted()),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        for (label, rgb) in PROJECT_TINT_PALETTE {
+                                            let color = egui::Color32::from_rgb(
+                                                rgb[0], rgb[1], rgb[2],
+                                            );
+                                            let btn = egui::Button::new(
+                                                egui::RichText::new(icons::TERMINAL_WINDOW)
+                                                    .color(color)
+                                                    .size(14.0),
+                                            )
+                                            .min_size(egui::vec2(22.0, 22.0))
+                                            .frame(false);
+                                            if ui.add(btn).on_hover_text(*label).clicked() {
+                                                set_tab_tint = Some((
+                                                    tab_pid,
+                                                    tab_wid,
+                                                    tab_tid,
+                                                    Some(*rgb),
+                                                ));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                    if ui
+                                        .button(format!(
+                                            "{}  Default color",
+                                            icons::ARROW_COUNTER_CLOCKWISE
+                                        ))
+                                        .clicked()
+                                    {
+                                        set_tab_tint =
+                                            Some((tab_pid, tab_wid, tab_tid, None));
                                         ui.close();
                                     }
                                 });
@@ -817,6 +878,13 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid)
     {
         w.tint = tint;
+    }
+    if let Some((pid, wid, tid, tint)) = set_tab_tint
+        && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
+        && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid)
+        && let Some(t) = w.tabs.iter_mut().find(|t| t.id == tid)
+    {
+        t.tint = tint;
     }
     if let Some(pid) = toggle_project
         && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {

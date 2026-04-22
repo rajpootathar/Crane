@@ -112,6 +112,8 @@ pub struct STab {
     pub focus: Option<PaneId>,
     pub next_pane_id: PaneId,
     pub panes: Vec<SPane>,
+    #[serde(default)]
+    pub tint: Option<[u8; 3]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -430,6 +432,7 @@ impl STab {
             focus: pruned_focus,
             next_pane_id: t.layout.next_pane_id(),
             panes,
+            tint: t.tint,
         }
     }
 
@@ -446,6 +449,7 @@ impl STab {
             id: self.id,
             name: self.name,
             layout,
+            tint: self.tint,
         }
     }
 }

@@ -21,6 +21,12 @@ pub struct Tab {
     pub id: TabId,
     pub name: String,
     pub layout: Layout,
+    /// Optional per-Tab accent tint applied to the tab's icon and
+    /// label in the Left Panel. Matches the Project / Workspace /
+    /// folder-group tint affordance so every entity in the sidebar
+    /// tree can be colour-coded consistently. `None` → fall back to
+    /// the active-tab accent (when active) or the default foreground.
+    pub tint: Option<[u8; 3]>,
 }
 
 pub struct Workspace {
@@ -538,6 +544,7 @@ impl App {
                 id: tab_id,
                 name: "Terminal".into(),
                 layout,
+                tint: None,
             };
             if first_active.is_none() {
                 first_active = Some((wt_id, tab_id));
@@ -709,6 +716,7 @@ impl App {
                     id: tab_id,
                     name: "Terminal".into(),
                     layout,
+                    tint: None,
                 };
                 let new_workspace = Workspace {
                     id: wt_id,
@@ -1085,6 +1093,7 @@ impl App {
             id: tab_id,
             name,
             layout,
+            tint: None,
         });
         wt.active_tab = Some(tab_id);
         self.active = Some((pid, wid, tab_id));
@@ -1255,6 +1264,7 @@ impl App {
                     id: tab_id,
                     name: "Terminal".into(),
                     layout,
+                    tint: None,
                 };
                 project.workspaces.push(Workspace {
                     id: wt_id,
