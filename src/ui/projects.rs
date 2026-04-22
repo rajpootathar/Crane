@@ -277,7 +277,15 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                     .as_ref()
                     .and_then(|gp| group_counts.get(gp))
                     .is_some_and(|c| *c > 1);
-                let row_trailing_count = if in_multi_group { 1 } else { 2 };
+                // A missing Project inside a multi-member group would
+                // otherwise be a dead end — the folder's "Remove folder
+                // group" nukes every healthy sibling, and the atomic-group
+                // rule hides the individual ×. Missing entries are
+                // already inconsistent placeholders asking to be
+                // relocated or removed, so let the user remove them
+                // in-place; the group recomputes cleanly next frame.
+                let allow_individual_remove = !in_multi_group || project.missing;
+                let row_trailing_count = if allow_individual_remove { 2 } else { 1 };
                 let row = draw_row(
                     ui,
                     RowConfig {
@@ -300,14 +308,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 // group. In that case the group must be removed
                 // atomically via the folder header's "Remove folder
                 // group" context menu.
-                let project_trailing = if in_multi_group {
-                    draw_trailing(
-                        ui,
-                        row.rect,
-                        row.hovered,
-                        &[(icons::PLUS, "New worktree", 0)],
-                    )
-                } else {
+                let project_trailing = if allow_individual_remove {
                     draw_trailing(
                         ui,
                         row.rect,
@@ -317,10 +318,17 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             (icons::X, "Remove project", 1),
                         ],
                     )
+                } else {
+                    draw_trailing(
+                        ui,
+                        row.rect,
+                        row.hovered,
+                        &[(icons::PLUS, "New worktree", 0)],
+                    )
                 };
                 if project_trailing[0] {
                     new_workspace_for_project = Some(project.id);
-                } else if !in_multi_group
+                } else if allow_individual_remove
                     && project_trailing.get(1).copied().unwrap_or(false)
                 {
                     remove_project = Some(project.id);
@@ -366,7 +374,10 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                     // isn't part of a multi-member folder group —
                     // those must be removed atomically via the folder
                     // header to keep groups internally consistent.
-                    if !in_multi_group {
+                    // Exception: a missing Project gets the escape hatch
+                    // regardless, so the modal's "relocate or remove"
+                    // promise holds when the project lives inside a group.
+                    if allow_individual_remove {
                         ui.separator();
                         if ui.button(format!("{}  Remove Project", icons::X)).clicked() {
                             remove_project = Some(pid);
