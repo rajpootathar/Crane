@@ -9,7 +9,7 @@
 //! happen in-place here).
 
 use crate::theme;
-use egui::{Align, Color32, CornerRadius, FontId, Layout, Pos2, Rect, Stroke, Vec2};
+use egui::{Color32, CornerRadius, FontId, Pos2, Rect, Stroke, TextureHandle, Vec2};
 use egui_phosphor::regular as icons;
 
 /// What the user clicked on the landing page. `None` means nothing
@@ -35,19 +35,46 @@ pub fn render(ui: &mut egui::Ui) -> Option<WelcomeAction> {
     // the content first, then drawing into a child UI anchored at the
     // computed top-left. Using egui's layout inheritance tends to push
     // things to the top-left, so we do the math explicitly.
+    const LOGO_H: f32 = 84.0;
+    const LOGO_W: f32 = 82.0; // crane.png is 800×820, keep that aspect
+    const GAP_LOGO: f32 = 16.0;
     const TITLE_H: f32 = 44.0;
     const SUBTITLE_H: f32 = 22.0;
     const BUTTONS_H: f32 = 96.0;
     const SHORTCUTS_H: f32 = 180.0;
     const GAP_TITLE: f32 = 6.0;
     const GAP_BLOCK: f32 = 28.0;
-    let total_h = TITLE_H + GAP_TITLE + SUBTITLE_H + GAP_BLOCK + BUTTONS_H + GAP_BLOCK + SHORTCUTS_H;
-    let top_y = rect.min.y + ((rect.height() - total_h) * 0.45).max(20.0);
+    let total_h = LOGO_H
+        + GAP_LOGO
+        + TITLE_H
+        + GAP_TITLE
+        + SUBTITLE_H
+        + GAP_BLOCK
+        + BUTTONS_H
+        + GAP_BLOCK
+        + SHORTCUTS_H;
+    // Sit a touch above geometric center — the shortcut cheat-sheet is
+    // informationally dense so the visual weight already leans low.
+    let top_y = rect.min.y + ((rect.height() - total_h) * 0.42).max(20.0);
     let content_w = rect.width().min(620.0);
     let left_x = rect.min.x + (rect.width() - content_w) * 0.5;
 
+    // Logo — centered horizontally above the wordmark.
+    let logo_rect = Rect::from_min_size(
+        Pos2::new(rect.center().x - LOGO_W * 0.5, top_y),
+        Vec2::new(LOGO_W, LOGO_H),
+    );
+    if let Some(tex) = crane_logo(ui.ctx()) {
+        ui.painter().image(
+            tex.id(),
+            logo_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
+
     let title_rect = Rect::from_min_size(
-        Pos2::new(left_x, top_y),
+        Pos2::new(left_x, logo_rect.max.y + GAP_LOGO),
         Vec2::new(content_w, TITLE_H),
     );
     ui.painter().text(
@@ -232,8 +259,22 @@ fn draw_shortcuts(ui: &mut egui::Ui, rect: Rect) {
         );
     }
 
-    // Silence unused-import warnings when the layout helpers above are
-    // the only reason we pulled them in (future-proofing if we ever
-    // add a nested ui for the buttons).
-    let _ = Layout::left_to_right(Align::Center);
+}
+
+/// Decode `crane.png` once and cache the GPU texture in the egui data
+/// store. Returns `None` only if decoding fails — in practice that can't
+/// happen because the PNG is `include_bytes!`-compiled in.
+fn crane_logo(ctx: &egui::Context) -> Option<TextureHandle> {
+    let key = egui::Id::new("crane_welcome_logo");
+    if let Some(tex) = ctx.data(|d| d.get_temp::<TextureHandle>(key)) {
+        return Some(tex);
+    }
+    let bytes = include_bytes!("../../crane.png");
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+    let handle = ctx.load_texture("crane_welcome_logo", color, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(key, handle.clone()));
+    Some(handle)
 }
