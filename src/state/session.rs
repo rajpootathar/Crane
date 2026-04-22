@@ -362,6 +362,11 @@ impl Session {
         app.left_panel_w = self.left_panel_w.clamp(180.0, 600.0);
         app.right_panel_w = self.right_panel_w.clamp(200.0, 700.0);
         app.language_configs = self.language_configs;
+        // Re-probe disk for repos / worktrees / sub-clones added outside
+        // Crane since the last session — picks up newly-cloned siblings,
+        // `git worktree add` branches, and `git init`-after-the-fact
+        // directories. See `App::reindex_git_state`.
+        app.reindex_git_state(ctx);
         app
     }
 }

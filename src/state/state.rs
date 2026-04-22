@@ -556,6 +556,141 @@ impl App {
         Some(id)
     }
 
+    /// Re-probe disk state for every existing Project and pick up any
+    /// repo / worktree / sibling-clone that was added outside Crane
+    /// between sessions. Three cases handled:
+    ///
+    /// 1. Project has a new `git worktree add` branch-checkout that
+    ///    isn't in its persisted Workspaces list → appended.
+    /// 2. A nested `.git` root appeared under an existing Project's
+    ///    path (user cloned into the monorepo parent, or `git init`'d
+    ///    a subdir) → added as a sibling Sub-project under the same
+    ///    group. A standalone Project whose path now has nested clones
+    ///    gets promoted to a group on-the-fly using the folder name as
+    ///    the group label.
+    /// 3. Project path was `(no git)` and is now a repo → the
+    ///    `git worktree list` call picks up the real branch(es) and
+    ///    appends them as additional Workspaces; the placeholder
+    ///    "(no git)" Workspace is left alone so any terminals/tabs the
+    ///    user opened there keep working.
+    ///
+    /// Missing projects (path gone) are skipped — the existing
+    /// missing-project modal flow already handles them.
+    pub fn reindex_git_state(&mut self, ctx: &egui::Context) {
+        use std::collections::HashSet;
+
+        let existing_project_paths: HashSet<PathBuf> =
+            self.projects.iter().map(|p| p.path.clone()).collect();
+
+        // Dedup scan roots: group parents (for already-grouped Projects)
+        // and standalone Project paths (for fresh clones under a
+        // not-yet-grouped folder).
+        let mut scan_roots: Vec<(PathBuf, Option<String>)> = Vec::new();
+        for p in &self.projects {
+            if p.missing || !p.path.exists() {
+                continue;
+            }
+            let (root, name) = match &p.group_path {
+                Some(gp) => (gp.clone(), p.group_name.clone()),
+                None => (p.path.clone(), None),
+            };
+            if !scan_roots.iter().any(|(r, _)| r == &root) {
+                scan_roots.push((root, name));
+            }
+        }
+
+        let mut new_sub_projects: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+        for (root, group_name) in &scan_roots {
+            let path_is_repo = root.join(".git").exists();
+            let discovered = crate::git::discover_repos(root, 5);
+            for repo_path in discovered {
+                if &repo_path == root {
+                    continue;
+                }
+                if existing_project_paths.contains(&repo_path) {
+                    continue;
+                }
+                // Same filter as add_project_from_path: when the root
+                // is itself a repo, only promote clones the parent
+                // doesn't track (gitignored, non-submodule).
+                if path_is_repo
+                    && (!crate::git::is_path_ignored(root, &repo_path)
+                        || crate::git::is_submodule(root, &repo_path))
+                {
+                    continue;
+                }
+                let effective_name = group_name.clone().unwrap_or_else(|| {
+                    root.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("group")
+                        .to_string()
+                });
+                new_sub_projects.push((repo_path, root.clone(), effective_name));
+            }
+        }
+
+        // Refresh worktrees for each existing non-missing project —
+        // catches `git worktree add` done outside Crane, and the
+        // "(no git) → now git" case where `list_workspaces` suddenly
+        // returns real branches.
+        let refresh_targets: Vec<(ProjectId, PathBuf)> = self
+            .projects
+            .iter()
+            .filter(|p| !p.missing && p.path.exists())
+            .map(|p| (p.id, p.path.clone()))
+            .collect();
+
+        for (pid, path) in refresh_targets {
+            let new_infos = crate::git::list_workspaces(&path);
+            if new_infos.is_empty() {
+                continue;
+            }
+            let existing_wt_paths: HashSet<PathBuf> = self
+                .projects
+                .iter()
+                .find(|p| p.id == pid)
+                .map(|p| p.workspaces.iter().map(|w| w.path.clone()).collect())
+                .unwrap_or_default();
+            for info in new_infos {
+                if existing_wt_paths.contains(&info.path) {
+                    continue;
+                }
+                let wt_id = self.next_workspace;
+                self.next_workspace += 1;
+                let tab_id = self.next_tab;
+                self.next_tab += 1;
+                let mut layout = Layout::new(info.path.clone());
+                layout.ensure_initial_terminal(ctx);
+                let tab = Tab {
+                    id: tab_id,
+                    name: "Terminal".into(),
+                    layout,
+                };
+                let new_workspace = Workspace {
+                    id: wt_id,
+                    name: info.branch,
+                    display_name: None,
+                    path: info.path,
+                    tabs: vec![tab],
+                    active_tab: Some(tab_id),
+                    expanded: true,
+                    git_status: None,
+                    last_status_refresh: None,
+                    git_rx: None,
+                };
+                if let Some(project) = self.projects.iter_mut().find(|p| p.id == pid) {
+                    project.workspaces.push(new_workspace);
+                }
+            }
+        }
+
+        // Apply new sub-projects last — add_single_project mutates
+        // self.projects which would invalidate the scan snapshot.
+        for (path, group_root, group_name) in new_sub_projects {
+            self.add_single_project(path, Some(group_root), Some(group_name), ctx);
+        }
+    }
+
     /// Nearest `.git` root for the active file's path, falling back to
     /// the active Workspace path if no file is open (or no nested repo
     /// is found). This is what branch picker / commit tree / branch
