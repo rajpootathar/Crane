@@ -333,6 +333,11 @@ pub struct App {
     /// and branches. Missing entry → fall back to the `muted()`
     /// folder colour.
     pub group_tints: std::collections::HashMap<PathBuf, [u8; 3]>,
+    /// Folder-group collapse state, keyed by `group_path`. Absent →
+    /// expanded (the default). Clicking a folder header toggles
+    /// membership; collapsed groups hide all their Sub-projects in
+    /// the Left Panel tree walk.
+    pub group_collapsed: std::collections::HashSet<PathBuf>,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -380,6 +385,7 @@ impl App {
             tab_mru: Vec::new(),
             tab_switcher: None,
             group_tints: std::collections::HashMap::new(),
+            group_collapsed: std::collections::HashSet::new(),
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,

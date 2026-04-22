@@ -125,6 +125,8 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut set_group_tint: Option<(std::path::PathBuf, Option<[u8; 3]>)> = None;
     // Pending tint change for a branch (Workspace).
     let mut set_workspace_tint: Option<(u64, u64, Option<[u8; 3]>)> = None;
+    // Pending "toggle folder group collapse" from a folder-header click.
+    let mut toggle_group_collapsed: Option<std::path::PathBuf> = None;
 
     // Precompute group member counts so individual-project "Remove"
     // can be suppressed when the group has siblings. Atomic unload
@@ -169,8 +171,14 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 // Render a group header row whenever we enter a new
                 // group. Projects without a group render flush-left as
                 // before; grouped Projects nest one level deeper under
-                // their shared folder name.
+                // their shared folder name. When a group is collapsed,
+                // the header still renders but its member Projects are
+                // skipped entirely.
                 let in_group = project.group_path.is_some();
+                let group_is_collapsed = project
+                    .group_path
+                    .as_ref()
+                    .is_some_and(|gp| app.group_collapsed.contains(gp));
                 if in_group && project.group_path != last_group {
                     let group_name = project
                         .group_name
@@ -185,7 +193,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         ui,
                         RowConfig {
                             depth: 0,
-                            expanded: Some(true),
+                            expanded: Some(!group_is_collapsed),
                             leading: Some(icons::FOLDER),
                             leading_color: Some(group_tint.unwrap_or_else(muted)),
                             label: &group_name,
@@ -197,6 +205,11 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             tree_guides: false, checkbox: None,
                         },
                     );
+                    if folder_row.main_clicked
+                        && let Some(gp) = &project.group_path
+                    {
+                        toggle_group_collapsed = Some(gp.clone());
+                    }
                     if let Some(gp) = &project.group_path {
                         let gp = gp.clone();
                         folder_row.response.context_menu(|ui| {
@@ -243,10 +256,28 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                     }
                 }
                 last_group = project.group_path.clone();
+                // Skip rendering this Project (and everything under it)
+                // when its group is collapsed.
+                if group_is_collapsed {
+                    continue;
+                }
                 let project_depth = if in_group { 1 } else { 0 };
                 let tint_color = project
                     .tint
                     .map(|[r, g, b]| egui::Color32::from_rgb(r, g, b));
+                // Reserve space for the buttons we ACTUALLY draw: one
+                // "new worktree" + (optional) "remove" for singleton /
+                // standalone Projects. When the Project belongs to a
+                // multi-member group, removal happens via the folder
+                // header, so we don't reserve its slot — otherwise the
+                // +N -M change badge sits further left than the icon
+                // row suggests.
+                let in_multi_group = project
+                    .group_path
+                    .as_ref()
+                    .and_then(|gp| group_counts.get(gp))
+                    .is_some_and(|c| *c > 1);
+                let row_trailing_count = if in_multi_group { 1 } else { 2 };
                 let row = draw_row(
                     ui,
                     RowConfig {
@@ -259,19 +290,16 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         is_active: false,
                         active_bar: false,
                         badge: None,
-                        trailing_count: 2,
+                        trailing_count: row_trailing_count,
                         tree_guides: in_group, checkbox: None,
                     },
                 );
-                // Suppress per-Project removal when the Project is one
-                // of several siblings inside a folder group. In that
-                // case the group must be removed atomically via the
-                // folder header's "Remove folder group" context menu.
-                let in_multi_group = project
-                    .group_path
-                    .as_ref()
-                    .and_then(|gp| group_counts.get(gp))
-                    .is_some_and(|c| *c > 1);
+                // `in_multi_group` reused from the row-construction
+                // block above — suppress per-Project removal when the
+                // Project is one of several siblings inside a folder
+                // group. In that case the group must be removed
+                // atomically via the folder header's "Remove folder
+                // group" context menu.
                 let project_trailing = if in_multi_group {
                     draw_trailing(
                         ui,
@@ -807,6 +835,11 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     }
     if let Some(group) = remove_group_pending {
         app.remove_group(&group);
+    }
+    if let Some(group) = toggle_group_collapsed {
+        if !app.group_collapsed.remove(&group) {
+            app.group_collapsed.insert(group);
+        }
     }
     if let Some((pid, wid)) = remove_worktree
         && let Some(p) = app.projects.iter().find(|p| p.id == pid)

@@ -47,6 +47,11 @@ pub struct Session {
     /// of non-string map keys. Missing → empty map on restore.
     #[serde(default)]
     pub group_tints: Vec<(PathBuf, [u8; 3])>,
+    /// Persisted folder-group collapse state. Only collapsed groups
+    /// are stored (default is expanded, so an empty list restores
+    /// with everything open).
+    #[serde(default)]
+    pub group_collapsed: Vec<PathBuf>,
 }
 
 fn default_left_w() -> f32 {
@@ -276,6 +281,7 @@ impl Session {
             right_panel_w: app.right_panel_w,
             language_configs: app.language_configs.clone(),
             group_tints: app.group_tints.iter().map(|(p, c)| (p.clone(), *c)).collect(),
+            group_collapsed: app.group_collapsed.iter().cloned().collect(),
         }
     }
 
@@ -377,6 +383,7 @@ impl Session {
         app.right_panel_w = self.right_panel_w.clamp(200.0, 700.0);
         app.language_configs = self.language_configs;
         app.group_tints = self.group_tints.into_iter().collect();
+        app.group_collapsed = self.group_collapsed.into_iter().collect();
         // Re-probe disk for repos / worktrees / sub-clones added outside
         // Crane since the last session — picks up newly-cloned siblings,
         // `git worktree add` branches, and `git init`-after-the-fact
