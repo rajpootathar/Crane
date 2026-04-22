@@ -1282,6 +1282,14 @@ impl App {
     }
 
     pub fn remove_project(&mut self, pid: ProjectId) {
+        // Remember the removed project's group so we can rebalance the
+        // group afterwards (promote a lone survivor out of the folder,
+        // drop group-keyed state when the group empties).
+        let removed_group: Option<PathBuf> = self
+            .projects
+            .iter()
+            .find(|p| p.id == pid)
+            .and_then(|p| p.group_path.clone());
         self.projects.retain(|p| p.id != pid);
         if let Some((p, _, _)) = self.active
             && p == pid {
@@ -1302,6 +1310,40 @@ impl App {
                             .and_then(|p| p.workspaces.first().map(|w| (p.id, w.id)))
                     });
             }
+        if let Some(gp) = removed_group {
+            let remaining: Vec<ProjectId> = self
+                .projects
+                .iter()
+                .filter(|p| p.group_path.as_ref() == Some(&gp))
+                .map(|p| p.id)
+                .collect();
+            match remaining.len() {
+                0 => {
+                    // Last member gone — drop the group's tint and
+                    // collapse state so re-adding the same folder
+                    // doesn't inherit stale UI preferences.
+                    self.group_tints.remove(&gp);
+                    self.group_collapsed.remove(&gp);
+                }
+                1 => {
+                    // A folder group containing a single project is
+                    // indistinguishable from a standalone project, so
+                    // flatten it — the survivor renders at the top
+                    // level rather than under a one-child folder header.
+                    if let Some(p) = self
+                        .projects
+                        .iter_mut()
+                        .find(|p| p.id == remaining[0])
+                    {
+                        p.group_path = None;
+                        p.group_name = None;
+                    }
+                    self.group_tints.remove(&gp);
+                    self.group_collapsed.remove(&gp);
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn breadcrumb(&self) -> String {
