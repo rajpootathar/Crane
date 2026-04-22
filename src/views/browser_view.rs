@@ -383,10 +383,55 @@ fn normalize_url(raw: &str) -> String {
     if raw.starts_with("http://") || raw.starts_with("https://") || raw.starts_with("about:") {
         return raw.to_string();
     }
+    // Loopback / RFC1918 private addresses always use http. A dev
+    // server on :3000 has no TLS cert, so https would bounce off the
+    // handshake and we'd route the user to an error page instead of
+    // their app. Also short-circuits the search branch below, which
+    // used to eat `localhost:3000` because it contains neither `.`
+    // nor `/`.
+    if is_local_host(raw) {
+        return format!("http://{raw}");
+    }
+    // Any `host:port` with a numeric port other than 443 — treat as
+    // http too. Public dev tunnels and self-hosted services commonly
+    // live on a non-443 port without TLS.
+    if let Some((_head, tail)) = raw.split_once(':') {
+        let port_str: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(port) = port_str.parse::<u16>()
+            && port != 443
+        {
+            return format!("http://{raw}");
+        }
+    }
     if !raw.contains('.') && !raw.contains('/') {
         return format!("https://duckduckgo.com/?q={}", urlencode(raw));
     }
     format!("https://{raw}")
+}
+
+/// Loopback or RFC1918 private-LAN host? Accepts raw input that may
+/// carry a trailing `:port` or `/path`, so we split off just the host
+/// segment before matching. Keeps the port/path attached to the URL
+/// when the caller prefixes `http://`.
+fn is_local_host(s: &str) -> bool {
+    let host_end = s.find(|c: char| c == ':' || c == '/').unwrap_or(s.len());
+    let host = &s[..host_end];
+    if matches!(host, "localhost" | "0.0.0.0" | "[::1]" | "[::]") {
+        return true;
+    }
+    if host.starts_with("127.") || host.starts_with("192.168.") || host.starts_with("10.") {
+        return true;
+    }
+    // 172.16.0.0 – 172.31.255.255 (RFC1918 middle block).
+    if let Some(rest) = host.strip_prefix("172.") {
+        let octet: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = octet.parse::<u8>()
+            && (16..=31).contains(&n)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn urlencode(s: &str) -> String {

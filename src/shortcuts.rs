@@ -61,13 +61,15 @@ pub fn handle(
     }
 
     let (split_terminal, new_tab, split_h, split_v, close_pane, next_pane, prev_pane,
-         zoom_in, zoom_out, zoom_reset, toggle_left, toggle_right, close_tab) =
+         zoom_in, zoom_out, zoom_reset, toggle_left, toggle_right, close_tab,
+         browser_new_tab) =
         ctx.input(|i| {
             let cmd = i.modifiers.command;
             let shift = i.modifiers.shift;
+            let alt = i.modifiers.alt;
             (
-                cmd && !shift && i.key_pressed(egui::Key::T),
-                cmd && shift && i.key_pressed(egui::Key::T),
+                cmd && !shift && !alt && i.key_pressed(egui::Key::T),
+                cmd && shift && !alt && i.key_pressed(egui::Key::T),
                 cmd && !shift && i.key_pressed(egui::Key::D),
                 cmd && shift && i.key_pressed(egui::Key::D),
                 cmd && !shift && i.key_pressed(egui::Key::W),
@@ -79,6 +81,12 @@ pub fn handle(
                 cmd && i.key_pressed(egui::Key::B),
                 cmd && i.key_pressed(egui::Key::Slash),
                 cmd && shift && i.key_pressed(egui::Key::W),
+                // Cmd+Option+T — add a tab to the focused Browser pane.
+                // Cmd+T alone is reserved for new-terminal-split, so
+                // Option is the escape hatch to disambiguate. No-op
+                // when the focused pane isn't a Browser; user focuses
+                // the browser first (click or Cmd+[ / Cmd+]).
+                cmd && alt && !shift && i.key_pressed(egui::Key::T),
             )
         });
 
@@ -89,6 +97,14 @@ pub fn handle(
     }
     if new_tab {
         app.new_tab_in_active_workspace(ctx);
+    }
+    if browser_new_tab
+        && let Some(ws) = app.active_layout()
+        && let Some(focus) = ws.focus
+        && let Some(pane) = ws.panes.get_mut(&focus)
+        && let crate::state::layout::PaneContent::Browser(browser) = &mut pane.content
+    {
+        browser.new_tab();
     }
     if split_h
         && let Some(ws) = app.active_layout()

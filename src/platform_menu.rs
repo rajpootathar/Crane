@@ -68,15 +68,34 @@ mod mac {
             &PredefinedMenuItem::quit(None),
         ]);
 
-        // No Edit submenu. muda's PredefinedMenuItem::copy/paste/cut
-        // etc. bind the standard shortcuts (Cmd+C/V/X) to the macOS
-        // system responder chain — which our egui window doesn't
-        // participate in. Result: the keys get swallowed by an
-        // inert menu item and never reach egui's event loop, so our
-        // terminal's Cmd+C (copy selection) and the selection-copy
-        // in modals both silently fail. Skipping this submenu lets
-        // the shortcuts pass through as plain key events, which egui
-        // turns into Event::Copy / Event::Paste / Event::Cut correctly.
+        // Edit submenu with standard clipboard accelerators. Required
+        // for the embedded WKWebView — without menu items wired to
+        // `copy:` / `paste:` / `cut:` / `selectAll:`, AppKit's
+        // responder chain has nothing to route Cmd+C/V/X/A to, and the
+        // webview silently swallows the keys. PredefinedMenuItem uses
+        // the standard AppKit actions so the focused NSView (WKWebView
+        // when the browser pane is focused) handles them natively.
+        //
+        // Trade-off: in pure-egui panes (Terminal, modals) these
+        // shortcuts now go through AppKit first. egui's terminal Cmd+C
+        // (copy selection) uses that same key, but because the egui
+        // window's content view doesn't implement `copy:`, the menu
+        // item is disabled when no webview has focus and the key
+        // falls through to winit/egui as a regular key event — so
+        // terminal selection copy still works. If that assumption
+        // turns out to be wrong in practice, the fix is to intercept
+        // the menu action ourselves and route by focused-pane type.
+        let edit = Submenu::new("Edit", true);
+        let _ = edit.append_items(&[
+            &PredefinedMenuItem::undo(None),
+            &PredefinedMenuItem::redo(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::cut(None),
+            &PredefinedMenuItem::copy(None),
+            &PredefinedMenuItem::paste(None),
+            &PredefinedMenuItem::select_all(None),
+        ]);
+
         let window = Submenu::new("Window", true);
         let _ = window.append_items(&[
             &PredefinedMenuItem::minimize(None),
@@ -93,7 +112,7 @@ mod mac {
             None,
         )]);
 
-        let _ = menu.append_items(&[&app_submenu, &window, &help]);
+        let _ = menu.append_items(&[&app_submenu, &edit, &window, &help]);
         menu.init_for_nsapp();
         // Intentionally leak: NSApp holds a weak-ish reference to the
         // menu via init_for_nsapp, and muda's Menu Drop would tear
