@@ -396,6 +396,14 @@ fn build_slot<W: HasWindowHandle>(
         .with_bounds(rect)
         .with_url(if url.is_empty() { "about:blank" } else { url })
         .with_transparent(false)
+        // Explicitly off — wry's default is `true` in debug builds
+        // (cfg(debug_assertions)), which surfaces "Inspect Element"
+        // in the webview's native right-click menu. That entry opens
+        // WebKit's _inspector attached to the hosting NSWindow; it
+        // covers Crane's panels and has no reachable close affordance.
+        // Keep debug and release behaviour identical until we have a
+        // proper devtools UX.
+        .with_devtools(false)
         .with_on_page_load_handler({
             let url_updates = url_updates.clone();
             move |event, url| {
