@@ -170,6 +170,9 @@ pub enum SPaneContent {
         #[serde(default)]
         active: usize,
     },
+    /// Landing-page pane. Stateless — just restores an empty Welcome
+    /// surface so the user lands back on the same screen they closed.
+    Welcome,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -544,6 +547,7 @@ impl SPane {
                     .collect(),
                 active: b.active,
             },
+            PaneContent::Welcome(_) => SPaneContent::Welcome,
         };
         SPane {
             id,
@@ -673,6 +677,9 @@ impl SPane {
                     bp.active = active.min(bp.tabs.len().saturating_sub(1));
                     PaneContent::Browser(bp)
                 }
+            }
+            SPaneContent::Welcome => {
+                PaneContent::Welcome(crate::state::layout::WelcomePane)
             }
         };
         (

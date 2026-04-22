@@ -294,12 +294,20 @@ impl BrowserPane {
     }
 }
 
+/// Landing-page pane content. Empty on purpose — the view is stateless,
+/// just renders the welcome layout (buttons + shortcut cheat-sheet) and
+/// bubbles a `PaneAction` up to replace itself with a Terminal / Browser
+/// pane in the same slot, or to open the Right Panel's Files tree.
+#[derive(Default)]
+pub struct WelcomePane;
+
 pub enum PaneContent {
     Terminal(Terminal),
     Files(FilesPane),
     Markdown(MarkdownPane),
     Diff(DiffPane),
     Browser(BrowserPane),
+    Welcome(WelcomePane),
 }
 
 impl PaneContent {
@@ -310,6 +318,7 @@ impl PaneContent {
             PaneContent::Markdown(_) => "Markdown",
             PaneContent::Diff(_) => "Diff",
             PaneContent::Browser(_) => "Browser",
+            PaneContent::Welcome(_) => "New Tab",
         }
     }
 }
@@ -344,12 +353,24 @@ impl Layout {
         }
     }
 
-    pub fn ensure_initial_terminal(&mut self, ctx: &egui::Context) {
+    /// Seed an empty layout with the Welcome landing pane. Used for
+    /// every new Tab / Workspace / Project so fresh surfaces don't
+    /// auto-spawn a shell — the user picks Terminal / Browser / Files
+    /// from the landing screen.
+    pub fn ensure_initial_welcome(&mut self) {
         if self.root.is_none() {
-            let cwd = self.cwd.clone();
-            if let Ok(term) = Terminal::spawn(ctx.clone(), 80, 24, Some(&cwd)) {
-                self.add_root(PaneContent::Terminal(term), "Terminal 1".into());
-            }
+            self.add_root(PaneContent::Welcome(WelcomePane), "New Tab".into());
+        }
+    }
+
+    /// In-place swap of the focused pane's content + title. Used by the
+    /// Welcome pane buttons to become a Terminal / Browser pane without
+    /// reflowing the layout tree.
+    pub fn replace_focused_content(&mut self, content: PaneContent, title: String) {
+        let Some(id) = self.focus else { return };
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.content = content;
+            pane.title = title;
         }
     }
 

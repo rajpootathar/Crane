@@ -607,6 +607,39 @@ impl eframe::App for CraneApp {
                             Some(id)
                         };
                     }
+                    PaneAction::ReplaceWithTerminal(id) => {
+                        // Focus the pane first so replace_focused_content
+                        // operates on the right slot, then spawn the PTY
+                        // against the layout's cwd (the workspace root).
+                        ws.focus = Some(id);
+                        let cwd = ws.cwd.clone();
+                        if let Ok(term) = crate::terminal::Terminal::spawn(
+                            ctx.clone(),
+                            80,
+                            24,
+                            Some(&cwd),
+                        ) {
+                            ws.replace_focused_content(
+                                state::layout::PaneContent::Terminal(term),
+                                "Terminal".into(),
+                            );
+                        }
+                    }
+                    PaneAction::ReplaceWithBrowser(id) => {
+                        ws.focus = Some(id);
+                        let browser =
+                            state::layout::BrowserPane::new_with(
+                                String::new(),
+                                "https://".into(),
+                            );
+                        ws.replace_focused_content(
+                            state::layout::PaneContent::Browser(browser),
+                            "Browser".into(),
+                        );
+                    }
+                    PaneAction::ShowFilesPanel => {
+                        self.app.show_right = true;
+                    }
                 }
             }
         } else {

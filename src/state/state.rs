@@ -511,7 +511,7 @@ impl App {
         path: PathBuf,
         group_path: Option<PathBuf>,
         group_name: Option<String>,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
     ) -> Option<ProjectId> {
         let id = self.next_project;
         self.next_project += 1;
@@ -539,7 +539,7 @@ impl App {
             let tab_id = self.next_tab;
             self.next_tab += 1;
             let mut layout = Layout::new(info.path.clone());
-            layout.ensure_initial_terminal(ctx);
+            layout.ensure_initial_welcome();
             let tab = Tab {
                 id: tab_id,
                 name: "Terminal".into(),
@@ -711,7 +711,7 @@ impl App {
                 let tab_id = self.next_tab;
                 self.next_tab += 1;
                 let mut layout = Layout::new(info.path.clone());
-                layout.ensure_initial_terminal(ctx);
+                layout.ensure_initial_welcome();
                 let tab = Tab {
                     id: tab_id,
                     name: "Terminal".into(),
@@ -1059,7 +1059,7 @@ impl App {
 
     fn push_tab(
         &mut self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         initial_content: Option<crate::state::layout::PaneContent>,
         tab_name: Option<String>,
     ) {
@@ -1080,7 +1080,7 @@ impl App {
         let mut layout = Layout::new(wt.path.clone());
         let name = match initial_content {
             None => {
-                layout.ensure_initial_terminal(ctx);
+                layout.ensure_initial_welcome();
                 tab_name.unwrap_or_else(|| format!("Tab {}", wt.tabs.len() + 1))
             }
             Some(content) => {
@@ -1218,7 +1218,7 @@ impl App {
         });
     }
 
-    pub fn create_workspace_from_modal(&mut self, ctx: &egui::Context) {
+    pub fn create_workspace_from_modal(&mut self, _ctx: &egui::Context) {
         let modal = match self.new_workspace_modal.take() {
             Some(m) => m,
             None => return,
@@ -1259,7 +1259,7 @@ impl App {
                 let tab_id = self.next_tab;
                 self.next_tab += 1;
                 let mut layout = Layout::new(wt_path.clone());
-                layout.ensure_initial_terminal(ctx);
+                layout.ensure_initial_welcome();
                 let tab = Tab {
                     id: tab_id,
                     name: "Terminal".into(),

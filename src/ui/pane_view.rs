@@ -1,4 +1,4 @@
-use crate::views::{browser_view, diff_view, file_view, markdown_view};
+use crate::views::{browser_view, diff_view, file_view, markdown_view, welcome_view};
 use crate::state::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
@@ -47,6 +47,15 @@ pub enum PaneAction {
     SwapPanes { a: PaneId, b: PaneId },
     DockPane { src: PaneId, target: PaneId, edge: DockEdge },
     ToggleMaximize(PaneId),
+    /// Welcome → Terminal: replace the focused pane's content with a
+    /// freshly spawned Terminal. Applied in main.rs where `ctx` is
+    /// available for the PTY spawn.
+    ReplaceWithTerminal(PaneId),
+    /// Welcome → Browser: replace the focused pane with a Browser
+    /// carrying a single blank tab.
+    ReplaceWithBrowser(PaneId),
+    /// Welcome → show the Right Panel (Files tree).
+    ShowFilesPanel,
 }
 
 fn dock_zone(rect: Rect, pos: Pos2) -> DockEdge {
@@ -381,6 +390,11 @@ fn render_pane(
     let mut child = ui.new_child(UiBuilder::new().max_rect(body_rect));
     child.set_clip_rect(body_rect);
 
+    // Welcome pane bubbles its button click out through this holder
+    // so the match arm below can stay synchronous + borrow-clean.
+    // Applied to `*action` after the match closes.
+    let mut welcome_action_holder: Option<(PaneId, welcome_view::WelcomeAction)> = None;
+
     // Scope every pane's widgets under a unique id so that, e.g., two
     // Markdown panes' ScrollAreas don't fight over the same auto-id. egui
     // paints a red outline on id-collision and also pays a hashing cost
@@ -414,7 +428,23 @@ fn render_pane(
         PaneContent::Browser(browser) => {
             browser_view::render(child, id, browser, &mut pane.title, is_drop_target);
         }
+        PaneContent::Welcome(_) => {
+            if let Some(act) = welcome_view::render(child) {
+                welcome_action_holder = Some((id, act));
+            }
+        }
     });
+    if let Some((pid, wact)) = welcome_action_holder {
+        *action = match wact {
+            welcome_view::WelcomeAction::OpenTerminal => {
+                PaneAction::ReplaceWithTerminal(pid)
+            }
+            welcome_view::WelcomeAction::OpenBrowser => {
+                PaneAction::ReplaceWithBrowser(pid)
+            }
+            welcome_view::WelcomeAction::ToggleFilesPanel => PaneAction::ShowFilesPanel,
+        };
+    }
 
     // Warp-style active/inactive: dim inactive panes with a translucent
     // black overlay. No border, no highlight ring — just a subtle value
