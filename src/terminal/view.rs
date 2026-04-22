@@ -19,6 +19,23 @@ struct UrlHit {
     url: String,
 }
 
+/// One local path detected in a row of the visible grid. Only paths
+/// that resolve to something on disk are kept — path detection without
+/// the existence check would underline every dotted identifier in the
+/// output. `line` / `col` carry an optional `:LINE[:COL]` suffix parsed
+/// from compiler-style references; unused at click time today because
+/// `open(1)` has no line argument, but recorded so a future in-app
+/// Files pane hookup can jump straight to the referenced location.
+struct PathHit {
+    col_start: usize,
+    col_end: usize,
+    path: std::path::PathBuf,
+    #[allow(dead_code)]
+    line: Option<u32>,
+    #[allow(dead_code)]
+    col: Option<u32>,
+}
+
 /// Scan a row of plain text for `http://` / `https://` URLs. Stops at
 /// whitespace and trims a small set of trailing punctuation that's
 /// almost never part of the URL itself (`.,;:!?)]}>"' `). Conservative
@@ -77,6 +94,152 @@ fn scan_urls(row: &str) -> Vec<UrlHit> {
         i = end.max(i + 1);
     }
     hits
+}
+
+/// Split a token into its path part and optional `:LINE[:COL]` suffix.
+/// Accepts `path:N` and `path:N:M` where N/M are all digits; anything
+/// else falls through as a plain path with no line info. Windows drive
+/// letters aren't supported (unix-only codebase), so single-char
+/// leading segments aren't a concern.
+fn split_line_col(s: &str) -> (&str, Option<u32>, Option<u32>) {
+    if let Some(c1) = s.rfind(':') {
+        let tail = &s[c1 + 1..];
+        let head = &s[..c1];
+        if let Ok(n1) = tail.parse::<u32>() {
+            if let Some(c2) = head.rfind(':') {
+                let mid = &head[c2 + 1..];
+                let head2 = &head[..c2];
+                if let Ok(n2) = mid.parse::<u32>() {
+                    return (head2, Some(n2), Some(n1));
+                }
+            }
+            return (head, Some(n1), None);
+        }
+    }
+    (s, None, None)
+}
+
+/// True when `s` looks like a bare filename (`main.rs`, `README.md`).
+/// The caller also accepts tokens that contain `/` or start with `~`,
+/// so this only needs to catch the no-separator case — reject dotted
+/// identifiers like `v1.2.3` or `Self.method` by requiring the extension
+/// to be short ASCII alphanumerics.
+fn looks_like_file(s: &str) -> bool {
+    let Some(dot) = s.rfind('.') else {
+        return false;
+    };
+    let ext = &s[dot + 1..];
+    if ext.is_empty() || ext.len() > 8 {
+        return false;
+    }
+    ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Resolve a terminal-emitted path token against the pane's cwd. `~`
+/// and `~/…` expand via `$HOME`; absolute tokens pass through; anything
+/// else is treated as relative to `cwd`. We don't canonicalize — that
+/// would flatten symlinks the user clicked on purpose.
+fn resolve_path(token: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+    if token == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::PathBuf::from(home);
+    }
+    if let Some(rest) = token.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::PathBuf::from(home).join(rest);
+    }
+    let p = std::path::Path::new(token);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
+/// Scan a row of plain text for references to paths that exist on
+/// disk. Deliberately aggressive on the syntactic side (any
+/// whitespace-separated token that contains `/`, a tilde prefix, or a
+/// plausible extension) and then filtered by `Path::exists()` — the
+/// stat check is the load-bearing part. URLs are skipped so the URL
+/// scanner stays the authority for those.
+fn scan_paths(row: &str, cwd: &std::path::Path) -> Vec<PathHit> {
+    let mut hits = Vec::new();
+    let chars: Vec<char> = row.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        while i < n && (chars[i].is_whitespace() || chars[i] == '\0') {
+            i += 1;
+        }
+        let start = i;
+        while i < n && !chars[i].is_whitespace() && chars[i] != '\0' {
+            i += 1;
+        }
+        if start == i {
+            break;
+        }
+        let mut ts = start;
+        let mut te = i;
+        while ts < te && matches!(chars[ts], '(' | '[' | '{' | '<' | '"' | '\'') {
+            ts += 1;
+        }
+        while te > ts
+            && matches!(
+                chars[te - 1],
+                '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\''
+            )
+        {
+            te -= 1;
+        }
+        if te - ts < 2 {
+            continue;
+        }
+        let token: String = chars[ts..te].iter().collect();
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("file://")
+        {
+            continue;
+        }
+        let (base, line_no, col_no) = split_line_col(&token);
+        if !(base.contains('/') || base.starts_with('~') || looks_like_file(base)) {
+            continue;
+        }
+        let resolved = resolve_path(base, cwd);
+        if !resolved.exists() {
+            continue;
+        }
+        let base_chars = base.chars().count();
+        hits.push(PathHit {
+            col_start: ts,
+            col_end: ts + base_chars,
+            path: resolved,
+            line: line_no,
+            col: col_no,
+        });
+    }
+    hits
+}
+
+/// Hand a path off to the OS to open in its default app. Matches the
+/// `reveal_in_file_manager` pattern in `ui/projects.rs` — spawn so we
+/// don't block the UI thread, ignore the child handle (fire-and-forget).
+fn open_in_default_app(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(path).spawn();
+    }
 }
 
 fn term_bg() -> Color32 {
@@ -458,35 +621,52 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         }
     }
 
-    // URL scan over the visible rows. We build each row's text from
-    // the already-assembled cells (cheaper than a second grid walk
-    // and respects scrollback offset + dedup). `by_row` is keyed by
+    // URL + path scan over the visible rows. We build each row's text
+    // from the already-assembled cells (cheaper than a second grid walk
+    // and respects scrollback offset + dedup). Both maps are keyed by
     // viewport_line so lookups during paint / hit-test map directly.
+    // URL hits take priority when ranges overlap — a URL is a strictly
+    // more specific match than "token with a dot".
     let col_stride_for_scan = cell_w.max(1.0);
-    let urls_by_line: std::collections::HashMap<i32, Vec<UrlHit>> = by_row
-        .iter()
-        .filter_map(|(line, cells)| {
-            let mut by_col = vec![' '; cols_count];
-            for (c, cell, _) in cells {
-                if *c < cols_count {
-                    let ch = match cell.c {
-                        '\0' | '\n' | '\r' | '\t' => ' ',
-                        c => c,
-                    };
-                    by_col[*c] = ch;
-                }
+    let mut urls_by_line: std::collections::HashMap<i32, Vec<UrlHit>> =
+        std::collections::HashMap::new();
+    let mut paths_by_line: std::collections::HashMap<i32, Vec<PathHit>> =
+        std::collections::HashMap::new();
+    let pane_cwd = terminal.cwd.clone();
+    for (line, cells) in by_row.iter() {
+        let mut by_col = vec![' '; cols_count];
+        for (c, cell, _) in cells {
+            if *c < cols_count {
+                let ch = match cell.c {
+                    '\0' | '\n' | '\r' | '\t' => ' ',
+                    c => c,
+                };
+                by_col[*c] = ch;
             }
-            let row_text: String = by_col.into_iter().collect();
-            let hits = scan_urls(&row_text);
-            if hits.is_empty() { None } else { Some((*line, hits)) }
-        })
-        .collect();
+        }
+        let row_text: String = by_col.into_iter().collect();
+        let u_hits = scan_urls(&row_text);
+        if !u_hits.is_empty() {
+            urls_by_line.insert(*line, u_hits);
+        }
+        let p_hits = scan_paths(&row_text, &pane_cwd);
+        if !p_hits.is_empty() {
+            paths_by_line.insert(*line, p_hits);
+        }
+    }
 
-    // Resolve the URL currently under the pointer (if any). Drives
-    // the hover underline and the click → pending_url_click handoff
-    // below. Mapping inverts `row_y = origin.y + line*cell_h + offset`
-    // so the hover cell tracks the sub-row scroll offset.
-    let hovered_url: Option<(i32, usize, usize, String)> =
+    /// What's under the pointer: a URL (click opens in default browser)
+    /// or a local path (click opens in default app). Borrowed from the
+    /// hit maps so we don't clone the path on every hover frame.
+    enum HoveredKind<'a> {
+        Url(&'a str),
+        Path(&'a std::path::Path),
+    }
+
+    // Resolve whatever's under the pointer — URL first, then path.
+    // Mapping inverts `row_y = origin.y + line*cell_h + offset` so the
+    // hover cell tracks the sub-row scroll offset.
+    let hovered_hit: Option<(i32, usize, usize, HoveredKind<'_>)> =
         response.hover_pos().and_then(|pos| {
             if !response.rect.contains(pos) {
                 return None;
@@ -498,24 +678,42 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             }
             let line = (rel_y / cell_h).floor() as i32;
             let col = (rel_x / col_stride_for_scan).floor() as usize;
-            let hits = urls_by_line.get(&line)?;
-            let hit = hits
-                .iter()
-                .find(|h| col >= h.col_start && col < h.col_end)?;
-            Some((line, hit.col_start, hit.col_end, hit.url.clone()))
+            if let Some(hits) = urls_by_line.get(&line)
+                && let Some(h) = hits
+                    .iter()
+                    .find(|h| col >= h.col_start && col < h.col_end)
+            {
+                return Some((line, h.col_start, h.col_end, HoveredKind::Url(&h.url)));
+            }
+            if let Some(hits) = paths_by_line.get(&line)
+                && let Some(h) = hits
+                    .iter()
+                    .find(|h| col >= h.col_start && col < h.col_end)
+            {
+                return Some((line, h.col_start, h.col_end, HoveredKind::Path(&h.path)));
+            }
+            None
         });
 
-    if hovered_url.is_some() {
+    if hovered_hit.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
-    // Plain click (no drag) on a hovered URL → hand it straight to
-    // the OS default browser. `response.clicked()` is false on drags,
+    // Plain click (no drag) on a hovered URL or path → hand it straight
+    // to the OS default handler. `response.clicked()` is false on drags,
     // so text selection is unaffected.
     if response.clicked()
-        && let Some((_, _, _, url)) = &hovered_url {
-            let _ = webbrowser::open(url);
+        && let Some((_, _, _, kind)) = &hovered_hit
+    {
+        match kind {
+            HoveredKind::Url(url) => {
+                let _ = webbrowser::open(url);
+            }
+            HoveredKind::Path(path) => {
+                open_in_default_app(path);
+            }
         }
+    }
 
     let fallback_fg = term_fg();
     // Per-run pinning: each style run is painted at run_start_col *
@@ -678,13 +876,13 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         flush(&mut buf, run_start_col, cur_fg, cur_bg, cur_underline, ui);
     }
 
-    // Hover underline for the URL under the pointer. Drawn AFTER the
-    // row paint so it sits on top of the glyph row and doesn't get
-    // overwritten. Painted as a single line_segment rather than baked
-    // into the run TextFormat, so the existing run/style logic stays
-    // untouched and a URL spanning multiple style runs still gets one
-    // continuous underline.
-    if let Some((line, col_start, col_end, _)) = &hovered_url {
+    // Hover underline for the URL / path under the pointer. Drawn
+    // AFTER the row paint so it sits on top of the glyph row and
+    // doesn't get overwritten. Painted as a single line_segment rather
+    // than baked into the run TextFormat, so the existing run/style
+    // logic stays untouched and a hit spanning multiple style runs
+    // still gets one continuous underline.
+    if let Some((line, col_start, col_end, _)) = &hovered_hit {
         let y = (origin.y + (*line as f32 + 1.0) * cell_h + scroll_pixel_offset - 1.0).round();
         let x0 = (origin.x + *col_start as f32 * col_stride).round();
         let x1 = (origin.x + *col_end as f32 * col_stride).round();
