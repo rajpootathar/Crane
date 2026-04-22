@@ -396,12 +396,6 @@ fn build_slot<W: HasWindowHandle>(
         .with_bounds(rect)
         .with_url(if url.is_empty() { "about:blank" } else { url })
         .with_transparent(false)
-        // Enables WebKit's Web Inspector. macOS adds an "Inspect
-        // Element" entry to the webview's native right-click menu,
-        // and `open_devtools()` becomes a no-op without this flag, so
-        // wire it on unconditionally — dev tooling is the whole point
-        // of an in-IDE browser pane.
-        .with_devtools(true)
         .with_on_page_load_handler({
             let url_updates = url_updates.clone();
             move |event, url| {
