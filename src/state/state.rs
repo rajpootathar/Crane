@@ -709,6 +709,39 @@ impl App {
             }
         }
 
+        // Catch the "already-grouped previously, but the parent Project
+        // at the group root itself is still standalone" case — i.e. an
+        // earlier reindex added sibling Sub-projects under a group_path
+        // without promoting the original Project, so the Left Panel
+        // renders two headers for the same directory (one cube + one
+        // folder). For each existing group's group_path, if there's a
+        // standalone Project whose own path matches that group_path,
+        // promote it so they collapse under one header.
+        let existing_group_paths: std::collections::HashMap<PathBuf, String> = self
+            .projects
+            .iter()
+            .filter_map(|p| {
+                let gp = p.group_path.as_ref()?;
+                let name = p.group_name.clone().unwrap_or_else(|| {
+                    gp.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("group")
+                        .to_string()
+                });
+                Some((gp.clone(), name))
+            })
+            .collect();
+        for p in &self.projects {
+            if p.missing || !p.path.exists() || p.group_path.is_some() {
+                continue;
+            }
+            if let Some(name) = existing_group_paths.get(&p.path) {
+                promote_to_group
+                    .entry(p.path.clone())
+                    .or_insert_with(|| name.clone());
+            }
+        }
+
         // Promote previously-standalone Projects into the group we're
         // about to create — must run BEFORE add_single_project so the
         // existing Project and the new siblings share one group_path,

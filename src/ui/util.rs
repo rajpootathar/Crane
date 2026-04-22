@@ -306,7 +306,21 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     }
 
     let text_color = cfg.label_color.unwrap_or(text());
-    painter.text(
+    // Reserve right-edge space for badge + trailing buttons so a long
+    // label (e.g. a verbose git branch name) can't overrun into them.
+    // We clip the label paint to the allowable rect rather than
+    // elide with "…" — the clean right-edge cutoff is enough of a
+    // visual hint that the text continues, matches how VS Code /
+    // Finder truncate narrow sidebar labels, and avoids the measure-
+    // and-shrink loop that an ellipsis pass would need.
+    let badge_reserve: f32 = if cfg.badge.is_some() { 64.0 } else { 0.0 };
+    let trailing_reserve = (cfg.trailing_count as f32) * 22.0;
+    let label_right = rect.max.x - 8.0 - badge_reserve - trailing_reserve;
+    let label_clip = Rect::from_min_max(
+        Pos2::new(cursor_x, rect.min.y),
+        Pos2::new(label_right.max(cursor_x + 1.0), rect.max.y),
+    );
+    painter.with_clip_rect(label_clip).text(
         Pos2::new(cursor_x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         cfg.label,
