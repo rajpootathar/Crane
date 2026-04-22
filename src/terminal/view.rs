@@ -161,29 +161,46 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     // delta is upward in egui (history); alacritty scrolls up into
     // history on positive delta, so the sign passes through.
     //
-    // Trackpad flicks arrive as ~3–6 px per frame. Cell height is
-    // ~16 px, so `(wheel/cell_h).round()` drops most frames to zero
-    // and the user sees a laggy, stuttery scroll. Accumulate the
-    // sub-line remainder in `scroll_carry` and only extract whole
-    // cells when the carry crosses ±1 — then the visible motion
-    // tracks the trackpad 1:1.
+    // Alacritty's grid is row-granular — `Scroll::Delta(1)` jumps the
+    // viewport by a whole cell_h every commit, which feels like the
+    // 16-px stutter the user sees vs. egui's pixel-smooth ScrollArea
+    // in Files. We close the gap by accumulating the wheel into
+    // `scroll_carry` (in fractional-row units) and applying the
+    // sub-row remainder as a pixel offset on the painted rows below.
+    // Whole-row crossings still get committed to alacritty so the
+    // grid actually advances; the carry persists between frames so
+    // the view stays where the user left it.
     if response.hovered() {
         let wheel = ui.input(|i| i.smooth_scroll_delta.y);
         if wheel.abs() > 0.01 {
+            let (disp, hist) = {
+                let g = terminal.term.lock();
+                (g.grid().display_offset(), g.history_size())
+            };
             let mut carry = terminal.scroll_carry.lock();
             *carry += wheel / cell_h;
+            // Clamp at the scroll boundaries so the pixel offset can't
+            // shift content past the live screen at the bottom or past
+            // the oldest history row at the top — without this the
+            // sub-row offset would tear the view off into an empty
+            // sliver that never fills.
+            if disp == 0 {
+                *carry = carry.max(0.0);
+            }
+            if disp >= hist {
+                *carry = carry.min(0.0);
+            }
             let lines = carry.trunc() as i32;
             if lines != 0 {
                 *carry -= lines as f32;
                 terminal.term.lock().scroll_display(Scroll::Delta(lines));
             }
-        } else {
-            // Decay the carry when the pointer is idle so a stale
-            // fractional remainder doesn't fire a phantom scroll on
-            // the next hover frame.
-            *terminal.scroll_carry.lock() = 0.0;
         }
     }
+    // Sub-row offset (px) applied to every painted row + the cursor so
+    // motion between commits tracks the trackpad 1:1 instead of
+    // snapping to row boundaries.
+    let scroll_pixel_offset = *terminal.scroll_carry.lock() * cell_h;
 
     // Drag: plain range select. pixel_to_point needs the current
     // display_offset so clicks on scrollback content resolve to the
@@ -382,7 +399,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let col_stride = cell_w.max(1.0);
     for (line, mut row_cells) in by_row {
         row_cells.sort_by_key(|(c, _, _)| *c);
-        let row_y = (origin.y + line as f32 * cell_h).round();
+        let row_y = (origin.y + line as f32 * cell_h + scroll_pixel_offset).round();
         let row_x = origin.x.round();
 
         // Paint each style run as its own galley pinned to
@@ -537,7 +554,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     // drift accumulates on long lines and makes the cursor look "off by
     // one" vs where the next character will print.
     let cx = origin.x.round() + cursor_col as f32 * col_stride;
-    let cy = (origin.y + cursor_line as f32 * cell_h).round();
+    let cy = (origin.y + cursor_line as f32 * cell_h + scroll_pixel_offset).round();
     let cw = col_stride;
     let ch = cell_h.round();
     let cursor_color = {
@@ -835,20 +852,33 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         }
     }
     if clear_requested {
-        // Only erase saved lines (`\x1b[3J`) — do NOT touch the visible
-        // grid or the cursor. A running TUI (Claude Code, vim, etc.)
-        // places its widget based on absolute cursor coordinates; an
-        // `\x1b[H\x1b[2J` would move the cursor to (0,0) and wipe its
-        // UI, after which the TUI's next write lands in the wrong
-        // place and interactive features (scroll, input, etc.) break
-        // until the next full redraw. Mac Terminal / iTerm's
-        // "Clear Buffer" shortcut is scrollback-only for exactly this
-        // reason.
+        // Two regimes, distinguished by whether a foreground process is
+        // running in the PTY:
+        //
+        // 1. Bare shell prompt — full clear: cursor home + erase
+        //    display + erase scrollback, then Ctrl+L to the PTY so zsh
+        //    / bash repaint the prompt at row 0. This is what the user
+        //    actually expects from Cmd+K and matches Terminal.app.
+        //
+        // 2. Foreground TUI (vim, claude, htop, …) — scrollback only
+        //    (`\x1b[3J`). A full clear would home the cursor and wipe
+        //    the alt-screen widget; the TUI's next write would then
+        //    land at (0,0) instead of where it left off, leaving its
+        //    UI broken until a manual redraw. Match iTerm2's "Clear
+        //    Buffer" semantics here.
+        let tui_active = terminal.has_foreground_process();
         let mut processor: Processor<StdSyncHandler> = Processor::new();
         {
             let mut guard = terminal.term.lock();
-            processor.advance(&mut *guard, b"\x1b[3J");
+            if tui_active {
+                processor.advance(&mut *guard, b"\x1b[3J");
+            } else {
+                processor.advance(&mut *guard, b"\x1b[H\x1b[2J\x1b[3J");
+            }
             guard.scroll_display(Scroll::Bottom);
+        }
+        if !tui_active {
+            terminal.write_input(b"\x0c");
         }
         terminal.history.lock().clear();
     }
