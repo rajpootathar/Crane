@@ -15,6 +15,12 @@ pub fn render(
     pane_id: PaneId,
     pane: &mut BrowserPane,
     title: &mut String,
+    // True when the pane is currently a drag-drop target. The native
+    // WKWebView sits above egui's GPU surface in the OS compositor, so
+    // the blue drop overlay painted by pane_view would render beneath
+    // the webview. Reporting the active tab as inactive hides the
+    // webview for the frame without destroying it (page state is kept).
+    native_hidden: bool,
 ) {
     // Tab strip (always visible). Left-to-right chips + a trailing `+`.
     ui.horizontal(|ui| {
@@ -219,7 +225,11 @@ pub fn render(
         // webview should be visible. All other tabs' webviews were
         // already reported as "alive" via report_inactive below so
         // they're retained but hidden.
-        crate::browser::report_pane(composite_id(pane_id, tab_id), inner, &tab.url);
+        if native_hidden {
+            crate::browser::report_inactive(composite_id(pane_id, tab_id), &tab.url);
+        } else {
+            crate::browser::report_pane(composite_id(pane_id, tab_id), inner, &tab.url);
+        }
         ui.painter().rect_filled(
             rect,
             0.0,

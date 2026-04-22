@@ -412,7 +412,7 @@ fn render_pane(
             diff_view::render(child, diff, font_size, &mut pane.title);
         }
         PaneContent::Browser(browser) => {
-            browser_view::render(child, id, browser, &mut pane.title);
+            browser_view::render(child, id, browser, &mut pane.title, is_drop_target);
         }
     });
 
