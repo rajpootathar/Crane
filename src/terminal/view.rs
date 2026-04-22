@@ -10,6 +10,75 @@ use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, Pos2, Rect, Sense, Vec2};
 
+/// One URL detected in a row of the visible grid. `col_end` is
+/// exclusive. Used by the renderer to draw a hover-underline and to
+/// resolve a click back to the URL string.
+struct UrlHit {
+    col_start: usize,
+    col_end: usize,
+    url: String,
+}
+
+/// Scan a row of plain text for `http://` / `https://` URLs. Stops at
+/// whitespace and trims a small set of trailing punctuation that's
+/// almost never part of the URL itself (`.,;:!?)]}>"' `). Conservative
+/// on purpose — false negatives are fine, false positives that swallow
+/// trailing prose punctuation are user-visible breakage.
+fn scan_urls(row: &str) -> Vec<UrlHit> {
+    let mut hits = Vec::new();
+    let chars: Vec<char> = row.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let starts_http = i + 7 <= n
+            && chars[i..i + 7].iter().collect::<String>().eq_ignore_ascii_case("http://");
+        let starts_https = i + 8 <= n
+            && chars[i..i + 8].iter().collect::<String>().eq_ignore_ascii_case("https://");
+        if !(starts_http || starts_https) {
+            i += 1;
+            continue;
+        }
+        // Don't treat `xhttp://` mid-word as a URL — require a
+        // word-boundary just before. Fine to be strict here; false
+        // negatives are recoverable, false positives aren't.
+        if i > 0 {
+            let prev = chars[i - 1];
+            if prev.is_alphanumeric() || prev == '/' || prev == '.' {
+                i += 1;
+                continue;
+            }
+        }
+        let mut end = i;
+        while end < n {
+            let c = chars[end];
+            if c.is_whitespace() || c == '\0' || (c as u32) < 0x20 {
+                break;
+            }
+            end += 1;
+        }
+        // Trim trailing punctuation that's likely the surrounding
+        // sentence, not part of the URL.
+        while end > i {
+            let c = chars[end - 1];
+            if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\'') {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        if end > i + 8 {
+            let url: String = chars[i..end].iter().collect();
+            hits.push(UrlHit {
+                col_start: i,
+                col_end: end,
+                url,
+            });
+        }
+        i = end.max(i + 1);
+    }
+    hits
+}
+
 fn term_bg() -> Color32 {
     theme::current().terminal_bg.to_color32()
 }
@@ -389,6 +458,65 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         }
     }
 
+    // URL scan over the visible rows. We build each row's text from
+    // the already-assembled cells (cheaper than a second grid walk
+    // and respects scrollback offset + dedup). `by_row` is keyed by
+    // viewport_line so lookups during paint / hit-test map directly.
+    let col_stride_for_scan = cell_w.max(1.0);
+    let urls_by_line: std::collections::HashMap<i32, Vec<UrlHit>> = by_row
+        .iter()
+        .filter_map(|(line, cells)| {
+            let mut by_col = vec![' '; cols_count];
+            for (c, cell, _) in cells {
+                if *c < cols_count {
+                    let ch = match cell.c {
+                        '\0' | '\n' | '\r' | '\t' => ' ',
+                        c => c,
+                    };
+                    by_col[*c] = ch;
+                }
+            }
+            let row_text: String = by_col.into_iter().collect();
+            let hits = scan_urls(&row_text);
+            if hits.is_empty() { None } else { Some((*line, hits)) }
+        })
+        .collect();
+
+    // Resolve the URL currently under the pointer (if any). Drives
+    // the hover underline and the click → pending_url_click handoff
+    // below. Mapping inverts `row_y = origin.y + line*cell_h + offset`
+    // so the hover cell tracks the sub-row scroll offset.
+    let hovered_url: Option<(i32, usize, usize, String)> =
+        response.hover_pos().and_then(|pos| {
+            if !response.rect.contains(pos) {
+                return None;
+            }
+            let rel_x = pos.x - origin.x;
+            let rel_y = pos.y - origin.y - scroll_pixel_offset;
+            if rel_x < 0.0 || rel_y < 0.0 {
+                return None;
+            }
+            let line = (rel_y / cell_h).floor() as i32;
+            let col = (rel_x / col_stride_for_scan).floor() as usize;
+            let hits = urls_by_line.get(&line)?;
+            let hit = hits
+                .iter()
+                .find(|h| col >= h.col_start && col < h.col_end)?;
+            Some((line, hit.col_start, hit.col_end, hit.url.clone()))
+        });
+
+    if hovered_url.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    // Plain click (no drag) on a hovered URL → hand it straight to
+    // the OS default browser. `response.clicked()` is false on drags,
+    // so text selection is unaffected.
+    if response.clicked()
+        && let Some((_, _, _, url)) = &hovered_url {
+            let _ = webbrowser::open(url);
+        }
+
     let fallback_fg = term_fg();
     // Per-run pinning: each style run is painted at run_start_col *
     // col_stride, so egui's galley advance only accumulates WITHIN a
@@ -548,6 +676,22 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             }
         }
         flush(&mut buf, run_start_col, cur_fg, cur_bg, cur_underline, ui);
+    }
+
+    // Hover underline for the URL under the pointer. Drawn AFTER the
+    // row paint so it sits on top of the glyph row and doesn't get
+    // overwritten. Painted as a single line_segment rather than baked
+    // into the run TextFormat, so the existing run/style logic stays
+    // untouched and a URL spanning multiple style runs still gets one
+    // continuous underline.
+    if let Some((line, col_start, col_end, _)) = &hovered_url {
+        let y = (origin.y + (*line as f32 + 1.0) * cell_h + scroll_pixel_offset - 1.0).round();
+        let x0 = (origin.x + *col_start as f32 * col_stride).round();
+        let x1 = (origin.x + *col_end as f32 * col_stride).round();
+        painter.line_segment(
+            [Pos2::new(x0, y), Pos2::new(x1, y)],
+            egui::Stroke::new(1.0, fallback_fg),
+        );
     }
 
     // Snap cursor to integer pixels so it aligns with char cells. Subpixel
