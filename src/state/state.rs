@@ -38,6 +38,11 @@ pub struct Workspace {
     pub git_status: Option<GitStatus>,
     pub last_status_refresh: Option<Instant>,
     pub git_rx: Option<std::sync::mpsc::Receiver<Option<GitStatus>>>,
+    /// Optional per-Workspace accent tint applied to the branch icon
+    /// and label in the Left Panel. Lets users colour-code branches
+    /// the same way [`Project::tint`] colour-codes projects. `None`
+    /// → fall back to the theme accent.
+    pub tint: Option<[u8; 3]>,
 }
 
 impl Workspace {
@@ -322,6 +327,12 @@ pub struct App {
     pub tab_mru: Vec<(ProjectId, WorkspaceId, TabId)>,
     /// Active tab-switcher overlay state. `None` = closed.
     pub tab_switcher: Option<TabSwitcherState>,
+    /// Per-group folder-header tints, keyed by a group's `group_path`.
+    /// Lets users colour-code folder groups the same way
+    /// [`Project::tint`] and [`Workspace::tint`] colour-code projects
+    /// and branches. Missing entry → fall back to the `muted()`
+    /// folder colour.
+    pub group_tints: std::collections::HashMap<PathBuf, [u8; 3]>,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -368,6 +379,7 @@ impl App {
             pending_close_tab: None,
             tab_mru: Vec::new(),
             tab_switcher: None,
+            group_tints: std::collections::HashMap::new(),
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,
@@ -535,6 +547,7 @@ impl App {
                 git_status: None,
                 last_status_refresh: None,
                 git_rx: None,
+                tint: None,
             });
         }
 
@@ -702,6 +715,7 @@ impl App {
                     git_status: None,
                     last_status_refresh: None,
                     git_rx: None,
+                    tint: None,
                 };
                 if let Some(project) = self.projects.iter_mut().find(|p| p.id == pid) {
                     project.workspaces.push(new_workspace);
@@ -761,6 +775,62 @@ impl App {
         // self.projects which would invalidate the scan snapshot.
         for (path, group_root, group_name) in new_sub_projects {
             self.add_single_project(path, Some(group_root), Some(group_name), ctx);
+        }
+
+        // Cluster each group's members contiguously, anchored at the
+        // first-occurrence slot. Without this pass, a group's existing
+        // siblings (restored from the last session) and newly-appended
+        // ones (from `add_single_project` above) can be interleaved
+        // with unrelated standalone Projects — the Left Panel then
+        // re-renders a folder header every time `group_path` flips
+        // between adjacent rows, producing the duplicate headers the
+        // reindex was supposed to collapse.
+        let n = self.projects.len();
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut placed_groups: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        for i in 0..n {
+            match &self.projects[i].group_path {
+                None => order.push(i),
+                Some(gp) => {
+                    if placed_groups.contains(gp) {
+                        continue;
+                    }
+                    let gp = gp.clone();
+                    placed_groups.insert(gp.clone());
+                    for j in 0..n {
+                        if self.projects[j].group_path.as_ref() == Some(&gp) {
+                            order.push(j);
+                        }
+                    }
+                }
+            }
+        }
+        if order.len() == n {
+            let mut slots: Vec<Option<Project>> =
+                std::mem::take(&mut self.projects).into_iter().map(Some).collect();
+            let mut reordered: Vec<Project> = Vec::with_capacity(n);
+            for idx in order {
+                if let Some(p) = slots[idx].take() {
+                    reordered.push(p);
+                }
+            }
+            self.projects = reordered;
+        }
+    }
+
+    /// Remove every Project whose `group_path` matches `group`. Used
+    /// by the Left Panel's folder-header context menu to unload an
+    /// entire group (all sibling Sub-projects) in one action.
+    pub fn remove_group(&mut self, group: &std::path::Path) {
+        let ids: Vec<ProjectId> = self
+            .projects
+            .iter()
+            .filter(|p| p.group_path.as_deref() == Some(group))
+            .map(|p| p.id)
+            .collect();
+        for id in ids {
+            self.remove_project(id);
         }
     }
 
@@ -1191,6 +1261,7 @@ impl App {
                     git_status: None,
                     last_status_refresh: None,
                     git_rx: None,
+                    tint: None,
                 });
                 self.active = Some((modal.project_id, wt_id, tab_id));
                 self.last_workspace = Some((modal.project_id, wt_id));

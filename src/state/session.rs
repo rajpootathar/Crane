@@ -42,6 +42,11 @@ pub struct Session {
     pub right_panel_w: f32,
     #[serde(default)]
     pub language_configs: crate::lsp::LanguageConfigs,
+    /// Persisted folder-group tints, keyed by the group's parent path.
+    /// Serialized as a Vec<(PathBuf, [u8; 3])> to survive JSON's lack
+    /// of non-string map keys. Missing → empty map on restore.
+    #[serde(default)]
+    pub group_tints: Vec<(PathBuf, [u8; 3])>,
 }
 
 fn default_left_w() -> f32 {
@@ -90,6 +95,8 @@ pub struct SWorkspace {
     pub expanded: bool,
     pub active_tab: Option<TabId>,
     pub tabs: Vec<STab>,
+    #[serde(default)]
+    pub tint: Option<[u8; 3]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -221,6 +228,7 @@ impl Session {
                     expanded: w.expanded,
                     active_tab: w.active_tab,
                     tabs,
+                    tint: w.tint,
                 });
             }
             projects.push(SProject {
@@ -267,6 +275,7 @@ impl Session {
             left_panel_w: app.left_panel_w,
             right_panel_w: app.right_panel_w,
             language_configs: app.language_configs.clone(),
+            group_tints: app.group_tints.iter().map(|(p, c)| (p.clone(), *c)).collect(),
         }
     }
 
@@ -301,6 +310,7 @@ impl Session {
                     git_status: None,
                     last_status_refresh: None,
                     git_rx: None,
+                    tint: sw.tint,
                 });
             }
             // Stat the folder on restore. Missing projects still load
@@ -366,6 +376,7 @@ impl Session {
         app.left_panel_w = self.left_panel_w.clamp(180.0, 600.0);
         app.right_panel_w = self.right_panel_w.clamp(200.0, 700.0);
         app.language_configs = self.language_configs;
+        app.group_tints = self.group_tints.into_iter().collect();
         // Re-probe disk for repos / worktrees / sub-clones added outside
         // Crane since the last session — picks up newly-cloned siblings,
         // `git worktree add` branches, and `git init`-after-the-fact

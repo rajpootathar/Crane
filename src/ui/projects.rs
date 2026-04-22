@@ -117,6 +117,27 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     // Pending tint change from a context-menu color pick.
     // `Some((id, None))` means "clear tint" (restore accent).
     let mut set_tint: Option<(u64, Option<[u8; 3]>)> = None;
+    // Pending "remove entire folder group" from a folder-header
+    // context-menu pick.
+    let mut remove_group_pending: Option<std::path::PathBuf> = None;
+    // Pending tint change for a folder-group header. `None` value
+    // clears the tint.
+    let mut set_group_tint: Option<(std::path::PathBuf, Option<[u8; 3]>)> = None;
+    // Pending tint change for a branch (Workspace).
+    let mut set_workspace_tint: Option<(u64, u64, Option<[u8; 3]>)> = None;
+
+    // Precompute group member counts so individual-project "Remove"
+    // can be suppressed when the group has siblings. Atomic unload
+    // rule: a multi-member group is removed whole via its folder
+    // header; per-member removal would leave the group in a weird
+    // half-state the user didn't ask for.
+    let mut group_counts: std::collections::HashMap<std::path::PathBuf, usize> =
+        std::collections::HashMap::new();
+    for p in &app.projects {
+        if let Some(gp) = &p.group_path {
+            *group_counts.entry(gp.clone()).or_insert(0) += 1;
+        }
+    }
 
     // Snapshot rename state into local buffers so the tree walk only
     // needs an immutable borrow of `app`. Buffers are flushed back into
@@ -155,15 +176,20 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         .group_name
                         .clone()
                         .unwrap_or_else(|| "group".into());
-                    draw_row(
+                    let group_tint = project
+                        .group_path
+                        .as_ref()
+                        .and_then(|gp| app.group_tints.get(gp).copied())
+                        .map(|[r, g, b]| egui::Color32::from_rgb(r, g, b));
+                    let folder_row = draw_row(
                         ui,
                         RowConfig {
                             depth: 0,
                             expanded: Some(true),
                             leading: Some(icons::FOLDER),
-                            leading_color: Some(muted()),
+                            leading_color: Some(group_tint.unwrap_or_else(muted)),
                             label: &group_name,
-                            label_color: Some(muted()),
+                            label_color: Some(group_tint.unwrap_or_else(muted)),
                             is_active: false,
                             active_bar: false,
                             badge: None,
@@ -171,6 +197,50 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             tree_guides: false, checkbox: None,
                         },
                     );
+                    if let Some(gp) = &project.group_path {
+                        let gp = gp.clone();
+                        folder_row.response.context_menu(|ui| {
+                            ui.label(
+                                egui::RichText::new("Highlight color")
+                                    .size(11.0)
+                                    .color(muted()),
+                            );
+                            ui.horizontal(|ui| {
+                                for (label, rgb) in PROJECT_TINT_PALETTE {
+                                    let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(icons::FOLDER)
+                                            .color(color)
+                                            .size(14.0),
+                                    )
+                                    .min_size(egui::vec2(22.0, 22.0))
+                                    .frame(false);
+                                    if ui.add(btn).on_hover_text(*label).clicked() {
+                                        set_group_tint = Some((gp.clone(), Some(*rgb)));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            if ui
+                                .button(format!(
+                                    "{}  Default color",
+                                    icons::ARROW_COUNTER_CLOCKWISE
+                                ))
+                                .clicked()
+                            {
+                                set_group_tint = Some((gp.clone(), None));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button(format!("{}  Remove folder group", icons::X))
+                                .clicked()
+                            {
+                                remove_group_pending = Some(gp.clone());
+                                ui.close();
+                            }
+                        });
+                    }
                 }
                 last_group = project.group_path.clone();
                 let project_depth = if in_group { 1 } else { 0 };
@@ -193,18 +263,38 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         tree_guides: in_group, checkbox: None,
                     },
                 );
-                let project_trailing = draw_trailing(
-                    ui,
-                    row.rect,
-                    row.hovered,
-                    &[
-                        (icons::PLUS, "New worktree", 0),
-                        (icons::X, "Remove project", 1),
-                    ],
-                );
+                // Suppress per-Project removal when the Project is one
+                // of several siblings inside a folder group. In that
+                // case the group must be removed atomically via the
+                // folder header's "Remove folder group" context menu.
+                let in_multi_group = project
+                    .group_path
+                    .as_ref()
+                    .and_then(|gp| group_counts.get(gp))
+                    .is_some_and(|c| *c > 1);
+                let project_trailing = if in_multi_group {
+                    draw_trailing(
+                        ui,
+                        row.rect,
+                        row.hovered,
+                        &[(icons::PLUS, "New worktree", 0)],
+                    )
+                } else {
+                    draw_trailing(
+                        ui,
+                        row.rect,
+                        row.hovered,
+                        &[
+                            (icons::PLUS, "New worktree", 0),
+                            (icons::X, "Remove project", 1),
+                        ],
+                    )
+                };
                 if project_trailing[0] {
                     new_workspace_for_project = Some(project.id);
-                } else if project_trailing[1] {
+                } else if !in_multi_group
+                    && project_trailing.get(1).copied().unwrap_or(false)
+                {
                     remove_project = Some(project.id);
                 } else if row.main_clicked {
                     toggle_project = Some(project.id);
@@ -244,10 +334,16 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         set_tint = Some((pid, None));
                         ui.close();
                     }
-                    ui.separator();
-                    if ui.button(format!("{}  Remove Project", icons::X)).clicked() {
-                        remove_project = Some(pid);
-                        ui.close();
+                    // Only expose individual Remove when this Project
+                    // isn't part of a multi-member folder group —
+                    // those must be removed atomically via the folder
+                    // header to keep groups internally consistent.
+                    if !in_multi_group {
+                        ui.separator();
+                        if ui.button(format!("{}  Remove Project", icons::X)).clicked() {
+                            remove_project = Some(pid);
+                            ui.close();
+                        }
                     }
                 });
 
@@ -336,15 +432,28 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         }
                         let wt_label = wt.label();
                         let wt_depth = if in_group { 2 } else { 1 };
+                        let wt_tint_color = wt
+                            .tint
+                            .map(|[r, g, b]| egui::Color32::from_rgb(r, g, b));
+                        // Tint priority: explicit user tint wins over
+                        // the active-branch accent hint. Without this,
+                        // the active row always paints the leading
+                        // icon in accent and any tint picked is
+                        // invisible on the active branch.
+                        let wt_leading_color = wt_tint_color.or(if active_wt {
+                            Some(accent())
+                        } else {
+                            None
+                        });
                         let wt_row = draw_row(
                             ui,
                             RowConfig {
                                 depth: wt_depth,
                                 expanded: Some(wt.expanded),
                                 leading: Some(icons::GIT_BRANCH),
-                                leading_color: if active_wt { Some(accent()) } else { None },
+                                leading_color: wt_leading_color,
                                 label: &wt_label,
-                                label_color: None,
+                                label_color: wt_tint_color,
                                 is_active: active_wt,
                                 active_bar: active_wt,
                                 badge,
@@ -384,6 +493,38 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             }
                             if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
                                 ui.ctx().copy_text(wt_path.to_string_lossy().to_string());
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Highlight color")
+                                    .size(11.0)
+                                    .color(muted()),
+                            );
+                            ui.horizontal(|ui| {
+                                for (label, rgb) in PROJECT_TINT_PALETTE {
+                                    let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(icons::GIT_BRANCH)
+                                            .color(color)
+                                            .size(14.0),
+                                    )
+                                    .min_size(egui::vec2(22.0, 22.0))
+                                    .frame(false);
+                                    if ui.add(btn).on_hover_text(*label).clicked() {
+                                        set_workspace_tint = Some((wt_pid, wt_id, Some(*rgb)));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            if ui
+                                .button(format!(
+                                    "{}  Default color",
+                                    icons::ARROW_COUNTER_CLOCKWISE
+                                ))
+                                .clicked()
+                            {
+                                set_workspace_tint = Some((wt_pid, wt_id, None));
                                 ui.close();
                             }
                             ui.separator();
@@ -622,6 +763,22 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
             p.tint = tint;
         }
+    if let Some((group, tint)) = set_group_tint {
+        match tint {
+            Some(rgb) => {
+                app.group_tints.insert(group, rgb);
+            }
+            None => {
+                app.group_tints.remove(&group);
+            }
+        }
+    }
+    if let Some((pid, wid, tint)) = set_workspace_tint
+        && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid)
+        && let Some(w) = p.workspaces.iter_mut().find(|w| w.id == wid)
+    {
+        w.tint = tint;
+    }
     if let Some(pid) = toggle_project
         && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
             p.expanded = !p.expanded;
@@ -647,6 +804,9 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     }
     if let Some(pid) = remove_project {
         app.remove_project(pid);
+    }
+    if let Some(group) = remove_group_pending {
+        app.remove_group(&group);
     }
     if let Some((pid, wid)) = remove_worktree
         && let Some(p) = app.projects.iter().find(|p| p.id == pid)
