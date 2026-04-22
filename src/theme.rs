@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default)]
 pub struct Rgb {
     pub r: u8,
     pub g: u8,
@@ -54,6 +54,13 @@ pub struct Theme {
     pub warning: Rgb,
     pub terminal_bg: Rgb,
     pub terminal_fg: Rgb,
+    /// Text selection / highlight background. Applied to selected
+    /// cells in the Terminal pane and (future) selected ranges in the
+    /// File pane. Custom themes set their own value in the `.toml`
+    /// under `selection = [r, g, b]`. Missing in older theme files →
+    /// falls back to the theme accent at ~28% opacity.
+    #[serde(default)]
+    pub selection: Rgb,
     /// Name of the syntect theme to use for code highlighting. Matches a
     /// `two_face::theme::EmbeddedThemeName` display name (e.g. "OneHalfDark",
     /// "VisualStudioDarkPlus", "Dracula") or a syntect default. Falls back to
@@ -89,6 +96,7 @@ impl Theme {
             warning: Rgb::new(220, 180, 110),
             terminal_bg: Rgb::new(14, 16, 24),
             terminal_fg: Rgb::new(176, 180, 192),
+            selection: Rgb::new(50, 78, 128),
             syntax_theme: "OneHalfDark".into(),
         }
     }
@@ -119,6 +127,7 @@ impl Theme {
             warning: Rgb::new(200, 140, 40),
             terminal_bg: Rgb::new(248, 249, 252),
             terminal_fg: Rgb::new(36, 40, 52),
+            selection: Rgb::new(186, 210, 246),
             syntax_theme: "InspiredGithub".into(),
         }
     }
@@ -150,6 +159,7 @@ impl Theme {
             warning: Rgb::new(220, 170, 90),
             terminal_bg: Rgb::new(43, 43, 43),
             terminal_fg: Rgb::new(187, 187, 187),
+            selection: Rgb::new(33, 66, 131),
             syntax_theme: "Dracula".into(),
         }
     }
@@ -180,6 +190,7 @@ impl Theme {
             warning: Rgb::new(210, 153, 34),
             terminal_bg: Rgb::new(13, 17, 23),
             terminal_fg: Rgb::new(201, 209, 217),
+            selection: Rgb::new(33, 60, 103),
             syntax_theme: "TwoDark".into(),
         }
     }
@@ -210,6 +221,7 @@ impl Theme {
             warning: Rgb::new(220, 180, 90),
             terminal_bg: Rgb::new(30, 30, 30),
             terminal_fg: Rgb::new(212, 212, 212),
+            selection: Rgb::new(38, 79, 120),
             syntax_theme: "VisualStudioDarkPlus".into(),
         }
     }
@@ -243,6 +255,7 @@ impl Theme {
             warning: Rgb::new(191, 138, 0),
             terminal_bg: Rgb::new(255, 255, 255),
             terminal_fg: Rgb::new(37, 37, 37),
+            selection: Rgb::new(173, 214, 255),
             syntax_theme: "OneHalfLight".into(),
         }
     }
@@ -273,6 +286,7 @@ impl Theme {
             warning: Rgb::new(229, 192, 123),
             terminal_bg: Rgb::new(40, 44, 52),
             terminal_fg: Rgb::new(171, 178, 191),
+            selection: Rgb::new(62, 68, 81),
             syntax_theme: "TwoDark".into(),
         }
     }

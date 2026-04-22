@@ -76,6 +76,8 @@ pub struct SProject {
     pub group_path: Option<PathBuf>,
     #[serde(default)]
     pub group_name: Option<String>,
+    #[serde(default)]
+    pub tint: Option<[u8; 3]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -232,6 +234,7 @@ impl Session {
                 preferred_custom_path: p.preferred_custom_path.clone(),
                 group_path: p.group_path.clone(),
                 group_name: p.group_name.clone(),
+                tint: p.tint,
             });
         }
 
@@ -320,6 +323,7 @@ impl Session {
                 preferred_custom_path: sp.preferred_custom_path,
                 group_path: sp.group_path,
                 group_name: sp.group_name,
+                tint: sp.tint,
             });
             if missing {
                 app.missing_project_modals.push(sp.id);

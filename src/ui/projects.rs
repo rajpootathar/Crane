@@ -10,6 +10,21 @@ const HEADER: Color32 = Color32::from_rgb(140, 146, 162);
 const ADD: Color32 = Color32::from_rgb(120, 210, 140);
 const DEL: Color32 = Color32::from_rgb(220, 110, 110);
 
+/// Project-tint palette for the right-click "Highlight color" picker.
+/// Hand-picked to stay legible on both light and dark themes — full
+/// saturation but moderate lightness so the label stays readable when
+/// the project name inherits the tint.
+const PROJECT_TINT_PALETTE: &[(&str, [u8; 3])] = &[
+    ("Red",    [239,  83,  80]),
+    ("Orange", [255, 152,   0]),
+    ("Yellow", [255, 202,  40]),
+    ("Green",  [102, 187, 106]),
+    ("Teal",   [ 38, 166, 154]),
+    ("Blue",   [ 66, 165, 245]),
+    ("Purple", [171,  71, 188]),
+    ("Pink",   [236,  64, 122]),
+];
+
 fn reveal_in_file_manager(path: &std::path::Path) {
     // Resolve symlinks and expand any relative segments so `open`
     // receives a concrete on-disk path. Worktrees can live under
@@ -99,6 +114,9 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut new_workspace_for_project: Option<u64> = None;
     let mut remove_project: Option<u64> = None;
     let mut remove_worktree: Option<(u64, u64)> = None;
+    // Pending tint change from a context-menu color pick.
+    // `Some((id, None))` means "clear tint" (restore accent).
+    let mut set_tint: Option<(u64, Option<[u8; 3]>)> = None;
 
     // Snapshot rename state into local buffers so the tree walk only
     // needs an immutable borrow of `app`. Buffers are flushed back into
@@ -156,15 +174,18 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 }
                 last_group = project.group_path.clone();
                 let project_depth = if in_group { 1 } else { 0 };
+                let tint_color = project
+                    .tint
+                    .map(|[r, g, b]| egui::Color32::from_rgb(r, g, b));
                 let row = draw_row(
                     ui,
                     RowConfig {
                         depth: project_depth,
                         expanded: Some(project.expanded),
                         leading: Some(icons::CUBE),
-                        leading_color: Some(accent()),
+                        leading_color: Some(tint_color.unwrap_or_else(accent)),
                         label: &project.name,
-                        label_color: None,
+                        label_color: tint_color,
                         is_active: false,
                         active_bar: false,
                         badge: None,
@@ -197,6 +218,30 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                     }
                     if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
                         ui.ctx().copy_text(proj_path.to_string_lossy().to_string());
+                        ui.close();
+                    }
+                    ui.separator();
+                    // Color picker — tints both the cube icon and the
+                    // project name. Swatch buttons show the actual color
+                    // so the palette is self-documenting. "Default"
+                    // clears the tint and falls back to the theme accent.
+                    ui.label(egui::RichText::new("Highlight color").size(11.0).color(muted()));
+                    ui.horizontal(|ui| {
+                        for (label, rgb) in PROJECT_TINT_PALETTE {
+                            let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                            let btn = egui::Button::new(
+                                egui::RichText::new(icons::CUBE).color(color).size(14.0),
+                            )
+                            .min_size(egui::vec2(22.0, 22.0))
+                            .frame(false);
+                            if ui.add(btn).on_hover_text(*label).clicked() {
+                                set_tint = Some((pid, Some(*rgb)));
+                                ui.close();
+                            }
+                        }
+                    });
+                    if ui.button(format!("{}  Default color", icons::ARROW_COUNTER_CLOCKWISE)).clicked() {
+                        set_tint = Some((pid, None));
                         ui.close();
                     }
                     ui.separator();
@@ -573,6 +618,10 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         app.renaming_workspace = Some(start);
     }
 
+    if let Some((pid, tint)) = set_tint
+        && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
+            p.tint = tint;
+        }
     if let Some(pid) = toggle_project
         && let Some(p) = app.projects.iter_mut().find(|p| p.id == pid) {
             p.expanded = !p.expanded;

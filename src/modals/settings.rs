@@ -255,7 +255,7 @@ fn render_appearance(
                 };
                 ui.painter().rect_filled(rect, 6.0, hover_fill);
                 let swatch_size = 12.0;
-                for (i, col) in [t.bg, t.surface, t.accent, t.text].iter().enumerate() {
+                for (i, col) in [t.bg, t.surface, t.accent, t.text, t.selection].iter().enumerate() {
                     let c = col.to_color32();
                     let sw = egui::Rect::from_min_size(
                         egui::pos2(
@@ -266,7 +266,7 @@ fn render_appearance(
                     );
                     ui.painter().rect_filled(sw, 2.0, c);
                 }
-                let name_x = rect.min.x + 12.0 + (swatch_size + 4.0) * 4.0 + 8.0;
+                let name_x = rect.min.x + 12.0 + (swatch_size + 4.0) * 5.0 + 8.0;
                 ui.painter().text(
                     egui::pos2(name_x, rect.center().y),
                     egui::Align2::LEFT_CENTER,

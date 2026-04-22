@@ -77,6 +77,10 @@ pub struct Project {
     /// this project (instead of resetting to Global + ~/.crane-worktrees/<name>).
     pub preferred_location_mode: Option<LocationMode>,
     pub preferred_custom_path: Option<String>,
+    /// Optional per-Project accent tint applied to the cube icon in the
+    /// Left Panel. Lets users visually distinguish projects at a glance
+    /// without renaming. `None` → fall back to the theme accent.
+    pub tint: Option<[u8; 3]>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -546,6 +550,7 @@ impl App {
             last_active_workspace: first_active.map(|(wt, _)| wt),
             preferred_location_mode: None,
             preferred_custom_path: None,
+            tint: None,
         });
         if let Some((wt, tab)) = first_active
             && self.active.is_none()
@@ -600,9 +605,17 @@ impl App {
         }
 
         let mut new_sub_projects: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+        // Standalone Projects that need to be promoted into a group
+        // header — happens when we discover new nested clones under
+        // a previously standalone Project's path. Keyed by the root
+        // path so the existing Project and the new siblings all
+        // end up sharing the same `group_path`.
+        let mut promote_to_group: std::collections::HashMap<PathBuf, String> =
+            std::collections::HashMap::new();
         for (root, group_name) in &scan_roots {
             let path_is_repo = root.join(".git").exists();
             let discovered = crate::git::discover_repos(root, 5);
+            let mut siblings: Vec<PathBuf> = Vec::new();
             for repo_path in discovered {
                 if &repo_path == root {
                     continue;
@@ -619,13 +632,25 @@ impl App {
                 {
                     continue;
                 }
-                let effective_name = group_name.clone().unwrap_or_else(|| {
-                    root.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("group")
-                        .to_string()
-                });
-                new_sub_projects.push((repo_path, root.clone(), effective_name));
+                siblings.push(repo_path);
+            }
+            if siblings.is_empty() {
+                continue;
+            }
+            let effective_name = group_name.clone().unwrap_or_else(|| {
+                root.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("group")
+                    .to_string()
+            });
+            // Standalone Project → needs to join the group we're
+            // about to create so it renders under one header with
+            // the new siblings.
+            if group_name.is_none() {
+                promote_to_group.insert(root.clone(), effective_name.clone());
+            }
+            for repo_path in siblings {
+                new_sub_projects.push((repo_path, root.clone(), effective_name.clone()));
             }
         }
 
@@ -681,6 +706,21 @@ impl App {
                 if let Some(project) = self.projects.iter_mut().find(|p| p.id == pid) {
                     project.workspaces.push(new_workspace);
                 }
+            }
+        }
+
+        // Promote previously-standalone Projects into the group we're
+        // about to create — must run BEFORE add_single_project so the
+        // existing Project and the new siblings share one group_path,
+        // rendering under a single folder header in the Left Panel.
+        for (root, name) in &promote_to_group {
+            if let Some(project) = self
+                .projects
+                .iter_mut()
+                .find(|p| p.path == *root && p.group_path.is_none())
+            {
+                project.group_path = Some(root.clone());
+                project.group_name = Some(name.clone());
             }
         }
 
