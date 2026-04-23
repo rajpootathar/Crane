@@ -831,6 +831,54 @@ impl App {
             }
             self.projects = reordered;
         }
+
+        // Demote any group whose live member count has dropped to ≤1.
+        // Happens when a sibling repo was deleted on disk outside Crane
+        // (the `Remove` UI path already flattens via `remove_project`,
+        // but nothing rebalances on session restore). A folder wrapping
+        // a single Project is indistinguishable from a standalone, so
+        // the survivor — plus any still-missing siblings — get their
+        // group bindings cleared and render flush-left.
+        self.rebalance_groups();
+    }
+
+    /// Collapse any `group_path` that no longer has at least two live
+    /// members (`!missing && path.exists()`). Clears `group_path` /
+    /// `group_name` on every remaining member (including missing ones
+    /// that previously belonged to the group) and drops the matching
+    /// `group_tints` / `group_collapsed` entries.
+    fn rebalance_groups(&mut self) {
+        use std::collections::HashMap;
+        let mut live_counts: HashMap<PathBuf, usize> = HashMap::new();
+        let mut total_counts: HashMap<PathBuf, usize> = HashMap::new();
+        for p in &self.projects {
+            if let Some(gp) = &p.group_path {
+                *total_counts.entry(gp.clone()).or_insert(0) += 1;
+                if !p.missing && p.path.exists() {
+                    *live_counts.entry(gp.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        let to_demote: Vec<PathBuf> = total_counts
+            .into_iter()
+            .filter_map(|(gp, _total)| {
+                let live = live_counts.get(&gp).copied().unwrap_or(0);
+                if live <= 1 { Some(gp) } else { None }
+            })
+            .collect();
+        if to_demote.is_empty() {
+            return;
+        }
+        for gp in &to_demote {
+            for p in self.projects.iter_mut() {
+                if p.group_path.as_ref() == Some(gp) {
+                    p.group_path = None;
+                    p.group_name = None;
+                }
+            }
+            self.group_tints.remove(gp);
+            self.group_collapsed.remove(gp);
+        }
     }
 
     /// Remove every Project whose `group_path` matches `group`. Used
