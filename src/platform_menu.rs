@@ -68,34 +68,21 @@ mod mac {
             &PredefinedMenuItem::quit(None),
         ]);
 
-        // Edit submenu with standard clipboard accelerators. Required
-        // for the embedded WKWebView — without menu items wired to
-        // `copy:` / `paste:` / `cut:` / `selectAll:`, AppKit's
-        // responder chain has nothing to route Cmd+C/V/X/A to, and the
-        // webview silently swallows the keys. PredefinedMenuItem uses
-        // the standard AppKit actions so the focused NSView (WKWebView
-        // when the browser pane is focused) handles them natively.
+        // No Edit submenu. muda's PredefinedMenuItem::copy/paste/cut
+        // registers Cmd+C/V/X on an NSMenuItem with selector `copy:`
+        // etc., and AppKit *always* intercepts key equivalents off the
+        // main menu before dispatching them to the key view. Our egui
+        // content view doesn't implement `copy:` / `paste:` / `cut:` /
+        // `selectAll:`, so AppKit sends the selector down a responder
+        // chain where nothing handles it and the key never reaches
+        // winit/egui — terminal copy + TextEdit paste silently fail.
         //
-        // Trade-off: in pure-egui panes (Terminal, modals) these
-        // shortcuts now go through AppKit first. egui's terminal Cmd+C
-        // (copy selection) uses that same key, but because the egui
-        // window's content view doesn't implement `copy:`, the menu
-        // item is disabled when no webview has focus and the key
-        // falls through to winit/egui as a regular key event — so
-        // terminal selection copy still works. If that assumption
-        // turns out to be wrong in practice, the fix is to intercept
-        // the menu action ourselves and route by focused-pane type.
-        let edit = Submenu::new("Edit", true);
-        let _ = edit.append_items(&[
-            &PredefinedMenuItem::undo(None),
-            &PredefinedMenuItem::redo(None),
-            &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::cut(None),
-            &PredefinedMenuItem::copy(None),
-            &PredefinedMenuItem::paste(None),
-            &PredefinedMenuItem::select_all(None),
-        ]);
-
+        // Instead, `mac_keys::install_cmd_v_monitor` intercepts
+        // Cmd+C/V/X/A at the NSEvent local-monitor level: when a
+        // Browser pane is focused it forwards the selector to the
+        // focused WKWebView (so the embedded browser can copy/paste),
+        // and otherwise passes the event through untouched so egui
+        // emits its normal Event::Copy / Event::Paste / Event::Cut.
         let window = Submenu::new("Window", true);
         let _ = window.append_items(&[
             &PredefinedMenuItem::minimize(None),
@@ -112,7 +99,7 @@ mod mac {
             None,
         )]);
 
-        let _ = menu.append_items(&[&app_submenu, &edit, &window, &help]);
+        let _ = menu.append_items(&[&app_submenu, &window, &help]);
         menu.init_for_nsapp();
         // Intentionally leak: NSApp holds a weak-ish reference to the
         // menu via init_for_nsapp, and muda's Menu Drop would tear

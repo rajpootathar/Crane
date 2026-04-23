@@ -17,6 +17,8 @@ use wry::{
     dpi::{LogicalPosition, LogicalSize},
     PageLoadEvent, Rect, WebView, WebViewBuilder,
 };
+#[cfg(target_os = "macos")]
+use wry::WebViewExtMacOS;
 
 /// Shared loading-state map. Each tab key goes in on Started and comes
 /// out on Finished. Owned by `BrowserHost`; cloned into the wry page-
@@ -66,11 +68,15 @@ pub enum Action {
 ///                but hidden (so page state survives tab switches).
 /// * `actions`  — per-key nav intents (Load / Back / Forward / Reload /
 ///                Close) queued by clicks this frame.
+/// * `focused`  — active-tab slot of the currently-focused Browser
+///                pane, if any. Consumed by `sync` to tell mac_keys
+///                which WKWebView should receive Cmd+C/V/X/A.
 #[derive(Default)]
 pub struct Bridge {
     pub alive: Vec<(SlotKey, egui::Rect, String)>,
     pub inactive: Vec<(SlotKey, String)>,
     pub actions: Vec<(SlotKey, Action)>,
+    pub focused: Option<SlotKey>,
 }
 
 thread_local! {
@@ -180,6 +186,16 @@ pub fn queue_action(key: SlotKey, action: Action) {
     BRIDGE.with(|b| b.borrow_mut().actions.push((key, action)));
 }
 
+/// Report that a Browser pane's active tab currently owns focus.
+/// `browser_view::render` calls this when the pane is the focused
+/// leaf of its layout AND the pane's native webview is visible this
+/// frame (i.e. no modal/overlay is hiding it). `BrowserHost::sync`
+/// drains this and passes the slot's WKWebView to mac_keys so
+/// Cmd+C/V/X/A can be routed to the embedded browser.
+pub fn report_focused_pane(key: SlotKey) {
+    BRIDGE.with(|b| b.borrow_mut().focused = Some(key));
+}
+
 pub fn take_bridge() -> Bridge {
     BRIDGE.with(|b| std::mem::take(&mut *b.borrow_mut()))
 }
@@ -283,11 +299,16 @@ impl BrowserHost {
         }
         let alive = bridge.alive;
         let inactive = bridge.inactive;
+        let focused = bridge.focused;
 
         if hide_all {
             for slot in self.slots.values() {
                 let _ = slot.webview.set_visible(false);
             }
+            // Webview is hidden — don't route Cmd+C/V/X/A to it.
+            // (The overlay — modal, tooltip, popup — owns focus, and
+            // its egui TextEdit should receive clipboard events.)
+            crate::mac_keys::set_focused_webview(None);
             return;
         }
 
@@ -367,6 +388,32 @@ impl BrowserHost {
                 }
             }
         }
+
+        // Tell mac_keys which WKWebView (if any) should receive
+        // Cmd+C/V/X/A on the next NSEvent. Done last so we've already
+        // (re)built the slot for a newly-focused pane above.
+        //
+        // We cross an objc2 major-version boundary here: wry 0.55 is
+        // built against objc2 0.6 (its `WryWebView` and `Retained`
+        // come from that crate version), but mac_keys.rs is built
+        // against our direct objc2 0.5 dep. We can't hand a 0.6
+        // `Retained` to a 0.5 API, so we pass a raw Obj-C object
+        // pointer — retain/release are ABI-stable across versions.
+        let focused_view_ptr: Option<std::ptr::NonNull<objc2::runtime::AnyObject>> =
+            focused.and_then(|key| {
+                let slot = self.slots.get(&key)?;
+                // wry's `webview()` returns a clone of its internal
+                // `Retained<WryWebView>` (+1 retain). We extract the
+                // raw Obj-C pointer; the clone drops at end of arm,
+                // but `slot.webview` still holds its own retain so
+                // the object stays alive until `set_focused_webview`
+                // issues *its* retain below.
+                let wryview = slot.webview.webview();
+                std::ptr::NonNull::new(
+                    &*wryview as *const _ as *mut objc2::runtime::AnyObject,
+                )
+            });
+        crate::mac_keys::set_focused_webview(focused_view_ptr);
     }
 }
 

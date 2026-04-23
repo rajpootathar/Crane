@@ -426,7 +426,7 @@ fn render_pane(
             diff_view::render(child, diff, font_size, &mut pane.title);
         }
         PaneContent::Browser(browser) => {
-            browser_view::render(child, id, browser, &mut pane.title, is_drop_target);
+            browser_view::render(child, id, browser, &mut pane.title, is_drop_target, is_focus);
         }
         PaneContent::Welcome(_) => {
             if let Some(act) = welcome_view::render(child) {

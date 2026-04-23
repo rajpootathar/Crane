@@ -1,23 +1,33 @@
-//! macOS-only Cmd+V hook that bypasses egui-winit's text-only paste
-//! handler. egui-winit calls `arboard.get()` on Cmd+V, which returns
-//! None for image clipboards — egui-winit then `return`s without
-//! pushing the Key event, so nothing downstream ever learns that V was
-//! pressed. We install an NSEvent local monitor that sees Cmd+V before
-//! winit, detects image clipboard content, writes it to a PNG under
-//! `~/.crane/paste-images/<uuid>.png`, and queues the path for the
-//! next render frame to consume. Non-image Cmd+V is passed through
-//! untouched so normal text paste still works.
+//! macOS-only NSEvent local monitor that intercepts a handful of key
+//! chords before winit/egui see them:
 //!
-//! Same mechanism Ghostty / iTerm2 / Warp use for image paste.
+//! * **Cmd+V (image paste)** — egui-winit calls `arboard.get()` on
+//!   Cmd+V, which returns None for image clipboards. We detect that
+//!   case, write the image to a PNG under
+//!   `~/.crane/paste-images/<uuid>.png`, and queue the path for the
+//!   next render frame. Same mechanism Ghostty / iTerm2 / Warp use.
+//!
+//! * **Cmd+C / Cmd+V / Cmd+X / Cmd+A (Browser pane clipboard)** —
+//!   when a Browser pane is focused we forward the corresponding
+//!   AppKit selector (`copy:` / `paste:` / `cut:` / `selectAll:`)
+//!   directly to the focused WKWebView and swallow. We do NOT install
+//!   these shortcuts as menu-item key equivalents because AppKit
+//!   would then eat them for every other focus context too and
+//!   egui's TextEdit / terminal selection copy would silently break.
+//!
+//! * **Shift+Tab / Tab / Cmd+`** — see comments at each path below.
 
 use block2::RcBlock;
 use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
+use objc2::msg_send;
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventMask, NSEventModifierFlags,
     NSEventType, NSPasteboard,
 };
 use objc2_foundation::{NSData, NSDictionary, NSString};
 use parking_lot::Mutex;
+use std::sync::atomic::AtomicPtr;
 use std::sync::OnceLock;
 
 static PENDING: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
@@ -41,6 +51,16 @@ static PENDING_TAB_CYCLE: std::sync::atomic::AtomicI32 =
 /// commit-on-release.
 static CMD_HELD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Pointer to the currently-focused WKWebView (embedded via wry in a
+/// Browser pane), or null when no browser pane owns focus. Holds a
+/// +1 retain while non-null so the object stays alive between the
+/// egui render frame that stored it and the NSEvent handler that
+/// reads it. Written only from the main thread (`set_focused_webview`
+/// from `BrowserHost::sync`); read only from the main thread (the
+/// NSEvent local monitor). AtomicPtr is used for lock-free access,
+/// not cross-thread synchronization.
+static FOCUSED_WEBVIEW: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 
 fn pending() -> &'static Mutex<Vec<String>> {
     PENDING.get_or_init(|| Mutex::new(Vec::new()))
@@ -86,6 +106,45 @@ pub fn is_cmd_held() -> bool {
 /// find bar, commit message) would silently disappear.
 pub fn set_terminal_focused(focused: bool) {
     TERMINAL_FOCUSED.store(focused, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Register (or clear) the currently-focused WKWebView. Called from
+/// `BrowserHost::sync` every frame — `Some(ptr)` when a Browser pane
+/// is focused and its webview is visible, `None` otherwise. The
+/// NSEvent monitor reads this to decide whether Cmd+C/V/X/A should
+/// be forwarded to the webview or passed through to egui.
+///
+/// We take a raw pointer (not an objc2 `Retained`) because wry's
+/// public API returns a `Retained<WryWebView>` from a *different*
+/// objc2 major version than ours (wry 0.55 pulls in objc2 0.6; we
+/// use 0.5). Raw pointers + the ABI-stable `objc_retain`/`objc_release`
+/// in `objc-sys` are version-agnostic. The caller is responsible for
+/// keeping the object alive at least long enough for this function
+/// to issue the retain.
+///
+/// Internally we hold a +1 retain while the pointer is stored so the
+/// object can't deallocate between the set and the NSEvent lookup.
+/// Replacing (or clearing) releases the old retain.
+pub fn set_focused_webview(view: Option<std::ptr::NonNull<AnyObject>>) {
+    let new_ptr = match view {
+        Some(p) => {
+            // SAFETY: `objc_retain` accepts any valid Obj-C object
+            // pointer and bumps its refcount. The caller guarantees
+            // `p` is live at call time.
+            unsafe {
+                objc2::ffi::objc_retain(p.as_ptr() as *mut _) as *mut AnyObject
+            }
+        }
+        None => std::ptr::null_mut(),
+    };
+    let old = FOCUSED_WEBVIEW.swap(new_ptr, std::sync::atomic::Ordering::Relaxed);
+    if !old.is_null() {
+        // SAFETY: `old` carried a +1 retain we issued on a previous
+        // `set_focused_webview` call. Balancing with release here.
+        unsafe {
+            objc2::ffi::objc_release(old as *mut _);
+        }
+    }
 }
 
 /// Register the NSEvent local monitor. Must be called on the main
@@ -211,6 +270,45 @@ pub fn install_cmd_v_monitor() {
                 Some(s) => s.to_string(),
                 None => return passthrough,
             };
+
+            // --- Browser-pane clipboard forwarding ------------------
+            // Cmd+C / V / X / A never reach the WKWebView via the
+            // winit NSView (which doesn't implement those selectors)
+            // and we deliberately don't use a menu-item key equivalent
+            // (see platform_menu.rs for why). Instead, when a Browser
+            // pane is focused we dispatch the standard AppKit action
+            // directly to the stored webview and swallow the event.
+            let lower = chars.to_ascii_lowercase();
+            if matches!(lower.as_str(), "c" | "v" | "x" | "a") {
+                let wv_ptr = FOCUSED_WEBVIEW.load(std::sync::atomic::Ordering::Relaxed);
+                if !wv_ptr.is_null() {
+                    // SAFETY: `wv_ptr` holds a +1 retain for as long
+                    // as FOCUSED_WEBVIEW carries it. We only borrow,
+                    // never take ownership, so the retain stays with
+                    // the slot until set_focused_webview swaps it.
+                    // (Outer `unsafe` block covers the whole handler.)
+                    let view: &AnyObject = &*wv_ptr;
+                    let nil: *mut AnyObject = std::ptr::null_mut();
+                    match lower.as_str() {
+                        "c" => {
+                            let _: () = msg_send![view, copy: nil];
+                        }
+                        "v" => {
+                            let _: () = msg_send![view, paste: nil];
+                        }
+                        "x" => {
+                            let _: () = msg_send![view, cut: nil];
+                        }
+                        "a" => {
+                            let _: () = msg_send![view, selectAll: nil];
+                        }
+                        _ => {}
+                    }
+                    // Consume so egui/winit never also processes it.
+                    return std::ptr::null_mut();
+                }
+            }
+
             if chars != "v" && chars != "V" {
                 return passthrough;
             }

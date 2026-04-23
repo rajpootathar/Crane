@@ -21,6 +21,11 @@ pub fn render(
     // the webview. Reporting the active tab as inactive hides the
     // webview for the frame without destroying it (page state is kept).
     native_hidden: bool,
+    // True when this pane is the focused leaf of its layout. When set
+    // (and the webview is visible), we report the active tab's slot
+    // to `browser::report_focused_pane` so Cmd+C/V/X/A routes to the
+    // embedded WKWebView via mac_keys's NSEvent monitor.
+    is_focus: bool,
 ) {
     // Tab strip (always visible). Left-to-right chips + a trailing `+`.
     ui.horizontal(|ui| {
@@ -229,6 +234,13 @@ pub fn render(
             crate::browser::report_inactive(composite_id(pane_id, tab_id), &tab.url);
         } else {
             crate::browser::report_pane(composite_id(pane_id, tab_id), inner, &tab.url);
+            // Only route clipboard to the webview when the pane is
+            // both focused AND visible. A focused-but-hidden pane
+            // (e.g. behind a modal) should let its Cmd+C/V/X/A fall
+            // through to the overlay's egui TextEdit instead.
+            if is_focus {
+                crate::browser::report_focused_pane(composite_id(pane_id, tab_id));
+            }
         }
         ui.painter().rect_filled(
             rect,
