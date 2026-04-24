@@ -374,14 +374,18 @@ fn render_pane(
         Some(p) => p,
         None => return,
     };
-    let clicked_inside = ui.input(|i| {
-        i.pointer.primary_clicked()
+    // Focus on press (not on click-release) so starting a drag-selection
+    // inside a non-focused pane still transfers focus to it. `primary_clicked`
+    // only fires for press+release without drag, so a drag-to-select in a
+    // sibling pane would otherwise leave focus on the old pane.
+    let pressed_inside = ui.input(|i| {
+        i.pointer.primary_pressed()
             && i.pointer
                 .interact_pos()
                 .map(|p| rect.contains(p))
                 .unwrap_or(false)
     });
-    if clicked_inside && !is_focus && matches!(action, PaneAction::None) {
+    if pressed_inside && !is_focus && matches!(action, PaneAction::None) {
         *action = PaneAction::Focus(id);
     }
 
