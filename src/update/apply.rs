@@ -1,21 +1,29 @@
 //! Staged auto-update.
 //!
-//! Flow (macOS is the fully-supported path today):
-//!   1. Background thread downloads the universal DMG to
-//!      `~/.crane/update/crane.dmg`, streaming bytes for progress UI.
-//!   2. `hdiutil attach` mounts the image.
+//! macOS:
+//!   1. Download the universal DMG to `~/.crane/update/crane.dmg`.
+//!   2. `hdiutil attach` mounts it.
 //!   3. Mounted `Crane.app` → `~/.crane/update/Crane.app` (staging dir).
 //!   4. `hdiutil detach`.
-//!   5. Strip `com.apple.quarantine` from the staged bundle so Gatekeeper
-//!      doesn't re-prompt on launch.
-//!   6. User clicks "Restart now" → we write a short shell script to
-//!      `/tmp/crane-swap-<pid>.sh` and spawn it detached. The script
-//!      waits for our PID to die, moves the staged bundle over the
-//!      current one, and re-launches via `open`.
+//!   5. Strip `com.apple.quarantine` so Gatekeeper doesn't re-prompt.
+//!   6. User clicks "Restart now" → write `/tmp/crane-swap-<pid>.sh`,
+//!      spawn detached. Script waits for our PID, swaps the bundle,
+//!      relaunches via `open`.
 //!
-//! Linux (.deb) and Windows (.zip) paths would each need platform-specific
-//! swap logic (dpkg / cp / rename-with-.new-trick). Both are left as
-//! follow-ups; today's update button falls back to opening the browser.
+//! Linux (self-managed installs only — see `LinuxInstallKind`):
+//!   1. Download `crane-<ver>-x86_64-linux.tar.gz` to
+//!      `~/.crane/update/crane.tar.gz`.
+//!   2. Extract via `tar -xzf` to `~/.crane/update/staging/`.
+//!   3. Locate the new `crane` binary inside the extracted dir.
+//!   4. Swap script: wait for PID, `cp -f` over `current_exe()`,
+//!      `chmod +x`, re-exec detached via `setsid`.
+//!
+//! Linux Snap / Flatpak / apt-installed binaries are detected up
+//! front; their auto-update path is "use your package manager",
+//! never an in-app overwrite (no privileges, would race the
+//! distro's update mechanism).
+//!
+//! Windows: not yet — falls back to opening the release page.
 
 use parking_lot::Mutex;
 use std::io::{Read, Write};
@@ -29,6 +37,63 @@ pub enum UpdateState {
     Installing,
     Ready { staged_bundle: PathBuf },
     Failed(String),
+}
+
+/// Linux install provenance. Only `SelfManaged` is safe to
+/// auto-overwrite — every other kind is owned by a package manager
+/// or a sandbox and would either fail or fight the distro's own
+/// update mechanism.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxInstallKind {
+    /// Snap install (e.g. Ubuntu Software). Read-only squashfs.
+    /// Updates flow via `snapd` / `snap refresh`.
+    Snap,
+    /// Flatpak install. Sandboxed, immutable. Updates via `flatpak update`.
+    Flatpak,
+    /// apt / dpkg / dnf / pacman / etc. Binary owned by root in a
+    /// system path. Requires user's package manager.
+    SystemPackage,
+    /// Tarball drop into a user-writable location (`~/.local/bin`,
+    /// `/opt/crane/bin`, `~/Applications`, …). Auto-update works.
+    SelfManaged,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_install_kind() -> LinuxInstallKind {
+    // Snap sets $SNAP to its install root inside the sandbox.
+    if std::env::var_os("SNAP").is_some() {
+        return LinuxInstallKind::Snap;
+    }
+    // Flatpak's runtime-spawned processes inherit $FLATPAK_ID.
+    if std::env::var_os("FLATPAK_ID").is_some() {
+        return LinuxInstallKind::Flatpak;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        // Can't resolve the binary path — assume system to fail safe.
+        return LinuxInstallKind::SystemPackage;
+    };
+    // Probe the parent dir's writability rather than the file itself —
+    // the swap step needs to create / replace a file IN that dir, and
+    // a write-bit on the binary alone wouldn't tell us about a
+    // read-only mount or a dir with a sticky bit.
+    if !parent_dir_writable(&exe) {
+        return LinuxInstallKind::SystemPackage;
+    }
+    LinuxInstallKind::SelfManaged
+}
+
+#[cfg(target_os = "linux")]
+fn parent_dir_writable(p: &Path) -> bool {
+    let Some(parent) = p.parent() else {
+        return false;
+    };
+    // Sentinel-file probe: honours real fs ACLs / immutable bits /
+    // nosuid mounts the way the upcoming write would actually fail.
+    let probe = parent.join(".crane-update-probe");
+    let ok = std::fs::File::create(&probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
 }
 
 pub struct Updater {
@@ -52,20 +117,67 @@ impl Updater {
         self.state.lock().clone()
     }
 
+    /// True when this binary's install context allows in-app update.
     pub fn is_supported_platform() -> bool {
-        cfg!(target_os = "macos")
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(target_os = "linux")]
+        {
+            matches!(linux_install_kind(), LinuxInstallKind::SelfManaged)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
+    /// When in-app update is unavailable on a platform we recognise,
+    /// a plain-language reason the user can act on. None for fully-
+    /// supported builds and on Windows (where the generic "open the
+    /// release page" fallback is the right UX anyway).
+    pub fn unsupported_reason() -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            return match linux_install_kind() {
+                LinuxInstallKind::Snap => Some(
+                    "Crane was installed via Snap. Updates come through \
+                     `snap refresh crane` or Snap's auto-refresh."
+                        .to_string(),
+                ),
+                LinuxInstallKind::Flatpak => Some(
+                    "Crane was installed via Flatpak. Update with \
+                     `flatpak update crane`."
+                        .to_string(),
+                ),
+                LinuxInstallKind::SystemPackage => Some(
+                    "Crane was installed via your system package manager. \
+                     Update with `sudo apt upgrade crane` (or your \
+                     distro's equivalent)."
+                        .to_string(),
+                ),
+                LinuxInstallKind::SelfManaged => None,
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     /// Kick off a background download-and-stage for a list of candidate
-    /// DMG urls. Tries each in order, stops at the first 200. Accepting
-    /// a list lets callers supply arch-specific + universal URLs and
-    /// fall through whichever the release actually shipped.
+    /// asset URLs. Tries each in order, stops at the first 200. Lets
+    /// callers supply arch-specific + universal URLs and fall through
+    /// whichever the release actually shipped.
     pub fn start(&self, urls: Vec<String>, ctx: egui::Context) {
         if !Self::is_supported_platform() {
             *self.state.lock() = UpdateState::Failed(
-                "In-app update supported on macOS only today. Open the Releases \
-                page to download the installer for your platform."
-                    .to_string(),
+                Self::unsupported_reason().unwrap_or_else(|| {
+                    "In-app update isn't supported on this platform yet. \
+                     Open the Releases page to download the installer."
+                        .to_string()
+                }),
             );
             return;
         }
@@ -93,7 +205,9 @@ impl Updater {
             for url in &urls {
                 match do_download_and_stage(url, &state, &ctx2) {
                     Ok(path) => {
-                        *state.lock() = UpdateState::Ready { staged_bundle: path };
+                        *state.lock() = UpdateState::Ready {
+                            staged_bundle: path,
+                        };
                         ctx2.request_repaint();
                         return;
                     }
@@ -111,16 +225,15 @@ impl Updater {
         });
     }
 
-    /// Spawn the swap script and exit. Safe to call even if the state is
-    /// not Ready (will no-op).
+    /// Spawn the swap script and exit. No-ops if state is not Ready.
     pub fn apply_and_exit(&self) {
         let staged = match self.state.lock().clone() {
             UpdateState::Ready { staged_bundle } => staged_bundle,
             _ => return,
         };
-        let Some(target) = current_bundle_path() else {
+        let Some(target) = current_install_path() else {
             *self.state.lock() =
-                UpdateState::Failed("Couldn't locate running Crane.app".into());
+                UpdateState::Failed("Couldn't locate running Crane install".into());
             return;
         };
         if let Err(e) = write_and_spawn_swap_script(&target, &staged) {
@@ -131,17 +244,23 @@ impl Updater {
     }
 }
 
-fn do_download_and_stage(
-    url: &str,
-    state: &Arc<Mutex<UpdateState>>,
-    ctx: &egui::Context,
-) -> std::io::Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .map_err(|_| std::io::Error::other("no HOME"))?;
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn update_dir() -> std::io::Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| std::io::Error::other("no HOME"))?;
     let dir = PathBuf::from(home).join(".crane").join("update");
     std::fs::create_dir_all(&dir)?;
-    let dmg_path = dir.join("crane.dmg");
+    Ok(dir)
+}
 
+fn download_to(
+    url: &str,
+    dest: &Path,
+    state: &Arc<Mutex<UpdateState>>,
+    ctx: &egui::Context,
+) -> std::io::Result<()> {
     // Explicit timeouts so a stalled TCP / slow server doesn't freeze
     // the update worker thread indefinitely.
     let agent = ureq::AgentBuilder::new()
@@ -153,7 +272,7 @@ fn do_download_and_stage(
         .call()
         .map_err(|e| std::io::Error::other(format!("GET failed: {e}")))?;
     let mut reader = resp.into_reader();
-    let mut file = std::fs::File::create(&dmg_path)?;
+    let mut file = std::fs::File::create(dest)?;
     let mut buf = [0u8; 64 * 1024];
     let mut total: u64 = 0;
     loop {
@@ -167,11 +286,41 @@ fn do_download_and_stage(
         ctx.request_repaint();
     }
     drop(file);
+    Ok(())
+}
+
+fn spawn_swap_script(script_path: &Path, script: &str, interpreter: &str) -> std::io::Result<()> {
+    std::fs::write(script_path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(script_path)?.permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(script_path, p)?;
+    }
+    std::process::Command::new(interpreter)
+        .arg(script_path)
+        .spawn()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// macOS path
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn do_download_and_stage(
+    url: &str,
+    state: &Arc<Mutex<UpdateState>>,
+    ctx: &egui::Context,
+) -> std::io::Result<PathBuf> {
+    let dir = update_dir()?;
+    let dmg_path = dir.join("crane.dmg");
+    download_to(url, &dmg_path, state, ctx)?;
 
     *state.lock() = UpdateState::Installing;
     ctx.request_repaint();
 
-    // Mount the DMG.
     let mount_out = std::process::Command::new("hdiutil")
         .args([
             "attach",
@@ -188,7 +337,7 @@ fn do_download_and_stage(
         )));
     }
     let mount_stdout = String::from_utf8_lossy(&mount_out.stdout).to_string();
-    // The mount point is the last whitespace-separated token on the last
+    // Mount point is the last whitespace-separated token on the last
     // line that starts with `/Volumes/`.
     let volume = mount_stdout
         .lines()
@@ -220,12 +369,9 @@ fn do_download_and_stage(
         )));
     }
 
-    // Verify the staged bundle's code signature. Our builds are only
-    // ad-hoc signed (no Developer ID), but codesign --verify will still
-    // detect any tampering between our build and the user's download —
-    // flipped bits, MITM, partial download that got unzipped. We
-    // explicitly use `--deep --strict` so every nested library gets
-    // checked, not just the top-level bundle.
+    // codesign --verify --deep --strict catches tampering between our
+    // build and the user's download (flipped bits, MITM, partial
+    // download that got unzipped) — even for ad-hoc-signed builds.
     let verify = std::process::Command::new("codesign")
         .args([
             "--verify",
@@ -235,8 +381,6 @@ fn do_download_and_stage(
         ])
         .output()?;
     if !verify.status.success() {
-        // Clean up so a bad download doesn't sit around. Returning an
-        // error lets the updater UI surface what went wrong.
         let _ = std::fs::remove_dir_all(&dest_app);
         return Err(std::io::Error::other(format!(
             "signature verify failed: {}",
@@ -244,7 +388,6 @@ fn do_download_and_stage(
         )));
     }
 
-    // Strip download quarantine so macOS doesn't re-prompt on first launch.
     let _ = std::process::Command::new("xattr")
         .args([
             "-dr",
@@ -257,7 +400,8 @@ fn do_download_and_stage(
     Ok(dest_app)
 }
 
-fn current_bundle_path() -> Option<PathBuf> {
+#[cfg(target_os = "macos")]
+fn current_install_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut cur = exe;
     while cur.pop() {
@@ -271,11 +415,10 @@ fn current_bundle_path() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn write_and_spawn_swap_script(target: &Path, staged: &Path) -> std::io::Result<()> {
     let pid = std::process::id();
     let script_path = std::env::temp_dir().join(format!("crane-swap-{pid}.sh"));
-    // Escape any embedded quotes so a path containing a `"` can't
-    // break out of the here-doc assignment.
     let target_esc = target.to_string_lossy().replace('"', "\\\"");
     let staged_esc = staged.to_string_lossy().replace('"', "\\\"");
     let script = format!(
@@ -301,23 +444,169 @@ fi
 cp -R "$STAGED" "$TARGET"
 xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
 
-# Relaunch + clean up.
 open "$TARGET"
 rm -rf "$STAGED"
 rm -rf "${{TARGET}}.old"
 "#,
         target_esc, staged_esc, pid
     );
-    std::fs::write(&script_path, script)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&script_path)?.permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&script_path, p)?;
+    spawn_swap_script(&script_path, &script, "/bin/bash")
+}
+
+// ---------------------------------------------------------------------------
+// Linux path
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn do_download_and_stage(
+    url: &str,
+    state: &Arc<Mutex<UpdateState>>,
+    ctx: &egui::Context,
+) -> std::io::Result<PathBuf> {
+    let dir = update_dir()?;
+    let tar_path = dir.join("crane.tar.gz");
+    let staging = dir.join("staging");
+    // Fresh staging each attempt — leftovers from a previous failed
+    // run could shadow the new binary (or change which one
+    // `find_extracted_binary` picks up first).
+    if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
     }
-    std::process::Command::new("/bin/bash")
-        .arg(&script_path)
-        .spawn()?;
-    Ok(())
+    std::fs::create_dir_all(&staging)?;
+
+    download_to(url, &tar_path, state, ctx)?;
+
+    *state.lock() = UpdateState::Installing;
+    ctx.request_repaint();
+
+    let extract = std::process::Command::new("tar")
+        .args([
+            "-xzf",
+            tar_path.to_string_lossy().as_ref(),
+            "-C",
+            staging.to_string_lossy().as_ref(),
+        ])
+        .output()?;
+    if !extract.status.success() {
+        return Err(std::io::Error::other(format!(
+            "tar extract failed: {}",
+            String::from_utf8_lossy(&extract.stderr)
+        )));
+    }
+    let _ = std::fs::remove_file(&tar_path);
+
+    // Workflow tarball expands to `crane-<ver>-x86_64-linux/` with the
+    // binary inside. We don't bake the version into the path here so
+    // a future tarball naming change doesn't silently break updates.
+    let bin = find_extracted_binary(&staging)
+        .ok_or_else(|| std::io::Error::other("extracted tarball had no `crane` binary"))?;
+
+    // Tar should preserve +x but if the runner stripped modes,
+    // restore +x explicitly so the swap script's exec succeeds.
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&bin)?.permissions();
+    if perms.mode() & 0o111 == 0 {
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms)?;
+    }
+    Ok(bin)
+}
+
+#[cfg(target_os = "linux")]
+fn find_extracted_binary(staging: &Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(staging).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            let candidate = path.join("crane");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        } else if path.is_file()
+            && path.file_name().and_then(|n| n.to_str()) == Some("crane")
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn current_install_path() -> Option<PathBuf> {
+    // On Linux we overwrite the binary in place. `current_exe()`
+    // returns the canonicalised path to the running binary (not the
+    // symlink that started us), which is exactly what the swap needs.
+    std::env::current_exe().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn write_and_spawn_swap_script(target: &Path, staged: &Path) -> std::io::Result<()> {
+    let pid = std::process::id();
+    let script_path = std::env::temp_dir().join(format!("crane-swap-{pid}.sh"));
+    let target_esc = target.to_string_lossy().replace('"', "\\\"");
+    let staged_esc = staged.to_string_lossy().replace('"', "\\\"");
+    // POSIX sh — bash isn't guaranteed on minimal distros (Alpine ships
+    // ash by default). `setsid` detaches the new Crane from the
+    // script's process group so it survives the script exiting; we
+    // fall back to `nohup` if setsid is missing on some embedded
+    // distros.
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+TARGET="{}"
+STAGED="{}"
+PID="{}"
+
+i=0
+while [ "$i" -lt 50 ]; do
+  if ! kill -0 "$PID" 2>/dev/null; then
+    break
+  fi
+  i=$((i + 1))
+  sleep 0.2
+done
+
+cp -f "$STAGED" "$TARGET"
+chmod +x "$TARGET"
+
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$TARGET" </dev/null >/dev/null 2>&1 &
+else
+  nohup "$TARGET" </dev/null >/dev/null 2>&1 &
+fi
+
+rm -rf "$(dirname "$STAGED")"
+"#,
+        target_esc, staged_esc, pid
+    );
+    spawn_swap_script(&script_path, &script, "/bin/sh")
+}
+
+// ---------------------------------------------------------------------------
+// Stubs for other platforms
+// ---------------------------------------------------------------------------
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn do_download_and_stage(
+    _url: &str,
+    _state: &Arc<Mutex<UpdateState>>,
+    _ctx: &egui::Context,
+) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::other(
+        "in-app update not implemented on this platform",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn current_install_path() -> Option<PathBuf> {
+    std::env::current_exe().ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn write_and_spawn_swap_script(_target: &Path, _staged: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "in-app swap not implemented on this platform",
+    ))
 }

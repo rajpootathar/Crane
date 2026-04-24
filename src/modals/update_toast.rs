@@ -1,27 +1,40 @@
 use crate::state::App;
 
 /// Candidate release-asset URLs for this build, in the order the
-/// updater should try them. Arch-specific DMG first (matches how we
-/// actually publish today), universal second (what cargo-bundle's
-/// Makefile target names them when run with release-universal), and
-/// a bare arm64 fallback for older builds. The first URL that returns
-/// 200 wins.
-fn dmg_urls_for(version: &str) -> Vec<String> {
-    if !cfg!(target_os = "macos") {
-        return Vec::new();
+/// updater should try them. The first URL that returns 200 wins.
+///
+/// macOS: arch-specific DMG first (how we publish today), universal
+/// second (cargo-bundle's release-universal target name).
+///
+/// Linux: the x86_64 tarball — auto-update is gated to self-managed
+/// installs (snap / flatpak / apt are detected upstream and fall
+/// through to a package-manager guidance message instead of running
+/// this download path).
+fn release_urls_for(version: &str) -> Vec<String> {
+    let base = format!("https://github.com/rajpootathar/Crane/releases/download/v{version}");
+    #[cfg(target_os = "macos")]
+    {
+        let arch = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x86_64"
+        };
+        return vec![
+            format!("{base}/Crane-{version}-{arch}.dmg"),
+            format!("{base}/Crane-{version}-universal.dmg"),
+        ];
     }
-    let arch = if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "x86_64"
-    };
-    let base = format!(
-        "https://github.com/rajpootathar/Crane/releases/download/v{version}/Crane-{version}"
-    );
-    vec![
-        format!("{base}-{arch}.dmg"),
-        format!("{base}-universal.dmg"),
-    ]
+    #[cfg(target_os = "linux")]
+    {
+        // arm64-linux would be a parallel asset and a second URL here
+        // when the workflow starts producing it.
+        return vec![format!("{base}/crane-{version}-x86_64-linux.tar.gz")];
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = base;
+        Vec::new()
+    }
 }
 
 fn human_bytes(n: u64) -> String {
@@ -97,9 +110,15 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                         });
                     });
                     ui.add_space(10.0);
-                    let dmg_urls = dmg_urls_for(&version);
+                    let asset_urls = release_urls_for(&version);
                     let supports_in_app = crate::update::apply::Updater::is_supported_platform()
-                        && !dmg_urls.is_empty();
+                        && !asset_urls.is_empty();
+                    // None on macOS / supported Linux installs; Some on
+                    // snap / flatpak / apt where the right answer is
+                    // "use your package manager", not the in-app
+                    // download.
+                    let unsupported_reason =
+                        crate::update::apply::Updater::unsupported_reason();
                     use crate::update::apply::UpdateState;
                     match app.updater.state() {
                         UpdateState::Downloading { bytes } => {
@@ -151,43 +170,79 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                             }
                         }
                         UpdateState::Idle => {
-                            ui.horizontal(|ui| {
-                                if supports_in_app {
+                            // Snap / Flatpak / apt-installed: skip the
+                            // download button entirely — the user's
+                            // package manager owns updates here.
+                            if let Some(reason) = &unsupported_reason {
+                                ui.label(
+                                    egui::RichText::new(reason)
+                                        .size(11.5)
+                                        .color(theme.text_muted.to_color32()),
+                                );
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button(egui::RichText::new("Got it").size(12.0))
+                                        .clicked()
+                                    {
+                                        app.update_check.dismiss_session();
+                                    }
                                     if ui
                                         .button(
+                                            egui::RichText::new("Remind in 7 days").size(12.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        app.update_check.remind_later();
+                                    }
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    if supports_in_app {
+                                        if ui
+                                            .button(
+                                                egui::RichText::new(format!(
+                                                    "{}  Install update",
+                                                    egui_phosphor::regular::DOWNLOAD_SIMPLE
+                                                ))
+                                                .size(12.0)
+                                                .strong(),
+                                            )
+                                            .clicked()
+                                            && !asset_urls.is_empty()
+                                        {
+                                            app.updater.start(asset_urls.clone(), ctx.clone());
+                                        }
+                                    } else if ui
+                                        .button(
                                             egui::RichText::new(format!(
-                                                "{}  Install update",
+                                                "{}  Download",
                                                 egui_phosphor::regular::DOWNLOAD_SIMPLE
                                             ))
                                             .size(12.0)
                                             .strong(),
                                         )
                                         .clicked()
-                                        && !dmg_urls.is_empty()
                                     {
-                                        app.updater.start(dmg_urls.clone(), ctx.clone());
+                                        let _ = webbrowser::open(&url);
+                                        app.update_check.dismiss_forever();
                                     }
-                                } else if ui
-                                    .button(
-                                        egui::RichText::new(format!(
-                                            "{}  Download",
-                                            egui_phosphor::regular::DOWNLOAD_SIMPLE
-                                        ))
-                                        .size(12.0)
-                                        .strong(),
-                                    )
-                                    .clicked()
-                                {
-                                    let _ = webbrowser::open(&url);
-                                    app.update_check.dismiss_forever();
-                                }
-                                if ui.button(egui::RichText::new("Not now").size(12.0)).clicked() {
-                                    app.update_check.dismiss_session();
-                                }
-                                if ui.button(egui::RichText::new("Remind in 7 days").size(12.0)).clicked() {
-                                    app.update_check.remind_later();
-                                }
-                            });
+                                    if ui
+                                        .button(egui::RichText::new("Not now").size(12.0))
+                                        .clicked()
+                                    {
+                                        app.update_check.dismiss_session();
+                                    }
+                                    if ui
+                                        .button(
+                                            egui::RichText::new("Remind in 7 days").size(12.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        app.update_check.remind_later();
+                                    }
+                                });
+                            }
                         }
                     }
                 });
