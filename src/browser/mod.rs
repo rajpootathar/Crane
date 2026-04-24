@@ -308,6 +308,7 @@ impl BrowserHost {
             // Webview is hidden — don't route Cmd+C/V/X/A to it.
             // (The overlay — modal, tooltip, popup — owns focus, and
             // its egui TextEdit should receive clipboard events.)
+            #[cfg(target_os = "macos")]
             crate::mac_keys::set_focused_webview(None);
             return;
         }
