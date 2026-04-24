@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod browser;
 mod format;
 #[cfg(target_os = "macos")]
@@ -30,6 +30,21 @@ use ui::pane_view::PaneAction;
 fn main() -> eframe::Result {
     env_logger::init();
     startup::fix_path_for_gui_launch();
+    // GTK has to be initialised on the main thread BEFORE any
+    // gtk/gdk/webkit2gtk object is constructed. wry's Linux backend
+    // creates its GTK window in `build_as_child`, so this has to
+    // happen before the first Browser pane is built. `gtk::init()` is
+    // idempotent-safe but we still only want to pay it once. Failure
+    // is non-fatal — the rest of the app doesn't depend on GTK, we
+    // just lose the Browser pane backend until the user installs the
+    // missing deps (libgtk-3 / libwebkit2gtk-4.1).
+    #[cfg(target_os = "linux")]
+    if let Err(e) = gtk::init() {
+        eprintln!(
+            "[crane] gtk::init failed: {e}. Browser pane will be unavailable. \
+             Install libgtk-3 + libwebkit2gtk-4.1 and relaunch."
+        );
+    }
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1480.0, 920.0])
@@ -96,7 +111,7 @@ struct CraneApp {
     last_saved_settings_snapshot: String,
     last_save_at: std::time::Instant,
     pending_close: Option<state::layout::PaneId>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     browser_host: browser::BrowserHost,
 }
 
@@ -126,7 +141,7 @@ impl CraneApp {
             last_saved_settings_snapshot: String::new(),
             last_save_at: std::time::Instant::now(),
             pending_close: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             browser_host: browser::BrowserHost::new(),
         }
     }
@@ -359,9 +374,9 @@ impl eframe::App for CraneApp {
         // server process now instead of waiting for app exit. Cheap no-op
         // when every running server is still enabled.
         self.app.lsp.shutdown_disabled(&self.app.language_configs);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            // Fold any URL changes the WKWebView reported (redirects,
+            // Fold any URL changes the webview reported (redirects,
             // link clicks, history manipulation) back into each tab's
             // state so the URL bar tracks in-page navigation.
             let updates = self.browser_host.drain_url_updates();
@@ -369,9 +384,9 @@ impl eframe::App for CraneApp {
                 browser::apply_url_updates_to_app(&mut self.app, &updates);
             }
             // Seed per-frame loading snapshot so the egui tab chips can
-            // show a spinner on tabs whose WKWebView is mid-load.
+            // show a spinner on tabs whose webview is mid-load.
             browser::set_loading_snapshot(self.browser_host.loading_set());
-            // Also surface the current WebKit memory usage so the
+            // Also surface the current webview memory usage so the
             // Browser pane can warn the user about heavy tabs.
             browser::set_memory_snapshot(self.browser_host.memory.snapshot());
             // Page-load callbacks fire on a background thread; without
@@ -379,6 +394,20 @@ impl eframe::App for CraneApp {
             // the next user event.
             if !self.browser_host.loading_set().is_empty() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+        // Pump GTK's event loop so webkit2gtk's async callbacks
+        // (page-load events, navigation deltas, IPC from injected
+        // scripts) actually dispatch. winit's loop doesn't drive GTK,
+        // so without this the webview would appear frozen — pages
+        // would load but the URL bar / spinner / nav handlers would
+        // never fire. `events_pending + iteration_do(false)` drains
+        // without blocking; we rely on ctx.request_repaint* elsewhere
+        // to wake the UI for async callback-driven redraws.
+        #[cfg(target_os = "linux")]
+        {
+            while gtk::events_pending() {
+                gtk::main_iteration_do(false);
             }
         }
 
@@ -724,10 +753,11 @@ impl eframe::App for CraneApp {
         ui::branch_picker::render(&ctx, &mut self.app);
         self.app.sync_lsp_changes(&ctx);
 
-        // Drive embedded WKWebViews: drain whatever the Browser panes
+        // Drive embedded webviews: drain whatever the Browser panes
         // reported during render_layout, then reconcile webview
-        // positions / creations / destructions against the NSWindow.
-        #[cfg(target_os = "macos")]
+        // positions / creations / destructions against the hosting
+        // OS window (NSWindow on macOS, X11 child window on Linux).
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let bridge = browser::take_bridge();
             // WKWebView always paints above egui. Any overlay (modal,
@@ -756,7 +786,7 @@ impl eframe::App for CraneApp {
             self.browser_host
                 .sync(frame, &ctx, bridge, overlay_visible, &all_keys);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = frame;
         }

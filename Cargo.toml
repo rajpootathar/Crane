@@ -101,6 +101,24 @@ block2 = "0.5"
 wry = "0.55"
 raw-window-handle = "0.6"
 
+# Linux browser pane. wry's `x11` feature (default-on) accepts a
+# RawWindowHandle::Xlib from winit and bridges it to GTK/webkit2gtk
+# internally by creating an X11 child window inside Crane's winit
+# window and wrapping it as a `gdk_x11_window_foreign_new_for_display`
+# GTK window. We still need the `gtk` crate directly so we can
+# `gtk::init()` at app start and pump `main_iteration_do(false)` each
+# frame from eframe's update — eframe drives winit's event loop, so
+# GTK's callbacks don't fire unless we iterate them ourselves.
+#
+# Build-time deps on Ubuntu/Debian:
+#   libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev
+# Fedora:
+#   webkit2gtk4.1-devel gtk3-devel libsoup3-devel
+[target.'cfg(target_os = "linux")'.dependencies]
+wry = "0.55"
+raw-window-handle = "0.6"
+gtk = "0.18"
+
 [profile.dev]
 opt-level = 1
 

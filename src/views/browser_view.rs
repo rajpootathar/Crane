@@ -53,7 +53,7 @@ pub fn render(
                 .inner_margin(egui::Margin::symmetric(8, 3))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
                         {
                             let key = composite_id(pane_id, tab.id);
                             if crate::browser::is_loading(key) {
@@ -131,7 +131,7 @@ pub fn render(
             pane.active = idx;
         }
         if let Some(idx) = to_close {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             if let Some(removed_tab_id) = pane.tabs.get(idx).map(|t| t.id) {
                 crate::browser::queue_action(
                     composite_id(pane_id, removed_tab_id),
@@ -159,7 +159,7 @@ pub fn render(
             .on_hover_text(tip)
             .clicked()
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let key = composite_id(pane_id, tab_id);
             if btn(ui, icons::ARROW_LEFT, "Back") {
@@ -172,7 +172,7 @@ pub fn render(
                 crate::browser::queue_action(key, crate::browser::Action::Reload);
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = btn;
         }
@@ -190,11 +190,21 @@ pub fn render(
                 tab.url = url.clone();
                 tab.title = url.clone();
                 *title = url.clone();
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 crate::browser::queue_action(
                     composite_id(pane_id, tab_id),
                     crate::browser::Action::Load(url),
                 );
+                // wry's Linux backend needs a GTK parent, but eframe
+                // uses winit/X11 — we can't embed there. Go / Enter
+                // falls through to the system browser instead of
+                // silently doing nothing.
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
+                    let _ = pane_id;
+                    let _ = tab_id;
+                    let _ = webbrowser::open(&url);
+                }
             }
         }
         if ui
@@ -223,7 +233,7 @@ pub fn render(
     );
     ui.allocate_rect(rect, egui::Sense::hover());
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let inner = rect.shrink(1.0);
         // Report only the active tab's rect — that's the one whose
@@ -248,18 +258,67 @@ pub fn render(
             theme::current().surface.to_color32(),
         );
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        ui.label(
-            RichText::new("Embedded webview is available on macOS only.")
-                .italics()
-                .color(egui::Color32::from_rgb(150, 150, 160)),
+        // Centered launcher card — fallback for platforms without an
+        // embedded-webview backend wired up (Windows WebView2 etc.).
+        // macOS and Linux have native webviews reported above. This
+        // pane hands off to the system browser.
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            theme::current().surface.to_color32(),
         );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)),
+        );
+        child.vertical_centered(|ui| {
+            ui.add_space((rect.height() / 2.0 - 60.0).max(16.0));
+            ui.label(
+                RichText::new("Embedded browser not available on this platform yet.")
+                    .size(13.0)
+                    .color(theme::current().text_muted.to_color32()),
+            );
+            ui.add_space(6.0);
+            if !tab.url.is_empty() {
+                ui.label(
+                    RichText::new(&tab.url)
+                        .size(12.5)
+                        .monospace()
+                        .color(theme::current().text.to_color32()),
+                );
+                ui.add_space(10.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!(
+                                "{}  Open in system browser",
+                                icons::ARROW_SQUARE_OUT
+                            ))
+                            .size(13.0),
+                        )
+                        .min_size(egui::vec2(220.0, 30.0)),
+                    )
+                    .clicked()
+                {
+                    let _ = webbrowser::open(&tab.url);
+                }
+            } else {
+                ui.label(
+                    RichText::new("Type a URL above and press Enter.")
+                        .size(12.5)
+                        .italics()
+                        .color(theme::current().text_muted.to_color32()),
+                );
+            }
+        });
     }
 
     // Keep every other tab's webview alive (reported, but hidden). We
     // do this AFTER the active tab so it takes precedence for focus.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     for (idx, t) in pane.tabs.iter().enumerate() {
         if idx == pane.active {
             continue;
@@ -270,9 +329,11 @@ pub fn render(
         );
     }
 
-    // Footer status bar — WebKit memory + tab count. Drawn last so it
-    // sits above the webview's reserved rect.
-    #[cfg(target_os = "macos")]
+    // Footer status bar — webview memory + tab count. Drawn last so
+    // it sits above the webview's reserved rect. On Linux the memory
+    // Monitor returns zero (no `sample_webkit_processes` equivalent
+    // wired up yet), which renders as "WebKit memory: —".
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         ui.painter().rect_filled(
             footer_rect,
@@ -354,14 +415,14 @@ pub fn render(
             ));
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = footer_rect;
         let _ = pane;
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn composite_id(pane_id: PaneId, tab_id: u32) -> crate::browser::SlotKey {
     (pane_id, tab_id)
 }

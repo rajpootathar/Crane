@@ -391,29 +391,41 @@ impl BrowserHost {
 
         // Tell mac_keys which WKWebView (if any) should receive
         // Cmd+C/V/X/A on the next NSEvent. Done last so we've already
-        // (re)built the slot for a newly-focused pane above.
-        //
-        // We cross an objc2 major-version boundary here: wry 0.55 is
-        // built against objc2 0.6 (its `WryWebView` and `Retained`
-        // come from that crate version), but mac_keys.rs is built
-        // against our direct objc2 0.5 dep. We can't hand a 0.6
-        // `Retained` to a 0.5 API, so we pass a raw Obj-C object
-        // pointer — retain/release are ABI-stable across versions.
-        let focused_view_ptr: Option<std::ptr::NonNull<objc2::runtime::AnyObject>> =
-            focused.and_then(|key| {
-                let slot = self.slots.get(&key)?;
-                // wry's `webview()` returns a clone of its internal
-                // `Retained<WryWebView>` (+1 retain). We extract the
-                // raw Obj-C pointer; the clone drops at end of arm,
-                // but `slot.webview` still holds its own retain so
-                // the object stays alive until `set_focused_webview`
-                // issues *its* retain below.
-                let wryview = slot.webview.webview();
-                std::ptr::NonNull::new(
-                    &*wryview as *const _ as *mut objc2::runtime::AnyObject,
-                )
-            });
-        crate::mac_keys::set_focused_webview(focused_view_ptr);
+        // (re)built the slot for a newly-focused pane above. macOS-
+        // only because the clipboard routing goes through NSEvent's
+        // local monitor + AppKit selector forwarding; on Linux
+        // webkit2gtk handles Ctrl+C/V natively via GDK events so no
+        // Crane-side routing is needed.
+        #[cfg(target_os = "macos")]
+        {
+            // We cross an objc2 major-version boundary here: wry
+            // 0.55 is built against objc2 0.6 (its `WryWebView` and
+            // `Retained` come from that crate version), but
+            // mac_keys.rs is built against our direct objc2 0.5 dep.
+            // We can't hand a 0.6 `Retained` to a 0.5 API, so we
+            // pass a raw Obj-C object pointer — retain/release are
+            // ABI-stable across versions.
+            let focused_view_ptr: Option<std::ptr::NonNull<objc2::runtime::AnyObject>> =
+                focused.and_then(|key| {
+                    let slot = self.slots.get(&key)?;
+                    // wry's `webview()` returns a clone of its
+                    // internal `Retained<WryWebView>` (+1 retain).
+                    // We extract the raw Obj-C pointer; the clone
+                    // drops at end of arm, but `slot.webview` still
+                    // holds its own retain so the object stays
+                    // alive until `set_focused_webview` issues *its*
+                    // retain below.
+                    let wryview = slot.webview.webview();
+                    std::ptr::NonNull::new(
+                        &*wryview as *const _ as *mut objc2::runtime::AnyObject,
+                    )
+                });
+            crate::mac_keys::set_focused_webview(focused_view_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = focused;
+        }
     }
 }
 
