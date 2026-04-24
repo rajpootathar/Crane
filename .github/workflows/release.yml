@@ -34,7 +34,7 @@ jobs:
           files: target/release/Crane-*-universal.dmg
 
   linux:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,7 +43,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libxkbcommon-dev libwayland-dev libgl-dev libx11-dev \
-            libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev pkg-config
+            libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev pkg-config \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
       - name: Install cargo-bundle
         run: cargo install cargo-bundle
       - name: Build release deb
