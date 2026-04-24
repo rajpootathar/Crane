@@ -290,7 +290,6 @@ pub fn strip_sync_and_track<'a>(
 /// to the parser as-is, and performs shadow-grid bookkeeping at each
 /// `Begin` / `End` boundary. `?2026$p` queries are silently dropped
 /// (the terminal answers via DECRQM on its own).
-#[allow(dead_code)]
 pub enum SyncChunk<'a> {
     /// Raw bytes that should be passed straight to the parser.
     Bytes(&'a [u8]),

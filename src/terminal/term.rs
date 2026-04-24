@@ -1,13 +1,22 @@
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+
+use super::sync_handler::{split_sync_markers, SyncChunk};
+
+/// Bound on remembered ghost-row texts. 2048 is ~128KB worst case
+/// (64-col row average) and comfortably spans many minutes of dense
+/// Ink-style redraw bursts.
+const GHOST_CAP: usize = 2048;
 
 pub struct TermSize {
     pub columns: usize,
@@ -175,6 +184,14 @@ pub struct Terminal {
     /// process exited (user typed `exit`, Ctrl-D, was killed, etc.).
     /// UI polls this each frame and closes the owning Pane.
     alive: Arc<std::sync::atomic::AtomicBool>,
+    /// Row texts known to be ghost-frame leftovers from Ink-style
+    /// redraw regions. Populated by the reader thread whenever a
+    /// `?2026h ... ?2026l` sync block's LFs push rows from the live
+    /// viewport into history — those rows are UI-region repaints, not
+    /// legitimate streamed output, so the paint path hides them when
+    /// scrolled up. FIFO-bounded; kept as trimmed text so the dedup
+    /// is stable across display_offset changes.
+    pub ghost_texts: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl Drop for Terminal {
@@ -366,10 +383,13 @@ impl Terminal {
         }
 
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ghost_texts: Arc<Mutex<VecDeque<String>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(128)));
         let term_clone = term.clone();
         let history_clone = history.clone();
         let ctx_clone = ctx.clone();
         let alive_clone = alive.clone();
+        let ghost_texts_clone = ghost_texts.clone();
         // Opt-in raw VT byte trace. Set CRANE_VT_TRACE=1 in the parent
         // env to dump everything the PTY produces, exactly as the
         // parser sees it, to ~/.crane/vt-trace-<pid>.log. Lets us diff
@@ -396,6 +416,13 @@ impl Terminal {
             let mut reader = reader;
             let mut processor: Processor<StdSyncHandler> = Processor::new();
             let mut buf = [0u8; 8192];
+            // Persistent across read() iterations — Ink sync blocks can
+            // span multiple PTY reads, so pre_sync_hist has to survive
+            // from whatever read saw `?2026h` to whichever later read
+            // sees `?2026l`. Without this, a sync block larger than 8KB
+            // would never get ghost-collected.
+            let mut in_sync: bool = false;
+            let mut pre_sync_hist: usize = 0;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -406,19 +433,79 @@ impl Terminal {
                             use std::io::Write;
                             let _ = g.write_all(&buf[..n]);
                         }
-                        // Feed bytes straight to the parser; alacritty's
-                        // built-in StdSyncHandler handles `?2026` sync
-                        // stashing internally. We tried a shadow-grid
-                        // snapshot/restore wrapper here to eliminate
-                        // ghost frames from Ink redraws; it rendered
-                        // correctly on small sync blocks but overlaid
-                        // shifted content onto the restored grid when
-                        // sync blocks scrolled. Leaving it as a v0.5
-                        // task; the ancillary code remains in
-                        // `sync_handler.rs` for reference.
+                        // Split on `?2026h`/`?2026l` markers so we can
+                        // bookend the sync region with a history-size
+                        // snapshot. Markers are stripped from the chunk
+                        // stream the parser sees — without that,
+                        // alacritty's StdSyncHandler would stash bytes
+                        // internally until commit and we'd lose the
+                        // ability to diff pre vs post hist around the
+                        // Ink redraw. The LFs still execute live and
+                        // still scroll rows into history, but now we
+                        // know exactly which rows were scrolled in by
+                        // the redraw and can mark them as ghosts for
+                        // the paint-side dedup. See `sync_handler.rs`.
+                        let chunks = split_sync_markers(&buf[..n]);
                         {
                             let mut t = term_clone.lock();
-                            processor.advance(&mut *t, &buf[..n]);
+                            for chunk in chunks {
+                                match chunk {
+                                    SyncChunk::Begin => {
+                                        if !in_sync {
+                                            pre_sync_hist = t.grid().history_size();
+                                            in_sync = true;
+                                        }
+                                    }
+                                    SyncChunk::End => {
+                                        if in_sync {
+                                            let post_hist = t.grid().history_size();
+                                            if post_hist > pre_sync_hist {
+                                                let delta = post_hist - pre_sync_hist;
+                                                let cols = t.grid().columns();
+                                                let mut gt = ghost_texts_clone.lock();
+                                                // Rows Line(-delta)..Line(-1)
+                                                // are what just got scrolled
+                                                // off the top of viewport
+                                                // during the redraw. Most
+                                                // recent = Line(-1).
+                                                for i in 1..=delta {
+                                                    let mut s = String::with_capacity(cols);
+                                                    for c in 0..cols {
+                                                        let ch = t.grid()
+                                                            [Point::new(
+                                                                Line(-(i as i32)),
+                                                                Column(c),
+                                                            )]
+                                                        .c;
+                                                        s.push(if ch == '\0' { ' ' } else { ch });
+                                                    }
+                                                    let trimmed =
+                                                        s.trim_end_matches(' ').to_string();
+                                                    // Skip blank / near-blank
+                                                    // rows — matching an
+                                                    // empty row to "ghost"
+                                                    // would hide legitimate
+                                                    // spacing in scrollback.
+                                                    let non_ws = trimmed
+                                                        .chars()
+                                                        .filter(|c| !c.is_whitespace())
+                                                        .count();
+                                                    if non_ws >= 3 {
+                                                        if gt.len() >= GHOST_CAP {
+                                                            gt.pop_front();
+                                                        }
+                                                        gt.push_back(trimmed);
+                                                    }
+                                                }
+                                            }
+                                            in_sync = false;
+                                        }
+                                    }
+                                    SyncChunk::Bytes(b) => {
+                                        processor.advance(&mut *t, b);
+                                    }
+                                }
+                            }
                         }
                         let mut h = history_clone.lock();
                         h.extend_from_slice(&buf[..n]);
@@ -455,6 +542,7 @@ impl Terminal {
             pending_scroll_to_bottom: std::sync::atomic::AtomicBool::new(false),
             scroll_carry: parking_lot::Mutex::new(0.0),
             alive,
+            ghost_texts,
         })
     }
 

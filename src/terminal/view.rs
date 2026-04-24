@@ -558,6 +558,21 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                 live_bottom.insert(trimmed);
             }
         }
+        // Also pull in rows the PTY reader recorded as "scrolled into
+        // history during a `?2026h..?2026l` sync block". Those are Ink
+        // redraw leftovers — content the TUI has since overwritten,
+        // but the LF-scroll pushed a copy into history. The current-
+        // bottom snapshot above only catches redraw artifacts that
+        // still match what's on screen right now; this covers older
+        // frames whose content has since rolled off the live region.
+        // Locked briefly, copied into the same set so the paint-side
+        // dedup stays a single HashSet lookup.
+        {
+            let gt = terminal.ghost_texts.lock();
+            for t in gt.iter() {
+                live_bottom.insert(t.clone());
+            }
+        }
         (cells, cursor, selection, offset, history, live_bottom)
     };
     let (cells, (cursor_col, cursor_line), selection, display_offset, history_size, live_bottom) = snapshot;
