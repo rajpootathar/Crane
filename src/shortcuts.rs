@@ -171,6 +171,50 @@ pub fn handle(
     if toggle_right {
         app.show_right = !app.show_right;
     }
+
+    // Trash the currently-selected file in the Files Pane.
+    // macOS: Cmd+Backspace (the "Move to Trash" Finder shortcut).
+    // Linux/Windows: Delete key alone (matches Nautilus / Explorer).
+    //
+    // Guards:
+    //   - Requires `app.selected_file` to be Some — without selection
+    //     there's nothing to delete and we don't want surprise fires.
+    //   - Requires no widget to currently hold keyboard focus —
+    //     otherwise the shortcut would steal Backspace from a
+    //     terminal pane (where ⌘⌫ commonly means "delete word") or
+    //     from a TextEdit in a modal/composer.
+    let any_focus = ctx.memory(|m| m.focused().is_some());
+    let delete_selected = ctx.input(|i| {
+        let cmd = i.modifiers.command;
+        cmd && i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete)
+    });
+    if delete_selected && !any_focus
+        && let Some(path) = app.selected_file.clone()
+    {
+        if let Err(e) = trash::delete(&path) {
+            app.git_error = Some(format!("Trash: {e}"));
+        } else {
+            app.selected_file = None;
+            app.close_file_tabs_for_path(&path);
+            // Push onto undo stack so Cmd+Z reverses the trash.
+            if app.file_op_history.len() >= crate::state::FILE_OP_HISTORY_CAP {
+                app.file_op_history.pop_front();
+            }
+            app.file_op_history.push_back(crate::state::FileOp::Trash { path });
+        }
+    }
+
+    // Cmd+Z: undo the most recent Files-Pane move/trash. Same focus
+    // guard as Cmd+Backspace so we don't steal undo from a TextEdit
+    // or terminal pane that's editing text.
+    let undo_pressed = ctx.input(|i| {
+        i.modifiers.command
+            && !i.modifiers.shift
+            && i.key_pressed(egui::Key::Z)
+    });
+    if undo_pressed && !any_focus {
+        app.undo_last_file_op();
+    }
 }
 
 fn terminal_is_running(app: &App, id: PaneId) -> bool {

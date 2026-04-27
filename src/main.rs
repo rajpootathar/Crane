@@ -19,8 +19,8 @@ mod views;
 
 use modals::{
     render_empty_state, render_help_modal, render_lsp_download_toast,
-    render_lsp_install_prompt, render_missing_project_modal, render_new_workspace_modal, render_settings_modal,
-    render_update_toast,
+    render_lsp_install_prompt, render_missing_project_modal, render_new_workspace_modal,
+    render_settings_modal, render_update_toast,
 };
 
 use eframe::egui;

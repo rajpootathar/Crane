@@ -76,6 +76,12 @@ toml = "0.8"
 ureq = { version = "2", features = ["json", "tls"] }
 flate2 = "1"
 uuid = { version = "1", features = ["v4"] }
+# Native trash / recycle-bin handling for the Files Pane "Delete"
+# action. Cross-platform: Finder trash on macOS (via objc2),
+# `gio trash` / `~/.local/share/Trash` on Linux, Recycle Bin on
+# Windows. Deliberately picked over a hand-rolled `mv ~/.Trash/`
+# shell-out so files keep their "Put Back" affordance in Finder.
+trash = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -167,6 +167,52 @@ impl LocationMode {
     }
 }
 
+/// Distinguishes "create file" from "create folder" in the
+/// [`NewEntryModal`]. Two-variant enum (instead of a bool) so call
+/// sites read clearly at a glance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewEntryKind {
+    File,
+    Folder,
+}
+
+/// One reversible Files-Pane operation. Pushed onto
+/// [`App::file_op_history`] after every successful move / trash so
+/// Cmd+Z can pop and undo. Bounded stack — see field docs there.
+#[derive(Debug, Clone)]
+pub enum FileOp {
+    /// User dragged `from` onto a folder; we did `fs::rename` to
+    /// `to`. Undo: rename back. Refuses if `from` now exists (would
+    /// overwrite a new file at the original location).
+    Move { from: PathBuf, to: PathBuf },
+    /// User trashed `path`. Undo on Linux/Windows uses the `trash`
+    /// crate's restore API. macOS has no programmatic restore — the
+    /// undo there silently no-ops (Finder's "Put Back" still works).
+    Trash { path: PathBuf },
+}
+
+/// Bound on undo history. 64 ops covers a typical refactor session
+/// without pinning unbounded path memory.
+pub const FILE_OP_HISTORY_CAP: usize = 64;
+
+/// State for the JetBrains-style inline "new entry" editor in the
+/// Files Pane: when the user picks New File / New Folder from a
+/// right-click menu, an extra row appears in the tree at the parent
+/// dir with a focused TextEdit. Enter creates, Escape cancels, focus
+/// loss with empty name cancels. `parent` is always a directory
+/// (the row's parent dir if right-clicked on a file, the dir itself
+/// if right-clicked on a folder).
+pub struct PendingNewEntry {
+    pub parent: PathBuf,
+    pub kind: NewEntryKind,
+    pub name: String,
+    pub error: Option<String>,
+    /// First-frame focus latch — prevents the TextEdit from stealing
+    /// focus on every subsequent frame, which would block clicks on
+    /// other rows from cancelling the pending entry.
+    pub focused_once: bool,
+}
+
 pub struct NewWorkspaceModal {
     pub project_id: ProjectId,
     pub branch: String,
@@ -283,6 +329,19 @@ pub struct App {
     pub expanded_dirs: HashSet<PathBuf>,
     pub collapsed_change_dirs: HashSet<String>,
     pub new_workspace_modal: Option<NewWorkspaceModal>,
+    pub pending_new_entry: Option<PendingNewEntry>,
+    /// Most recently single-clicked path in the Files Pane. Drives
+    /// the row highlight + the Cmd+Delete keyboard shortcut. Cleared
+    /// when the file is deleted/moved, or when focus moves to a
+    /// non-tree widget.
+    pub selected_file: Option<PathBuf>,
+    /// LIFO stack of reversible Files-Pane operations. Driven by
+    /// Cmd+Z. Bounded so a long session doesn't pin large pathbuf
+    /// allocations forever. Reversal: Move → fs::rename back; Trash
+    /// → restore via the `trash` crate (Linux/Windows only — macOS
+    /// `trash` crate doesn't expose a programmatic restore API, so
+    /// the entry is dropped from the stack as a no-op there).
+    pub file_op_history: std::collections::VecDeque<FileOp>,
     pub update_check: UpdateCheck,
     pub updater: crate::update::apply::Updater,
     pub selected_theme: String,
@@ -365,6 +424,9 @@ impl App {
             expanded_dirs: HashSet::new(),
             collapsed_change_dirs: HashSet::new(),
             new_workspace_modal: None,
+            pending_new_entry: None,
+            selected_file: None,
+            file_op_history: std::collections::VecDeque::new(),
             update_check: UpdateCheck::new(Default::default()),
             updater: crate::update::apply::Updater::new(),
             selected_theme: "crane-dark".to_string(),
@@ -1003,6 +1065,174 @@ impl App {
         let project = self.projects.iter().find(|p| p.id == pid)?;
         let wt = project.workspaces.iter().find(|w| w.id == wid)?;
         Some(&wt.path)
+    }
+
+    /// Drop any open File Tab whose path matches `path`. Called after
+    /// a Files-Pane delete or move so the editor doesn't keep
+    /// pointing at a non-existent file. Walks every project →
+    /// workspace → tab → pane the same way `refresh_diff_panes_for_path`
+    /// does — paths can be opened in multiple Layouts at once and we
+    /// want to clean them all.
+    pub fn close_file_tabs_for_path(&mut self, path: &Path) {
+        use crate::state::layout::PaneContent;
+        let path_str = path.to_string_lossy().to_string();
+        for project in &mut self.projects {
+            for workspace in &mut project.workspaces {
+                for tab in &mut workspace.tabs {
+                    for (_, pane) in tab.layout.panes.iter_mut() {
+                        let PaneContent::Files(files) = &mut pane.content else {
+                            continue;
+                        };
+                        // Iterate from the back so we can swap_remove
+                        // without shifting later indices.
+                        let mut i = files.tabs.len();
+                        while i > 0 {
+                            i -= 1;
+                            if files.tabs[i].path == path_str {
+                                files.tabs.remove(i);
+                                if files.active >= files.tabs.len()
+                                    && !files.tabs.is_empty()
+                                {
+                                    files.active = files.tabs.len() - 1;
+                                } else if files.tabs.is_empty() {
+                                    files.active = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update any open File Tab whose path matches `src` to point at
+    /// `dst` after a Files-Pane move/rename. The buffer text and
+    /// dirty state are preserved; only the path + display name
+    /// change.
+    pub fn rename_file_tabs_for_path(&mut self, src: &Path, dst: &Path) {
+        use crate::state::layout::PaneContent;
+        let src_str = src.to_string_lossy().to_string();
+        let dst_str = dst.to_string_lossy().to_string();
+        let dst_name = dst
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&dst_str)
+            .to_string();
+        for project in &mut self.projects {
+            for workspace in &mut project.workspaces {
+                for tab in &mut workspace.tabs {
+                    for (_, pane) in tab.layout.panes.iter_mut() {
+                        let PaneContent::Files(files) = &mut pane.content else {
+                            continue;
+                        };
+                        for ft in files.tabs.iter_mut() {
+                            if ft.path == src_str {
+                                ft.path = dst_str.clone();
+                                ft.name = dst_name.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pop the last reversible Files-Pane op and undo it. Returns
+    /// true if anything was undone, false if the stack was empty or
+    /// the op couldn't be reversed (e.g. trash undo on macOS, or
+    /// the original location is now occupied). Errors surface via
+    /// `git_error` so the user sees a soft warning in the bottom bar.
+    pub fn undo_last_file_op(&mut self) -> bool {
+        let Some(op) = self.file_op_history.pop_back() else {
+            return false;
+        };
+        match op {
+            FileOp::Move { from, to } => {
+                if from.exists() {
+                    self.git_error = Some(format!(
+                        "Undo: `{}` is occupied — refusing to overwrite",
+                        from.display()
+                    ));
+                    return false;
+                }
+                if let Err(e) = std::fs::rename(&to, &from) {
+                    self.git_error = Some(format!("Undo move: {e}"));
+                    return false;
+                }
+                if self.selected_file.as_deref() == Some(&to) {
+                    self.selected_file = Some(from.clone());
+                }
+                self.rename_file_tabs_for_path(&to, &from);
+                if let Some(parent) = from.parent() {
+                    self.expanded_dirs.insert(parent.to_path_buf());
+                }
+                true
+            }
+            FileOp::Trash { path } => {
+                // macOS: `trash::os_limited` isn't compiled in, so
+                // there's no programmatic restore. Surface a hint
+                // pointing the user at Finder's "Put Back" so they
+                // know what to do.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = path;
+                    self.git_error = Some(
+                        "Undo trash: open Finder → Trash → right-click → Put Back".into(),
+                    );
+                    false
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    use trash::os_limited;
+                    // Match by path — trash items have an
+                    // `original_parent` we can compare against.
+                    let parent = match path.parent() {
+                        Some(p) => p.to_path_buf(),
+                        None => {
+                            self.git_error = Some("Undo trash: no parent dir".into());
+                            return false;
+                        }
+                    };
+                    let name = match path.file_name() {
+                        Some(n) => n.to_os_string(),
+                        None => {
+                            self.git_error = Some("Undo trash: no file name".into());
+                            return false;
+                        }
+                    };
+                    let items = match os_limited::list() {
+                        Ok(items) => items,
+                        Err(e) => {
+                            self.git_error = Some(format!("Undo trash: list: {e}"));
+                            return false;
+                        }
+                    };
+                    let target = items.into_iter().find(|it| {
+                        it.original_parent == parent && it.name == name
+                    });
+                    match target {
+                        Some(item) => match os_limited::restore_all([item]) {
+                            Ok(()) => {
+                                if let Some(parent) = path.parent() {
+                                    self.expanded_dirs.insert(parent.to_path_buf());
+                                }
+                                true
+                            }
+                            Err(e) => {
+                                self.git_error = Some(format!("Undo trash: {e}"));
+                                false
+                            }
+                        },
+                        None => {
+                            self.git_error = Some(
+                                "Undo trash: not found in trash (already restored or emptied?)".into(),
+                            );
+                            false
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn active_layout_ref(&self) -> Option<&Layout> {

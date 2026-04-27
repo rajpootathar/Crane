@@ -1,5 +1,5 @@
 use crate::git::{self, FileChange};
-use crate::state::{App, RightTab};
+use crate::state::{App, FileOp, NewEntryKind, PendingNewEntry, RightTab, FILE_OP_HISTORY_CAP};
 use crate::ui::util::{
     draw_row, section_header,
     RowConfig, accent, muted, text,
@@ -714,6 +714,12 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
     };
     let mut opened: Option<PathBuf> = None;
     let mut toggled: Option<PathBuf> = None;
+    let mut new_entry: Option<(PathBuf, NewEntryKind)> = None;
+    let mut delete_request: Option<PathBuf> = None;
+    let mut drop_request: Option<(PathBuf, PathBuf)> = None;
+    let mut commit_pending = false;
+    let mut cancel_pending = false;
+    let selected_snapshot = app.selected_file.clone();
     egui::ScrollArea::vertical()
         .id_salt("right_files")
         .auto_shrink([false, false])
@@ -725,8 +731,57 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 &app.expanded_dirs,
                 &mut opened,
                 &mut toggled,
+                &mut new_entry,
+                &mut delete_request,
+                &mut drop_request,
+                selected_snapshot.as_deref(),
+                app.pending_new_entry.as_mut(),
+                &mut commit_pending,
+                &mut cancel_pending,
+                &path,
             );
+            // Sink for right-clicks on the empty space below entries
+            // — `interact` claims the rest of the ScrollArea's height
+            // so a context menu can fire even when no row sits under
+            // the cursor. New entries created here go into the
+            // workspace root.
+            let avail = ui.available_size_before_wrap();
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(avail.x.max(1.0), avail.y.max(20.0)),
+                egui::Sense::click(),
+            );
+            let _ = rect;
+            let root_for_menu = path.clone();
+            resp.context_menu(|ui| {
+                if ui.button(format!("{}  New File…", icons::FILE)).clicked() {
+                    new_entry = Some((root_for_menu.clone(), NewEntryKind::File));
+                    ui.close();
+                }
+                if ui
+                    .button(format!("{}  New Folder…", icons::FOLDER_PLUS))
+                    .clicked()
+                {
+                    new_entry = Some((root_for_menu.clone(), NewEntryKind::Folder));
+                    ui.close();
+                }
+            });
         });
+    if cancel_pending {
+        app.pending_new_entry = None;
+    } else if commit_pending {
+        try_commit_pending(app);
+    }
+    if let Some(p) = opened.as_ref() {
+        // Clicking a row also marks it as the active selection so
+        // Cmd+Delete (handled in shortcuts.rs) targets it.
+        app.selected_file = Some(p.clone());
+    }
+    if let Some(p) = delete_request {
+        delete_to_trash(app, &p);
+    }
+    if let Some((src, dst_dir)) = drop_request {
+        move_path(app, &src, &dst_dir);
+    }
     if let Some(p) = toggled
         && !app.expanded_dirs.remove(&p) {
             app.expanded_dirs.insert(p);
@@ -742,8 +797,21 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
         let ctx = ui.ctx().clone();
         app.open_file_into_active_layout(&ctx, path_str, name, content);
     }
+    if let Some((parent, kind)) = new_entry {
+        // Make sure the parent is expanded so the inline editor row
+        // is visible immediately under it.
+        app.expanded_dirs.insert(parent.clone());
+        app.pending_new_entry = Some(PendingNewEntry {
+            parent,
+            kind,
+            name: String::new(),
+            error: None,
+            focused_once: false,
+        });
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_fs_dir(
     ui: &mut egui::Ui,
     path: &std::path::Path,
@@ -751,9 +819,31 @@ fn render_fs_dir(
     expanded: &std::collections::HashSet<PathBuf>,
     open_file: &mut Option<PathBuf>,
     toggle_dir: &mut Option<PathBuf>,
+    new_entry: &mut Option<(PathBuf, NewEntryKind)>,
+    delete_request: &mut Option<PathBuf>,
+    drop_request: &mut Option<(PathBuf, PathBuf)>,
+    selected: Option<&std::path::Path>,
+    pending: Option<&mut PendingNewEntry>,
+    commit: &mut bool,
+    cancel: &mut bool,
+    workspace_root: &std::path::Path,
 ) {
     if depth > 6 {
         return;
+    }
+    // Pending-entry editor lives in exactly one directory at a time
+    // (`pending.parent`). Split the `&mut` so children recursions
+    // don't see it for unrelated subdirs — only the matching dir
+    // renders the inline TextEdit row.
+    let (pending_here, mut pending_for_children): (
+        Option<&mut PendingNewEntry>,
+        Option<&mut PendingNewEntry>,
+    ) = match pending {
+        Some(p) if p.parent == path => (Some(p), None),
+        other => (None, other),
+    };
+    if let Some(p) = pending_here {
+        render_pending_editor_row(ui, depth, p, commit, cancel);
     }
     let read = match std::fs::read_dir(path) {
         Ok(r) => r,
@@ -777,6 +867,7 @@ fn render_fs_dir(
         let entry_path = e.path();
         let is_dir = entry_path.is_dir();
         let is_expanded = is_dir && expanded.contains(&entry_path);
+        let is_selected = selected.is_some_and(|s| s == entry_path);
         let row = draw_row(
             ui,
             RowConfig {
@@ -786,7 +877,7 @@ fn render_fs_dir(
                 leading_color: Some(muted()),
                 label: &name,
                 label_color: None,
-                is_active: false,
+                is_active: is_selected,
                 active_bar: false,
                 badge: None,
                 trailing_count: 0,
@@ -800,12 +891,56 @@ fn render_fs_dir(
                 *open_file = Some(entry_path.clone());
             }
         }
+        // Drag source: any row can be dragged. dnd_set_drag_payload
+        // attaches the path to egui's global drag state; pointer
+        // release on a folder row reads it back as a drop target.
+        if row.response.dragged() {
+            row.response.dnd_set_drag_payload(entry_path.clone());
+        }
+        // Drop target: only directories accept drops. We refuse a
+        // drop when the source is the directory itself (no-op) or a
+        // descendant of itself (would loop the filesystem). The
+        // actual rename is deferred to the caller via `drop_request`.
+        if is_dir {
+            if let Some(payload) = row.response.dnd_release_payload::<PathBuf>() {
+                let src: PathBuf = (*payload).clone();
+                let same = src == entry_path;
+                let into_self_or_descendant = entry_path.starts_with(&src);
+                if !same && !into_self_or_descendant {
+                    *drop_request = Some((src, entry_path.clone()));
+                }
+            }
+        }
         let path_owned = entry_path.clone();
+        // New entries land in the directory itself for folder rows,
+        // and in the file's parent directory for file rows — same
+        // affordance as VS Code so right-clicking any nearby row
+        // creates the entry next to it.
+        let create_parent: PathBuf = if is_dir {
+            path_owned.clone()
+        } else {
+            path_owned
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| workspace_root.to_path_buf())
+        };
         row.response.context_menu(|ui| {
             if !is_dir && ui.button(format!("{}  Open", icons::FILE)).clicked() {
                 *open_file = Some(path_owned.clone());
                 ui.close();
             }
+            if ui.button(format!("{}  New File…", icons::FILE)).clicked() {
+                *new_entry = Some((create_parent.clone(), NewEntryKind::File));
+                ui.close();
+            }
+            if ui
+                .button(format!("{}  New Folder…", icons::FOLDER_PLUS))
+                .clicked()
+            {
+                *new_entry = Some((create_parent.clone(), NewEntryKind::Folder));
+                ui.close();
+            }
+            ui.separator();
             if ui
                 .button(format!("{}  Reveal in File Manager", icons::FOLDER_OPEN))
                 .clicked()
@@ -817,9 +952,205 @@ fn render_fs_dir(
                 ui.ctx().copy_text(path_owned.to_string_lossy().to_string());
                 ui.close();
             }
+            ui.separator();
+            if ui
+                .button(format!("{}  Move to Trash", icons::TRASH))
+                .clicked()
+            {
+                *delete_request = Some(path_owned.clone());
+                ui.close();
+            }
         });
         if is_dir && is_expanded {
-            render_fs_dir(ui, &entry_path, depth + 1, expanded, open_file, toggle_dir);
+            let pending_reborrow = pending_for_children.as_deref_mut();
+            render_fs_dir(
+                ui,
+                &entry_path,
+                depth + 1,
+                expanded,
+                open_file,
+                toggle_dir,
+                new_entry,
+                delete_request,
+                drop_request,
+                selected,
+                pending_reborrow,
+                commit,
+                cancel,
+                workspace_root,
+            );
         }
     }
 }
+
+/// Move a path to the system trash via the `trash` crate (Finder
+/// trash on macOS, `gio trash` / FreeDesktop spec on Linux, Recycle
+/// Bin on Windows). After delete, scrub any open File Tab pointing
+/// at the gone path so the editor doesn't try to write back to a
+/// trashed file.
+fn delete_to_trash(app: &mut App, path: &std::path::Path) {
+    if let Err(e) = trash::delete(path) {
+        app.git_error = Some(format!("Trash: {e}"));
+        return;
+    }
+    if app.selected_file.as_deref() == Some(path) {
+        app.selected_file = None;
+    }
+    app.close_file_tabs_for_path(path);
+    push_file_op(app, FileOp::Trash { path: path.to_path_buf() });
+}
+
+/// Move a path into a target directory via `std::fs::rename`. Only
+/// works for same-filesystem moves; cross-filesystem (e.g. user
+/// dragged a file from a mounted volume) returns EXDEV and we
+/// surface the error instead of silently copying — copy-then-delete
+/// across filesystems would change the move's atomicity guarantees.
+/// Refuses to overwrite an existing entry at the destination.
+fn move_path(app: &mut App, src: &std::path::Path, dst_dir: &std::path::Path) {
+    let Some(name) = src.file_name() else { return; };
+    let dst = dst_dir.join(name);
+    if dst.exists() {
+        app.git_error = Some(format!(
+            "`{}` already exists in {}",
+            name.to_string_lossy(),
+            dst_dir.display()
+        ));
+        return;
+    }
+    if let Err(e) = std::fs::rename(src, &dst) {
+        app.git_error = Some(format!("Move: {e}"));
+        return;
+    }
+    if app.selected_file.as_deref() == Some(src) {
+        app.selected_file = Some(dst.clone());
+    }
+    app.rename_file_tabs_for_path(src, &dst);
+    app.expanded_dirs.insert(dst_dir.to_path_buf());
+    push_file_op(
+        app,
+        FileOp::Move {
+            from: src.to_path_buf(),
+            to: dst,
+        },
+    );
+}
+
+/// Push an op onto the LIFO undo stack, evicting the oldest when
+/// at capacity.
+fn push_file_op(app: &mut App, op: FileOp) {
+    if app.file_op_history.len() >= FILE_OP_HISTORY_CAP {
+        app.file_op_history.pop_front();
+    }
+    app.file_op_history.push_back(op);
+}
+
+/// Inline TextEdit row for the pending new-file/folder editor.
+/// Looks like a tree row at the right indent, no leading expander.
+/// Enter commits via `*commit = true`, Escape cancels via
+/// `*cancel = true`. Focus loss with empty input also cancels —
+/// matches JetBrains.
+fn render_pending_editor_row(
+    ui: &mut egui::Ui,
+    depth: usize,
+    pending: &mut PendingNewEntry,
+    commit: &mut bool,
+    cancel: &mut bool,
+) {
+    let leading = match pending.kind {
+        NewEntryKind::File => icons::FILE,
+        NewEntryKind::Folder => icons::FOLDER,
+    };
+    let hint = match pending.kind {
+        NewEntryKind::File => "filename.ext",
+        NewEntryKind::Folder => "folder-name",
+    };
+    let indent = (depth as f32 + 1.0) * 14.0;
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        ui.label(egui::RichText::new(leading).color(muted()));
+        let edit_id = egui::Id::new(("pending_new_entry_edit", depth));
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut pending.name)
+                .id(edit_id)
+                .hint_text(hint)
+                .desired_width(f32::INFINITY),
+        );
+        if !pending.focused_once {
+            resp.request_focus();
+            pending.focused_once = true;
+        }
+        // Enter on a singleline TextEdit drops focus first, so the
+        // right detection is `lost_focus() + key_pressed(Enter)`.
+        let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if escape_pressed {
+            *cancel = true;
+        } else if resp.lost_focus() && enter_pressed {
+            if pending.name.trim().is_empty() {
+                *cancel = true;
+            } else {
+                *commit = true;
+            }
+        } else if resp.lost_focus() && pending.name.trim().is_empty() {
+            // Clicked away with no name typed → cancel (JetBrains).
+            *cancel = true;
+        }
+    });
+    if let Some(err) = &pending.error {
+        ui.horizontal(|ui| {
+            ui.add_space(indent + 18.0);
+            ui.label(
+                egui::RichText::new(err)
+                    .size(10.5)
+                    .color(egui::Color32::from_rgb(220, 100, 100)),
+            );
+        });
+    }
+}
+
+/// Try to materialize the pending entry. On success, clears the
+/// pending state. On failure, populates `error` so the inline row
+/// displays it under the input.
+fn try_commit_pending(app: &mut App) {
+    let Some(pending) = app.pending_new_entry.as_ref() else {
+        return;
+    };
+    let name = pending.name.trim().to_string();
+    let parent = pending.parent.clone();
+    let kind = pending.kind;
+    if name.is_empty() {
+        return;
+    }
+    if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        if let Some(p) = app.pending_new_entry.as_mut() {
+            p.error = Some("Name can't contain `/`, `\\`, `.`, or `..`".into());
+        }
+        return;
+    }
+    let target = parent.join(&name);
+    if target.exists() {
+        if let Some(p) = app.pending_new_entry.as_mut() {
+            p.error = Some(format!("`{}` already exists", name));
+        }
+        return;
+    }
+    let result = match kind {
+        NewEntryKind::File => std::fs::File::create(&target).map(|_| ()),
+        NewEntryKind::Folder => std::fs::create_dir(&target),
+    };
+    match result {
+        Ok(()) => {
+            app.expanded_dirs.insert(parent);
+            app.pending_new_entry = None;
+        }
+        Err(e) => {
+            if let Some(p) = app.pending_new_entry.as_mut() {
+                p.error = Some(format!("Couldn't create: {e}"));
+                // Re-focus the editor so the user can fix and retry
+                // without an extra click.
+                p.focused_once = false;
+            }
+        }
+    }
+}
+
