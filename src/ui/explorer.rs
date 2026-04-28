@@ -660,22 +660,6 @@ fn render_change_node(
         } else {
             format!("{prefix}/{dir_name}")
         };
-        if node.dirs.len() == 1 && child.files.is_empty() && !child.dirs.is_empty() {
-            render_change_node(
-                ui,
-                section,
-                child,
-                &child_prefix,
-                depth,
-                staged,
-                collapsed,
-                unstage_paths,
-                stage_paths,
-                open_diff,
-                toggle_dir,
-            );
-            continue;
-        }
         let key = format!("{section}:{child_prefix}");
         let is_collapsed = collapsed.contains(&key);
         // Folder checkbox mirrors the section: in a STAGED tree it's
