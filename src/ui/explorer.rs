@@ -1,5 +1,8 @@
 use crate::git::{self, FileChange};
-use crate::state::{App, FileOp, NewEntryKind, PendingNewEntry, RightTab, FILE_OP_HISTORY_CAP};
+use crate::state::{
+    App, FileOp, GitOpKind, GitOpStatus, NewEntryKind, PendingNewEntry, RightTab,
+    FILE_OP_HISTORY_CAP,
+};
 use crate::ui::util::{
     draw_row, section_header,
     RowConfig, accent, muted, text,
@@ -13,6 +16,45 @@ use std::path::PathBuf;
 const ADD: Color32 = Color32::from_rgb(120, 210, 140);
 const DEL: Color32 = Color32::from_rgb(220, 110, 110);
 const WARN: Color32 = Color32::from_rgb(220, 180, 110);
+
+/// Compact toolbar button for the Changes-pane top row. Shows the
+/// kind icon, plus tooltip, and a spinner when its op is running.
+/// All buttons disable while ANY op is in flight so a double-click
+/// can't enqueue a competing op.
+fn toolbar_button(
+    ui: &mut egui::Ui,
+    icon: &str,
+    tooltip: &str,
+    running: bool,
+    any_running: bool,
+) -> bool {
+    let label = if running {
+        // The phosphor "circle notch" / spinner glyph isn't in our
+        // icon set; use a small ring-ish placeholder. The repaint
+        // tick in the toolbar makes this re-render at 6-7Hz so it
+        // reads as "active".
+        format!("{}", icons::ARROW_COUNTER_CLOCKWISE)
+    } else {
+        icon.to_string()
+    };
+    let resp = ui.add_enabled(
+        !any_running || running,
+        egui::Button::new(egui::RichText::new(label).size(13.0))
+            .min_size(egui::vec2(28.0, 22.0)),
+    );
+    let resp = resp.on_hover_text(tooltip);
+    if running {
+        // Tint when busy so the running button stands apart.
+        let painter = ui.painter();
+        painter.rect_stroke(
+            resp.rect,
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.0, accent()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    resp.clicked()
+}
 
 fn reveal_in_file_manager(path: &std::path::Path) {
     #[cfg(target_os = "macos")]
@@ -125,16 +167,96 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
         }
     };
 
+    // Top toolbar: branch + ahead/behind + push/pull/fetch.
+    // Replaces the dropdown-buried push/pull from the old design —
+    // the most-used network ops are now first-class clickable
+    // buttons. Each button shows a spinner while its op is in
+    // flight (driven by `app.git_op_status`); other buttons
+    // disable so a double-click can't queue a second op.
+    let op_status = app.git_op_status.lock().clone();
+    let any_op_running = matches!(op_status, GitOpStatus::Running(_));
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         ui.label(
             RichText::new(format!("{}  {}", icons::GIT_BRANCH, status.branch))
-                .color(muted())
-                .size(11.5),
+                .color(text())
+                .size(12.0)
+                .strong(),
         );
+        if let Some(ab) = status.ahead_behind {
+            if ab.ahead > 0 {
+                ui.label(
+                    RichText::new(format!("{} {}", icons::ARROW_UP, ab.ahead))
+                        .color(muted())
+                        .size(11.0),
+                );
+            }
+            if ab.behind > 0 {
+                ui.label(
+                    RichText::new(format!("{} {}", icons::ARROW_DOWN, ab.behind))
+                        .color(muted())
+                        .size(11.0),
+                );
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
+            let fetch_running = matches!(op_status, GitOpStatus::Running(GitOpKind::Fetch));
+            let push_running = matches!(op_status, GitOpStatus::Running(GitOpKind::Push));
+            let pull_running = matches!(op_status, GitOpStatus::Running(GitOpKind::Pull));
+            // Render right-to-left so insertion order is reverse:
+            // Fetch, Pull, Push (visually).
+            if toolbar_button(
+                ui,
+                if fetch_running { icons::ARROW_COUNTER_CLOCKWISE } else { icons::ARROW_COUNTER_CLOCKWISE },
+                "Fetch",
+                fetch_running,
+                any_op_running,
+            ) {
+                app.dispatch_git_op(
+                    GitOpKind::Fetch,
+                    repo_path.clone(),
+                    ui.ctx().clone(),
+                    None,
+                );
+            }
+            if toolbar_button(
+                ui,
+                icons::ARROW_DOWN,
+                "Pull",
+                pull_running,
+                any_op_running,
+            ) {
+                app.dispatch_git_op(
+                    GitOpKind::Pull,
+                    repo_path.clone(),
+                    ui.ctx().clone(),
+                    None,
+                );
+            }
+            if toolbar_button(
+                ui,
+                icons::ARROW_UP,
+                "Push",
+                push_running,
+                any_op_running,
+            ) {
+                app.dispatch_git_op(
+                    GitOpKind::Push,
+                    repo_path.clone(),
+                    ui.ctx().clone(),
+                    None,
+                );
+            }
+        });
     });
     ui.add_space(4.0);
+    // While a network op runs, request a frame in ~150ms so the
+    // spinner animates smoothly even without other input.
+    if any_op_running {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+    }
 
     let mut stage_paths: Vec<String> = Vec::new();
     let mut unstage_paths: Vec<String> = Vec::new();
@@ -257,108 +379,113 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
             .desired_width(footer_ui.available_width())
             .font(egui::FontId::new(12.5, egui::FontFamily::Proportional)),
     );
+    let mut keyboard_commit = false;
     if text_resp.has_focus() {
         let submit = footer_ui.input(|i| {
             i.key_pressed(egui::Key::Enter)
                 && (i.modifiers.command || i.modifiers.mac_cmd)
         });
-        if submit && can_commit {
-            do_commit(app, &repo_path, false);
+        if submit && can_commit && !any_op_running {
+            keyboard_commit = true;
         }
     }
 
     footer_ui.add_space(8.0);
 
     let mut action_commit = false;
-    let mut action_commit_push = false;
-    let mut action_push = false;
-    let mut action_pull = false;
 
-    let row_w = footer_ui.available_width();
-    let menu_w = 32.0;
-    let gap = 6.0;
-    let primary_w = row_w - menu_w - gap;
+    let commit_running = matches!(
+        op_status,
+        GitOpStatus::Running(GitOpKind::Commit | GitOpKind::CommitAndPush)
+    );
+    let commit_enabled = can_commit && !any_op_running;
+    let commit_label = if commit_running {
+        format!("{}  Committing…", icons::ARROW_COUNTER_CLOCKWISE)
+    } else {
+        // Show "Commit to <branch>" so users see exactly where the
+        // commit will land before clicking. Catches the "wait, am I
+        // on main?" mistake at the bottom of long debug sessions.
+        format!("{}  Commit to {}", icons::CHECK, status.branch)
+    };
 
-    footer_ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        ui.scope(|ui| {
-            let v = ui.visuals_mut();
-            v.widgets.inactive.weak_bg_fill = theme.accent.to_color32();
-            v.widgets.inactive.bg_fill = theme.accent.to_color32();
-            v.widgets.hovered.weak_bg_fill = theme.accent.to_color32().gamma_multiply(1.15);
-            v.widgets.hovered.bg_fill = theme.accent.to_color32().gamma_multiply(1.15);
-            v.widgets.active.weak_bg_fill = theme.accent.to_color32().gamma_multiply(0.9);
-            v.widgets.active.bg_fill = theme.accent.to_color32().gamma_multiply(0.9);
-            v.widgets.inactive.fg_stroke.color = Color32::WHITE;
-            v.widgets.hovered.fg_stroke.color = Color32::WHITE;
-            v.widgets.active.fg_stroke.color = Color32::WHITE;
-            v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-            v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-            v.widgets.active.bg_stroke = egui::Stroke::NONE;
-            v.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
-            v.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
-            v.widgets.active.corner_radius = egui::CornerRadius::same(6);
-            ui.add_enabled_ui(can_commit, |ui| {
-                let r = ui.add(
-                    egui::Button::new(
-                        RichText::new(format!("{}  Commit", icons::CHECK))
-                            .size(13.0)
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .min_size(egui::vec2(primary_w, 30.0)),
-                );
-                if r.clicked() {
-                    action_commit = true;
-                }
-            });
-        });
-
-        let menu_resp = ui.add(
-            egui::Button::new(RichText::new(icons::CARET_DOWN).size(12.0))
-                .min_size(egui::vec2(menu_w, 30.0))
-                .corner_radius(egui::CornerRadius::same(6)),
-        );
-        egui::Popup::menu(&menu_resp).show(|ui| {
-            ui.set_min_width(180.0);
-            let commit_btn = egui::Button::new(
-                RichText::new(format!("{}  Commit", icons::CHECK)).size(12.0),
-            )
-            .min_size(egui::vec2(ui.available_width(), 24.0));
-            if ui.add_enabled(can_commit, commit_btn).clicked() {
+    let primary_w = footer_ui.available_width();
+    footer_ui.scope(|ui| {
+        let v = ui.visuals_mut();
+        v.widgets.inactive.weak_bg_fill = theme.accent.to_color32();
+        v.widgets.inactive.bg_fill = theme.accent.to_color32();
+        v.widgets.hovered.weak_bg_fill = theme.accent.to_color32().gamma_multiply(1.15);
+        v.widgets.hovered.bg_fill = theme.accent.to_color32().gamma_multiply(1.15);
+        v.widgets.active.weak_bg_fill = theme.accent.to_color32().gamma_multiply(0.9);
+        v.widgets.active.bg_fill = theme.accent.to_color32().gamma_multiply(0.9);
+        v.widgets.inactive.fg_stroke.color = Color32::WHITE;
+        v.widgets.hovered.fg_stroke.color = Color32::WHITE;
+        v.widgets.active.fg_stroke.color = Color32::WHITE;
+        v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+        v.widgets.active.bg_stroke = egui::Stroke::NONE;
+        v.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        v.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        v.widgets.active.corner_radius = egui::CornerRadius::same(6);
+        ui.add_enabled_ui(commit_enabled, |ui| {
+            let r = ui.add(
+                egui::Button::new(
+                    RichText::new(commit_label)
+                        .size(13.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .min_size(egui::vec2(primary_w, 30.0)),
+            );
+            if r.clicked() {
                 action_commit = true;
-            }
-            let commit_push = egui::Button::new(
-                RichText::new(format!("{}  Commit & Push", icons::ARROW_UP))
-                    .size(12.0),
-            )
-            .min_size(egui::vec2(ui.available_width(), 24.0));
-            if ui.add_enabled(can_commit, commit_push).clicked() {
-                action_commit_push = true;
-            }
-            ui.separator();
-            let push_btn = egui::Button::new(
-                RichText::new(format!("{}  Push", icons::ARROW_UP)).size(12.0),
-            )
-            .min_size(egui::vec2(ui.available_width(), 24.0));
-            if ui.add(push_btn).clicked() {
-                action_push = true;
-            }
-            let pull_btn = egui::Button::new(
-                RichText::new(format!("{}  Pull", icons::ARROW_DOWN)).size(12.0),
-            )
-            .min_size(egui::vec2(ui.available_width(), 24.0));
-            if ui.add(pull_btn).clicked() {
-                action_pull = true;
             }
         });
     });
 
-    if let Some(err) = &app.git_error {
-        footer_ui.add_space(6.0);
-        footer_ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(err).color(DEL).size(11.0));
-        });
+    // Status pill: shows in-flight op, last success, or error.
+    // Wins over the legacy `git_error` pill since it carries the
+    // op kind too (so users can tell if "auth failed" was Push or
+    // Pull).
+    match &op_status {
+        GitOpStatus::Idle => {
+            if let Some(err) = &app.git_error {
+                footer_ui.add_space(6.0);
+                footer_ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(err).color(DEL).size(11.0));
+                });
+            }
+        }
+        GitOpStatus::Running(kind) => {
+            footer_ui.add_space(6.0);
+            footer_ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("{}…", kind.label()))
+                        .color(muted())
+                        .size(11.0)
+                        .italics(),
+                );
+            });
+        }
+        GitOpStatus::Done { kind, message } => {
+            footer_ui.add_space(6.0);
+            footer_ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("{}: {}", kind.label(), message))
+                        .color(ADD)
+                        .size(11.0),
+                );
+            });
+        }
+        GitOpStatus::Failed { kind, error } => {
+            footer_ui.add_space(6.0);
+            footer_ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("{} failed: {}", kind.label(), error))
+                        .color(DEL)
+                        .size(11.0),
+                );
+            });
+        }
     }
 
     if let Some(dir) = toggle_dir
@@ -400,49 +527,20 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     if let Some(path) = open_diff {
         open_file_diff(app, &repo_path, &path);
     }
-    if action_commit {
-        do_commit(app, &repo_path, false);
-    } else if action_commit_push {
-        do_commit(app, &repo_path, true);
-    } else if action_push {
-        do_push(app, &repo_path);
-    } else if action_pull {
-        match git::pull(&repo_path) {
-            Ok(()) => {
-                app.git_error = None;
-                force_status_refresh(app);
-            }
-            Err(e) => app.git_error = Some(e),
-        }
+    if action_commit || keyboard_commit {
+        let msg = app.commit_message.clone();
+        app.dispatch_git_op(
+            GitOpKind::Commit,
+            repo_path.clone(),
+            ui.ctx().clone(),
+            Some(msg),
+        );
+        app.commit_message.clear();
     }
-}
-
-fn do_commit(app: &mut App, repo: &std::path::Path, then_push: bool) {
-    let msg = app.commit_message.trim().to_string();
-    if msg.is_empty() {
-        app.git_error = Some("Commit message is empty".into());
-        return;
-    }
-    match git::commit(repo, &msg) {
-        Ok(()) => {
-            app.commit_message.clear();
-            app.git_error = None;
-            force_status_refresh(app);
-            if then_push {
-                do_push(app, repo);
-            }
-        }
-        Err(e) => app.git_error = Some(e),
-    }
-}
-
-fn do_push(app: &mut App, repo: &std::path::Path) {
-    match git::push(repo) {
-        Ok(()) => {
-            app.git_error = None;
-            force_status_refresh(app);
-        }
-        Err(e) => app.git_error = Some(e),
+    // Refresh git_status whenever an async op transitions to Done
+    // so the file list + ahead/behind reflect the new HEAD.
+    if matches!(&op_status, GitOpStatus::Done { .. }) {
+        force_status_refresh(app);
     }
 }
 

@@ -195,6 +195,58 @@ pub enum FileOp {
 /// without pinning unbounded path memory.
 pub const FILE_OP_HISTORY_CAP: usize = 64;
 
+/// Async git operation kinds the Changes pane can dispatch. Drives
+/// per-button spinner state + post-completion result message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitOpKind {
+    Commit,
+    /// Reserved for a future keyboard shortcut (e.g. ⌘⇧↩) — the
+    /// caret dropdown that previously surfaced this got removed
+    /// when push/pull/fetch moved to the top toolbar. The dispatch
+    /// path still handles it so wiring a shortcut is a one-liner.
+    #[allow(dead_code)]
+    CommitAndPush,
+    Push,
+    Pull,
+    Fetch,
+}
+
+impl GitOpKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            GitOpKind::Commit => "Commit",
+            GitOpKind::CommitAndPush => "Commit & Push",
+            GitOpKind::Push => "Push",
+            GitOpKind::Pull => "Pull",
+            GitOpKind::Fetch => "Fetch",
+        }
+    }
+}
+
+/// State of the most recent (or in-flight) async git op. Worker
+/// thread owns this via `Arc<Mutex<…>>` and the render loop polls.
+#[derive(Clone, Debug)]
+pub enum GitOpStatus {
+    /// No op has been run yet, or the last result was dismissed.
+    Idle,
+    /// An op is in flight — the UI shows a spinner on the matching
+    /// button and disables the others.
+    Running(GitOpKind),
+    /// Last op succeeded; carries a short result message ("Pulled
+    /// 3 commits", "Already up to date", "Pushed to origin/main")
+    /// for the bottom pill. Auto-cleared when the user starts the
+    /// next op.
+    Done { kind: GitOpKind, message: String },
+    /// Last op failed; carries the stderr-derived error text.
+    Failed { kind: GitOpKind, error: String },
+}
+
+impl Default for GitOpStatus {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
 /// State for the JetBrains-style inline "new entry" editor in the
 /// Files Pane: when the user picks New File / New Folder from a
 /// right-click menu, an extra row appears in the tree at the parent
@@ -342,6 +394,10 @@ pub struct App {
     /// `trash` crate doesn't expose a programmatic restore API, so
     /// the entry is dropped from the stack as a no-op there).
     pub file_op_history: std::collections::VecDeque<FileOp>,
+    /// Shared with the git-op worker thread. Reads from the render
+    /// loop drive spinner state + result-pill rendering; writes from
+    /// the worker mark Running → Done/Failed atomically.
+    pub git_op_status: std::sync::Arc<parking_lot::Mutex<GitOpStatus>>,
     pub update_check: UpdateCheck,
     pub updater: crate::update::apply::Updater,
     pub selected_theme: String,
@@ -427,6 +483,7 @@ impl App {
             pending_new_entry: None,
             selected_file: None,
             file_op_history: std::collections::VecDeque::new(),
+            git_op_status: std::sync::Arc::new(parking_lot::Mutex::new(GitOpStatus::Idle)),
             update_check: UpdateCheck::new(Default::default()),
             updater: crate::update::apply::Updater::new(),
             selected_theme: "crane-dark".to_string(),
@@ -1135,6 +1192,95 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Kick off a git operation in a background thread. Sets status
+    /// to `Running(kind)` immediately so the spinner appears the
+    /// next frame, runs the op (network-bound for push/pull/fetch),
+    /// then writes the result back as `Done` or `Failed`. Repaint is
+    /// requested at completion so the UI doesn't have to poll. The
+    /// `commit_message` arg is only consulted for Commit.
+    ///
+    /// Pre-checks short-circuit before spawning a thread when the op
+    /// would be a guaranteed no-op (Push with `ahead == 0`, Pull
+    /// with `behind == 0`) — the result lands as `Done` with a
+    /// plain-language explanation so the user sees "Nothing to
+    /// push" instead of getting an opaque "Everything up-to-date"
+    /// from git.
+    pub fn dispatch_git_op(
+        &self,
+        kind: GitOpKind,
+        repo: std::path::PathBuf,
+        ctx: egui::Context,
+        commit_message: Option<String>,
+    ) {
+        {
+            let mut guard = self.git_op_status.lock();
+            if matches!(*guard, GitOpStatus::Running(_)) {
+                return;
+            }
+            *guard = GitOpStatus::Running(kind);
+        }
+
+        // Short-circuit pre-checks. Cheap (single git rev-list).
+        // Without these, the user clicks Push and waits 800ms only
+        // to be told "Everything up-to-date" — confusing because it
+        // looks like nothing happened. Tell them upfront instead.
+        if matches!(kind, GitOpKind::Push | GitOpKind::Pull) {
+            if let Some(ab) = crate::git::ahead_behind(&repo) {
+                let mut guard = self.git_op_status.lock();
+                if kind == GitOpKind::Push && ab.ahead == 0 {
+                    *guard = GitOpStatus::Done {
+                        kind,
+                        message: if ab.behind > 0 {
+                            format!("Nothing to push (behind {} — pull first)", ab.behind)
+                        } else {
+                            "Nothing to push (up to date)".into()
+                        },
+                    };
+                    ctx.request_repaint();
+                    return;
+                }
+                if kind == GitOpKind::Pull && ab.behind == 0 {
+                    *guard = GitOpStatus::Done {
+                        kind,
+                        message: "Already up to date".into(),
+                    };
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+
+        let status = self.git_op_status.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let result: Result<String, String> = match kind {
+                GitOpKind::Commit => match commit_message.as_deref() {
+                    Some(msg) if !msg.trim().is_empty() => {
+                        crate::git::commit(&repo, msg).map(|()| "Committed".to_string())
+                    }
+                    _ => Err("No commit message".into()),
+                },
+                GitOpKind::CommitAndPush => match commit_message.as_deref() {
+                    Some(msg) if !msg.trim().is_empty() => crate::git::commit(&repo, msg)
+                        .map_err(|e| e)
+                        .and_then(|()| crate::git::push(&repo))
+                        .map(|s| format!("Committed and pushed — {s}")),
+                    _ => Err("No commit message".into()),
+                },
+                GitOpKind::Push => crate::git::push(&repo),
+                GitOpKind::Pull => crate::git::pull(&repo),
+                GitOpKind::Fetch => crate::git::fetch(&repo),
+            };
+            let mut guard = status.lock();
+            *guard = match result {
+                Ok(message) => GitOpStatus::Done { kind, message },
+                Err(error) => GitOpStatus::Failed { kind, error },
+            };
+            drop(guard);
+            ctx2.request_repaint();
+        });
     }
 
     /// Pop the last reversible Files-Pane op and undo it. Returns

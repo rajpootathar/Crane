@@ -69,6 +69,10 @@ pub struct GitStatus {
     pub changes: Vec<FileChange>,
     pub added: usize,
     pub deleted: usize,
+    /// `Some` when an upstream is configured and `git rev-list` worked.
+    /// `None` for fresh branches without `@{u}`. The Changes-pane
+    /// toolbar uses this to decide whether to render the `↑N ↓N` pair.
+    pub ahead_behind: Option<AheadBehind>,
 }
 
 pub fn status(repo: &Path) -> Option<GitStatus> {
@@ -174,11 +178,13 @@ pub fn status(repo: &Path) -> Option<GitStatus> {
     }
 
     let (added, deleted) = shortstat(repo).unwrap_or((0, 0));
+    let ahead_behind = ahead_behind(repo);
     Some(GitStatus {
         branch,
         changes,
         added,
         deleted,
+        ahead_behind,
     })
 }
 
@@ -220,7 +226,7 @@ pub fn commit(repo: &Path, message: &str) -> Result<(), String> {
     run(repo, &["commit", "-m", message])
 }
 
-pub fn push(repo: &Path) -> Result<(), String> {
+pub fn push(repo: &Path) -> Result<String, String> {
     // Run non-interactively: without these, an HTTPS remote that
     // wants credentials will block the background thread forever
     // waiting on a tty, with zero UI feedback.
@@ -231,15 +237,128 @@ pub fn push(repo: &Path) -> Result<(), String> {
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).to_string())
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        // git pushes the actual error to stderr; preserve it verbatim
+        // so the user sees auth failures / network errors clearly.
+        return Err(if stderr.is_empty() {
+            "git push failed (no error output)".into()
+        } else {
+            stderr
+        });
     }
+    // git push reports progress to stderr even on success ("To
+    // git@host…\n   abc..def  branch -> branch"). Look for the
+    // ref-update line first; otherwise distinguish "Everything
+    // up-to-date" from a generic success.
+    let combined = if stderr.is_empty() { stdout } else { stderr };
+    let summary = combined
+        .lines()
+        .rev()
+        .find_map(|l| {
+            let t = l.trim();
+            if t.contains("Everything up-to-date") {
+                Some(t.to_string())
+            } else if t.starts_with("*") || t.contains("->") {
+                Some(t.trim_start_matches('*').trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "Pushed".to_string());
+    Ok(summary)
 }
 
-pub fn pull(repo: &Path) -> Result<(), String> {
-    run(repo, &["pull", "--ff-only"])
+pub fn pull(repo: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["pull", "--ff-only"])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        return Err(if stderr.is_empty() { stdout } else { stderr });
+    }
+    // First-line summary: typically "Already up to date." or
+    // "Updating abc..def" (followed by the diff stat). Picking the
+    // first non-empty line keeps the pill compact and meaningful.
+    let summary = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Pulled".to_string());
+    Ok(summary)
+}
+
+pub fn fetch(repo: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["fetch", "--prune"])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        return Err(if stderr.is_empty() { stdout } else { stderr });
+    }
+    // git fetch prints to stderr; stdout is usually empty. Look for
+    // the "<from> -> <to>" line; otherwise report "No new refs" so
+    // the user knows nothing changed.
+    let combined = if stderr.is_empty() { stdout } else { stderr };
+    let updates: Vec<&str> = combined
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("->"))
+        .collect();
+    let summary = if updates.is_empty() {
+        "No new refs".to_string()
+    } else if updates.len() == 1 {
+        updates[0].to_string()
+    } else {
+        format!("Fetched {} refs", updates.len())
+    };
+    Ok(summary)
+}
+
+/// Commits ahead/behind the upstream branch. `None` when no upstream
+/// is configured (typical for fresh branches before first push). The
+/// UI uses this to render "↑N ↓N" indicators next to the branch name
+/// in the Changes-pane toolbar.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AheadBehind {
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+pub fn ahead_behind(repo: &Path) -> Option<AheadBehind> {
+    let out = Command::new("git")
+        .args([
+            "rev-list",
+            "--left-right",
+            "--count",
+            "@{u}...HEAD",
+        ])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let behind = parts[0].parse::<usize>().ok()?;
+    let ahead = parts[1].parse::<usize>().ok()?;
+    Some(AheadBehind { ahead, behind })
 }
 
 /// Summary of what would be lost if a worktree were removed right now.
