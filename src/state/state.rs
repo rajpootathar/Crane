@@ -1546,58 +1546,70 @@ impl App {
 
     pub fn refresh_active_git_status(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
-        // Skip polls on projects whose root folder is gone. Spares us
-        // a pile of spurious "fatal: not a git repository" subprocess
-        // errors per tick while the user hasn't relocated yet.
-        if let Some((pid, _, _)) = self.active
-            && let Some(p) = self.projects.iter().find(|p| p.id == pid)
-            && p.missing
-        {
-            return;
-        }
-        let wt = match self.active_workspace_mut() {
-            Some(w) => w,
-            None => return,
-        };
+        let active_wid = self.active.map(|(_, w, _)| w);
+        // Active workspace polls at 1s for snappy feedback while the
+        // user is interacting. Inactive workspaces poll at 5s so the
+        // Left Panel +N/-N badges update for branches touched by
+        // sub-agents or external git operations without burning a git
+        // subprocess per workspace per second.
+        let active_interval = Duration::from_millis(1000);
+        let inactive_interval = Duration::from_millis(5000);
 
-        if let Some(rx) = wt.git_rx.as_ref()
-            && let Ok(status) = rx.try_recv() {
-                // Pull the branch name forward from the freshly-polled
-                // git status: branches renamed outside Crane (e.g.
-                // `git branch -m`) now show up on the next tick instead
-                // of being frozen at worktree-creation time. Canonical
-                // `name` updates; `display_name` alias stays intact.
-                if let Some(s) = status.as_ref()
-                    && !s.branch.is_empty()
-                    && s.branch != wt.name
-                {
-                    wt.name = s.branch.clone();
-                }
-                wt.git_status = status;
-                wt.last_status_refresh = Some(now);
-                wt.git_rx = None;
+        for project in self.projects.iter_mut() {
+            // Skip polls on projects whose root folder is gone. Spares
+            // us a pile of spurious "fatal: not a git repository"
+            // subprocess errors per tick while the user hasn't
+            // relocated yet.
+            if project.missing {
+                continue;
             }
+            for wt in project.workspaces.iter_mut() {
+                if let Some(rx) = wt.git_rx.as_ref()
+                    && let Ok(status) = rx.try_recv() {
+                        // Pull the branch name forward from the
+                        // freshly-polled git status: branches renamed
+                        // outside Crane (e.g. `git branch -m`) now show
+                        // up on the next tick instead of being frozen
+                        // at worktree-creation time. Canonical `name`
+                        // updates; `display_name` alias stays intact.
+                        if let Some(s) = status.as_ref()
+                            && !s.branch.is_empty()
+                            && s.branch != wt.name
+                        {
+                            wt.name = s.branch.clone();
+                        }
+                        wt.git_status = status;
+                        wt.last_status_refresh = Some(now);
+                        wt.git_rx = None;
+                    }
 
-        if wt.git_rx.is_some() {
-            return;
-        }
-        let due = wt
-            .last_status_refresh
-            .map(|t| now.duration_since(t) > Duration::from_millis(2000))
-            .unwrap_or(true);
-        if !due {
-            return;
-        }
+                if wt.git_rx.is_some() {
+                    continue;
+                }
+                let interval = if Some(wt.id) == active_wid {
+                    active_interval
+                } else {
+                    inactive_interval
+                };
+                let due = wt
+                    .last_status_refresh
+                    .map(|t| now.duration_since(t) > interval)
+                    .unwrap_or(true);
+                if !due {
+                    continue;
+                }
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let path = wt.path.clone();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let status = git::status(&path);
-            let _ = tx.send(status);
-            ctx.request_repaint();
-        });
-        wt.git_rx = Some(rx);
+                let (tx, rx) = std::sync::mpsc::channel();
+                let path = wt.path.clone();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let status = git::status(&path);
+                    let _ = tx.send(status);
+                    ctx.request_repaint();
+                });
+                wt.git_rx = Some(rx);
+            }
+        }
     }
 
     pub fn open_new_workspace_modal(&mut self, pid: ProjectId) {
