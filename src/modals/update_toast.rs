@@ -142,22 +142,40 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                             ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
                         }
                         UpdateState::Ready { .. } => {
-                            if ui
-                                .button(
-                                    egui::RichText::new(format!(
-                                        "{}  Restart now",
-                                        egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE
-                                    ))
-                                    .size(12.0)
-                                    .strong(),
-                                )
-                                .clicked()
-                            {
-                                app.updater.apply_and_exit();
-                            }
-                            if ui.button(egui::RichText::new("Later").size(12.0)).clicked() {
-                                app.update_check.dismiss_session();
-                            }
+                            // Single horizontal row: "Later" on the
+                            // left as the safe default, "Restart now"
+                            // pinned to the right via right_to_left
+                            // layout so the destructive action is
+                            // off the user's natural Tab/click path.
+                            // The two buttons are pushed apart by a
+                            // flexible spacer to prevent accidental
+                            // double-fires from rapid clicks.
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button(egui::RichText::new("Later").size(12.0))
+                                    .clicked()
+                                {
+                                    app.update_check.dismiss_session();
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .button(
+                                                egui::RichText::new(format!(
+                                                    "{}  Restart now",
+                                                    egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE
+                                                ))
+                                                .size(12.0)
+                                                .strong(),
+                                            )
+                                            .clicked()
+                                        {
+                                            app.updater.apply_and_exit();
+                                        }
+                                    },
+                                );
+                            });
                         }
                         UpdateState::Failed(err) => {
                             ui.label(

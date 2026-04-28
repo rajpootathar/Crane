@@ -91,6 +91,12 @@ impl UpdateCheck {
         if let Some(u) = &self.available {
             self.dismissed_this_session = Some(u.version.clone());
         }
+        // Clear manual_check too — otherwise should_show() short-
+        // circuits on it and the toast keeps appearing despite
+        // dismissed_this_session being set. The manual flag's job
+        // is done once the user has acted on the prompt.
+        self.manual_check = false;
+        self.manual_result_seen = true;
     }
 
     pub fn dismiss_forever(&mut self) {
@@ -99,6 +105,8 @@ impl UpdateCheck {
                 .insert(u.version.clone(), PromptState::Dismissed);
             self.dismissed_this_session = Some(u.version.clone());
         }
+        self.manual_check = false;
+        self.manual_result_seen = true;
     }
 
     pub fn remind_later(&mut self) {
@@ -109,6 +117,8 @@ impl UpdateCheck {
             );
             self.dismissed_this_session = Some(u.version.clone());
         }
+        self.manual_check = false;
+        self.manual_result_seen = true;
     }
 }
 
