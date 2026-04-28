@@ -404,8 +404,8 @@ fn render_pane(
     // paints a red outline on id-collision and also pays a hashing cost
     // to detect them, so this helps both speed and the "red flash" bug.
     child.push_id(("pane_body", id), |child| match &mut pane.content {
-        PaneContent::Terminal(term) => {
-            crate::terminal::view::render_terminal(child, term, font_size, is_focus);
+        PaneContent::Terminal(tp) => {
+            crate::terminal::view::render_terminal_pane(child, tp, font_size, is_focus, id);
         }
         PaneContent::Files(files) => {
             file_view::render(

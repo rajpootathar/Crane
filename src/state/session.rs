@@ -137,15 +137,20 @@ pub struct SPane {
 #[derive(Serialize, Deserialize)]
 pub enum SPaneContent {
     Terminal {
+        /// Legacy single-tab fields — populated for old session files.
+        /// Newer writes use `tabs` + `active` below and leave these
+        /// empty. Restore reads the legacy fields only when `tabs` is
+        /// missing/empty.
+        #[serde(default, skip_serializing_if = "path_is_empty")]
         cwd: PathBuf,
-        /// Plain-text grid snapshot (rows joined with CRLF). Preferred
-        /// format — replay is width-stable.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         history_text: String,
-        /// Legacy raw-PTY-byte log. Kept so old session files still
-        /// restore *something*, but write path no longer populates it.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         history_b64: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tabs: Vec<STerminalTab>,
+        #[serde(default)]
+        active: usize,
     },
     Files {
         files: Vec<SFile>,
@@ -178,6 +183,17 @@ pub enum SPaneContent {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SBrowserTab {
     pub url: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct STerminalTab {
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub history_text: String,
+}
+
+fn path_is_empty(p: &PathBuf) -> bool {
+    p.as_os_str().is_empty()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -503,13 +519,23 @@ impl SNode {
 impl SPane {
     fn from_pane(id: PaneId, p: &Pane) -> Self {
         let content = match &p.content {
-            PaneContent::Terminal(t) => {
+            PaneContent::Terminal(tp) => {
                 // Rendered-grid text snapshot instead of the raw PTY byte
                 // log — see Terminal::snapshot_text for the reasoning.
+                let tabs: Vec<STerminalTab> = tp
+                    .tabs
+                    .iter()
+                    .map(|t| STerminalTab {
+                        cwd: t.cwd.clone(),
+                        history_text: t.snapshot_text(),
+                    })
+                    .collect();
                 SPaneContent::Terminal {
-                    cwd: t.cwd.clone(),
-                    history_text: t.snapshot_text(),
+                    cwd: PathBuf::new(),
+                    history_text: String::new(),
                     history_b64: String::new(),
+                    tabs,
+                    active: tp.active,
                 }
             }
             PaneContent::Files(f) => SPaneContent::Files {
@@ -562,43 +588,64 @@ impl SPane {
                 cwd: saved_cwd,
                 history_text,
                 history_b64,
+                tabs,
+                active,
             } => {
-                let spawn_cwd = if saved_cwd.as_os_str().is_empty() {
-                    cwd
+                // New format (tabs vec) wins. Fall back to the legacy
+                // single-tab fields when `tabs` is empty — keeps old
+                // session.json files restoring without surprise.
+                let saved_tabs: Vec<STerminalTab> = if !tabs.is_empty() {
+                    tabs
                 } else {
-                    saved_cwd.as_path()
+                    let legacy_text = if !history_text.is_empty() {
+                        history_text.clone()
+                    } else if !history_b64.is_empty() {
+                        let raw = base64_decode(&history_b64).unwrap_or_default();
+                        String::from_utf8_lossy(&strip_ansi(&raw)).into_owned()
+                    } else {
+                        String::new()
+                    };
+                    vec![STerminalTab {
+                        cwd: saved_cwd.clone(),
+                        history_text: legacy_text,
+                    }]
                 };
-                // Prefer the text snapshot. Fall back to legacy raw-byte
-                // log only when a session.json pre-dating the text-
-                // snapshot format is loaded — strip ANSI escapes so the
-                // staggered RPROMPT mess doesn't come back.
-                let replay_text = if !history_text.is_empty() {
-                    history_text.clone()
-                } else if !history_b64.is_empty() {
-                    let raw = base64_decode(&history_b64).unwrap_or_default();
-                    String::from_utf8_lossy(&strip_ansi(&raw)).into_owned()
+
+                let spawned: Vec<crate::terminal::Terminal> = saved_tabs
+                    .into_iter()
+                    .filter_map(|st| {
+                        let spawn_cwd: &Path = if st.cwd.as_os_str().is_empty() {
+                            cwd
+                        } else {
+                            st.cwd.as_path()
+                        };
+                        let result = if st.history_text.is_empty() {
+                            crate::terminal::Terminal::spawn(
+                                ctx.clone(),
+                                80,
+                                24,
+                                Some(spawn_cwd),
+                            )
+                        } else {
+                            crate::terminal::Terminal::spawn_with_text_history(
+                                ctx.clone(),
+                                80,
+                                24,
+                                Some(spawn_cwd),
+                                &st.history_text,
+                            )
+                        };
+                        result.ok()
+                    })
+                    .collect();
+                if spawned.is_empty() {
+                    PaneContent::Files(FilesPane::empty())
                 } else {
-                    String::new()
-                };
-                let spawned = if replay_text.is_empty() {
-                    crate::terminal::Terminal::spawn(
-                        ctx.clone(),
-                        80,
-                        24,
-                        Some(spawn_cwd),
-                    )
-                } else {
-                    crate::terminal::Terminal::spawn_with_text_history(
-                        ctx.clone(),
-                        80,
-                        24,
-                        Some(spawn_cwd),
-                        &replay_text,
-                    )
-                };
-                match spawned {
-                    Ok(t) => PaneContent::Terminal(t),
-                    Err(_) => PaneContent::Files(FilesPane::empty()),
+                    let active_idx = active.min(spawned.len().saturating_sub(1));
+                    PaneContent::Terminal(crate::state::layout::TerminalPane {
+                        tabs: spawned,
+                        active: active_idx,
+                    })
                 }
             }
             SPaneContent::Files { files, active } => {

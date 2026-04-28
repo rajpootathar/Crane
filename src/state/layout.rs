@@ -301,8 +301,53 @@ impl BrowserPane {
 #[derive(Default)]
 pub struct WelcomePane;
 
+/// Container for one or more terminals sharing a single Pane. Mirrors
+/// the `FilesPane` / `BrowserPane` multi-tab pattern: only the active
+/// tab renders into the pane body, the inactive ones keep streaming
+/// PTY output in the background. The "+" button on the tab strip
+/// appends a new tab; closing the last tab is the caller's signal to
+/// close the whole Pane.
+pub struct TerminalPane {
+    pub tabs: Vec<Terminal>,
+    pub active: usize,
+}
+
+impl TerminalPane {
+    pub fn single(term: Terminal) -> Self {
+        Self { tabs: vec![term], active: 0 }
+    }
+
+    pub fn active_terminal(&self) -> Option<&Terminal> {
+        self.tabs.get(self.active)
+    }
+
+    #[allow(dead_code)]
+    pub fn active_terminal_mut(&mut self) -> Option<&mut Terminal> {
+        self.tabs.get_mut(self.active)
+    }
+
+    pub fn add(&mut self, term: Terminal) {
+        self.tabs.push(term);
+        self.active = self.tabs.len() - 1;
+    }
+
+    pub fn close(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if self.active > idx {
+            self.active -= 1;
+        }
+    }
+}
+
 pub enum PaneContent {
-    Terminal(Terminal),
+    Terminal(TerminalPane),
     Files(FilesPane),
     Markdown(MarkdownPane),
     Diff(DiffPane),
@@ -423,7 +468,7 @@ impl Layout {
     pub fn split_focused_with_terminal(&mut self, ctx: &egui::Context, dir: Dir) {
         let cwd = self.cwd.clone();
         if let Ok(term) = Terminal::spawn(ctx.clone(), 80, 24, Some(&cwd)) {
-            self.add_pane(PaneContent::Terminal(term), Some(dir));
+            self.add_pane(PaneContent::Terminal(TerminalPane::single(term)), Some(dir));
         }
     }
 

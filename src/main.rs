@@ -347,24 +347,23 @@ impl eframe::App for CraneApp {
         if !switcher_consumed {
             shortcuts::handle(&ctx, &mut self.app, &mut self.pending_close);
         }
-        // Shell exited (user typed `exit`, Ctrl-D, kill, etc.) — close
-        // any Terminal panes whose PTY reader hit EOF. No confirm prompt:
-        // the process is already gone.
+        // Shell exited (user typed `exit`, Ctrl-D, kill, etc.) — drop
+        // dead tabs from each Terminal Pane. If the last tab in a pane
+        // dies, close the whole pane. No confirm prompt: the process
+        // is already gone.
         if let Some(ws) = self.app.active_layout() {
-            let dead: Vec<_> = ws
-                .panes
-                .iter()
-                .filter_map(|(id, pane)| {
-                    if let state::layout::PaneContent::Terminal(t) = &pane.content
-                        && !t.is_alive()
-                    {
-                        Some(*id)
-                    } else {
-                        None
+            let mut dead_panes: Vec<state::layout::PaneId> = Vec::new();
+            for (id, pane) in ws.panes.iter_mut() {
+                if let state::layout::PaneContent::Terminal(tp) = &mut pane.content {
+                    tp.tabs.retain(|t| t.is_alive());
+                    if tp.tabs.is_empty() {
+                        dead_panes.push(*id);
+                    } else if tp.active >= tp.tabs.len() {
+                        tp.active = tp.tabs.len() - 1;
                     }
-                })
-                .collect();
-            for id in dead {
+                }
+            }
+            for id in dead_panes {
                 ws.focus = Some(id);
                 ws.close_focused();
             }
@@ -610,7 +609,7 @@ impl eframe::App for CraneApp {
                     PaneAction::Close(id) => {
                         let running = matches!(
                             ws.panes.get(&id).map(|p| &p.content),
-                            Some(state::layout::PaneContent::Terminal(t)) if t.has_foreground_process()
+                            Some(state::layout::PaneContent::Terminal(t)) if t.tabs.iter().any(|x| x.has_foreground_process())
                         );
                         if running {
                             self.pending_close = Some(id);
@@ -649,7 +648,9 @@ impl eframe::App for CraneApp {
                             Some(&cwd),
                         ) {
                             ws.replace_focused_content(
-                                state::layout::PaneContent::Terminal(term),
+                                state::layout::PaneContent::Terminal(
+                                    state::layout::TerminalPane::single(term),
+                                ),
                                 "Terminal".into(),
                             );
                         }

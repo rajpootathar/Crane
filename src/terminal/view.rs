@@ -342,6 +342,214 @@ fn pixel_to_point(
     (Point::new(Line(grid_line), Column(col)), side)
 }
 
+/// Render the multi-tab Terminal Pane: a thin tab strip at the top
+/// (one chip per terminal + a trailing "+" button to spawn a new
+/// terminal in the same pane) and the active terminal underneath.
+/// Mirrors the Files-Pane tab pattern. When the user clicks × on the
+/// last remaining tab the pane is left with zero tabs — `main.rs`'s
+/// dead-tab sweep then closes the pane on the next frame.
+pub fn render_terminal_pane(
+    ui: &mut egui::Ui,
+    tp: &mut crate::state::layout::TerminalPane,
+    font_size: f32,
+    has_focus: bool,
+    pane_id: crate::state::layout::PaneId,
+) {
+    if tp.tabs.is_empty() {
+        return;
+    }
+
+    // Always show the tab strip — mirrors the Files Pane, and keeps
+    // the "+" button reachable so the user can spawn a second
+    // terminal in the same pane without learning a keybind. The chip
+    // is compact so a single-tab pane only loses ~26 px to the strip.
+    let mut activate: Option<usize> = None;
+    let mut close: Option<usize> = None;
+    let mut spawn_new = false;
+
+    {
+        let strip_height = 26.0;
+        let (strip_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), strip_height),
+            egui::Sense::hover(),
+        );
+        let mut strip_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(strip_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        strip_ui.spacing_mut().item_spacing.x = 2.0;
+        strip_ui.add_space(4.0);
+
+        let tab_count = tp.tabs.len();
+        let active_idx = tp.active;
+        for idx in 0..tab_count {
+            let cwd_label = tp
+                .tabs
+                .get(idx)
+                .map(|t| {
+                    t.cwd
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("tab {}", idx + 1))
+                })
+                .unwrap_or_else(|| format!("tab {}", idx + 1));
+            let (clicked, close_clicked) =
+                draw_terminal_tab(&mut strip_ui, &cwd_label, idx == active_idx, pane_id, idx);
+            if clicked {
+                activate = Some(idx);
+            }
+            if close_clicked {
+                close = Some(idx);
+            }
+        }
+
+        // "+" button — pinned to the right edge of the strip.
+        strip_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(4.0);
+            let t = theme::current();
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(22.0, 22.0),
+                egui::Sense::click(),
+            );
+            if resp.hovered() {
+                ui.painter().rect_filled(
+                    rect,
+                    4.0,
+                    t.row_hover.to_color32(),
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                egui_phosphor::regular::PLUS,
+                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                t.text.to_color32(),
+            );
+            if resp.clicked() {
+                spawn_new = true;
+            }
+        });
+
+        ui.add_space(2.0);
+    }
+
+    if let Some(idx) = activate {
+        tp.active = idx;
+    }
+    if let Some(idx) = close {
+        tp.close(idx);
+        if tp.tabs.is_empty() {
+            return;
+        }
+    }
+    if spawn_new {
+        // Spawn against the active tab's cwd so a new tab opens where
+        // the user is currently working, not always at the workspace
+        // root. Cols/rows seeded at 80×24 — `render_terminal` resizes
+        // on the next frame to match the actual pane viewport.
+        let cwd = tp
+            .active_terminal()
+            .map(|t| t.cwd.clone())
+            .unwrap_or_default();
+        if let Ok(term) = Terminal::spawn(
+            ui.ctx().clone(),
+            80,
+            24,
+            if cwd.as_os_str().is_empty() { None } else { Some(cwd.as_path()) },
+        ) {
+            tp.add(term);
+        }
+    }
+
+    let active = tp.active.min(tp.tabs.len().saturating_sub(1));
+    tp.active = active;
+    if let Some(term) = tp.tabs.get_mut(active) {
+        render_terminal(ui, term, font_size, has_focus);
+    }
+}
+
+fn draw_terminal_tab(
+    ui: &mut egui::Ui,
+    name: &str,
+    is_active: bool,
+    pane_id: crate::state::layout::PaneId,
+    idx: usize,
+) -> (bool, bool) {
+    let font = egui::FontId::new(11.5, egui::FontFamily::Proportional);
+    let close_font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+    let text_w = ui
+        .fonts_mut(|f| f.layout_no_wrap(name.to_string(), font.clone(), egui::Color32::WHITE))
+        .size()
+        .x;
+    let padding_x = 8.0;
+    let gap = 5.0;
+    let close_size = 14.0;
+    let height = 22.0;
+    let width = padding_x + text_w + gap + close_size + padding_x - 2.0;
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, height),
+        egui::Sense::click(),
+    );
+    let close_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.max.x - padding_x - close_size + 2.0,
+            rect.min.y + (height - close_size) / 2.0,
+        ),
+        egui::vec2(close_size, close_size),
+    );
+    let close_response = ui.interact(
+        close_rect,
+        ui.id().with(("term_tab_close", pane_id, idx)),
+        egui::Sense::click(),
+    );
+
+    let t = theme::current();
+    let accent_tint = {
+        let a = t.accent;
+        egui::Color32::from_rgba_unmultiplied(a.r, a.g, a.b, 55)
+    };
+    let (bg, fg) = if is_active {
+        (accent_tint, t.text.to_color32())
+    } else if response.hovered() || close_response.hovered() {
+        (t.row_hover.to_color32(), t.text.to_color32())
+    } else {
+        (egui::Color32::TRANSPARENT, t.text_muted.to_color32())
+    };
+    if bg != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 5.0, bg);
+    }
+    ui.painter().text(
+        egui::pos2(rect.min.x + padding_x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        name,
+        font,
+        fg,
+    );
+    if close_response.hovered() {
+        ui.painter().rect_filled(
+            close_rect.shrink(1.0),
+            4.0,
+            t.error.to_color32(),
+        );
+    }
+    ui.painter().text(
+        close_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        egui_phosphor::regular::X,
+        close_font,
+        fg,
+    );
+    if response.hovered() || close_response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let closed = close_response.clicked() || response.middle_clicked();
+    (response.clicked() && !close_response.hovered(), closed)
+}
+
 pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f32, has_focus: bool) {
     let font_id = FontId::new(font_size, FontFamily::Monospace);
     // Measure the stride egui actually uses when it lays out a galley,
