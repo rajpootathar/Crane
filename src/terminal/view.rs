@@ -366,6 +366,14 @@ pub fn render_terminal_pane(
     let mut activate: Option<usize> = None;
     let mut close: Option<usize> = None;
     let mut spawn_new = false;
+    let mut start_rename: Option<usize> = None;
+    let mut commit_rename: Option<(usize, String)> = None;
+    let mut cancel_rename = false;
+
+    // Borrow `tp.renaming` out for the duration of the strip so the
+    // TextEdit can mutate the buffer. Put it back at the end (only if
+    // neither commit nor cancel fired).
+    let mut rename_state: Option<(usize, String)> = tp.renaming.take();
 
     {
         let strip_height = 26.0;
@@ -384,24 +392,79 @@ pub fn render_terminal_pane(
         let tab_count = tp.tabs.len();
         let active_idx = tp.active;
         for idx in 0..tab_count {
-            let cwd_label = tp
-                .tabs
-                .get(idx)
-                .map(|t| {
-                    t.cwd
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("tab {}", idx + 1))
-                })
-                .unwrap_or_else(|| format!("tab {}", idx + 1));
-            let (clicked, close_clicked) =
-                draw_terminal_tab(&mut strip_ui, &cwd_label, idx == active_idx, pane_id, idx);
-            if clicked {
-                activate = Some(idx);
-            }
-            if close_clicked {
-                close = Some(idx);
+            let label = tab_label(&tp.tabs[idx], idx);
+            let is_renaming_this =
+                matches!(&rename_state, Some((i, _)) if *i == idx);
+            if is_renaming_this {
+                if let Some((_, buf)) = rename_state.as_mut() {
+                    let te_id = egui::Id::new(("term_tab_rename", pane_id, idx));
+                    let resp = strip_ui.add(
+                        egui::TextEdit::singleline(buf)
+                            .id(te_id)
+                            .desired_width(110.0)
+                            .font(egui::FontId::new(11.5, egui::FontFamily::Proportional)),
+                    );
+                    // Auto-focus + select all on the first frame the
+                    // editor appears so the user can type a fresh name
+                    // without hitting Cmd+A first.
+                    let focus_done_id =
+                        egui::Id::new(("term_tab_rename_focused", pane_id, idx));
+                    let already_focused = strip_ui
+                        .ctx()
+                        .data(|d| d.get_temp::<bool>(focus_done_id))
+                        .unwrap_or(false);
+                    if !already_focused {
+                        resp.request_focus();
+                        if let Some(mut state) = egui::TextEdit::load_state(
+                            strip_ui.ctx(),
+                            te_id,
+                        ) {
+                            let len = buf.chars().count();
+                            state.cursor.set_char_range(Some(
+                                egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(len),
+                                ),
+                            ));
+                            state.store(strip_ui.ctx(), te_id);
+                        }
+                        strip_ui.ctx().data_mut(|d| {
+                            d.insert_temp(focus_done_id, true);
+                        });
+                    }
+                    let enter = strip_ui
+                        .input(|i| i.key_pressed(egui::Key::Enter));
+                    let esc = strip_ui
+                        .input(|i| i.key_pressed(egui::Key::Escape));
+                    if enter {
+                        commit_rename = Some((idx, buf.clone()));
+                        strip_ui.ctx().data_mut(|d| {
+                            d.remove::<bool>(focus_done_id);
+                        });
+                    } else if esc || resp.lost_focus() {
+                        cancel_rename = true;
+                        strip_ui.ctx().data_mut(|d| {
+                            d.remove::<bool>(focus_done_id);
+                        });
+                    }
+                }
+            } else {
+                let (clicked, close_clicked, dbl_clicked) = draw_terminal_tab(
+                    &mut strip_ui,
+                    &label,
+                    idx == active_idx,
+                    pane_id,
+                    idx,
+                );
+                if clicked {
+                    activate = Some(idx);
+                }
+                if close_clicked {
+                    close = Some(idx);
+                }
+                if dbl_clicked {
+                    start_rename = Some(idx);
+                }
             }
         }
 
@@ -436,6 +499,33 @@ pub fn render_terminal_pane(
         ui.add_space(2.0);
     }
 
+    // Apply rename results before re-installing renaming on tp.
+    if let Some((idx, buf)) = commit_rename {
+        if let Some(tab) = tp.tabs.get_mut(idx) {
+            let trimmed = buf.trim();
+            tab.name = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        rename_state = None;
+    }
+    if cancel_rename {
+        rename_state = None;
+    }
+    if let Some(idx) = start_rename
+        && rename_state.is_none()
+    {
+        let initial = tp
+            .tabs
+            .get(idx)
+            .map(|t| tab_label(t, idx))
+            .unwrap_or_default();
+        rename_state = Some((idx, initial));
+    }
+    tp.renaming = rename_state;
+
     if let Some(idx) = activate {
         tp.active = idx;
     }
@@ -466,9 +556,21 @@ pub fn render_terminal_pane(
 
     let active = tp.active.min(tp.tabs.len().saturating_sub(1));
     tp.active = active;
-    if let Some(term) = tp.tabs.get_mut(active) {
-        render_terminal(ui, term, font_size, has_focus);
+    if let Some(tab) = tp.tabs.get_mut(active) {
+        render_terminal(ui, &mut tab.terminal, font_size, has_focus);
     }
+}
+
+fn tab_label(tab: &crate::state::layout::TerminalTab, idx: usize) -> String {
+    if let Some(name) = tab.name.as_ref() {
+        return name.clone();
+    }
+    tab.terminal
+        .cwd
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("tab {}", idx + 1))
 }
 
 fn draw_terminal_tab(
@@ -477,7 +579,7 @@ fn draw_terminal_tab(
     is_active: bool,
     pane_id: crate::state::layout::PaneId,
     idx: usize,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let font = egui::FontId::new(11.5, egui::FontFamily::Proportional);
     let close_font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
     let text_w = ui
@@ -492,7 +594,7 @@ fn draw_terminal_tab(
 
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(width, height),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
     let close_rect = egui::Rect::from_min_size(
         egui::pos2(
@@ -547,7 +649,8 @@ fn draw_terminal_tab(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let closed = close_response.clicked() || response.middle_clicked();
-    (response.clicked() && !close_response.hovered(), closed)
+    let dbl = response.double_clicked() && !close_response.hovered();
+    (response.clicked() && !close_response.hovered(), closed, dbl)
 }
 
 pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f32, has_focus: bool) {

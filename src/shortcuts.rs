@@ -223,7 +223,7 @@ fn terminal_is_running(app: &App, id: PaneId) -> bool {
     };
     match &pane.content {
         crate::state::layout::PaneContent::Terminal(t) => {
-            t.tabs.iter().any(|x| x.has_foreground_process())
+            t.tabs.iter().any(|x| x.terminal.has_foreground_process())
         }
         _ => false,
     }

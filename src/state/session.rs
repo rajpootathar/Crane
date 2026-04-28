@@ -190,6 +190,11 @@ pub struct STerminalTab {
     pub cwd: PathBuf,
     #[serde(default)]
     pub history_text: String,
+    /// User-set display name for the tab chip. Empty string means
+    /// "no override" — restore lands `None` in that case so the cwd
+    /// basename shows again.
+    #[serde(default)]
+    pub name: String,
 }
 
 fn path_is_empty(p: &PathBuf) -> bool {
@@ -526,8 +531,9 @@ impl SPane {
                     .tabs
                     .iter()
                     .map(|t| STerminalTab {
-                        cwd: t.cwd.clone(),
-                        history_text: t.snapshot_text(),
+                        cwd: t.terminal.cwd.clone(),
+                        history_text: t.terminal.snapshot_text(),
+                        name: t.name.clone().unwrap_or_default(),
                     })
                     .collect();
                 SPaneContent::Terminal {
@@ -608,10 +614,11 @@ impl SPane {
                     vec![STerminalTab {
                         cwd: saved_cwd.clone(),
                         history_text: legacy_text,
+                        name: String::new(),
                     }]
                 };
 
-                let spawned: Vec<crate::terminal::Terminal> = saved_tabs
+                let spawned: Vec<crate::state::layout::TerminalTab> = saved_tabs
                     .into_iter()
                     .filter_map(|st| {
                         let spawn_cwd: &Path = if st.cwd.as_os_str().is_empty() {
@@ -635,7 +642,14 @@ impl SPane {
                                 &st.history_text,
                             )
                         };
-                        result.ok()
+                        result.ok().map(|term| crate::state::layout::TerminalTab {
+                            terminal: term,
+                            name: if st.name.trim().is_empty() {
+                                None
+                            } else {
+                                Some(st.name)
+                            },
+                        })
                     })
                     .collect();
                 if spawned.is_empty() {
@@ -645,6 +659,7 @@ impl SPane {
                     PaneContent::Terminal(crate::state::layout::TerminalPane {
                         tabs: spawned,
                         active: active_idx,
+                        renaming: None,
                     })
                 }
             }

@@ -301,6 +301,26 @@ impl BrowserPane {
 #[derive(Default)]
 pub struct WelcomePane;
 
+/// One tab inside a [`TerminalPane`]. The PTY-bearing [`Terminal`]
+/// stays focused on its own concerns (grid, reader thread, child
+/// process); UI-only state — the optional user-set display name —
+/// rides on the wrapper instead so renaming a tab doesn't leak into
+/// the terminal abstraction.
+pub struct TerminalTab {
+    pub terminal: Terminal,
+    /// User-set display name. When `Some(x)`, the tab chip renders
+    /// `x` in place of the cwd-basename default; on rename-clear (`x`
+    /// trimmed to empty) we drop back to `None` and the cwd label
+    /// shows again.
+    pub name: Option<String>,
+}
+
+impl TerminalTab {
+    pub fn new(terminal: Terminal) -> Self {
+        Self { terminal, name: None }
+    }
+}
+
 /// Container for one or more terminals sharing a single Pane. Mirrors
 /// the `FilesPane` / `BrowserPane` multi-tab pattern: only the active
 /// tab renders into the pane body, the inactive ones keep streaming
@@ -308,26 +328,34 @@ pub struct WelcomePane;
 /// appends a new tab; closing the last tab is the caller's signal to
 /// close the whole Pane.
 pub struct TerminalPane {
-    pub tabs: Vec<Terminal>,
+    pub tabs: Vec<TerminalTab>,
     pub active: usize,
+    /// Inline rename buffer. `Some((idx, buf))` while the user is
+    /// editing the chip label for tab `idx` via double-click. Enter
+    /// commits, Esc cancels. Not persisted.
+    pub renaming: Option<(usize, String)>,
 }
 
 impl TerminalPane {
     pub fn single(term: Terminal) -> Self {
-        Self { tabs: vec![term], active: 0 }
+        Self {
+            tabs: vec![TerminalTab::new(term)],
+            active: 0,
+            renaming: None,
+        }
     }
 
     pub fn active_terminal(&self) -> Option<&Terminal> {
-        self.tabs.get(self.active)
+        self.tabs.get(self.active).map(|t| &t.terminal)
     }
 
     #[allow(dead_code)]
     pub fn active_terminal_mut(&mut self) -> Option<&mut Terminal> {
-        self.tabs.get_mut(self.active)
+        self.tabs.get_mut(self.active).map(|t| &mut t.terminal)
     }
 
     pub fn add(&mut self, term: Terminal) {
-        self.tabs.push(term);
+        self.tabs.push(TerminalTab::new(term));
         self.active = self.tabs.len() - 1;
     }
 
@@ -336,6 +364,17 @@ impl TerminalPane {
             return;
         }
         self.tabs.remove(idx);
+        // Cancel any in-flight rename targeting the closed tab — and
+        // shift the rename index down if a tab to its left went away.
+        let rid = self.renaming.as_ref().map(|(r, _)| *r);
+        if let Some(rid) = rid {
+            if rid == idx {
+                self.renaming = None;
+            } else if rid > idx
+                && let Some((r, _)) = self.renaming.as_mut() {
+                    *r -= 1;
+                }
+        }
         if self.tabs.is_empty() {
             self.active = 0;
         } else if self.active >= self.tabs.len() {

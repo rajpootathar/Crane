@@ -355,7 +355,7 @@ impl eframe::App for CraneApp {
             let mut dead_panes: Vec<state::layout::PaneId> = Vec::new();
             for (id, pane) in ws.panes.iter_mut() {
                 if let state::layout::PaneContent::Terminal(tp) = &mut pane.content {
-                    tp.tabs.retain(|t| t.is_alive());
+                    tp.tabs.retain(|t| t.terminal.is_alive());
                     if tp.tabs.is_empty() {
                         dead_panes.push(*id);
                     } else if tp.active >= tp.tabs.len() {
@@ -609,7 +609,7 @@ impl eframe::App for CraneApp {
                     PaneAction::Close(id) => {
                         let running = matches!(
                             ws.panes.get(&id).map(|p| &p.content),
-                            Some(state::layout::PaneContent::Terminal(t)) if t.tabs.iter().any(|x| x.has_foreground_process())
+                            Some(state::layout::PaneContent::Terminal(t)) if t.tabs.iter().any(|x| x.terminal.has_foreground_process())
                         );
                         if running {
                             self.pending_close = Some(id);
