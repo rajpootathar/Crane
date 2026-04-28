@@ -685,6 +685,7 @@ impl eframe::App for CraneApp {
         self.render_confirm_close(&ctx);
         modals::render_confirm_remove_worktree(&ctx, &mut self.app);
         modals::render_confirm_close_tab(&ctx, &mut self.app);
+        modals::render_confirm_delete_file(&ctx, &mut self.app);
         let _ = modals::tab_switcher::render(&ctx, &mut self.app);
         render_lsp_install_prompt(&ctx, &mut self.app);
         render_lsp_download_toast(&ctx, &self.app);

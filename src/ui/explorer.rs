@@ -859,7 +859,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
         app.selected_file = Some(p.clone());
     }
     if let Some(p) = delete_request {
-        delete_to_trash(app, &p);
+        app.pending_delete_file = Some(crate::state::PendingDeleteFile { path: p });
     }
     if let Some((src, dst_dir)) = drop_request {
         move_path(app, &src, &dst_dir);
@@ -1063,23 +1063,6 @@ fn render_fs_dir(
             );
         }
     }
-}
-
-/// Move a path to the system trash via the `trash` crate (Finder
-/// trash on macOS, `gio trash` / FreeDesktop spec on Linux, Recycle
-/// Bin on Windows). After delete, scrub any open File Tab pointing
-/// at the gone path so the editor doesn't try to write back to a
-/// trashed file.
-fn delete_to_trash(app: &mut App, path: &std::path::Path) {
-    if let Err(e) = trash::delete(path) {
-        app.git_error = Some(format!("Trash: {e}"));
-        return;
-    }
-    if app.selected_file.as_deref() == Some(path) {
-        app.selected_file = None;
-    }
-    app.close_file_tabs_for_path(path);
-    push_file_op(app, FileOp::Trash { path: path.to_path_buf() });
 }
 
 /// Move a path into a target directory via `std::fs::rename`. Only

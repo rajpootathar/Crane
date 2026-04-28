@@ -357,6 +357,10 @@ pub struct TabSwitcherState {
     pub cmd_was_held: bool,
 }
 
+pub struct PendingDeleteFile {
+    pub path: PathBuf,
+}
+
 pub struct PendingRemoveWorktree {
     pub project_id: ProjectId,
     pub workspace_id: WorkspaceId,
@@ -365,6 +369,11 @@ pub struct PendingRemoveWorktree {
     pub unpushed_commits: usize,
     pub modified_files: usize,
     pub has_upstream: bool,
+    /// True when this is the project's main checkout (path == project
+    /// root), not an added worktree. The modal skips
+    /// `git worktree remove` for main since git refuses to remove the
+    /// primary worktree — only the in-memory entry is dropped.
+    pub is_main: bool,
 }
 
 pub struct App {
@@ -436,6 +445,11 @@ pub struct App {
     /// worktree has unpushed commits or modified files. `None` while no
     /// modal is open.
     pub pending_remove_worktree: Option<PendingRemoveWorktree>,
+    /// Pending "Move file to Trash" awaiting user confirmation. Set by
+    /// the Files-Pane right-click "Move to Trash" action and the
+    /// Cmd+Backspace / Delete shortcut. Cleared on Cancel / Esc /
+    /// confirm.
+    pub pending_delete_file: Option<PendingDeleteFile>,
     /// Pending "Close workspace tab" awaiting user confirmation.
     /// Populated by the × button or middle-click on a tab row in the
     /// projects pane — closing a tab drops its terminal / pane
@@ -506,6 +520,7 @@ impl App {
             pending_gotos: Vec::new(),
             repo_branch_cache: std::collections::HashMap::new(),
             pending_remove_worktree: None,
+            pending_delete_file: None,
             pending_close_tab: None,
             tab_mru: Vec::new(),
             tab_switcher: None,

@@ -25,6 +25,7 @@ pub fn handle(
         || app.new_workspace_modal.is_some()
         || app.pending_remove_worktree.is_some()
         || app.pending_close_tab.is_some()
+        || app.pending_delete_file.is_some()
         || !app.missing_project_modals.is_empty()
         || pending_close.is_some();
     if modal_open {
@@ -49,6 +50,9 @@ pub fn handle(
             }
             if esc && app.pending_close_tab.is_some() {
                 app.pending_close_tab = None;
+            }
+            if esc && app.pending_delete_file.is_some() {
+                app.pending_delete_file = None;
             }
             if esc && !app.missing_project_modals.is_empty() {
                 app.missing_project_modals.clear();
@@ -191,17 +195,10 @@ pub fn handle(
     if delete_selected && !any_focus
         && let Some(path) = app.selected_file.clone()
     {
-        if let Err(e) = trash::delete(&path) {
-            app.git_error = Some(format!("Trash: {e}"));
-        } else {
-            app.selected_file = None;
-            app.close_file_tabs_for_path(&path);
-            // Push onto undo stack so Cmd+Z reverses the trash.
-            if app.file_op_history.len() >= crate::state::FILE_OP_HISTORY_CAP {
-                app.file_op_history.pop_front();
-            }
-            app.file_op_history.push_back(crate::state::FileOp::Trash { path });
-        }
+        // Stage a confirm modal — the user always sees what they're
+        // about to discard. The modal handles `trash::delete`, the
+        // file-op history push, and tab cleanup on confirm.
+        app.pending_delete_file = Some(crate::state::PendingDeleteFile { path });
     }
 
     // Cmd+Z: undo the most recent Files-Pane move/trash. Same focus
