@@ -670,6 +670,18 @@ impl eframe::App for CraneApp {
                     PaneAction::ShowFilesPanel => {
                         self.app.show_right = true;
                     }
+                    PaneAction::OpenFile(path) => {
+                        let path_str = path.to_string_lossy().to_string();
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&path_str)
+                            .to_string();
+                        let content = std::fs::read_to_string(&path).unwrap_or_default();
+                        self.app.open_file_into_active_layout(
+                            &ctx, path_str, name, content,
+                        );
+                    }
                 }
             }
         } else {
@@ -769,6 +781,9 @@ impl eframe::App for CraneApp {
             let overlay_visible = self.app.show_settings
                 || self.app.show_help
                 || self.app.new_workspace_modal.is_some()
+                || self.app.pending_remove_worktree.is_some()
+                || self.app.pending_close_tab.is_some()
+                || self.app.pending_delete_file.is_some()
                 || !self.app.missing_project_modals.is_empty()
                 || self.pending_close.is_some()
                 || ctx.memory(|m| {

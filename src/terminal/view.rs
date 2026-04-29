@@ -342,9 +342,10 @@ pub fn render_terminal_pane(
     font_size: f32,
     has_focus: bool,
     pane_id: crate::state::layout::PaneId,
-) {
+    workspace_root: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
     if tp.tabs.is_empty() {
-        return;
+        return None;
     }
 
     // Always show the tab strip — mirrors the Files Pane, and keeps
@@ -353,6 +354,8 @@ pub fn render_terminal_pane(
     // is compact so a single-tab pane only loses ~26 px to the strip.
     let mut activate: Option<usize> = None;
     let mut close: Option<usize> = None;
+    let mut close_others: Option<usize> = None;
+    let mut duplicate_tab: Option<usize> = None;
     let mut spawn_new = false;
     let mut start_rename: Option<usize> = None;
     let mut commit_rename: Option<(usize, String)> = None;
@@ -437,7 +440,7 @@ pub fn render_terminal_pane(
                     }
                 }
             } else {
-                let (clicked, close_clicked, dbl_clicked) = draw_terminal_tab(
+                let (clicked, close_clicked, dbl_clicked, tab_resp) = draw_terminal_tab(
                     &mut strip_ui,
                     &label,
                     idx == active_idx,
@@ -453,6 +456,56 @@ pub fn render_terminal_pane(
                 if dbl_clicked {
                     start_rename = Some(idx);
                 }
+                // Right-click context menu
+                tab_resp.context_menu(|ui| {
+                    let mut act = None;
+                    if ui.button(format!(
+                        "{}  Rename Tab",
+                        egui_phosphor::regular::PENCIL_SIMPLE,
+                    ))
+                    .clicked()
+                    {
+                        act = Some("rename");
+                        ui.close();
+                    }
+                    if ui.button(format!(
+                        "{}  Close Tab",
+                        egui_phosphor::regular::X,
+                    ))
+                    .clicked()
+                    {
+                        act = Some("close");
+                        ui.close();
+                    }
+                    if tab_count > 1
+                        && ui
+                            .button(format!(
+                                "{}  Close Other Tabs",
+                                egui_phosphor::regular::X_CIRCLE,
+                            ))
+                            .clicked()
+                    {
+                        act = Some("close_others");
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!(
+                            "{}  Duplicate Tab",
+                            egui_phosphor::regular::COPY,
+                        ))
+                        .clicked()
+                    {
+                        act = Some("duplicate");
+                        ui.close();
+                    }
+                    match act {
+                        Some("rename") => start_rename = Some(idx),
+                        Some("close") => close = Some(idx),
+                        Some("close_others") => close_others = Some(idx),
+                        Some("duplicate") => duplicate_tab = Some(idx),
+                        _ => {}
+                    }
+                });
             }
         }
 
@@ -520,7 +573,39 @@ pub fn render_terminal_pane(
     if let Some(idx) = close {
         tp.close(idx);
         if tp.tabs.is_empty() {
-            return;
+            return None;
+        }
+    }
+    if let Some(keep) = close_others {
+        // Drain from the back so indices stay stable while we remove.
+        for i in (0..tp.tabs.len()).rev() {
+            if i != keep {
+                tp.close(i);
+            }
+        }
+        tp.active = 0;
+        tp.renaming = None;
+        if tp.tabs.is_empty() {
+            return None;
+        }
+    }
+    if let Some(idx) = duplicate_tab {
+        let cwd = tp
+            .tabs
+            .get(idx)
+            .map(|t| t.terminal.cwd.clone())
+            .unwrap_or_default();
+        if let Ok(term) = Terminal::spawn(
+            ui.ctx().clone(),
+            80,
+            24,
+            if cwd.as_os_str().is_empty() {
+                None
+            } else {
+                Some(cwd.as_path())
+            },
+        ) {
+            tp.add(term);
         }
     }
     if spawn_new {
@@ -545,7 +630,9 @@ pub fn render_terminal_pane(
     let active = tp.active.min(tp.tabs.len().saturating_sub(1));
     tp.active = active;
     if let Some(tab) = tp.tabs.get_mut(active) {
-        render_terminal(ui, &mut tab.terminal, font_size, has_focus);
+        render_terminal(ui, &mut tab.terminal, font_size, has_focus, workspace_root)
+    } else {
+        None
     }
 }
 
@@ -567,7 +654,7 @@ fn draw_terminal_tab(
     is_active: bool,
     pane_id: crate::state::layout::PaneId,
     idx: usize,
-) -> (bool, bool, bool) {
+) -> (bool, bool, bool, egui::Response) {
     let font = egui::FontId::new(11.5, egui::FontFamily::Proportional);
     let close_font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
     let text_w = ui
@@ -638,10 +725,16 @@ fn draw_terminal_tab(
     }
     let closed = close_response.clicked() || response.middle_clicked();
     let dbl = response.double_clicked() && !close_response.hovered();
-    (response.clicked() && !close_response.hovered(), closed, dbl)
+    (response.clicked() && !close_response.hovered(), closed, dbl, response)
 }
 
-pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f32, has_focus: bool) {
+pub fn render_terminal(
+    ui: &mut egui::Ui,
+    terminal: &mut Terminal,
+    font_size: f32,
+    has_focus: bool,
+    workspace_root: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
     let font_id = FontId::new(font_size, FontFamily::Monospace);
     // Measure the stride egui actually uses when it lays out a galley,
     // not the bare glyph advance. `glyph_width('M')` differs from the
@@ -933,9 +1026,11 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
-    // Plain click (no drag) on a hovered URL or path → hand it straight
-    // to the OS default handler. `response.clicked()` is false on drags,
-    // so text selection is unaffected.
+    // Plain click (no drag) on a hovered URL or path. Paths inside the
+    // workspace are opened in Crane's file editor; everything else falls
+    // through to the OS default handler. `response.clicked()` is false on
+    // drags, so text selection is unaffected.
+    let mut file_to_open: Option<std::path::PathBuf> = None;
     if response.clicked()
         && let Some((_, _, _, kind)) = &hovered_hit
     {
@@ -944,7 +1039,14 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                 let _ = webbrowser::open(url);
             }
             HoveredKind::Path(path) => {
-                open_in_default_app(path);
+                let is_in_workspace = workspace_root.is_some_and(|root| {
+                    path.starts_with(root) && !path.starts_with(root.join(".git"))
+                });
+                if is_in_workspace && path.is_file() {
+                    file_to_open = Some(path.to_path_buf());
+                } else {
+                    open_in_default_app(path);
+                }
             }
         }
     }
@@ -1198,7 +1300,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     }
 
     if !has_focus {
-        return;
+        return None;
     }
     // True when another egui widget (e.g. tab-rename TextEdit) owns
     // keyboard focus. We still want terminal-level command shortcuts
@@ -1450,6 +1552,8 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         }
         terminal.history.lock().clear();
     }
+
+    file_to_open
 }
 
 fn color_to_egui(color: TermColor, is_fg: bool) -> Color32 {

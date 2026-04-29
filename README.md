@@ -1,6 +1,9 @@
 # Crane
 
-![Crane](screenshot/crane-hero.png)
+<p align="center">
+<img src="screenshot/crane-hero.png" width="49%" alt="Crane — project tree and terminal">
+<img src="screenshot/crane-multi-pane.png" width="49%" alt="Crane — multi-pane layout with file editor">
+</p>
 
 Native, GPU-rendered desktop development environment for orchestrating terminals, file browsing, diffs, and git workflows across isolated git workspaces.
 

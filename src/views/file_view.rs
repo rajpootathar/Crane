@@ -306,7 +306,8 @@ fn render_scoped(
     let save_pressed = ui.input(|i| {
         (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::S)
     });
-    // Cmd+F toggles the find bar for the active tab.
+    // Cmd+F opens the find bar (or replaces the query with the current
+    // selection). Esc closes it — Cmd+F never closes.
     let find_toggle = ui.input(|i| {
         (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::F)
     });
@@ -315,10 +316,22 @@ fn render_scoped(
     {
         let idx = pane.active.min(pane.tabs.len() - 1);
         let t = &mut pane.tabs[idx];
-        t.find_query = match &t.find_query {
-            Some(_) => None,
-            None => Some(String::new()),
-        };
+        let te_id = egui::Id::new(("file_editor", &t.path)).with("body");
+        let selection = egui::TextEdit::load_state(ui.ctx(), te_id)
+            .and_then(|s| s.cursor.char_range())
+            .filter(|r| r.primary.index != r.secondary.index)
+            .map(|r| {
+                let start = r.primary.index.min(r.secondary.index);
+                let end = r.primary.index.max(r.secondary.index);
+                let start_byte = crate::format::char_idx_to_byte(&t.content, start);
+                let end_byte = crate::format::char_idx_to_byte(&t.content, end);
+                t.content[start_byte..end_byte].to_string()
+            });
+        if let Some(sel) = selection {
+            t.find_query = Some(sel);
+        } else if t.find_query.is_none() {
+            t.find_query = Some(String::new());
+        }
     }
 
     {
@@ -442,10 +455,7 @@ fn render_scoped(
             && !q.is_empty()
         {
             // Jump cursor to the next / prev occurrence of `q`.
-            let te_id = ui
-                .id()
-                .with(("file_editor", &tab.path))
-                .with("body");
+            let te_id = egui::Id::new(("file_editor", &tab.path)).with("body");
             let cur = egui::TextEdit::load_state(ui.ctx(), te_id)
                 .and_then(|s| s.cursor.char_range().map(|r| r.primary.index))
                 .unwrap_or(0);
@@ -466,6 +476,9 @@ fn render_scoped(
                 let (line, col) =
                     char_idx_to_line_col(&tab.content, chars_up_to);
                 tab.pending_cursor = Some((line, col));
+                // Store target line so the scroll area can scroll to it
+                // when it renders on the next frame.
+                tab.find_scroll_to_line = Some(line);
             }
         }
 
@@ -593,12 +606,13 @@ fn render_scoped(
         // trailing empty line after a final newline) without double-counting.
         let line_count = tab.content.split('\n').count().max(1);
         let digits = line_count.to_string().len().max(2);
-        let gutter_font = FontId::new(font_size, FontFamily::Monospace);
+        let gutter_size = font_size * 0.7;
+        let gutter_font = FontId::new(gutter_size, FontFamily::Monospace);
         // Cache the monospace glyph width per font size in egui memory
         // so we're not doing a full font layout every frame just to
         // measure the number "0".
         let gutter_char_w = {
-            let key = egui::Id::new(("gutter_char_w", font_size.to_bits()));
+            let key = egui::Id::new(("gutter_char_w", gutter_size.to_bits()));
             if let Some(w) = ui.memory(|m| m.data.get_temp::<f32>(key)) {
                 w
             } else {
@@ -667,41 +681,48 @@ fn render_scoped(
             return;
         }
 
+        // Two-column layout: fixed gutter on the left, horizontally-
+        // scrollable code on the right. We use a manual child UI for the
+        // gutter and a ScrollArea for the code, sharing vertical scroll.
+        let avail = ui.available_rect_before_wrap();
+        let gutter_rect = egui::Rect::from_min_size(
+            avail.min,
+            egui::vec2(gutter_w, editor_h),
+        );
+        let code_left = avail.min.x + gutter_w;
+
+        // --- Code area (scrolls both ways) ---
+        // Shrink the available width so the scroll area sits to the right
+        // of the gutter column.
+        let code_pad = 6.0; // gap between gutter and code
+        let mut code_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(
+                    egui::pos2(code_left + code_pad, avail.min.y),
+                    egui::vec2(avail.width() - gutter_w - code_pad, avail.height()),
+                ))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        let code_ui_id = code_ui.id();
+
+        // Capture the actual row height from the TextEdit's galley so the
+        // gutter aligns exactly — no guessed multiplier needed.
+        let mut actual_row_h = font_size * 1.2;
+
         let scroll_out = ScrollArea::both()
             .id_salt(("file_scroll", active_idx))
             .auto_shrink([false; 2])
             .max_height(editor_h)
-            .show(ui, |ui| {
+            .show(&mut code_ui, |ui| {
                 ui.horizontal_top(|ui| {
-                    // Gutter: right-aligned muted line numbers in the editor's
-                    // monospace font so the baseline matches the code rows.
-                    let gutter_color = theme::current().text_muted.to_color32();
-                    ui.vertical(|ui| {
-                        ui.set_min_width(gutter_w);
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        let mut job = LayoutJob::default();
-                        for n in 1..=line_count {
-                            let s = format!("{n:>width$}  \n", n = n, width = digits);
-                            job.append(
-                                &s,
-                                0.0,
-                                TextFormat {
-                                    font_id: gutter_font.clone(),
-                                    color: gutter_color,
-                                    ..Default::default()
-                                },
-                            );
-                        }
-                        ui.add(egui::Label::new(job).selectable(false));
-                    });
                     // Scope the TextEdit's widget id by file path — without
                     // this every tab in a Files Pane shared the same
                     // source-location-derived id, so undo/redo history
                     // (and cursor position + selection) leaked across files.
                     // Ctrl+Z in file A would replay edits made in file B.
                     let tab_path_for_id = tab.path.clone();
+                    let te_id = egui::Id::new(("file_editor", &tab_path_for_id)).with("body");
                     ui.push_id(("file_editor", tab_path_for_id), |ui| {
-                        let te_id = ui.id().with("body");
                         // Project-local indent rules from nearest .prettierrc
                         // or package.json "prettier" field. In a monorepo
                         // each subproject's rules apply to its own files.
@@ -889,6 +910,14 @@ fn render_scoped(
                             .desired_rows(30)
                             .layouter(&mut layouter);
                         let out = editor.show(ui);
+                        // Capture the actual row height from the galley so the
+                        // gutter aligns exactly with code lines.
+                        if out.galley.rows.len() >= 2 {
+                            actual_row_h = out.galley.rows[1].rect().min.y
+                                - out.galley.rows[0].rect().min.y;
+                        } else if let Some(row) = out.galley.rows.first() {
+                            actual_row_h = row.rect().height();
+                        }
                         // Stash the current primary cursor so the
                         // status strip below renders up-to-date
                         // Ln/Col. `TextEdit::load_state` from the
@@ -1002,12 +1031,268 @@ fn render_scoped(
                 });
             });
 
+        // Scroll to find-match target line if requested.
+        if let Some(line) = tab.find_scroll_to_line.take() {
+            let row_h = actual_row_h;
+            let target_y = line as f32 * row_h;
+            let mut state = scroll_out.state;
+            if target_y < state.offset.y + row_h {
+                state.offset.y = (target_y - row_h).max(0.0);
+            } else if target_y > state.offset.y + editor_h - row_h * 2.0 {
+                state.offset.y = target_y - editor_h + row_h * 3.0;
+            }
+            state.offset.y = state.offset.y.max(0.0);
+            // Must match the ScrollArea's internal state ID:
+            // state_id = parent_ui.id().with(id_salt)
+            let scroll_state_id =
+                code_ui_id.with(egui::Id::new(("file_scroll", active_idx)));
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(scroll_state_id, state);
+            });
+        }
+
+        // Consume the full editor height in the parent ui.
+        ui.allocate_rect(
+            egui::Rect::from_min_size(
+                ui.available_rect_before_wrap().min,
+                egui::vec2(ui.available_width(), editor_h),
+            ),
+            egui::Sense::hover(),
+        );
+
+        // Paint the fixed gutter overlay. Reads the code area's vertical
+        // scroll offset so line numbers scroll in sync with the code,
+        // but ignores horizontal scroll entirely (stays pinned left).
+        let v_offset = scroll_out.state.offset.y;
+        let gutter_bg = theme::current().bg.to_color32();
+        let gutter_fg = theme::current().text_muted.to_color32();
+        let painter = ui.painter();
+        // Background fill to hide code scrolling behind the gutter.
+        painter.rect_filled(gutter_rect, 0.0, gutter_bg);
+        // Right border separating gutter from code.
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(gutter_rect.max.x - 1.0, gutter_rect.min.y),
+                egui::vec2(1.0, gutter_rect.height()),
+            ),
+            0.0,
+            theme::current().border.to_color32(),
+        );
+
+        // Refresh per-line git change data when the content changes.
+        let content_hash = {
+            use std::hash::Hasher;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&tab.content, &mut h);
+            h.finish()
+        };
+        if tab.line_changes_key != content_hash {
+            tab.line_changes = workspace_root.and_then(|root| {
+                let rel = std::path::Path::new(&tab.path).strip_prefix(root).ok()?;
+                crate::git::parse_file_diff(root, rel.to_str()?)
+            });
+            tab.line_changes_key = content_hash;
+        }
+        let file_diff = tab.line_changes.as_ref();
+
+        const GREEN: Color32 = Color32::from_rgb(80, 180, 100);
+        const BLUE: Color32 = Color32::from_rgb(80, 140, 210);
+        const RED: Color32 = Color32::from_rgb(200, 80, 80);
+        const DIFF_OLD: Color32 = Color32::from_rgb(200, 120, 120);
+        const DIFF_NEW: Color32 = Color32::from_rgb(120, 200, 140);
+
+        // Paint line numbers + gutter change markers.
+        let row_h = actual_row_h;
+        let first_visible = (v_offset / row_h).floor() as usize;
+        let last_visible = ((v_offset + gutter_rect.height()) / row_h).ceil() as usize;
+        let clipped = painter.with_clip_rect(gutter_rect);
+
+        // Tooltip state: (tooltip_pos, first_line_no, old_lines, new_lines)
+        let mut tooltip: Option<(egui::Pos2, usize, Vec<String>, Vec<String>)> = None;
+        let pointer_pos = ui.ctx().pointer_hover_pos();
+        let content_lines: Vec<&str> = tab.content.lines().collect();
+
+        for n in (first_visible + 1)..=(last_visible.min(line_count)) {
+            let y = gutter_rect.min.y + (n as f32 - 0.5) * row_h - v_offset;
+
+            if let Some(diff) = file_diff {
+                if let Some(dl) = diff.lines.get(&n) {
+                    let color = match dl.kind {
+                        crate::git::DiffLineKind::Added => GREEN,
+                        crate::git::DiffLineKind::Modified => BLUE,
+                    };
+                    let marker_rect = egui::Rect::from_min_size(
+                        egui::pos2(gutter_rect.min.x, y - row_h * 0.5),
+                        egui::vec2(3.0, row_h),
+                    );
+                    clipped.rect_filled(marker_rect, 0.0, color);
+
+                    // Only blue (Modified) lines are hoverable
+                    if dl.kind == crate::git::DiffLineKind::Modified {
+                        if let Some(pos) = pointer_pos {
+                            if gutter_rect.contains(pos) {
+                                let line_top = y - row_h * 0.5;
+                                let line_bot = y + row_h * 0.5;
+                                if pos.y >= line_top
+                                    && pos.y <= line_bot
+                                    && tooltip.is_none()
+                                {
+                                    // Use the hunk's full block — this is what
+                                    // makes a `-20 +5` chunk render as one
+                                    // change with all 20 old lines visible
+                                    // (rather than truncating to the first 5).
+                                    if let Some(block) = dl
+                                        .block_idx
+                                        .and_then(|i| diff.blocks.get(i))
+                                    {
+                                        let new_lines: Vec<String> = (0..block
+                                            .new_count)
+                                            .map(|i| {
+                                                content_lines
+                                                    .get(block.new_start - 1 + i)
+                                                    .map(|s| s.to_string())
+                                                    .unwrap_or_default()
+                                            })
+                                            .collect();
+                                        let old = block.old_lines.clone();
+                                        if old != new_lines {
+                                            let tip_y = gutter_rect.min.y
+                                                + (block.new_start as f32 - 0.5)
+                                                    * row_h
+                                                - v_offset
+                                                - row_h * 0.5;
+                                            tooltip = Some((
+                                                egui::pos2(
+                                                    gutter_rect.max.x + 4.0,
+                                                    tip_y,
+                                                ),
+                                                block.new_start,
+                                                old,
+                                                new_lines,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            clipped.text(
+                egui::pos2(gutter_rect.max.x - 8.0, y),
+                egui::Align2::RIGHT_CENTER,
+                format!("{n:>width$}", n = n, width = digits),
+                gutter_font.clone(),
+                gutter_fg,
+            );
+        }
+
+        // Deletion gap markers: red bar between lines where content was removed.
+        if let Some(diff) = file_diff {
+            for gap in &diff.deletions {
+                let gap_y = if gap.after_line == 0 {
+                    gutter_rect.min.y - v_offset
+                } else {
+                    gutter_rect.min.y + gap.after_line as f32 * row_h - v_offset
+                };
+                if gap_y >= gutter_rect.min.y - 4.0 && gap_y <= gutter_rect.max.y + 4.0 {
+                    let gap_h = 3.0;
+                    let gap_rect = egui::Rect::from_min_size(
+                        egui::pos2(gutter_rect.min.x, gap_y - gap_h * 0.5),
+                        egui::vec2(gutter_rect.width() - 8.0, gap_h),
+                    );
+                    clipped.rect_filled(gap_rect, 1.0, RED);
+
+                    if let Some(pos) = pointer_pos {
+                        let expanded = gap_rect.expand2(egui::vec2(0.0, 4.0));
+                        if expanded.contains(pos) && tooltip.is_none() {
+                            tooltip = Some((
+                                egui::pos2(gutter_rect.max.x + 4.0, gap_y - 4.0),
+                                gap.after_line,
+                                gap.head_lines.clone(),
+                                Vec::new(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Show diff tooltip outside the clip rect
+        if let Some((pos, first_line, old_lines, new_lines)) = tooltip {
+            egui::show_tooltip_at(
+                ui.ctx(),
+                egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("gutter_diff_tooltip")),
+                egui::Id::new("gutter_diff_tooltip"),
+                pos,
+                |ui| {
+                    ui.vertical(|ui| {
+                        let count = old_lines.len().max(new_lines.len());
+                        let last_line = first_line + count.saturating_sub(1);
+                        ui.label(
+                            RichText::new(format!("Lines {}-{}", first_line, last_line))
+                                .size(11.0)
+                                .strong()
+                                .color(Color32::from_rgb(160, 160, 160)),
+                        );
+                        ui.add_space(2.0);
+                        for line in &old_lines {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("-").monospace().size(12.0).color(DIFF_OLD));
+                                ui.label(RichText::new(line.clone()).monospace().size(12.0).color(DIFF_OLD));
+                            });
+                        }
+                        for line in &new_lines {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("+").monospace().size(12.0).color(DIFF_NEW));
+                                ui.label(RichText::new(line.clone()).monospace().size(12.0).color(DIFF_NEW));
+                            });
+                        }
+                    });
+                },
+            );
+        }
+
         crate::views::file_status::paint_scrollbar_diag_markers(
             ui,
             scroll_out.inner_rect,
             line_count,
             &diagnostics,
         );
+
+        // Git change markers on the scrollbar — colored dashes on the right
+        // edge showing where added/modified lines sit.
+        if let Some(diff) = file_diff {
+            let scroll_rect = scroll_out.inner_rect;
+            let scroll_painter = ui.painter_at(scroll_rect);
+            let x1 = scroll_rect.max.x - 2.0;
+            let x0 = x1 - 6.0;
+            let h = scroll_rect.height();
+            let total = line_count.max(1) as f32;
+            for (&line_no, dl) in &diff.lines {
+                let color = match dl.kind {
+                    crate::git::DiffLineKind::Added => GREEN,
+                    crate::git::DiffLineKind::Modified => BLUE,
+                };
+                let y = scroll_rect.min.y + (line_no as f32 / total) * h;
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(x0, y - 1.5),
+                    egui::pos2(x1, y + 1.5),
+                );
+                scroll_painter.rect_filled(rect, 1.0, color);
+            }
+            // Deletion markers on scrollbar
+            for gap in &diff.deletions {
+                let y = scroll_rect.min.y
+                    + ((gap.after_line as f32 + 0.5) / total) * h;
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(x0, y - 1.0),
+                    egui::pos2(x1, y + 1.0),
+                );
+                scroll_painter.rect_filled(rect, 1.0, RED);
+            }
+        }
 
         crate::views::file_status::render_status_strip(ui, tab, &diagnostics, status_h);
     }

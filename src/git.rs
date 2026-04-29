@@ -59,8 +59,15 @@ pub struct FileChange {
     /// Source side of a rename, if any. Only set when `status` is
     /// `Renamed` — `path` holds the new name, `old_path` the old name.
     pub old_path: Option<String>,
-    pub staged: bool,
     pub status: ChangeStatus,
+    /// True if this file has staged changes in the index.
+    pub has_staged: bool,
+    /// True if this file has unstaged changes in the worktree.
+    pub has_unstaged: bool,
+    /// The staged-side status, if any (e.g. Added, Modified, Renamed).
+    pub staged_status: Option<ChangeStatus>,
+    /// The unstaged-side status, if any (e.g. Modified, Deleted).
+    pub unstaged_status: Option<ChangeStatus>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -147,34 +154,35 @@ pub fn status(repo: &Path) -> Option<GitStatus> {
             changes.push(FileChange {
                 path,
                 old_path,
-                staged: false,
                 status: ChangeStatus::Untracked,
+                has_staged: false,
+                has_unstaged: true,
+                staged_status: None,
+                unstaged_status: Some(ChangeStatus::Untracked),
             });
             continue;
         }
-        // `old_path` only belongs to the Renamed status — the rename
-        // itself is always on the staged (X) side. If Y is also set
-        // (e.g. "RM": renamed and then modified in worktree), the
-        // unstaged row is a plain Modified against the new path and
-        // must not render the `old -> new` label.
-        if x != ' ' && x != '?' {
-            let sx = map(x);
-            changes.push(FileChange {
-                path: path.clone(),
-                old_path: if sx == ChangeStatus::Renamed { old_path.clone() } else { None },
-                staged: true,
-                status: sx,
-            });
-        }
-        if y != ' ' && y != '?' {
-            let sy = map(y);
-            changes.push(FileChange {
-                path,
-                old_path: if sy == ChangeStatus::Renamed { old_path } else { None },
-                staged: false,
-                status: sy,
-            });
-        }
+        // Build a single merged entry per file. X = staged side,
+        // Y = unstaged side. Both can be set simultaneously (e.g. MM).
+        let has_staged = x != ' ' && x != '?';
+        let has_unstaged = y != ' ' && y != '?';
+        let staged_status = if has_staged { Some(map(x)) } else { None };
+        let unstaged_status = if has_unstaged { Some(map(y)) } else { None };
+        // Pick a representative status for the row. Prefer staged side
+        // so the status glyph reflects the most significant change.
+        let status = staged_status.or(unstaged_status).unwrap_or(ChangeStatus::Modified);
+        // old_path belongs to the Renamed status — always the staged (X)
+        // side. If Y is also set (e.g. "RM"), the rename is staged and
+        // the worktree modification is against the new path.
+        changes.push(FileChange {
+            path,
+            old_path: if staged_status == Some(ChangeStatus::Renamed) { old_path } else { None },
+            status,
+            has_staged,
+            has_unstaged,
+            staged_status,
+            unstaged_status,
+        });
     }
 
     let (added, deleted) = shortstat(repo).unwrap_or((0, 0));
@@ -633,6 +641,156 @@ pub fn head_content(repo: &Path, path: &str) -> String {
         _ => return String::new(),
     };
     String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Per-line diff classification for the editor gutter. Returned by
+/// `parse_file_diff()` from `git diff HEAD -U0 -- <path>`.
+#[derive(Clone, Debug, Default)]
+pub struct FileDiff {
+    /// 1-based line number → diff info for lines that exist in the working tree.
+    pub lines: std::collections::HashMap<usize, DiffLine>,
+    /// Deletion gaps: small red markers between lines where content was removed.
+    /// `after_line` is 1-based — the gap sits between line `after_line` and
+    /// `after_line + 1`.  0 means before line 1.
+    pub deletions: Vec<DeletionGap>,
+    /// Per-hunk modification blocks. A `-N +M` hunk produces one block that
+    /// holds the full N old lines, regardless of whether N == M, N > M, or
+    /// N < M. The gutter tooltip uses these so a `-20 +5` block can display
+    /// all 20 deleted lines next to all 5 new lines.
+    pub blocks: Vec<DiffBlock>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    /// Index into `FileDiff::blocks` for Modified lines. None for Added.
+    pub block_idx: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DiffLineKind {
+    Added,
+    Modified,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeletionGap {
+    /// 1-based: the gap sits between this line and the next. 0 = before line 1.
+    pub after_line: usize,
+    /// The original lines that were deleted (from HEAD), for tooltip display.
+    pub head_lines: Vec<String>,
+}
+
+/// One `-N +M` modification hunk: full old content from HEAD plus the
+/// 1-based line range in the working tree where the new lines live.
+#[derive(Clone, Debug)]
+pub struct DiffBlock {
+    /// 1-based first line in the working tree.
+    pub new_start: usize,
+    /// Number of new lines (M in `-N +M`).
+    pub new_count: usize,
+    /// Full old content from HEAD (N lines in `-N +M`).
+    pub old_lines: Vec<String>,
+}
+
+/// Parse `git diff HEAD -U0 -- <path>` into per-line change markers and
+/// deletion gaps. Returns `None` if the file is untracked or unchanged.
+pub fn parse_file_diff(repo: &Path, rel_path: &str) -> Option<FileDiff> {
+    let tracked = Command::new("git")
+        .args(["ls-files", "--error-unmatch", rel_path])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .is_some_and(|o| o.status.success());
+
+    if !tracked {
+        return None;
+    }
+
+    let out = Command::new("git")
+        .args(["diff", "HEAD", "-U0", "--", rel_path])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.trim().is_empty() {
+        return None;
+    }
+
+    let head = head_content(repo, rel_path);
+    let head_lines: Vec<&str> = head.lines().collect();
+
+    let mut diff = FileDiff::default();
+
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix("@@") else { continue };
+        let end = rest.find("@@").unwrap_or(rest.len());
+        let header = rest[..end].trim();
+
+        let minus = header.split_whitespace().find(|s| s.starts_with('-'))?;
+        let plus = header.split_whitespace().find(|s| s.starts_with('+'))?;
+
+        let (old_start, old_count) = parse_range(&minus[1..])?;
+        let (new_start, new_count) = parse_range(&plus[1..])?;
+
+        if new_count > 0 && old_count == 0 {
+            // Pure addition
+            for i in 0..new_count {
+                diff.lines.insert(new_start + i, DiffLine {
+                    kind: DiffLineKind::Added,
+                    block_idx: None,
+                });
+            }
+        } else if new_count > 0 && old_count > 0 {
+            // `-N +M` modification — capture all N old lines as one block.
+            // Even when N >> M (e.g. -20 +5) the whole hunk is treated as a
+            // change, not a deletion: every new line is BLUE and the tooltip
+            // shows the full old vs new content.
+            let old_block: Vec<String> = (0..old_count)
+                .filter_map(|i| head_lines.get(old_start + i - 1).map(|s| s.to_string()))
+                .collect();
+            let block_idx = diff.blocks.len();
+            diff.blocks.push(DiffBlock {
+                new_start,
+                new_count,
+                old_lines: old_block,
+            });
+            for i in 0..new_count {
+                diff.lines.insert(new_start + i, DiffLine {
+                    kind: DiffLineKind::Modified,
+                    block_idx: Some(block_idx),
+                });
+            }
+        } else if new_count == 0 && old_count > 0 {
+            // Pure deletion
+            let deleted: Vec<String> = (0..old_count)
+                .filter_map(|i| head_lines.get(old_start + i - 1).map(|s| s.to_string()))
+                .collect();
+            diff.deletions.push(DeletionGap {
+                after_line: new_start.saturating_sub(1),
+                head_lines: deleted,
+            });
+        }
+    }
+
+    if diff.lines.is_empty() && diff.deletions.is_empty() && diff.blocks.is_empty() {
+        None
+    } else {
+        Some(diff)
+    }
+}
+
+/// Parse a diff range like "3,2" → (3, 2) or "5" → (5, 1).
+fn parse_range(s: &str) -> Option<(usize, usize)> {
+    if let Some(comma) = s.find(',') {
+        let start: usize = s[..comma].parse().ok()?;
+        let count: usize = s[comma + 1..].parse().ok()?;
+        Some((start, count))
+    } else {
+        let start: usize = s.parse().ok()?;
+        Some((start, 1))
+    }
 }
 
 fn run(repo: &Path, args: &[&str]) -> Result<(), String> {
