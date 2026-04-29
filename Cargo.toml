@@ -1,3 +1,10 @@
+[workspace]
+# Root package + workspace. New library crates (e.g. the in-house
+# terminal core `crane_term`) live under `crates/`. The binary at the
+# root is implicitly a workspace member alongside whatever matches
+# `crates/*`.
+members = ["crates/*"]
+
 [package]
 name = "crane"
 version = "0.4.28"

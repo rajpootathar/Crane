@@ -10,3 +10,10 @@ Cargo.lock
 # Cargo.toml via path so edits are picked up on cargo build without
 # a git push.
 /alacritty-fork
+
+# Local read-only checkouts used as research references when designing
+# the in-house terminal core. Both are AGPL (warp-terminal) or
+# MIT/Apache (warp-vte) third-party code — never committed into Crane.
+/warp-terminal
+/warp-vte
+/vte
