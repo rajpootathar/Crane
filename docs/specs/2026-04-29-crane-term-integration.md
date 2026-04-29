@@ -31,6 +31,42 @@ The fix is in `crane_term`: `Term::linefeed` only calls
 LFs just bump the cursor row; nothing reaches scrollback. Tests in
 `crates/crane_term/src/term.rs` (16 + 4 = 20 passing) verify this.
 
+## Correction (after writing this spec)
+
+**The original framing was incomplete.** Reading alacritty 0.25's
+`Term::linefeed` (`/Users/.../alacritty_terminal-0.25.1/src/term/mod.rs:1423`)
+revealed it has the same scroll-region-bottom check `crane_term`
+started with:
+
+```rust
+if next == self.scroll_region.end {
+    self.scroll_up(1);  // pushes to history
+}
+```
+
+So the bug isn't "alacritty scrolls more aggressively than
+crane_term." Both push to history when an LF lands the cursor at
+the scroll-region bottom AND the region starts at row 0 (the
+default).
+
+**The actual fix** (committed as `6ac0942`): suppress scrollback
+eviction *during a `?2026` sync replay*. While the
+`crane_term::Processor` is replaying a buffered sync block, it
+calls `Handler::set_sync_frame(true)` on the term; `Term::scroll_up_one`
+checks that flag and drops the evicted row instead of preserving
+it. After the replay, `set_sync_frame(false)` restores normal
+scrollback behavior for streaming output.
+
+A new test, `sync_block_landing_at_screen_bottom_does_not_evict`,
+reproduces the exact real-world failure pattern (sync block whose
+last LF lands at screen bottom). It failed before this fix and
+passes after. 29/29 tests green.
+
+The earlier `tui_redraw_does_not_pollute_scrollback` test passed
+under a wrong premise — its setup never landed an LF at the scroll
+region bottom, so neither alacritty nor crane_term would have
+pushed under that condition.
+
 ## Phase 1 — `crane_term` API surface (complete)
 
 Done in commits `8ce489e`, `6442df0`, `678366f`. Crate at
@@ -61,22 +97,51 @@ Done in commits `8ce489e`, `6442df0`, `678366f`. Crate at
 Touchpoints (~672 lines today):
 
 - `term: Arc<Mutex<alacritty::Term<WakeListener>>>` →
-  `term: Arc<Mutex<crane_term::Term>>`.
-- `parser: alacritty::vte::ansi::Processor` →
-  `parser: crane_term::Processor`.
+  `term: Arc<Mutex<crane_term::Term>>`. The Processor lives next to
+  the term, since crane_term separates parser+state from the term
+  itself: store a `parser: Arc<Mutex<crane_term::Processor>>` on
+  the Terminal struct and pass both to the reader thread.
 - `WakeListener` event listener — drop. crane_term doesn't have an
-  EventListener; PTY reader thread wakes the egui context after each
-  parse-and-mutate batch via the `dirty_epoch` counter delta.
+  EventListener; PTY reader thread:
+  1. Calls `processor.lock().parse_bytes(&mut *term.lock(), &buf)`.
+  2. After parsing, drains DSR/DA replies with
+     `term.lock().take_pty_replies()`. Writes them back to
+     `master.take_writer()`.
+  3. Compares the term's `dirty_epoch` to the previous frame's
+     value. If different, calls `ctx.request_repaint()`. This
+     replaces the per-byte `request_repaint` storm that contributed
+     to the 18-30% CPU finding.
 - Reader-thread `split_sync_markers` snapshot/restore loop (lines
   415–520) — delete. crane_term's `Processor::parse_bytes` handles
-  `?2026` internally, and the linefeed routing means scrollback
-  duplication doesn't happen at all.
+  `?2026` internally, and `set_sync_frame` around the replay
+  prevents scrollback duplication (verified by
+  `sync_block_landing_at_screen_bottom_does_not_evict` test).
 - `ghost_texts: Arc<Mutex<VecDeque<String>>>` field — delete (it
   exists only to dedup duplicates that won't happen anymore).
 - `snapshot_text()` — replace alacritty grid iteration with
   `Term::snapshot_text()` (already implemented).
 - `resize()` — replace `Term::resize(TermSize)` with
-  `crane_term::Term::resize(rows, cols)`.
+  `crane_term::Term::resize(rows, cols)`. Also resize the master
+  PTY (already there) and the parser doesn't need resize info.
+- Transcript replay (lines 365–383) — replace alacritty's Processor
+  with crane_term's: `processor.parse_bytes(&mut term, text)` then
+  the padding `\r\n.repeat(rows)` and `\x1b[H` work identically.
+  After replay, `term.scroll_to_bottom()` instead of
+  `Scroll::Bottom`.
+
+**Sequence of edits to keep the build at red→green points**:
+
+1. Switch the field types and constructor in one edit; this WILL
+   break compilation everywhere `term.lock()` is called from
+   view.rs. Treat that as expected — phase 3 fixes it.
+2. Inside term.rs: rewrite the reader thread loop. Drop sync
+   handler import.
+3. Inside term.rs: rewrite `snapshot_text`, `resize`,
+   `flush_scroll_to_bottom`, `flush_pty_replies` (becomes a
+   no-op or a `take_pty_replies` drainer used in the reader).
+4. Stop. Commit term.rs alone with a "WIP" note. View.rs will not
+   build at this checkpoint.
+5. In a separate commit, rewrite view.rs (phase 3).
 
 **Missing API to add to `crane_term` first** (estimate: 200 LOC):
 
