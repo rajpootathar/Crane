@@ -546,7 +546,20 @@ impl Handler for Term {
         // semantics — without this, "echo $LINE" with a string the
         // exact width of the terminal scrolls early and TUIs
         // mis-position their next paint.
+        //
+        // This branch is the actual wrap. Mark WRAPLINE on the
+        // source row's last cell *here*, not preemptively when the
+        // margin fills — otherwise a line that ends naturally with
+        // \r\n right after filling the margin would get falsely
+        // tagged as continued, and reflow would merge it with the
+        // next row's unrelated content.
         if self.grid.cursor.input_needs_wrap && self.mode.contains(TermMode::LINE_WRAP) {
+            let prev_row_idx = self.grid.cursor.row.min(self.grid.rows.len() - 1);
+            if let Some(row) = self.grid.rows.get_mut(prev_row_idx) {
+                if let Some(last) = row.cells.last_mut() {
+                    last.flags.insert(Flags::WRAPLINE);
+                }
+            }
             self.carriage_return();
             let _ = self.linefeed();
         }
@@ -612,17 +625,10 @@ impl Handler for Term {
         if self.grid.cursor.col + advance >= self.grid.columns {
             self.grid.cursor.col = self.grid.columns - 1;
             self.grid.cursor.input_needs_wrap = true;
-            // Mark this row as continuing into the next on auto-
-            // wrap. Reflow on resize uses WRAPLINE on the last cell
-            // to identify which physical rows belong to a single
-            // logical line, so widening the terminal can re-join
-            // wrapped content into one row.
-            let row_idx = self.grid.cursor.row.min(self.grid.rows.len() - 1);
-            if let Some(row) = self.grid.rows.get_mut(row_idx) {
-                if let Some(last) = row.cells.last_mut() {
-                    last.flags.insert(Flags::WRAPLINE);
-                }
-            }
+            // WRAPLINE is set above only when the wrap *actually*
+            // happens on the next input — not here when the margin
+            // fills. A line that ends with \r\n right after filling
+            // shouldn't be marked as continued.
         } else {
             self.grid.cursor.col += advance;
             self.grid.cursor.input_needs_wrap = false;

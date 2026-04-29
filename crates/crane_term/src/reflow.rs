@@ -357,6 +357,52 @@ mod tests {
         assert!(!result.rows[0].cells.last().unwrap().flags.contains(Flags::WRAPLINE));
     }
 
+    /// Line that fills the right margin exactly and then ends
+    /// with `\r\n` is NOT a wrap — the next row contains
+    /// unrelated content. Reflow must not join them.
+    #[test]
+    fn margin_filling_line_with_lf_does_not_wrap() {
+        use crate::term::Term;
+        use crate::Processor;
+
+        let mut t = Term::new(5, 10);
+        let mut p = Processor::new();
+        // Type exactly 10 chars (fills margin), then \r\n, then
+        // a different line. The margin-filler should NOT carry
+        // WRAPLINE into the next row's content.
+        p.parse_bytes(&mut t, b"0123456789\r\nabc");
+
+        // Row 0 last cell should NOT have WRAPLINE.
+        let row0_last_wraps = t.grid.rows[0]
+            .cells
+            .last()
+            .map(|c| c.flags.contains(crate::Flags::WRAPLINE))
+            .unwrap_or(false);
+        assert!(
+            !row0_last_wraps,
+            "row 0 falsely tagged as wrapped despite ending with \\r\\n"
+        );
+
+        // After resize to wider, "0123456789" should stay on row 0
+        // and "abc" should stay on row 1 — they should NOT merge
+        // into one row.
+        t.resize(5, 30);
+        let row0_text: String = t.grid.rows[0]
+            .cells
+            .iter()
+            .take(t.grid.rows[0].occ)
+            .map(|c| c.ch)
+            .collect();
+        let row1_text: String = t.grid.rows[1]
+            .cells
+            .iter()
+            .take(t.grid.rows[1].occ)
+            .map(|c| c.ch)
+            .collect();
+        assert_eq!(row0_text, "0123456789");
+        assert_eq!(row1_text, "abc");
+    }
+
     /// Multi-resize cycle should also fix up scrollback. Type a
     /// long line, force it into scrollback (by filling rows
     /// below), shrink, grow — content in scrollback should
