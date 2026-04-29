@@ -239,7 +239,19 @@ impl Term {
     /// Used by the renderer to walk the visible area in row-major
     /// order without poking into Grid / Scrollback internals.
     pub fn renderable_content(&self) -> RenderableContent<'_> {
-        let cursor_line = self.grid.cursor.row as i32 - self.grid.display_offset as i32;
+        // The cursor's `line` field stores its **grid** row, not a
+        // viewport row. View.rs adds `display_offset` to get the
+        // viewport row for rendering — same convention as cells:
+        // `viewport_row = point.line.0 + display_offset`. Cells
+        // emit `line = self.row - display_offset` so their viewport
+        // row works out to `self.row`. The cursor doesn't iterate;
+        // we just emit its grid row and let view.rs do the
+        // identical addition. Subtracting display_offset here would
+        // cause the cursor to drift upward visually as the user
+        // scrolls into history, while view.rs's reverse-add would
+        // snap it back only after typing — exactly the artifact in
+        // the user-reported bug.
+        let cursor_line = self.grid.cursor.row as i32;
         RenderableContent {
             term: self,
             cursor: RenderableCursor {
