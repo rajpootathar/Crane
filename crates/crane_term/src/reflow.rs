@@ -357,6 +357,53 @@ mod tests {
         assert!(!result.rows[0].cells.last().unwrap().flags.contains(Flags::WRAPLINE));
     }
 
+    /// Multi-resize cycle should also fix up scrollback. Type a
+    /// long line, force it into scrollback (by filling rows
+    /// below), shrink, grow — content in scrollback should
+    /// survive the cycle without being truncated.
+    #[test]
+    fn scrollback_reflows_through_multi_resize() {
+        use crate::term::Term;
+        use crate::Processor;
+
+        let mut t = Term::new(3, 30);
+        let mut p = Processor::new();
+        // Type a long line + enough LFs to push it into scrollback.
+        p.parse_bytes(&mut t, b"hello world this is a long line\r\n");
+        p.parse_bytes(&mut t, b"second line\r\n");
+        p.parse_bytes(&mut t, b"third line\r\n");
+        p.parse_bytes(&mut t, b"fourth line\r\n");
+
+        // Cycle: 30 -> 15 -> 50.
+        t.resize(3, 15);
+        t.resize(3, 50);
+
+        // The original first line should still be reconstructable
+        // by walking scrollback + grid by WRAPLINE chains.
+        let mut all_text = String::new();
+        for row in t.scrollback.iter() {
+            for cell in row.cells.iter().take(row.occ) {
+                if !cell.flags.contains(crate::Flags::WIDE_CHAR_SPACER) {
+                    all_text.push(cell.ch);
+                }
+            }
+            // Newline boundary unless the last cell wraps.
+            let wraps = row
+                .cells
+                .last()
+                .map(|c| c.flags.contains(crate::Flags::WRAPLINE))
+                .unwrap_or(false);
+            if !wraps {
+                all_text.push('\n');
+            }
+        }
+        assert!(
+            all_text.contains("hello world this is a long line"),
+            "scrollback lost original line. got: {:?}",
+            all_text
+        );
+    }
+
     /// Reproduce the user-reported pattern: type a line at one
     /// width, shrink, grow, shrink, grow. Content should not get
     /// silently truncated through the cycle — the line should

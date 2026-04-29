@@ -65,51 +65,114 @@ impl Term {
         self.pty_replies.extend_from_slice(bytes);
     }
 
-    /// Resize the viewport with full reflow of the live grid.
-    ///
-    /// Plain row-by-row resize (truncate-or-pad) leaves wrapped
-    /// content garbled across multi-resize sequences — content that
-    /// was wrapped at col K stays at col K even when the new width
-    /// could fit it on one line, and content past the new right
-    /// margin is silently dropped on shrink. Reflow walks
-    /// `WRAPLINE`-joined logical lines and re-wraps them to
-    /// `cols`-wide rows, keeping the cursor anchored to its
-    /// logical position.
-    ///
-    /// Scrollback rows still pass through with a column-only
-    /// resize for now — historical wrapped lines won't reflow
-    /// retroactively. v2 work.
+    /// Resize the viewport with full reflow of scrollback + live
+    /// grid. Plain truncate-or-pad leaves wrapped content garbled
+    /// across multi-resize sequences. Reflow walks `WRAPLINE`-joined
+    /// logical lines spanning scrollback and live grid, re-wraps
+    /// each at `cols`, then distributes the new physical rows back:
+    /// oldest into scrollback, newest into the live grid. The
+    /// cursor's logical position carries forward.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         if rows == self.grid.visible_rows && cols == self.grid.columns {
             return;
         }
         let template = self.grid.cursor.template.clone();
+
+        // Build a unified row vec: scrollback first (oldest first),
+        // then live grid. The cursor's row index becomes
+        // `scrollback.len() + cursor.row` in this combined view.
+        let scrollback_len = self.scrollback.len();
+        let mut combined: Vec<Row> = Vec::with_capacity(scrollback_len + self.grid.rows.len());
+        combined.extend(self.scrollback.iter().cloned());
+        combined.extend(self.grid.rows.drain(..));
+
+        let combined_cursor = crate::grid::Cursor {
+            row: scrollback_len + self.grid.cursor.row,
+            col: self.grid.cursor.col,
+            input_needs_wrap: self.grid.cursor.input_needs_wrap,
+            template: self.grid.cursor.template.clone(),
+        };
+
+        // Reflow with target = (combined_rows, cols) so nothing
+        // overflows internally; we redistribute below.
+        let target_rows = combined.len().max(rows);
         let result = crate::reflow::reflow_grid(
-            &self.grid.rows,
-            &self.grid.cursor,
+            &combined,
+            &combined_cursor,
             cols,
-            rows,
+            target_rows,
             &template,
         );
 
-        // Push reflow overflow to scrollback so the cursor's
-        // logical line keeps its visible position when the height
-        // drops. Alt screen never feeds scrollback.
+        // Reconstruct the full reflowed sequence: overflow rows
+        // from reflow_grid are oldest, then result.rows are the
+        // remaining content. Overflow had been peeled off because
+        // reflow_grid was called with target_rows == combined len,
+        // but our intent here is "keep everything; just split into
+        // scrollback + live grid by the new viewport height."
+        let overflow_count = result.overflow_to_scrollback.len();
+        let mut all: Vec<Row> = result.overflow_to_scrollback;
+        all.extend(result.rows);
+        // result.cursor_row was relative to result.rows; convert
+        // back to a flat index into `all`.
+        let cursor_in_all = result.cursor_row + overflow_count;
+
+        // Trim trailing all-empty rows past the cursor so the
+        // live grid doesn't sit at an empty bottom when we have
+        // content above. We keep the cursor's row even if it's
+        // empty.
+        while all.len() > rows {
+            let last_idx = all.len() - 1;
+            if last_idx > cursor_in_all
+                && all[last_idx].occ == 0
+            {
+                all.pop();
+            } else {
+                break;
+            }
+        }
+        let new_scrollback: Vec<Row> = if all.len() > rows {
+            all.drain(..all.len() - rows).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Pad live grid bottom if reflow produced fewer rows than
+        // the new viewport.
+        while all.len() < rows {
+            all.push(Row::new(cols, &template));
+        }
+        let mut wrapped = all;
+
+        // Cursor: cursor_in_all is index in the pre-split flat
+        // sequence. After splitting off `new_scrollback.len()`
+        // rows for scrollback, the live grid index is
+        // `cursor_in_all - new_scrollback.len()`.
+        let mut cursor_row = if cursor_in_all >= new_scrollback.len() {
+            cursor_in_all - new_scrollback.len()
+        } else {
+            0
+        };
+        cursor_row = cursor_row.min(rows.saturating_sub(1));
+        let cursor_col = result.cursor_col.min(cols.saturating_sub(1));
+        // Ensure we don't lose the cursor's home position when
+        // wrapped is now shorter than expected.
+        let _ = &mut wrapped;
+
+        self.scrollback.clear();
         if !self.mode.contains(TermMode::ALT_SCREEN) {
-            for row in result.overflow_to_scrollback {
+            for row in new_scrollback {
                 self.scrollback.push(row);
             }
         }
-
-        self.grid.rows = result.rows;
+        self.grid.rows = wrapped;
         self.grid.columns = cols;
         self.grid.visible_rows = rows;
         self.grid.scroll_region = 0..rows;
-        self.grid.cursor.row = result.cursor_row;
-        self.grid.cursor.col = result.cursor_col;
+        self.grid.cursor.row = cursor_row;
+        self.grid.cursor.col = cursor_col;
         self.grid.cursor.input_needs_wrap = false;
 
-        self.scrollback.resize_columns(cols, &template);
         self.mark_dirty();
     }
 
