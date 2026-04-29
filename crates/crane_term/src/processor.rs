@@ -220,6 +220,20 @@ mod tests {
         );
     }
 
+    /// Plain ASCII text fed through the parser preserves every
+    /// character including spaces and punctuation. Regression
+    /// guard for a render-side bug where spaces appeared dropped.
+    #[test]
+    fn parser_preserves_ascii_input_byte_for_byte() {
+        let mut t = Term::new(3, 80);
+        let mut p = Processor::new();
+        let input = b"  feat(terminal): replace alacritty_terminal with crane_term";
+        p.parse_bytes(&mut t, input);
+        let row = &t.grid.rows[0];
+        let s: String = row.cells.iter().take(input.len()).map(|c| c.ch).collect();
+        assert_eq!(s.as_bytes(), input);
+    }
+
     /// Plain non-sync streaming input still scrolls normally
     /// when the cursor reaches the bottom.
     #[test]

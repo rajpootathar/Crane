@@ -1160,6 +1160,53 @@ mod tests {
         assert_eq!(t.take_pty_replies(), b"\x1b[?6c");
     }
 
+    /// Mimics the view.rs render loop: pull cells out via
+    /// `renderable_content`, group by viewport line, walk col 0..cols
+    /// pulling either the cell at that col or the default. The
+    /// reconstructed row string must contain every space typed.
+    #[test]
+    fn render_path_simulation_preserves_every_space() {
+        use crate::Cell;
+        let mut t = Term::new(3, 60);
+        let mut p = crate::Processor::new();
+        let input = b"auto mode on (shift+tab to cycle)";
+        p.parse_bytes(&mut t, input);
+
+        let cells: Vec<_> = t
+            .renderable_content()
+            .map(|item| (item.point, item.cell.clone()))
+            .collect();
+        let mut by_row: std::collections::BTreeMap<i32, Vec<(usize, Cell)>> =
+            std::collections::BTreeMap::new();
+        for (point, cell) in cells {
+            by_row.entry(point.line.0).or_default().push((point.column.0, cell));
+        }
+        for row in by_row.values_mut() {
+            row.sort_by_key(|(c, _)| *c);
+        }
+
+        let row_cells = &by_row[&0];
+        let mut idx = 0;
+        let default_cell = Cell::default();
+        let mut reconstructed = String::new();
+        for col in 0..60 {
+            while idx < row_cells.len() && row_cells[idx].0 < col {
+                idx += 1;
+            }
+            let cell = if idx < row_cells.len() && row_cells[idx].0 == col {
+                &row_cells[idx].1
+            } else {
+                &default_cell
+            };
+            reconstructed.push(cell.ch);
+        }
+        assert!(
+            reconstructed.starts_with(std::str::from_utf8(input).unwrap()),
+            "render path lost chars. got: {:?}",
+            reconstructed
+        );
+    }
+
     #[test]
     fn renderable_content_walks_visible_cells() {
         let mut t = Term::new(2, 3);
