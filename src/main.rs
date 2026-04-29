@@ -769,6 +769,9 @@ impl eframe::App for CraneApp {
             let overlay_visible = self.app.show_settings
                 || self.app.show_help
                 || self.app.new_workspace_modal.is_some()
+                || self.app.pending_remove_worktree.is_some()
+                || self.app.pending_close_tab.is_some()
+                || self.app.pending_delete_file.is_some()
                 || !self.app.missing_project_modals.is_empty()
                 || self.pending_close.is_some()
                 || ctx.memory(|m| {
