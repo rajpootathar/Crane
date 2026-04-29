@@ -111,6 +111,14 @@ impl Processor {
     /// Replay buffered bytes through the parser as a single sync
     /// frame, then mark the boundary so the renderer can elide
     /// per-byte repaints during the flush.
+    ///
+    /// `set_sync_frame(true)` is called on the handler around the
+    /// replay so it can suppress scrollback eviction for rows that
+    /// fall off the top during the redraw — those rows are
+    /// intermediate state of an atomic frame, not real history.
+    /// Without this guard, every Ink-style redraw whose last LF
+    /// lands at screen bottom pushes one duplicate row into
+    /// scrollback (the "duplicate splash" artifact).
     fn flush_sync<H>(&mut self, handler: &mut H)
     where
         H: Handler,
@@ -119,7 +127,9 @@ impl Processor {
             Some(b) => b,
             None => return,
         };
+        handler.set_sync_frame(true);
         self.feed_parser(handler, &buffered);
+        handler.set_sync_frame(false);
         handler.on_finish_byte_processing(&ProcessorInput {
             bytes: &buffered,
             is_sync_frame: true,
@@ -178,6 +188,36 @@ mod tests {
         // The five LFs landed mid-region (cursor was at row 4
         // after the up-5), so no scrollback eviction.
         assert_eq!(term.scrollback.len(), before);
+    }
+
+    /// THE actual bug we're fixing: an Ink-style redraw block whose
+    /// last LF lands the cursor at the screen bottom row. In a
+    /// terminal without sync-frame suppression (alacritty 0.25 OR
+    /// the pre-fix crane_term), this pushes the top row into
+    /// scrollback for every redraw — that's the duplicate-prompt
+    /// artifact in CLAUDE.md.
+    #[test]
+    fn sync_block_landing_at_screen_bottom_does_not_evict() {
+        let mut term = Term::new(5, 10);
+        let mut proc_ = Processor::new();
+        // Fill the screen first.
+        proc_.parse_bytes(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        let before = term.scrollback.len();
+
+        // Now wrap a redraw in ?2026: cursor up 5 to the top, then
+        // emit 5 lines of content with LFs between. The last LF
+        // lands the cursor at the bottom row — exactly the case
+        // that triggers scrollback eviction.
+        let redraw = b"\x1b[?2026h\x1b[5A\
+            R0\nR1\nR2\nR3\nR4\
+            \x1b[?2026l";
+        proc_.parse_bytes(&mut term, redraw);
+
+        assert_eq!(
+            term.scrollback.len(),
+            before,
+            "sync replay must not promote rows into scrollback"
+        );
     }
 
     /// Plain non-sync streaming input still scrolls normally

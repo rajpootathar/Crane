@@ -138,4 +138,15 @@ pub trait Handler {
     /// flush replays its buffered bytes. Implementations typically
     /// use this to mark a render-frame boundary.
     fn on_finish_byte_processing(&mut self, input: &ProcessorInput) {}
+
+    /// Called by the [`crate::processor::Processor`] around a
+    /// `?2026h ... ?2026l` replay. While `true`, scroll-producing
+    /// methods that would otherwise evict a row to scrollback must
+    /// drop the row instead — TUI redraws emit LFs that land at
+    /// the screen bottom while stepping back through their own
+    /// region, and those rows aren't "real history" to be
+    /// preserved. Cleared back to `false` after the replay so
+    /// streaming output following the sync block continues to
+    /// feed scrollback normally.
+    fn set_sync_frame(&mut self, _active: bool) {}
 }

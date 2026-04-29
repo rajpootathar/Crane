@@ -177,6 +177,16 @@ impl Term {
     /// is reset against the cursor template. Called only by
     /// [`Term::linefeed`] when the cursor sits at scroll-region
     /// bottom — that's the single chokepoint for scrollback writes.
+    ///
+    /// **Sync-frame guard**: when `in_sync_frame` is true, the
+    /// evicted row is dropped instead of preserved. Inside a
+    /// `?2026h ... ?2026l` block, a TUI is repainting its own
+    /// region; the rows that fall off the top during the replay
+    /// are intermediate state, not real history. Without this
+    /// guard, every Ink-style redraw whose last LF lands at the
+    /// screen bottom pushes one duplicate row into scrollback —
+    /// the exact "duplicate Claude Code splash" artifact tracked
+    /// in CLAUDE.md.
     fn scroll_up_one(&mut self) {
         let region = self.grid.scroll_region.clone();
         if region.is_empty() {
@@ -186,7 +196,7 @@ impl Term {
             &mut self.grid.rows[region.start],
             Row::new(self.grid.columns, &self.grid.cursor.template),
         );
-        if !self.mode.contains(TermMode::ALT_SCREEN) {
+        if !self.mode.contains(TermMode::ALT_SCREEN) && !self.in_sync_frame {
             self.scrollback.push(evicted);
         }
         for r in region.start..region.end.saturating_sub(1) {
@@ -828,6 +838,10 @@ impl Handler for Term {
             Some('>') => self.reply(b"\x1b[>0;0;0c"),
             _ => {}
         }
+    }
+
+    fn set_sync_frame(&mut self, active: bool) {
+        self.in_sync_frame = active;
     }
 
     fn on_finish_byte_processing(&mut self, _input: &ProcessorInput) {
