@@ -1160,6 +1160,32 @@ mod tests {
         assert_eq!(t.take_pty_replies(), b"\x1b[?6c");
     }
 
+    /// Real-world reproduction: a Claude-Code-style status line
+    /// with SGR color changes around each word. Each space sits
+    /// between attribute boundaries — exactly the case where our
+    /// run-batching could in principle drop a cell. Cells must
+    /// still come out byte-for-byte.
+    #[test]
+    fn sgr_colored_status_line_preserves_inter_word_spaces() {
+        let mut t = Term::new(3, 80);
+        let mut p = crate::Processor::new();
+        // Each word in its own SGR color; spaces emitted between
+        // them inherit the most-recent SGR.
+        let bytes = b"\x1b[32mauto\x1b[0m \x1b[33mmode\x1b[0m \x1b[36mon\x1b[0m";
+        p.parse_bytes(&mut t, bytes);
+
+        let row = &t.grid.rows[0];
+        let s: String = row.cells.iter().take(12).map(|c| c.ch).collect();
+        assert_eq!(s, "auto mode on");
+
+        // And confirm the inter-word spaces really are space chars,
+        // not somehow spacers or zero-width markers.
+        assert_eq!(row.cells[4].ch, ' ');
+        assert!(!row.cells[4].flags.contains(crate::Flags::WIDE_CHAR_SPACER));
+        assert_eq!(row.cells[9].ch, ' ');
+        assert!(!row.cells[9].flags.contains(crate::Flags::WIDE_CHAR_SPACER));
+    }
+
     /// Mimics the view.rs render loop: pull cells out via
     /// `renderable_content`, group by viewport line, walk col 0..cols
     /// pulling either the cell at that col or the default. The
