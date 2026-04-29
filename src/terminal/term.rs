@@ -269,13 +269,6 @@ impl Terminal {
         thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
-            // Last `dirty_epoch` we observed on the term — used to
-            // gate `ctx.request_repaint()` so we wake egui only when
-            // the grid actually changed since the previous parse,
-            // not once per PTY read. With many concurrent Ink TUIs
-            // this is the difference between idle CPU and the 18-30%
-            // range observed pre-fix.
-            let mut last_epoch: u64 = 0;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -285,17 +278,16 @@ impl Terminal {
                         {
                             let _ = g.write_all(&buf[..n]);
                         }
-                        let new_epoch = {
+                        {
                             let mut p = parser_clone.lock();
                             let mut t = term_clone.lock();
                             p.parse_bytes(&mut *t, &buf[..n]);
-                            // Drain any DSR / DA / title-ack replies
-                            // the parser produced into the writer
-                            // BEFORE releasing the term lock — the
+                            // Drain DSR / DA / title-ack replies the
+                            // parser produced into the writer BEFORE
+                            // releasing the term lock — the
                             // Powerlevel10k width-miscount workaround
                             // depends on these arriving promptly.
                             let replies = t.take_pty_replies();
-                            let epoch = t.dirty_epoch;
                             drop(t);
                             drop(p);
                             if !replies.is_empty() {
@@ -303,8 +295,7 @@ impl Terminal {
                                 let _ = w.write_all(&replies);
                                 let _ = w.flush();
                             }
-                            epoch
-                        };
+                        }
                         let mut h = history_clone.lock();
                         h.extend_from_slice(&buf[..n]);
                         if h.len() > HISTORY_MAX {
@@ -312,10 +303,14 @@ impl Terminal {
                             h.drain(0..drop_n);
                         }
                         drop(h);
-                        if new_epoch != last_epoch {
-                            last_epoch = new_epoch;
-                            ctx_clone.request_repaint();
-                        }
+                        // Wake egui per PTY batch unconditionally.
+                        // The earlier dirty_epoch gate skipped
+                        // repaints for cursor-only moves and on parse
+                        // calls whose net effect was no cell change,
+                        // which left the cursor visibly stuck. egui
+                        // coalesces multiple repaint requests within
+                        // a frame, so per-batch wakes are still cheap.
+                        ctx_clone.request_repaint();
                     }
                     Err(_) => break,
                 }
