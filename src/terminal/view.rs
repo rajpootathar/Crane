@@ -669,9 +669,10 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let cols = ((available.x / cell_w).floor() as usize).max(20);
     let rows = ((available.y / cell_h).floor() as usize).max(5);
     terminal.resize(cols, rows);
-    // Flush any VT replies alacritty's parser queued (CSI 6n cursor
-    // position, DSR, etc.). See WakeListener comment for why these
-    // are queued rather than written synchronously.
+    // Drain any VT replies the parser queued (CSI 6n cursor
+    // position, DSR, DA, etc.). The PTY reader already drains
+    // these per parse batch, so this call is mostly a no-op once
+    // the live grid catches up — kept as a render-time safety net.
     terminal.flush_pty_replies();
 
     let (response, painter) = ui.allocate_painter(
@@ -688,19 +689,19 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
     }
 
-    // Scrollback: mouse wheel → alacritty Scroll::Delta. Positive
-    // delta is upward in egui (history); alacritty scrolls up into
-    // history on positive delta, so the sign passes through.
+    // Scrollback: mouse wheel → Term::scroll_display. Positive
+    // delta is upward (into history); Term scrolls up on positive
+    // delta, so the sign passes through.
     //
-    // Alacritty's grid is row-granular — `Scroll::Delta(1)` jumps the
-    // viewport by a whole cell_h every commit, which feels like the
-    // 16-px stutter the user sees vs. egui's pixel-smooth ScrollArea
-    // in Files. We close the gap by accumulating the wheel into
+    // The grid is row-granular — a single-row scroll jumps the
+    // viewport by cell_h every commit, which would feel like 16-px
+    // stutter vs. egui's pixel-smooth ScrollArea in the Files
+    // pane. We close the gap by accumulating the wheel into
     // `scroll_carry` (in fractional-row units) and applying the
-    // sub-row remainder as a pixel offset on the painted rows below.
-    // Whole-row crossings still get committed to alacritty so the
-    // grid actually advances; the carry persists between frames so
-    // the view stays where the user left it.
+    // sub-row remainder as a pixel offset on the painted rows
+    // below. Whole-row crossings still get committed to the term
+    // so the grid actually advances; the carry persists between
+    // frames so the view stays where the user left it.
     if response.hovered() {
         let wheel = ui.input(|i| i.smooth_scroll_delta.y);
         if wheel.abs() > 0.01 {
@@ -837,10 +838,10 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     let mut by_row: std::collections::BTreeMap<i32, Vec<(usize, CtCell, bool)>> =
         std::collections::BTreeMap::new();
     for (point, cell) in cells {
-        // alacritty yields display_iter items in grid-absolute line
-        // coordinates, which go negative into history when the user has
-        // scrolled up. Translate to viewport-local (0..screen_lines) by
-        // adding the current display offset.
+        // renderable_content yields cells in grid-absolute line
+        // coordinates, which go negative into history when the user
+        // has scrolled up. Translate to viewport-local
+        // (0..screen_lines) by adding the current display offset.
         let viewport_line = point.line.0 + display_offset;
         if viewport_line < 0 || viewport_line as usize >= rows {
             continue;
@@ -1040,21 +1041,21 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             } else {
                 (&default_cell, false)
             };
-            // Wide-char second cell: alacritty emits a WIDE_CHAR on
+            // Wide-char second cell: crane_term emits a WIDE_CHAR on
             // col N and a WIDE_CHAR_SPACER on col N+1 (CJK, emoji,
             // Nerd Font icons marked wide). We MUST contribute
             // something at col N+1 — if we `continue` here, `buf`
             // ends up one char short per spacer, left-shifting every
-            // cell right of the wide char by one cell_w. Emit a space
-            // with the same style so the visible spacing stays
+            // cell right of the wide char by one cell_w. Emit a
+            // space with the same style so the visible spacing stays
             // 1-cell-per-column.
             let is_wide_spacer = cell.flags.contains(CellFlags::WIDE_CHAR_SPACER);
             let mut fg = color_to_egui(cell.fg, true);
             let mut bg = color_to_egui(cell.bg, false);
-            // SGR 7 (reverse video) — TUIs like nvitop / htop use this
-            // to highlight the selected row. alacritty tags cells with
-            // CellFlags::INVERSE; the renderer must swap fg and bg at
-            // paint time. Without this the row looks unhighlighted.
+            // SGR 7 (reverse video) — TUIs like nvitop / htop use
+            // this to highlight the selected row. The cell carries
+            // CellFlags::INVERSE; the renderer must swap fg and bg
+            // at paint time. Without this the row looks unhighlighted.
             if cell.flags.contains(CellFlags::INVERSE) {
                 // If bg was the default (terminal bg), swapping gives us
                 // the theme bg as the text color — unreadable. Use the
@@ -1285,12 +1286,12 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
                         continue;
                     }
                     // Queue; actual work happens after the input
-                    // closure unlocks Context. Driving the ANSI parser
-                    // inside `ui.input` used to deadlock because
-                    // alacritty's WakeListener calls
-                    // ctx.request_repaint() on certain escape events,
-                    // and that call takes a Context write lock while
-                    // our ui.input closure still holds its read lock.
+                    // closure unlocks Context. Driving the ANSI
+                    // parser inside `ui.input` could deadlock if any
+                    // escape callback ends up calling
+                    // ctx.request_repaint() — that takes a Context
+                    // write lock while our ui.input closure still
+                    // holds its read lock.
                     clear_requested = true;
                 }
                 egui::Event::Key {
@@ -1392,21 +1393,21 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
             }
         }
     }); }
-    // Safe to drive scroll_display now that ui.input's read lock on
-    // Context has released. write_input accumulates into a flag —
-    // drain it here so typing snaps the viewport back to the live
-    // screen without racing the alacritty listener → request_repaint
-    // → Context write-lock path.
+    // Safe to drive scroll_display now that ui.input's read lock
+    // on Context has released. write_input accumulates into a flag
+    // — drain it here so typing snaps the viewport back to the
+    // live screen without racing any code path that needs a
+    // Context write lock.
     terminal.flush_scroll_to_bottom();
     if let Some(t) = copy_text {
         ui.ctx().copy_text(t);
     }
     if let Some(t) = paste_text {
-        // Only wrap in bracketed-paste markers when the running shell
-        // / TUI has actually asked for it (DECSET 2004 — alacritty
-        // tracks this as TermMode::BRACKETED_PASTE). If we wrap
-        // unconditionally, shells/apps that haven't enabled the mode
-        // see "200~…201~" as literal command text.
+        // Only wrap in bracketed-paste markers when the running
+        // shell / TUI has actually asked for it (DECSET 2004 —
+        // crane_term tracks this as TermMode::BRACKETED_PASTE). If
+        // we wrap unconditionally, shells/apps that haven't enabled
+        // the mode see "200~…201~" as literal command text.
         let bracketed = terminal.term.lock().is_bracketed_paste();
         if bracketed {
             let mut bytes = Vec::with_capacity(t.len() + 12);
