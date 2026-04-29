@@ -301,9 +301,17 @@ fn pixel_to_point(
     cols: usize,
     rows: usize,
     display_offset: usize,
+    scroll_pixel_offset: f32,
 ) -> (Point, Side) {
-    let rel_x = (pos.x - origin.x).max(0.0);
-    let rel_y = (pos.y - origin.y).max(0.0);
+    // Rows paint at `origin.y + line*cell_h + scroll_pixel_offset`,
+    // so click math has to undo the same offset — otherwise a click
+    // on the visible bottom edge of a row gets attributed to the
+    // next row when the trackpad has a sub-row carry. Use the
+    // rounded origin.x to match `row_x = origin.x.round()` in the
+    // paint path so left-to-right drag doesn't drift one column on
+    // sub-pixel boundaries.
+    let rel_x = (pos.x - origin.x.round()).max(0.0);
+    let rel_y = (pos.y - origin.y - scroll_pixel_offset).max(0.0);
     let col_f = rel_x / cell_w;
     let line_f = rel_y / cell_h;
     let col = (col_f.floor() as usize).min(cols.saturating_sub(1));
@@ -733,7 +741,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         && let Some(pos) = response.interact_pointer_pos() {
             let mut guard = terminal.term.lock();
             let off = guard.display_offset();
-            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off);
+            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off, scroll_pixel_offset);
             // Ghostty-style column-aware selection: if the start cell
             // sits between two columns that contain vertical
             // box-drawing characters on most visible rows (i.e. the TUI
@@ -756,7 +764,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
         && let Some(pos) = response.interact_pointer_pos() {
             let mut guard = terminal.term.lock();
             let off = guard.display_offset();
-            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off);
+            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off, scroll_pixel_offset);
             if let Some(sel) = guard.selection.as_mut() {
                 sel.update(point, side);
             }
@@ -767,7 +775,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: &mut Terminal, font_size: f3
     if response.clicked()
         && let Some(pos) = response.interact_pointer_pos() {
             let off = terminal.term.lock().display_offset();
-            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off);
+            let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off, scroll_pixel_offset);
             let shift_held = ui.input(|i| i.modifiers.shift);
             let now = std::time::Instant::now();
             let is_multi = terminal
