@@ -50,6 +50,9 @@ pub struct FileTab {
     pub image_texture: Option<egui::TextureHandle>,
     /// Find bar state. None = closed; Some(query) = open and filtered.
     pub find_query: Option<String>,
+    /// When the find-bar's next/prev jumps to a match, this stores the
+    /// target line so the scroll area can reveal it. Cleared after scroll.
+    pub find_scroll_to_line: Option<u32>,
     /// File mtime at last read (open / reload / save). Used to detect
     /// edits made outside Crane: if the file on disk has a newer mtime
     /// AND its bytes differ from `original_content`, we refuse to save
@@ -67,6 +70,14 @@ pub struct FileTab {
     /// stash it explicitly here.
     #[allow(dead_code)]
     pub last_cursor_idx: usize,
+    /// Cached per-line git change classification. Refreshed from
+    /// `git::line_changes()` when the content changes (keyed by
+    /// content hash). Used by the gutter and scrollbar to paint
+    /// colored change markers.
+    pub line_changes: Option<crate::git::FileDiff>,
+    /// Content hash at the time `line_changes` was computed. We use this
+    /// to avoid re-running `git diff` every frame when nothing changed.
+    pub line_changes_key: u64,
 }
 
 impl FileTab {
@@ -115,9 +126,12 @@ impl FilesPane {
             pending_cursor: None,
             image_texture: None,
             find_query: None,
+            find_scroll_to_line: None,
             disk_mtime,
             external_change: false,
             last_cursor_idx: 0,
+            line_changes: None,
+            line_changes_key: 0,
             content,
             name,
         });

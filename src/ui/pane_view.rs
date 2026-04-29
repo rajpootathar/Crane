@@ -3,6 +3,7 @@ use crate::state::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
 use egui_phosphor::regular as icons;
+use std::path::PathBuf;
 
 pub const HEADER_H: f32 = 26.0;
 const BORDER_W: f32 = 1.0;
@@ -56,6 +57,9 @@ pub enum PaneAction {
     ReplaceWithBrowser(PaneId),
     /// Welcome → show the Right Panel (Files tree).
     ShowFilesPanel,
+    /// Terminal → Files Pane: user clicked a local path that's inside the
+    /// workspace. Open it in Crane's file editor instead of the system app.
+    OpenFile(PathBuf),
 }
 
 fn dock_zone(rect: Rect, pos: Pos2) -> DockEdge {
@@ -405,7 +409,12 @@ fn render_pane(
     // to detect them, so this helps both speed and the "red flash" bug.
     child.push_id(("pane_body", id), |child| match &mut pane.content {
         PaneContent::Terminal(tp) => {
-            crate::terminal::view::render_terminal_pane(child, tp, font_size, is_focus, id);
+            let opened = crate::terminal::view::render_terminal_pane(
+                child, tp, font_size, is_focus, id, workspace_root,
+            );
+            if let Some(path) = opened {
+                *action = PaneAction::OpenFile(path);
+            }
         }
         PaneContent::Files(files) => {
             file_view::render(

@@ -681,9 +681,12 @@ impl SPane {
                             pending_cursor: None,
                             image_texture: None,
                             find_query: None,
+                            find_scroll_to_line: None,
                             disk_mtime,
                             external_change: false,
                             last_cursor_idx: 0,
+                            line_changes: None,
+                            line_changes_key: 0,
                             content,
                         }
                     })

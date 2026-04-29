@@ -102,6 +102,14 @@ pub fn section_header(ui: &mut Ui, label: &str) {
 
 // --- Tree row primitive ---
 
+/// Tri-state checkbox for the Changes tree: checked (staged),
+/// unchecked (unstaged), indeterminate (partially staged).
+pub enum CheckState {
+    Unchecked,
+    Checked,
+    Indeterminate,
+}
+
 pub struct RowConfig<'a> {
     pub depth: usize,
     pub expanded: Option<bool>,
@@ -119,12 +127,11 @@ pub struct RowConfig<'a> {
     /// give the multi-repo Project tree a file-explorer feel without
     /// affecting flat lists elsewhere. Default off.
     pub tree_guides: bool,
-    /// When `Some(checked)`, render a persistent checkbox just after the
+    /// When `Some(state)`, render a persistent checkbox just after the
     /// expand chevron. Click on the checkbox is reported in
     /// `RowResult::checkbox_clicked`; click anywhere else still fires
-    /// `main_clicked`. Used by the Changes tree for JetBrains-style
-    /// stage / unstage toggles.
-    pub checkbox: Option<bool>,
+    /// `main_clicked`. Used by the Changes tree for stage / unstage toggles.
+    pub checkbox: Option<CheckState>,
 }
 
 pub struct RowResult {
@@ -233,14 +240,12 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     // + primary-click detection so the checkbox can paint its own
     // hover state and steal the click from the row reliably.
     let mut checkbox_clicked = false;
-    if let Some(checked) = cfg.checkbox {
+    if let Some(state) = cfg.checkbox {
         let cb_rect = Rect::from_min_size(
             Pos2::new(cursor_x, rect.center().y - 9.0),
             Vec2::splat(18.0),
         );
         let pointer_over = ui.rect_contains_pointer(cb_rect);
-        // Hover background fades in over 80 ms — same feel as the row
-        // tint, just scoped to the checkbox square.
         let cb_hover_id = response.id.with("row_cb_hover_t");
         let cb_hover_t = ui.ctx().animate_bool_with_time(cb_hover_id, pointer_over, 0.08);
         if cb_hover_t > 0.01 {
@@ -257,38 +262,73 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
                 checkbox_clicked = true;
             }
         }
-        // Cross-fade between the empty box and the filled check so the
-        // state change reads as a transition, not a glyph swap. 130 ms
-        // is long enough to notice, short enough to feel responsive.
-        let cb_state_id = response.id.with("row_cb_state_t");
-        let state_t = ui.ctx().animate_bool_with_time(cb_state_id, checked, 0.13);
         let fade = |c: Color32, a: f32| -> Color32 {
             Color32::from_rgba_unmultiplied(
                 c.r(), c.g(), c.b(),
                 (c.a() as f32 * a.clamp(0.0, 1.0)) as u8,
             )
         };
-        // A tiny scale pop when state_t is mid-transition — peaks at
-        // 0.5 and returns to 1.0 at both ends.
-        let pop = 1.0 + (state_t * std::f32::consts::PI).sin() * 0.12;
-        let font_size = 14.0 * pop;
-        if state_t < 0.999 {
-            painter.text(
-                cb_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                icons::SQUARE,
-                egui::FontId::new(font_size, egui::FontFamily::Proportional),
-                fade(muted(), 1.0 - state_t),
-            );
-        }
-        if state_t > 0.001 {
-            painter.text(
-                cb_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                icons::CHECK_SQUARE,
-                egui::FontId::new(font_size, egui::FontFamily::Proportional),
-                fade(accent(), state_t),
-            );
+        match state {
+            CheckState::Checked => {
+                let cb_state_id = response.id.with("row_cb_state_t");
+                let state_t = ui.ctx().animate_bool_with_time(cb_state_id, true, 0.13);
+                let pop = 1.0 + (state_t * std::f32::consts::PI).sin() * 0.12;
+                let font_size = 14.0 * pop;
+                if state_t < 0.999 {
+                    painter.text(
+                        cb_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        icons::SQUARE,
+                        egui::FontId::new(font_size, egui::FontFamily::Proportional),
+                        fade(muted(), 1.0 - state_t),
+                    );
+                }
+                painter.text(
+                    cb_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icons::CHECK_SQUARE,
+                    egui::FontId::new(14.0, egui::FontFamily::Proportional),
+                    fade(accent(), state_t),
+                );
+            }
+            CheckState::Indeterminate => {
+                painter.text(
+                    cb_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icons::SQUARE,
+                    egui::FontId::new(14.0, egui::FontFamily::Proportional),
+                    fade(accent(), 0.6),
+                );
+                painter.text(
+                    cb_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icons::MINUS,
+                    egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                    accent(),
+                );
+            }
+            CheckState::Unchecked => {
+                let cb_state_id = response.id.with("row_cb_state_t");
+                let state_t = ui.ctx().animate_bool_with_time(cb_state_id, false, 0.13);
+                let pop = 1.0 + ((1.0 - state_t) * std::f32::consts::PI).sin() * 0.12;
+                let font_size = 14.0 * pop;
+                if state_t > 0.001 {
+                    painter.text(
+                        cb_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        icons::CHECK_SQUARE,
+                        egui::FontId::new(font_size, egui::FontFamily::Proportional),
+                        fade(accent(), state_t),
+                    );
+                }
+                painter.text(
+                    cb_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icons::SQUARE,
+                    egui::FontId::new(14.0, egui::FontFamily::Proportional),
+                    fade(muted(), 1.0 - state_t),
+                );
+            }
         }
         cursor_x += 20.0;
     }

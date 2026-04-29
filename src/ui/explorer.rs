@@ -4,18 +4,39 @@ use crate::state::{
     FILE_OP_HISTORY_CAP,
 };
 use crate::ui::util::{
-    draw_row, section_header,
+    CheckState, draw_row,
     RowConfig, accent, muted, text,
 };
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icons;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 
 const ADD: Color32 = Color32::from_rgb(120, 210, 140);
 const DEL: Color32 = Color32::from_rgb(220, 110, 110);
 const WARN: Color32 = Color32::from_rgb(220, 180, 110);
+const MODIFIED_BLUE: Color32 = Color32::from_rgb(100, 160, 230);
+
+fn status_color(status: git::ChangeStatus) -> Color32 {
+    match status {
+        git::ChangeStatus::Added => ADD,
+        git::ChangeStatus::Modified => MODIFIED_BLUE,
+        git::ChangeStatus::Deleted => DEL,
+        git::ChangeStatus::Renamed => MODIFIED_BLUE,
+        git::ChangeStatus::Untracked => ADD,
+    }
+}
+
+fn status_glyph(status: git::ChangeStatus) -> &'static str {
+    match status {
+        git::ChangeStatus::Added => "A",
+        git::ChangeStatus::Modified => "M",
+        git::ChangeStatus::Deleted => "D",
+        git::ChangeStatus::Renamed => "R",
+        git::ChangeStatus::Untracked => "U",
+    }
+}
 
 /// Compact toolbar button for the Changes-pane top row. Shows the
 /// kind icon, plus tooltip, and a spinner when its op is running.
@@ -288,62 +309,19 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
         .id_salt("right_changes")
         .auto_shrink([false, false])
         .show(&mut scroll_ui, |ui| {
-            let staged: Vec<&FileChange> = status.changes.iter().filter(|c| c.staged).collect();
-            let unstaged: Vec<&FileChange> = status
-                .changes
-                .iter()
-                .filter(|c| !c.staged && c.status != git::ChangeStatus::Untracked)
-                .collect();
-            let untracked: Vec<&FileChange> = status
-                .changes
-                .iter()
-                .filter(|c| c.status == git::ChangeStatus::Untracked)
-                .collect();
+            let all_changes: Vec<&FileChange> = status.changes.iter().collect();
 
-            if !staged.is_empty() {
-                section_header(ui, "STAGED");
+            if !all_changes.is_empty() {
                 render_change_tree(
                     ui,
-                    "stg",
-                    &staged,
-                    true,
+                    &all_changes,
                     &collapsed,
                     &mut unstage_paths,
                     &mut stage_paths,
                     &mut open_diff,
                     &mut toggle_dir,
                 );
-            }
-            if !unstaged.is_empty() {
-                section_header(ui, "UNSTAGED");
-                render_change_tree(
-                    ui,
-                    "unstg",
-                    &unstaged,
-                    false,
-                    &collapsed,
-                    &mut unstage_paths,
-                    &mut stage_paths,
-                    &mut open_diff,
-                    &mut toggle_dir,
-                );
-            }
-            if !untracked.is_empty() {
-                section_header(ui, "UNTRACKED");
-                render_change_tree(
-                    ui,
-                    "untr",
-                    &untracked,
-                    false,
-                    &collapsed,
-                    &mut unstage_paths,
-                    &mut stage_paths,
-                    &mut open_diff,
-                    &mut toggle_dir,
-                );
-            }
-
-            if status.changes.is_empty() {
+            } else {
                 dim_row(ui, "working tree clean");
             }
         });
@@ -358,7 +336,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
         egui::Stroke::new(1.0, divider_col),
     );
 
-    let staged_count = status.changes.iter().filter(|c| c.staged).count();
+    let staged_count = status.changes.iter().filter(|c| c.has_staged).count();
     let has_staged = staged_count > 0;
     let has_message = !app.commit_message.trim().is_empty();
     let can_commit = has_staged && has_message;
@@ -615,9 +593,7 @@ fn build_tree(changes: &[&FileChange]) -> DirNode {
 #[allow(clippy::too_many_arguments)]
 fn render_change_tree(
     ui: &mut egui::Ui,
-    section: &str,
     changes: &[&FileChange],
-    staged: bool,
     collapsed: &std::collections::HashSet<String>,
     unstage_paths: &mut Vec<String>,
     stage_paths: &mut Vec<String>,
@@ -627,11 +603,9 @@ fn render_change_tree(
     let tree = build_tree(changes);
     render_change_node(
         ui,
-        section,
         &tree,
         "",
         0,
-        staged,
         collapsed,
         unstage_paths,
         stage_paths,
@@ -643,11 +617,9 @@ fn render_change_tree(
 #[allow(clippy::too_many_arguments)]
 fn render_change_node(
     ui: &mut egui::Ui,
-    section: &str,
     node: &DirNode,
     prefix: &str,
     depth: usize,
-    staged: bool,
     collapsed: &std::collections::HashSet<String>,
     unstage_paths: &mut Vec<String>,
     stage_paths: &mut Vec<String>,
@@ -660,12 +632,16 @@ fn render_change_node(
         } else {
             format!("{prefix}/{dir_name}")
         };
-        let key = format!("{section}:{child_prefix}");
+        let key = child_prefix.clone();
         let is_collapsed = collapsed.contains(&key);
-        // Folder checkbox mirrors the section: in a STAGED tree it's
-        // always checked (since every file under it is staged), in an
-        // UNSTAGED / UNTRACKED tree it's always unchecked. Click flips
-        // every file in the subtree.
+        let (all_staged, any_staged) = dir_staged_state(child);
+        let check = if all_staged {
+            CheckState::Checked
+        } else if any_staged {
+            CheckState::Indeterminate
+        } else {
+            CheckState::Unchecked
+        };
         let row = draw_row(
             ui,
             RowConfig {
@@ -680,13 +656,13 @@ fn render_change_node(
                 badge: None,
                 trailing_count: 0,
                 tree_guides: false,
-                checkbox: Some(staged),
+                checkbox: Some(check),
             },
         );
         if row.checkbox_clicked {
             let mut paths = Vec::new();
             collect_paths(child, &mut paths);
-            if staged {
+            if all_staged {
                 unstage_paths.extend(paths);
             } else {
                 stage_paths.extend(paths);
@@ -697,11 +673,9 @@ fn render_change_node(
         if !is_collapsed {
             render_change_node(
                 ui,
-                section,
                 child,
                 &child_prefix,
                 depth + 1,
-                staged,
                 collapsed,
                 unstage_paths,
                 stage_paths,
@@ -718,9 +692,6 @@ fn render_change_node(
             git::ChangeStatus::Renamed => ("R", accent()),
             git::ChangeStatus::Untracked => ("?", WARN),
         };
-        // For renames show "oldName → newName" on a single leaf so the
-        // destination folder groups the row but the move is still
-        // visible. Pure filename for everything else.
         let rename_label;
         let label: &str = if let Some(old) = change.old_path.as_ref() {
             let old_name = std::path::Path::new(old)
@@ -731,6 +702,13 @@ fn render_change_node(
             &rename_label
         } else {
             file_name
+        };
+        let check = if change.has_staged && !change.has_unstaged {
+            CheckState::Checked
+        } else if change.has_staged && change.has_unstaged {
+            CheckState::Indeterminate
+        } else {
+            CheckState::Unchecked
         };
         let row = draw_row(
             ui,
@@ -746,11 +724,11 @@ fn render_change_node(
                 badge: None,
                 trailing_count: 0,
                 tree_guides: false,
-                checkbox: Some(staged),
+                checkbox: Some(check),
             },
         );
         if row.checkbox_clicked {
-            if staged {
+            if change.has_staged && !change.has_unstaged {
                 unstage_paths.push(change.path.clone());
             } else {
                 stage_paths.push(change.path.clone());
@@ -758,18 +736,19 @@ fn render_change_node(
         } else if row.main_clicked {
             *open_diff = Some(change.path.clone());
         }
-        // Right-click → stage / unstage / open diff / copy path.
         let change_path = change.path.clone();
-        let staged_here = staged;
+        let has_staged = change.has_staged;
+        let has_unstaged = change.has_unstaged;
         row.response.context_menu(|ui| {
-            if staged_here {
-                if ui.button(format!("{}  Unstage", icons::MINUS)).clicked() {
-                    unstage_paths.push(change_path.clone());
-                    ui.close();
-                }
-            } else {
+            if has_unstaged {
                 if ui.button(format!("{}  Stage", icons::PLUS)).clicked() {
                     stage_paths.push(change_path.clone());
+                    ui.close();
+                }
+            }
+            if has_staged {
+                if ui.button(format!("{}  Unstage", icons::MINUS)).clicked() {
+                    unstage_paths.push(change_path.clone());
                     ui.close();
                 }
             }
@@ -786,6 +765,31 @@ fn render_change_node(
     }
 }
 
+/// Walk a `DirNode` and return `(all_staged, any_staged)`.
+/// `all_staged` = every file is fully staged (has_staged && !has_unstaged).
+/// `any_staged` = at least one file has staged changes.
+fn dir_staged_state(node: &DirNode) -> (bool, bool) {
+    let mut total = 0usize;
+    let mut fully_staged = 0usize;
+    let mut any_staged = false;
+    fn walk(n: &DirNode, total: &mut usize, fully_staged: &mut usize, any_staged: &mut bool) {
+        for child in n.dirs.values() {
+            walk(child, total, fully_staged, any_staged);
+        }
+        for (_, change) in &n.files {
+            *total += 1;
+            if change.has_staged && !change.has_unstaged {
+                *fully_staged += 1;
+            }
+            if change.has_staged {
+                *any_staged = true;
+            }
+        }
+    }
+    walk(node, &mut total, &mut fully_staged, &mut any_staged);
+    (total > 0 && fully_staged == total, any_staged)
+}
+
 fn render_files(ui: &mut egui::Ui, app: &mut App) {
     let path = match app.active_workspace_path() {
         Some(p) => p.to_path_buf(),
@@ -794,6 +798,26 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
             return;
         }
     };
+    // Build a map of relative-path → (ChangeStatus, has_staged, has_unstaged)
+    // so file rows can show git status colors. Directories get the "worst"
+    // status of any descendant.
+    let git_status_map: HashMap<String, (git::ChangeStatus, bool, bool)> =
+        app.active_workspace_mut()
+            .and_then(|w| w.git_status.as_ref())
+            .map(|s| {
+                s.changes
+                    .iter()
+                    .map(|c| {
+                        let status = c
+                            .unstaged_status
+                            .or(c.staged_status)
+                            .unwrap_or(c.status);
+                        (c.path.clone(), (status, c.has_staged, c.has_unstaged))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
     let mut opened: Option<PathBuf> = None;
     let mut toggled: Option<PathBuf> = None;
     let mut new_entry: Option<(PathBuf, NewEntryKind)> = None;
@@ -821,6 +845,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 &mut commit_pending,
                 &mut cancel_pending,
                 &path,
+                &git_status_map,
             );
             // Sink for right-clicks on the empty space below entries
             // — `interact` claims the rest of the ScrollArea's height
@@ -909,6 +934,7 @@ fn render_fs_dir(
     commit: &mut bool,
     cancel: &mut bool,
     workspace_root: &std::path::Path,
+    git_status_map: &HashMap<String, (git::ChangeStatus, bool, bool)>,
 ) {
     if depth > 6 {
         return;
@@ -950,15 +976,35 @@ fn render_fs_dir(
         let is_dir = entry_path.is_dir();
         let is_expanded = is_dir && expanded.contains(&entry_path);
         let is_selected = selected.is_some_and(|s| s == entry_path);
+        // Resolve git status for this file/directory.
+        let rel = entry_path.strip_prefix(workspace_root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .map(|s| s.to_string());
+        let git_info = rel.as_deref()
+            .and_then(|r| git_status_map.get(r));
+        // For directories, look for any descendant with changes
+        let dir_has_changes = is_dir && git_status_map.keys().any(|k| {
+            k.starts_with(rel.as_deref().unwrap_or(""))
+                && k != rel.as_deref().unwrap_or("")
+        });
+        let (leading_icon, leading_col, label_col) = if is_dir {
+            let col = if dir_has_changes { MODIFIED_BLUE } else { muted() };
+            (icons::FOLDER, col, None)
+        } else if let Some((status, _staged, _unstaged)) = git_info {
+            (status_glyph(*status), status_color(*status), Some(status_color(*status)))
+        } else {
+            (icons::FILE, muted(), None)
+        };
         let row = draw_row(
             ui,
             RowConfig {
                 depth,
                 expanded: if is_dir { Some(is_expanded) } else { None },
-                leading: Some(if is_dir { icons::FOLDER } else { icons::FILE }),
-                leading_color: Some(muted()),
+                leading: Some(leading_icon),
+                leading_color: Some(leading_col),
                 label: &name,
-                label_color: None,
+                label_color: label_col,
                 is_active: is_selected,
                 active_bar: false,
                 badge: None,
@@ -1060,6 +1106,7 @@ fn render_fs_dir(
                 commit,
                 cancel,
                 workspace_root,
+                git_status_map,
             );
         }
     }
