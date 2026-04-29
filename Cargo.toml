@@ -7,7 +7,7 @@ members = ["crates/*"]
 
 [package]
 name = "crane"
-version = "0.4.29"
+version = "0.4.30"
 edition = "2024"
 description = "Native GPU-rendered terminal + IDE environment"
 authors = ["rajpootathar"]
