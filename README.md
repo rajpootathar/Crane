@@ -4,7 +4,7 @@
 
 Native, GPU-rendered desktop development environment for orchestrating terminals, file browsing, diffs, and git workflows across isolated git workspaces.
 
-Built in pure Rust on [egui](https://github.com/emilk/egui) + [wgpu](https://github.com/gfx-rs/wgpu), with [alacritty_terminal](https://github.com/alacritty/alacritty) driving the VT parser and [portable-pty](https://github.com/wez/wezterm/tree/main/pty) for cross-platform PTY.
+Built in pure Rust on [egui](https://github.com/emilk/egui) + [wgpu](https://github.com/gfx-rs/wgpu), with an in-house terminal core (`crates/crane_term`) wrapping [vte](https://github.com/alacritty/vte) for VT parsing and [portable-pty](https://github.com/wez/wezterm/tree/main/pty) for cross-platform PTY.
 
 ---
 
@@ -130,8 +130,10 @@ src/
 ├── main.rs          eframe entry + shortcuts + top-level composition
 ├── state.rs         App · Project · Workspace · Tab
 ├── layout.rs        Layout tree (Node::Leaf / Node::Split) · Pane · PaneContent
-├── terminal.rs      PTY spawn + alacritty Term + reader thread + input writer
-├── terminal_view.rs Grid renderer via egui::Painter; key → escape sequence
+├── terminal/
+│   ├── term.rs      PTY spawn + crane_term::Term wiring + reader thread + input writer
+│   └── view.rs      Grid renderer via egui::Painter; key → escape sequence
+├── (crates/crane_term) In-house VT parser glue + grid + scrollback + reflow
 ├── pane_view.rs     Renders Layout tree · headers · borders · splitters · focus
 ├── ui_left.rs       Left Panel (project tree)
 ├── ui_right.rs      Right Panel (Changes · Files)

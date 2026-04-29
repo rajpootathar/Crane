@@ -1,84 +1,10 @@
-use alacritty_terminal::event::{Event as TermEvent, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+use crane_term::{Processor as CtProcessor, Term as CtTerm};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
-use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-
-use super::sync_handler::{split_sync_markers, SyncChunk};
-
-/// Bound on remembered ghost-row texts. 2048 is ~128KB worst case
-/// (64-col row average) and comfortably spans many minutes of dense
-/// Ink-style redraw bursts.
-const GHOST_CAP: usize = 2048;
-
-pub struct TermSize {
-    pub columns: usize,
-    pub screen_lines: usize,
-}
-
-impl Dimensions for TermSize {
-    fn total_lines(&self) -> usize {
-        self.screen_lines
-    }
-    fn screen_lines(&self) -> usize {
-        self.screen_lines
-    }
-    fn columns(&self) -> usize {
-        self.columns
-    }
-}
-
-#[derive(Clone)]
-pub struct WakeListener {
-    ctx: egui::Context,
-    /// Queue of VT-parser replies (CSI 6n / DSR / title ack) the
-    /// Terminal drains and writes back to the PTY on each render.
-    /// Deliberately a queue rather than a direct write: making these
-    /// replies synchronous (write from the listener in-line) exposed
-    /// a Powerlevel10k width-miscount bug where P10k computes its
-    /// RPROMPT cursor-back against byte-width instead of column-width
-    /// of Nerd Font icons, landing the cursor a few columns short of
-    /// the prompt end. With a small delay, P10k's internal timeout
-    /// falls through to an absolute-positioning code path that
-    /// doesn't rely on width counting.
-    pty_replies: Arc<Mutex<Vec<u8>>>,
-}
-
-impl EventListener for WakeListener {
-    fn send_event(&self, event: TermEvent) {
-        if let TermEvent::PtyWrite(s) = event {
-            let bytes = s.as_bytes();
-            // Suppress CSI 6n / DSR cursor-position reports (CPR).
-            // Powerlevel10k computes RPROMPT cursor-back math against
-            // byte-width instead of column-width for Nerd-Font icons;
-            // when we reply with a correct CPR it lands the cursor a
-            // few columns short of the prompt end, so typed chars
-            // overwrite the prompt. The in-place "queue then drain per
-            // frame" delay isn't long enough at 60fps to beat P10k's
-            // ~20ms internal timeout. Dropping CPRs lets P10k always
-            // fall through to its absolute-positioning fallback that
-            // doesn't rely on width counting. Other replies (DA, title
-            // ack, etc.) still pass through.
-            // CPR format: `\x1b[<row>;<col>R` or `\x1b[<row>R`.
-            let is_cpr = bytes.starts_with(b"\x1b[")
-                && bytes.ends_with(b"R")
-                && bytes[2..bytes.len() - 1]
-                    .iter()
-                    .all(|&b| b.is_ascii_digit() || b == b';');
-            if !is_cpr {
-                self.pty_replies.lock().extend_from_slice(bytes);
-            }
-        }
-        self.ctx.request_repaint();
-    }
-}
 
 const HISTORY_MAX: usize = 256 * 1024;
 
@@ -86,72 +12,62 @@ const HISTORY_MAX: usize = 256 * 1024;
 // Terminfo: extend xterm-256color with the Sync extended capability
 // (Synchronized Output, DEC mode 2026). Ink-based TUIs (Claude Code,
 // etc.) check terminfo for `Sync` and, when present, wrap their
-// redraws in \e[?2026h .. \e[?2026l. Our SyncAwareHandler then
-// converts the LFs inside the redraw region to non-scrolling
-// move_down(1), preventing ghost-frame accumulation in scrollback.
-// Compiled on first launch via `tic -x`; installed to ~/.terminfo/.
-// Falls back to plain xterm-256color if tic is unavailable.
+// redraws in \e[?2026h .. \e[?2026l. Our Processor / Term then
+// buffers the redraw and replays it with `set_sync_frame(true)` so
+// the LFs at scroll-region bottom don't push intermediate redraw
+// rows into scrollback.
 // ---------------------------------------------------------------------------
 
-/// Terminfo source: xterm-256color + Sync capability.
 const CRANE_TERMINFO_SRC: &[u8] = b"xterm-crane|Crane terminal emulator,\n\
     \tuse=xterm-256color,\n\
     \tSync=\\E[?2026h\\E[?2026l,\n";
 
-/// One-time gate: true once xterm-crane has been installed (or was
-/// already present). Cached for the process lifetime so `tic` only
-/// runs once, even across many terminal panes.
 static CRANE_TERMINFO_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Ensure `~/.terminfo/<hash>/xterm-crane` exists. Compiles via
-/// `tic -x` on first call. Returns true when the custom entry is
-/// usable (either just compiled or already present).
 fn use_crane_terminfo() -> bool {
     *CRANE_TERMINFO_OK.get_or_init(|| {
         let home = match std::env::var("HOME") {
             Ok(h) => h,
             Err(_) => return false,
         };
-        let dir = format!("{home}/.terminfo");
-        // ncurses uses either a hex subdirectory (macOS: 78/) or a
-        // character subdirectory (Linux: x/). Check both.
-        let hex = format!("{dir}/78/xterm-crane");
-        let chr = format!("{dir}/x/xterm-crane");
-        if std::path::Path::new(&hex).exists() || std::path::Path::new(&chr).exists() {
+        let terminfo_dir = std::path::PathBuf::from(format!("{home}/.terminfo"));
+        if !std::path::Path::new(&format!("{}/x", terminfo_dir.display())).exists() {
+            let _ = std::fs::create_dir_all(&terminfo_dir);
+        }
+        let probe = terminfo_dir.join("78").join("xterm-crane");
+        if probe.exists() {
             return true;
         }
-        let _ = std::fs::create_dir_all(&dir);
-        let tmp = std::env::temp_dir().join(format!(
-            "xterm-crane-{}.ti",
-            std::process::id()
-        ));
+        // tic compiles a terminfo source file and emits a binary
+        // entry under ~/.terminfo. Stdin doesn't work cross-version
+        // on macOS, so write a temp file and pass the path.
+        let tmp = std::env::temp_dir().join("crane-terminfo.src");
         if std::fs::write(&tmp, CRANE_TERMINFO_SRC).is_err() {
             return false;
         }
         let out = std::process::Command::new("tic")
-            .args(["-x", "-o", &dir])
+            .args(["-x", "-o"])
+            .arg(&terminfo_dir)
             .arg(&tmp)
             .output();
         let _ = std::fs::remove_file(&tmp);
         match out {
             Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                eprintln!(
-                    "[crane] tic failed: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                false
-            }
-            Err(e) => {
-                eprintln!("[crane] tic unavailable: {e}");
-                false
-            }
+            _ => false,
         }
     })
 }
 
 pub struct Terminal {
-    pub term: Arc<Mutex<Term<WakeListener>>>,
+    /// Crane's in-house terminal core. Holds the grid, scrollback,
+    /// cursor, mode bag, and scroll region. The Processor below
+    /// drives mutations through its Handler impl.
+    pub term: Arc<Mutex<CtTerm>>,
+    /// VT parser + `?2026` sync buffer. Owns the byte → Handler
+    /// dispatch loop. Held next to the term so the reader thread
+    /// and any pre-boot transcript replay both go through the same
+    /// parser state.
+    pub parser: Arc<Mutex<CtProcessor>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub cols: usize,
     pub rows: usize,
@@ -162,71 +78,36 @@ pub struct Terminal {
     master: Box<dyn MasterPty + Send>,
     shell_pid: Option<u32>,
     /// Shell child handle. Kept so `Drop` can `kill()` + `wait()` it
-    /// when the Pane closes, instead of relying on SIGHUP-on-master-
-    /// close (which some shells / subprocesses ignore, leaving the
-    /// reader thread pinned and the alacritty grid resident in RAM
-    /// long after the user closed the terminal).
+    /// when the Pane closes — relying on SIGHUP-on-master-close is
+    /// unreliable for shells / subprocesses that ignore the signal.
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    /// Shared with WakeListener; flushed once per render frame via
-    /// `flush_pty_replies`.
-    pty_replies: Arc<Mutex<Vec<u8>>>,
     /// Set by `write_input` when the user types; drained by
-    /// `flush_scroll_to_bottom` after ui.input releases to avoid a
-    /// deadlock against egui's Context lock.
+    /// `flush_scroll_to_bottom` after ui.input releases.
     pending_scroll_to_bottom: std::sync::atomic::AtomicBool,
-    /// Sub-line wheel-delta carry. egui's `smooth_scroll_delta` arrives
-    /// in pixels; a trackpad flick commonly emits ~3–6 px per frame
-    /// and cell height is ~16 px, so rounding-per-frame silently
-    /// drops most events and scrolling feels laggy. We accumulate the
-    /// remainder here and extract whole cells once it crosses ±1.
+    /// Sub-line wheel-delta carry. egui's `smooth_scroll_delta` is
+    /// pixels; cell height ~16 px means rounding-per-frame drops
+    /// most events. Carry the remainder across frames.
     pub scroll_carry: parking_lot::Mutex<f32>,
-    /// False once the PTY reader has hit EOF / error — i.e. the shell
-    /// process exited (user typed `exit`, Ctrl-D, was killed, etc.).
-    /// UI polls this each frame and closes the owning Pane.
+    /// False once the PTY reader has hit EOF / error. UI polls
+    /// each frame and closes the owning Pane.
     alive: Arc<std::sync::atomic::AtomicBool>,
-    /// Row texts known to be ghost-frame leftovers from Ink-style
-    /// redraw regions. Populated by the reader thread whenever a
-    /// `?2026h ... ?2026l` sync block's LFs push rows from the live
-    /// viewport into history — those rows are UI-region repaints, not
-    /// legitimate streamed output, so the paint path hides them when
-    /// scrolled up. FIFO-bounded; kept as trimmed text so the dedup
-    /// is stable across display_offset changes.
-    pub ghost_texts: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl Drop for Terminal {
-    /// Close-down order matters: kill the child first so the PTY's
-    /// slave side has no writers, then the master drops (closes its
-    /// fd), which EOFs the reader thread. Without this, shells that
-    /// ignore SIGHUP (or nested subprocesses that inherited the pty)
-    /// can keep the master fd busy, stranding the reader thread —
-    /// which holds Arc<Mutex<Term>> + Arc<Mutex<history>> and pins
-    /// the whole grid (tens of MB per terminal) in RAM long after
-    /// the Pane was closed.
+    /// Close-down order: kill child first so the PTY's slave side
+    /// has no writers, then master drops (closes its fd) which
+    /// EOFs the reader thread. Without this, shells that ignore
+    /// SIGHUP can keep the master fd busy.
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
-            // Reap the zombie — otherwise the child sits as defunct
-            // until the Crane process itself exits.
             let _ = c.wait();
         }
-        // `master` drops after this fn returns, which closes the pty
-        // fd and EOFs the detached reader thread. We don't join it;
-        // once the Arc drops the thread's closure finishes within a
-        // few ms and exits on its own.
         #[cfg(target_os = "macos")]
         macos_release_freed_pages();
     }
 }
 
-/// Ask macOS's malloc to return freed pages to the kernel. Without
-/// this hint, RSS doesn't drop when a terminal closes — the grid is
-/// freed to the process's malloc arena but the arena holds the pages
-/// as "dirty-but-free" until memory pressure forces a release, so
-/// Activity Monitor keeps showing the same usage.
-///
-/// `malloc_zone_pressure_relief(NULL, 0)` walks every registered zone
-/// and madvise(MADV_FREE)s unused pages. Microseconds-cheap.
 #[cfg(target_os = "macos")]
 fn macos_release_freed_pages() {
     unsafe extern "C" {
@@ -247,15 +128,14 @@ impl Terminal {
 }
 
 impl Terminal {
-    /// Drain any VT replies the parser has queued and forward them
-    /// to the PTY. Called once per render.
+    /// Drain VT replies the parser queued (DSR / DA / title-ack) and
+    /// forward them to the PTY. Now a thin wrapper since
+    /// `crane_term::Term` exposes `take_pty_replies()` directly.
     pub fn flush_pty_replies(&mut self) {
-        let mut q = self.pty_replies.lock();
-        if q.is_empty() {
+        let bytes = self.term.lock().take_pty_replies();
+        if bytes.is_empty() {
             return;
         }
-        let bytes = std::mem::take(&mut *q);
-        drop(q);
         let mut w = self.writer.lock();
         let _ = w.write_all(&bytes);
         let _ = w.flush();
@@ -291,25 +171,25 @@ impl Terminal {
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
         let mut cmd = CommandBuilder::new(shell);
-        // TUIs like Claude Code / Ink inspect these env vars to pick
-        // their redraw strategy. We install a custom terminfo entry
-        // (xterm-crane) that extends xterm-256color with the `Sync`
-        // extended capability, advertising Synchronized Output (DEC
-        // 2026). Ink's `log-update` package checks terminfo for `Sync`;
-        // when found it wraps each redraw in \e[?2026h .. \e[?2026l,
-        // which our SyncAwareHandler converts to non-scrolling LFs —
-        // no ghost frames in scrollback. Falls back to xterm-256color
-        // if tic is unavailable (e.g. stripped minimal Linux).
-        cmd.env("TERM", if use_crane_terminfo() { "xterm-crane" } else { "xterm-256color" });
+        // Ink-based TUIs (Claude Code, etc.) check terminfo for the
+        // `Sync` capability and wrap their redraws in
+        // \e[?2026h .. \e[?2026l when present. Our Processor handles
+        // those blocks correctly via the in-house sync-frame replay
+        // path, so we want TUIs to use them.
+        cmd.env(
+            "TERM",
+            if use_crane_terminfo() {
+                "xterm-crane"
+            } else {
+                "xterm-256color"
+            },
+        );
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Crane");
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        // Inherited from gnome-terminal / other VTE-based parents. If
-        // it leaks through, TUIs like neovim / Claude Code misdetect
-        // the renderer and pick feature flags meant for VTE's grid
-        // semantics (which differ subtly around scroll regions and
-        // cursor-save). Clearing it matches what Ghostty / WezTerm /
-        // kitty do — keeps detection unambiguous.
+        // Inherited from gnome-terminal / VTE-based parents. Leaks
+        // confuse TUIs that pick feature flags meant for VTE's grid
+        // semantics. Cleared, matching Ghostty / Wezterm / kitty.
         cmd.env_remove("VTE_VERSION");
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
@@ -334,68 +214,42 @@ impl Terminal {
                 .map_err(|e| std::io::Error::other(e.to_string()))?,
         ));
 
-        let pty_replies = Arc::new(Mutex::new(Vec::<u8>::with_capacity(64)));
-        let listener = WakeListener {
-            ctx: ctx.clone(),
-            pty_replies: pty_replies.clone(),
-        };
-        let term = Arc::new(Mutex::new(Term::new(
-            Config::default(),
-            &TermSize {
-                columns: cols,
-                screen_lines: rows,
-            },
-            listener,
-        )));
+        let term = Arc::new(Mutex::new(CtTerm::new(rows, cols)));
+        let parser = Arc::new(Mutex::new(CtProcessor::new()));
 
         let history = Arc::new(Mutex::new(Vec::<u8>::with_capacity(HISTORY_MAX / 2)));
 
-        // If the caller provided transcript text (from a previous
-        // session), write it into alacritty's scrollback BEFORE the
-        // reader thread starts — followed by enough blank lines to
-        // push the whole transcript up into the history buffer, and
-        // finally an explicit cursor-home so the shell's subsequent
-        // prompt-drawing starts from a known (0,0) state. This gives
-        // us unified scroll: alacritty's own scrollbar spans both
-        // transcript + live content. Cursor correctness is preserved
-        // because the shell boots with a clean cursor position; any
-        // PtyWrite replies accumulated during this pre-injection get
-        // written immediately by the WakeListener and are harmless
-        // (empty Term queries have no cursor queries yet).
+        // Replay any prior session transcript BEFORE starting the
+        // reader thread. The transcript is plain text + CRLF, so
+        // feeding it through the parser produces predictable
+        // line-by-line layout. Pad with `rows` blank rows so the
+        // whole transcript ends up in scrollback (none in visible
+        // grid), then home the cursor for the shell's first prompt.
         if let Some(text) = transcript.as_deref()
             && !text.is_empty()
         {
-            let mut processor: Processor<StdSyncHandler> = Processor::new();
-            let mut guard = term.lock();
-            processor.advance(&mut *guard, text.as_bytes());
+            let mut p = parser.lock();
+            let mut t = term.lock();
+            p.parse_bytes(&mut *t, text.as_bytes());
             if !text.ends_with('\n') {
-                processor.advance(&mut *guard, b"\r\n");
+                p.parse_bytes(&mut *t, b"\r\n");
             }
-            // Pad with screen_lines blank rows so every transcript
-            // line ends up in scrollback (none left in visible grid).
             let padding = "\r\n".repeat(rows);
-            processor.advance(&mut *guard, padding.as_bytes());
-            // Home cursor — shell boots with a known-good state.
-            processor.advance(&mut *guard, b"\x1b[H");
-            // Make sure the viewport is at the bottom so the shell's
-            // first prompt is visible without the user needing to scroll.
-            guard.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+            p.parse_bytes(&mut *t, padding.as_bytes());
+            p.parse_bytes(&mut *t, b"\x1b[H");
+            t.scroll_to_bottom();
         }
 
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let ghost_texts: Arc<Mutex<VecDeque<String>>> =
-            Arc::new(Mutex::new(VecDeque::with_capacity(128)));
         let term_clone = term.clone();
+        let parser_clone = parser.clone();
+        let writer_clone = writer.clone();
         let history_clone = history.clone();
         let ctx_clone = ctx.clone();
         let alive_clone = alive.clone();
-        let ghost_texts_clone = ghost_texts.clone();
-        // Opt-in raw VT byte trace. Set CRANE_VT_TRACE=1 in the parent
-        // env to dump everything the PTY produces, exactly as the
-        // parser sees it, to ~/.crane/vt-trace-<pid>.log. Lets us diff
-        // our byte stream against what iTerm / Alacritty see for the
-        // same TUI and pin down which escape sequence our parser is
-        // mis-handling. Cheap branch when the flag is unset.
+        // Opt-in raw VT byte trace. CRANE_VT_TRACE=1 dumps every
+        // byte the PTY produces, exactly as the parser sees it,
+        // to ~/.crane/vt-trace-<pid>.log. Cheap branch when unset.
         let trace_file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> = {
             if std::env::var("CRANE_VT_TRACE").ok().as_deref() == Some("1") {
                 let home = std::env::var("HOME").unwrap_or_default();
@@ -414,15 +268,7 @@ impl Terminal {
         let trace_file_clone = trace_file.clone();
         thread::spawn(move || {
             let mut reader = reader;
-            let mut processor: Processor<StdSyncHandler> = Processor::new();
             let mut buf = [0u8; 8192];
-            // Persistent across read() iterations — Ink sync blocks can
-            // span multiple PTY reads, so pre_sync_hist has to survive
-            // from whatever read saw `?2026h` to whichever later read
-            // sees `?2026l`. Without this, a sync block larger than 8KB
-            // would never get ghost-collected.
-            let mut in_sync: bool = false;
-            let mut pre_sync_hist: usize = 0;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -430,81 +276,24 @@ impl Terminal {
                         if let Some(f) = trace_file_clone.as_ref()
                             && let Ok(mut g) = f.lock()
                         {
-                            use std::io::Write;
                             let _ = g.write_all(&buf[..n]);
                         }
-                        // Split on `?2026h`/`?2026l` markers so we can
-                        // bookend the sync region with a history-size
-                        // snapshot. Markers are stripped from the chunk
-                        // stream the parser sees — without that,
-                        // alacritty's StdSyncHandler would stash bytes
-                        // internally until commit and we'd lose the
-                        // ability to diff pre vs post hist around the
-                        // Ink redraw. The LFs still execute live and
-                        // still scroll rows into history, but now we
-                        // know exactly which rows were scrolled in by
-                        // the redraw and can mark them as ghosts for
-                        // the paint-side dedup. See `sync_handler.rs`.
-                        let chunks = split_sync_markers(&buf[..n]);
                         {
+                            let mut p = parser_clone.lock();
                             let mut t = term_clone.lock();
-                            for chunk in chunks {
-                                match chunk {
-                                    SyncChunk::Begin => {
-                                        if !in_sync {
-                                            pre_sync_hist = t.grid().history_size();
-                                            in_sync = true;
-                                        }
-                                    }
-                                    SyncChunk::End => {
-                                        if in_sync {
-                                            let post_hist = t.grid().history_size();
-                                            if post_hist > pre_sync_hist {
-                                                let delta = post_hist - pre_sync_hist;
-                                                let cols = t.grid().columns();
-                                                let mut gt = ghost_texts_clone.lock();
-                                                // Rows Line(-delta)..Line(-1)
-                                                // are what just got scrolled
-                                                // off the top of viewport
-                                                // during the redraw. Most
-                                                // recent = Line(-1).
-                                                for i in 1..=delta {
-                                                    let mut s = String::with_capacity(cols);
-                                                    for c in 0..cols {
-                                                        let ch = t.grid()
-                                                            [Point::new(
-                                                                Line(-(i as i32)),
-                                                                Column(c),
-                                                            )]
-                                                        .c;
-                                                        s.push(if ch == '\0' { ' ' } else { ch });
-                                                    }
-                                                    let trimmed =
-                                                        s.trim_end_matches(' ').to_string();
-                                                    // Skip blank / near-blank
-                                                    // rows — matching an
-                                                    // empty row to "ghost"
-                                                    // would hide legitimate
-                                                    // spacing in scrollback.
-                                                    let non_ws = trimmed
-                                                        .chars()
-                                                        .filter(|c| !c.is_whitespace())
-                                                        .count();
-                                                    if non_ws >= 3 {
-                                                        if gt.len() >= GHOST_CAP {
-                                                            gt.pop_front();
-                                                        }
-                                                        gt.push_back(trimmed);
-                                                    }
-                                                }
-                                            }
-                                            in_sync = false;
-                                        }
-                                    }
-                                    SyncChunk::Bytes(b) => {
-                                        processor.advance(&mut *t, b);
-                                    }
-                                }
+                            p.parse_bytes(&mut *t, &buf[..n]);
+                            // Drain DSR / DA / title-ack replies the
+                            // parser produced into the writer BEFORE
+                            // releasing the term lock — the
+                            // Powerlevel10k width-miscount workaround
+                            // depends on these arriving promptly.
+                            let replies = t.take_pty_replies();
+                            drop(t);
+                            drop(p);
+                            if !replies.is_empty() {
+                                let mut w = writer_clone.lock();
+                                let _ = w.write_all(&replies);
+                                let _ = w.flush();
                             }
                         }
                         let mut h = history_clone.lock();
@@ -514,9 +303,13 @@ impl Terminal {
                             h.drain(0..drop_n);
                         }
                         drop(h);
-                        // Immediate repaint: typing latency > throughput;
-                        // egui coalesces multiple requests within a frame
-                        // so this is cheap for bursty output too.
+                        // Wake egui per PTY batch unconditionally.
+                        // The earlier dirty_epoch gate skipped
+                        // repaints for cursor-only moves and on parse
+                        // calls whose net effect was no cell change,
+                        // which left the cursor visibly stuck. egui
+                        // coalesces multiple repaint requests within
+                        // a frame, so per-batch wakes are still cheap.
                         ctx_clone.request_repaint();
                     }
                     Err(_) => break,
@@ -528,6 +321,7 @@ impl Terminal {
 
         Ok(Self {
             term,
+            parser,
             writer,
             cols,
             rows,
@@ -538,16 +332,14 @@ impl Terminal {
             master: pair.master,
             shell_pid,
             child: child_handle,
-            pty_replies,
             pending_scroll_to_bottom: std::sync::atomic::AtomicBool::new(false),
             scroll_carry: parking_lot::Mutex::new(0.0),
             alive,
-            ghost_texts,
         })
     }
 
-    /// True if the PTY's foreground process group is not the shell itself —
-    /// i.e. something is actively running (vim, a build, a long-running test).
+    /// True if the PTY's foreground process group is not the shell —
+    /// i.e. something is actively running (vim, a build, etc.).
     /// Unix-only; other platforms always return false.
     #[cfg(unix)]
     pub fn has_foreground_process(&self) -> bool {
@@ -569,12 +361,7 @@ impl Terminal {
         false
     }
 
-    /// Restore a terminal with a plain-text scrollback snapshot. The
-    /// snapshot (produced by `snapshot_text()` on save) is pure text +
-    /// CRLF — no escapes — so replaying it into a fresh grid produces
-    /// predictable line-by-line layout regardless of the new terminal
-    /// width. Happens BEFORE the reader thread starts, so there's no
-    /// race with the new shell's startup output.
+    /// Restore a terminal with a plain-text scrollback snapshot.
     pub fn spawn_with_text_history(
         ctx: egui::Context,
         cols: usize,
@@ -585,69 +372,42 @@ impl Terminal {
         Self::spawn_inner(ctx, cols, rows, cwd, Some(history_text.to_string()))
     }
 
-    /// Raw PTY byte log. Retained on `Terminal` for future features
-    /// (e.g. exporting a session transcript); no longer written to
-    /// session state since the grid-text snapshot is more useful there.
+    /// Raw PTY byte log. Retained for future export use.
     #[allow(dead_code)]
     pub fn history_snapshot(&self) -> Vec<u8> {
         self.history.lock().clone()
     }
 
-    /// Plain-text snapshot of the terminal's scrollback + visible grid,
-    /// joined with CRLF. This is what the session should persist —
-    /// replaying the raw PTY byte log doesn't work because shell prompts
-    /// (especially ZSH RPROMPT) use absolute cursor-positioning escapes
-    /// that were baked against the original terminal width and emit no
-    /// LFs; replaying them into a fresh terminal stacks everything on
-    /// one row.
-    ///
-    /// Trailing trailing empty rows are trimmed. Returns an empty
-    /// string when there's nothing meaningful to capture.
+    /// Plain-text snapshot of the terminal's scrollback + visible
+    /// grid, joined with CRLF. Used for session save — replaying
+    /// raw PTY bytes doesn't survive width changes (shell prompts
+    /// use absolute cursor-positioning escapes baked against the
+    /// original width). Trailing empties trimmed.
     pub fn snapshot_text(&self) -> String {
-        use alacritty_terminal::index::{Column, Line, Point};
-        let guard = self.term.lock();
-        let grid = guard.grid();
-        let cols = grid.columns();
-        let screen_lines = grid.screen_lines() as i32;
-        let history = grid.history_size() as i32;
-        let mut rows: Vec<String> = Vec::with_capacity((history + screen_lines) as usize);
-        for line in -history..screen_lines {
-            let mut row = String::with_capacity(cols);
-            for c in 0..cols {
-                let cell = &grid[Point::new(Line(line), Column(c))];
-                let ch = cell.c;
-                row.push(if ch == '\0' { ' ' } else { ch });
-            }
-            rows.push(row.trim_end().to_string());
-        }
-        while rows.last().is_some_and(|r| r.is_empty()) {
-            rows.pop();
-        }
-        rows.join("\r\n")
+        self.term.lock().snapshot_text()
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
         let mut w = self.writer.lock();
         let _ = w.write_all(data);
         let _ = w.flush();
-        // Set a flag instead of driving scroll_display here. Most
-        // write_input callers execute inside a `ui.input(…)` closure
-        // (which holds a read lock on egui's Context), and
-        // `scroll_display` can wake the alacritty listener, which
-        // calls `ctx.request_repaint()` → write lock → deadlock. The
-        // render loop drains this flag after ui.input releases.
+        // Don't drive scroll_display from here — most callers run
+        // inside `ui.input(…)` which holds an egui Context read
+        // lock; scroll_display can wake the parser, which calls
+        // `ctx.request_repaint()` → write lock → deadlock. Stash a
+        // flag instead; the render loop flushes it after ui.input
+        // releases.
         self.pending_scroll_to_bottom
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Called by the render loop after `ui.input` closes, to snap the
-    /// viewport back to the live screen if the user typed this frame.
+    /// Snap viewport to the live screen if the user typed this frame.
     pub fn flush_scroll_to_bottom(&mut self) {
         if self
             .pending_scroll_to_bottom
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            self.term.lock().scroll_display(Scroll::Bottom);
+            self.term.lock().scroll_to_bottom();
         }
     }
 
@@ -663,10 +423,6 @@ impl Terminal {
             pixel_width: 0,
             pixel_height: 0,
         });
-        self.term.lock().resize(TermSize {
-            columns: cols,
-            screen_lines: rows,
-        });
+        self.term.lock().resize(rows, cols);
     }
 }
-

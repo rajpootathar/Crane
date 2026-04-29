@@ -6,7 +6,7 @@ Native GPU-rendered desktop development environment built in pure Rust with egui
 
 - **Language**: Rust edition 2024
 - **GUI**: eframe 0.34 + egui 0.34 + wgpu backend
-- **Terminal**: alacritty_terminal 0.25 (VT parser + grid) + portable-pty 0.9 (cross-platform PTY)
+- **Terminal**: in-house `crane_term` crate (`crates/crane_term`) wrapping `vte` 0.15 (parser only) + portable-pty 0.9 (cross-platform PTY). Owns the grid, scrollback, ?2026 sync replay, and resize reflow. Replaced `alacritty_terminal` end-to-end on the `feat/crane-term` branch.
 - **Concurrency**: parking_lot mutexes, `std::thread` for PTY reader; no async runtime
 - **Git**: shell out to the `git` binary via `std::process::Command` — never `git2`, never `libgit2`
 - **Text / markdown / diff**: syntect (syntax highlighting), pulldown-cmark (markdown), similar (diff)
@@ -39,7 +39,10 @@ src/
 ├── main.rs          — eframe entry + shortcuts + top-level layout composition + modal
 ├── state.rs         — App + Project + Worktree (→ Workspace) + Tab, active focus
 ├── workspace.rs     — Layout tree (Node::Leaf / Node::Split), Pane, PaneContent enum
-├── terminal.rs      — PTY spawn, alacritty Term, reader thread, input write
+├── terminal/
+│   ├── term.rs      — PTY spawn, crane_term::Term wiring, reader thread, input write
+│   └── view.rs      — grid renderer via egui::Painter, key → escape sequence
+├── (crates/crane_term/) — VT parser glue, grid, scrollback, reflow, sync replay
 ├── terminal_view.rs — grid renderer via egui::Painter, key → escape sequence
 ├── pane_view.rs     — renders Layout tree, headers, borders, splitters, focus
 ├── ui_left.rs       — Left Panel (project tree, + workspace, × remove, add project)
@@ -167,25 +170,28 @@ User-facing persistence: `~/.crane/` (planned for config, sessions, themes). Not
   prompt theme or switch its icon set to ASCII. Crane cannot repair
   this from the terminal side without lying about grid width.
 
-- **Claude Code / Ink TUIs duplicate their prompt into scrollback.**
-  Ink wraps each redraw in `\e[?2026h…\e[?2026l` (Synchronized
-  Output) and inside the block steps through the UI region with
-  cursor-up + LF-based rewrites. alacritty_terminal 0.25 stashes
-  bytes during sync but replays them one-at-a-time at commit — the
-  replayed LFs still scroll the live grid, pushing each redraw's
-  bottom row into history. iTerm2 avoids this with a shadow-grid
-  sync (write to a snapshot, diff cells at commit, never replay LFs
-  into the live grid). Ghostty and real Alacritty have the same
-  latent bug but hide it by only waking the renderer once per sync
-  block. Proper fix: a `SyncAwareHandler` wrapping `Term` that
-  converts in-sync LFs to non-scrolling `move_down` — tracked as a
-  v0.5 milestone. Diagnostic probe: `CRANE_VT_TRACE=1` dumps raw
-  PTY bytes to `~/.crane/vt-trace-<pid>.log`.
+- **Older scrollback rows imperfectly reflow on width changes.**
+  After multi-resize sequences, rows that pre-date the
+  WRAPLINE-on-actual-wrap logic may not perfectly unwrap when the
+  terminal is widened back. Recent content (typed after the fix
+  landed) reflows correctly. Recoverable by a fresh shell `clear`
+  — the grid surface beyond the visible viewport is just
+  presentation state, not real content. Tracked under
+  `crane_term::reflow` v2: extend reflow to recover from older
+  rows that lack the full WRAPLINE chain.
+
+- **Diagnostic probe**: `CRANE_VT_TRACE=1` dumps raw PTY bytes to
+  `~/.crane/vt-trace-<pid>.log` for offline replay. The
+  `?2026` Synchronized Output duplicate-prompt bug that drove the
+  alacritty_terminal → crane_term migration is fixed at the
+  Processor/Term layer (sync-frame replay suppresses scrollback
+  eviction). 38 unit tests in `crates/crane_term` pin the
+  behavior.
 
 ## Pending major work
 
-- **`SyncAwareHandler` for `?2026` (Synchronized Output)** — wrap `Term<WakeListener>` in a Handler-trait adapter; track `move_up` count during sync blocks; convert that many `linefeed`/`newline`/`index` calls to non-scrolling `move_down(1)` so redraw LFs can't leak into scrollback. ~150 LOC of trait delegation. Matches what iTerm2's shadow-grid sync achieves, without the full clone. Fixes the Claude Code TUI duplicate-prompt bug.
 - Rename `Workspace` → `Layout`, `Worktree` → `Workspace` throughout the code
+- `crane_term` v2 reflow: walk WRAPLINE chains across the live-grid / scrollback boundary so older scrollback rows reflow on multi-resize the same way recent rows do
 - Drag-drop Pane rearrange in Layout tree
 - `wry`-backed embedded browser Pane (currently a placeholder)
 - Session save/restore (`~/.crane/sessions/`)

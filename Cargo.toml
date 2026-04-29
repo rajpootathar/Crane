@@ -1,3 +1,10 @@
+[workspace]
+# Root package + workspace. New library crates (e.g. the in-house
+# terminal core `crane_term`) live under `crates/`. The binary at the
+# root is implicitly a workspace member alongside whatever matches
+# `crates/*`.
+members = ["crates/*"]
+
 [package]
 name = "crane"
 version = "0.4.28"
@@ -51,13 +58,10 @@ assets = [
 [dependencies]
 eframe = { version = "0.34", features = ["wgpu", "persistence"] }
 egui = "0.34"
-alacritty_terminal = "0.25"
-# Pulled in for the `CursorIcon` type that appears in vte's Handler
-# trait signature (set_mouse_cursor_icon). vte doesn't re-export it,
-# so we depend on the same crate directly. Pinned to the major
-# version vte 0.15 uses — mismatch would produce a distinct type and
-# fail to impl Handler.
-cursor-icon = "1"
+# In-house terminal core. Owns VT parsing, grid, scrollback, and
+# the linefeed routing that fixes TUI scrollback duplication
+# (Claude Code splash etc.). Replaces alacritty_terminal entirely.
+crane_term = { path = "crates/crane_term" }
 portable-pty = "0.9"
 parking_lot = "0.12"
 log = "0.4"
