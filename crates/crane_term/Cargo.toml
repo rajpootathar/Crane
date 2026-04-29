@@ -16,3 +16,8 @@ vte = { version = "0.15", features = ["ansi"] }
 bitflags = "2"
 cursor-icon = "1"
 log = "0.4"
+# East-Asian-Wide / emoji column-width detection. Already in the
+# workspace's lock file via alacritty's transitive deps; adding
+# directly so wide-char handling in [`Term::input`] doesn't need
+# an ad-hoc range table.
+unicode-width = "0.2"

@@ -55,6 +55,75 @@ impl Term {
         self.dirty_epoch = self.dirty_epoch.wrapping_add(1);
     }
 
+    /// Convenience query — `true` when `mode` is set in the bag.
+    pub fn mode_contains(&self, mode: TermMode) -> bool {
+        self.mode.contains(mode)
+    }
+
+    pub fn is_alt_screen(&self) -> bool {
+        self.mode.contains(TermMode::ALT_SCREEN)
+    }
+
+    pub fn is_app_cursor(&self) -> bool {
+        self.mode.contains(TermMode::APP_CURSOR)
+    }
+
+    pub fn is_bracketed_paste(&self) -> bool {
+        self.mode.contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Number of rows the user has scrolled up into history. `0`
+    /// means the live screen is showing.
+    pub fn display_offset(&self) -> usize {
+        self.grid.display_offset
+    }
+
+    /// Adjust the display offset by `delta`. Positive `delta`
+    /// scrolls upward into scrollback; negative scrolls back toward
+    /// the live screen. Clamped to `[0, scrollback.len()]`.
+    pub fn scroll_display(&mut self, delta: i32) {
+        let max = self.scrollback.len();
+        let new = if delta >= 0 {
+            self.grid
+                .display_offset
+                .saturating_add(delta as usize)
+                .min(max)
+        } else {
+            self.grid.display_offset.saturating_sub((-delta) as usize)
+        };
+        if new != self.grid.display_offset {
+            self.grid.display_offset = new;
+            self.mark_dirty();
+        }
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        if self.grid.display_offset != 0 {
+            self.grid.display_offset = 0;
+            self.mark_dirty();
+        }
+    }
+
+    /// Plain-text snapshot: every scrollback row, then every
+    /// visible row, joined with CRLF, trailing empties trimmed.
+    /// Used for session save (which can't replay raw PTY bytes
+    /// because shell prompts use absolute-positioning escapes
+    /// that are width-baked).
+    pub fn snapshot_text(&self) -> String {
+        let cap = self.scrollback.len() + self.grid.rows.len();
+        let mut out: Vec<String> = Vec::with_capacity(cap);
+        for row in self.scrollback.iter() {
+            out.push(row_to_text(row));
+        }
+        for row in self.grid.rows.iter() {
+            out.push(row_to_text(row));
+        }
+        while out.last().is_some_and(|r| r.is_empty()) {
+            out.pop();
+        }
+        out.join("\r\n")
+    }
+
     /// Evict the row at the top of the active scroll region into
     /// scrollback and shift the rest up by one. The new bottom row
     /// is reset against the cursor template. Called only by
@@ -223,6 +292,28 @@ impl Handler for Term {
     }
 
     fn input(&mut self, c: char) {
+        use unicode_width::UnicodeWidthChar;
+        // Width 0: zero-width / combining mark. Stack onto the
+        // previous cell instead of advancing the cursor.
+        let width = UnicodeWidthChar::width(c).unwrap_or(1);
+        if width == 0 {
+            let row_idx = self.grid.cursor.row.min(self.grid.rows.len() - 1);
+            let col = self
+                .grid
+                .cursor
+                .col
+                .saturating_sub(1)
+                .min(self.grid.columns.saturating_sub(1));
+            if let Some(row) = self.grid.rows.get_mut(row_idx) {
+                if let Some(cell) = row.cells.get_mut(col) {
+                    cell.push_zero_width(c);
+                }
+                row.mark_touched(col);
+            }
+            self.mark_dirty();
+            return;
+        }
+
         // DECAWM: when the previous write filled the right margin,
         // defer the wrap until the next character arrives. xterm
         // semantics — without this, "echo $LINE" with a string the
@@ -236,21 +327,66 @@ impl Handler for Term {
         let row_idx = self.grid.cursor.row.min(self.grid.rows.len() - 1);
         let col_idx = self.grid.cursor.col.min(self.grid.columns - 1);
         let template = self.grid.cursor.template.clone();
+        let is_wide = width >= 2;
+        // Wide char that would land its second column past the
+        // right margin: instead of straddling, wrap first so both
+        // halves stay on the next row.
+        if is_wide && col_idx + 1 >= self.grid.columns {
+            if self.mode.contains(TermMode::LINE_WRAP) {
+                self.carriage_return();
+                let _ = self.linefeed();
+            } else {
+                // No wrap mode: clamp to last column with a normal
+                // narrow paint to avoid a stray spacer overwriting
+                // a real cell off-screen.
+                if let Some(row) = self.grid.rows.get_mut(row_idx) {
+                    if let Some(cell) = row.cells.get_mut(self.grid.columns - 1) {
+                        cell.ch = c;
+                        cell.fg = template.fg;
+                        cell.bg = template.bg;
+                        cell.flags = template.flags;
+                        cell.extra = None;
+                    }
+                }
+                self.grid.cursor.input_needs_wrap = true;
+                self.mark_dirty();
+                return;
+            }
+        }
+
+        let row_idx = self.grid.cursor.row.min(self.grid.rows.len() - 1);
+        let col_idx = self.grid.cursor.col.min(self.grid.columns - 1);
         if let Some(row) = self.grid.rows.get_mut(row_idx) {
             if let Some(cell) = row.cells.get_mut(col_idx) {
                 cell.ch = c;
                 cell.fg = template.fg;
                 cell.bg = template.bg;
                 cell.flags = template.flags;
+                if is_wide {
+                    cell.flags.insert(Flags::WIDE_CHAR);
+                }
                 cell.extra = None;
             }
-            row.mark_touched(col_idx);
+            if is_wide {
+                if let Some(spacer) = row.cells.get_mut(col_idx + 1) {
+                    spacer.ch = ' ';
+                    spacer.fg = template.fg;
+                    spacer.bg = template.bg;
+                    spacer.flags = template.flags;
+                    spacer.flags.insert(Flags::WIDE_CHAR_SPACER);
+                    spacer.extra = None;
+                }
+                row.mark_touched(col_idx + 1);
+            } else {
+                row.mark_touched(col_idx);
+            }
         }
-        if self.grid.cursor.col + 1 >= self.grid.columns {
+        let advance = if is_wide { 2 } else { 1 };
+        if self.grid.cursor.col + advance >= self.grid.columns {
             self.grid.cursor.col = self.grid.columns - 1;
             self.grid.cursor.input_needs_wrap = true;
         } else {
-            self.grid.cursor.col += 1;
+            self.grid.cursor.col += advance;
             self.grid.cursor.input_needs_wrap = false;
         }
         self.mark_dirty();
@@ -794,6 +930,66 @@ mod tests {
     }
 
     #[test]
+    fn wide_char_occupies_two_columns_with_spacer() {
+        let mut t = Term::new(3, 10);
+        // CJK ideograph — full-width.
+        t.input('文');
+        let row = &t.grid.rows[0];
+        assert_eq!(row.cells[0].ch, '文');
+        assert!(row.cells[0].flags.contains(Flags::WIDE_CHAR));
+        assert!(row.cells[1].flags.contains(Flags::WIDE_CHAR_SPACER));
+        assert_eq!(t.grid.cursor.col, 2);
+    }
+
+    #[test]
+    fn zero_width_combining_mark_stacks_onto_previous_cell() {
+        let mut t = Term::new(3, 10);
+        t.input('e');
+        // Combining acute accent (U+0301).
+        t.input('\u{0301}');
+        let cell = &t.grid.rows[0].cells[0];
+        assert_eq!(cell.ch, 'e');
+        assert!(cell.extra.is_some());
+        assert_eq!(cell.extra.as_ref().unwrap().zero_width, vec!['\u{0301}']);
+        // Cursor stayed on column 1 — no advance for the combiner.
+        assert_eq!(t.grid.cursor.col, 1);
+    }
+
+    #[test]
+    fn snapshot_text_reads_visible_grid() {
+        let mut t = Term::new(3, 10);
+        for c in "hello".chars() {
+            t.input(c);
+        }
+        t.carriage_return();
+        let _ = t.linefeed();
+        for c in "world".chars() {
+            t.input(c);
+        }
+        let s = t.snapshot_text();
+        assert!(s.starts_with("hello"));
+        assert!(s.contains("world"));
+    }
+
+    #[test]
+    fn scroll_display_clamps_to_scrollback_size() {
+        let mut t = Term::new(2, 5);
+        t.scroll_display(10);
+        // No scrollback yet — clamps to 0.
+        assert_eq!(t.display_offset(), 0);
+        // Generate scrollback by overflowing the grid bottom.
+        for _ in 0..5 {
+            t.goto(1, 0);
+            let _ = t.linefeed();
+        }
+        assert!(t.scrollback.len() > 0);
+        t.scroll_display(2);
+        assert_eq!(t.display_offset(), 2);
+        t.scroll_to_bottom();
+        assert_eq!(t.display_offset(), 0);
+    }
+
+    #[test]
     fn insert_blank_lines_does_not_pollute_scrollback() {
         let mut t = Term::new(5, 5);
         for _ in 0..5 {
@@ -810,4 +1006,24 @@ mod tests {
         t.insert_blank_lines(2);
         assert_eq!(t.scrollback.len(), before);
     }
+}
+
+/// Convert one row to plain text. `occ` bounds the scan so empty
+/// tail cells don't get emitted as trailing spaces. Wide-char
+/// spacers are skipped — their glyph is owned by the preceding
+/// `WIDE_CHAR` cell. Trailing whitespace is trimmed.
+fn row_to_text(row: &crate::row::Row) -> String {
+    let bound = row.occ.min(row.cells.len());
+    let mut s = String::with_capacity(bound);
+    for cell in row.cells.iter().take(bound) {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let ch = cell.ch;
+        s.push(if ch == '\0' { ' ' } else { ch });
+    }
+    while s.ends_with(' ') {
+        s.pop();
+    }
+    s
 }

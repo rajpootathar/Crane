@@ -44,6 +44,11 @@ pub struct Grid {
     pub scroll_region: Range<usize>,
     pub columns: usize,
     pub visible_rows: usize,
+    /// Number of rows the user has scrolled the viewport up into
+    /// scrollback. `0` means "viewing the live screen". Set by
+    /// [`Grid::scroll_display`]. Renderer reads this to decide
+    /// which rows to paint and where the cursor should appear.
+    pub display_offset: usize,
 }
 
 impl Grid {
@@ -56,6 +61,7 @@ impl Grid {
             scroll_region: 0..rows,
             columns: cols,
             visible_rows: rows,
+            display_offset: 0,
         }
     }
 
@@ -96,5 +102,11 @@ impl Grid {
     /// `linefeed` only evicts a row to scrollback when this is true.
     pub fn cursor_at_scroll_bottom(&self) -> bool {
         self.cursor.row == self.scroll_bottom()
+    }
+
+    /// Cell at viewport-relative (row, col). `None` if the address
+    /// is out of bounds. Cheap; renderers loop over this per frame.
+    pub fn cell_at(&self, row: usize, col: usize) -> Option<&Cell> {
+        self.rows.get(row).and_then(|r| r.cells.get(col))
     }
 }
