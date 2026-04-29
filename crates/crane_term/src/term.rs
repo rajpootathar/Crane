@@ -152,6 +152,62 @@ impl Term {
         }
     }
 
+    /// Materialize the active selection as plain text. `None` when
+    /// no selection is set or the selection is empty. Wide-char
+    /// spacers are skipped — their glyph belongs to the preceding
+    /// `WIDE_CHAR` cell — and trailing whitespace per row is
+    /// trimmed (matches iTerm2/WezTerm copy semantics so the right-
+    /// padding TUIs apply doesn't show up in clipboard text).
+    pub fn selection_to_string(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        if sel.is_empty() {
+            return None;
+        }
+        let range = sel.to_range();
+        let cols = self.grid.columns;
+        let mut lines: Vec<String> = Vec::new();
+        for line in range.start.line.0..=range.end.line.0 {
+            let mut row = String::with_capacity(cols);
+            for col in 0..cols {
+                if !range.contains(Point::new(Line(line), Column(col))) {
+                    if !row.is_empty() {
+                        // Selection ended on this line — trim and
+                        // emit, breaking the col loop.
+                        break;
+                    }
+                    continue;
+                }
+                let cell_opt = if line >= 0 {
+                    self.grid.cell_at(line as usize, col)
+                } else {
+                    let from_back = (-line) as usize;
+                    self.scrollback
+                        .len()
+                        .checked_sub(from_back)
+                        .and_then(|i| {
+                            self.scrollback
+                                .iter()
+                                .nth(i)
+                                .and_then(|r| r.cells.get(col))
+                        })
+                };
+                if let Some(cell) = cell_opt {
+                    if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        row.push(if cell.ch == '\0' { ' ' } else { cell.ch });
+                    }
+                }
+            }
+            // Trim trailing padding spaces — TUIs right-pad to the
+            // column width and copy users don't want that.
+            let trimmed = row.trim_end_matches([' ', '\t']).to_string();
+            lines.push(trimmed);
+        }
+        if lines.iter().all(|l| l.is_empty()) {
+            return None;
+        }
+        Some(lines.join("\n"))
+    }
+
     /// Plain-text snapshot: every scrollback row, then every
     /// visible row, joined with CRLF, trailing empties trimmed.
     /// Used for session save (which can't replay raw PTY bytes

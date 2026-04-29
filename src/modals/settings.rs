@@ -451,7 +451,7 @@ fn render_about(ui: &mut egui::Ui, app: &mut App) {
     );
     ui.add_space(8.0);
     ui.label(
-        RichText::new("Built with Rust · egui · wgpu · alacritty_terminal.")
+        RichText::new("Built with Rust · egui · wgpu · vte · crane_term.")
             .size(11.5)
             .color(theme::current().text_muted.to_color32()),
     );

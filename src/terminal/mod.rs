@@ -1,7 +1,5 @@
-//! PTY-backed terminal: alacritty parser + egui grid renderer.
+//! PTY-backed terminal: crane_term parser + egui grid renderer.
 
-mod grid_snap;
-mod sync_handler;
 mod term;
 pub mod view;
 
