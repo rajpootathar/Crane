@@ -58,6 +58,60 @@ pub enum Color {
     Rgb { r: u8, g: u8, b: u8 },
 }
 
+impl Color {
+    /// Translate a `vte::ansi::Color` into our internal type. The
+    /// vte enum's NamedColor has 30 variants vs our 28; the two we
+    /// don't carry (`BrightForeground`, `DimForeground`) collapse
+    /// onto plain `Foreground` since the renderer derives bright/
+    /// dim from the SGR flag bits anyway.
+    pub fn from_vte(c: vte::ansi::Color) -> Self {
+        match c {
+            vte::ansi::Color::Named(n) => Color::Named(NamedColor::from_vte(n)),
+            vte::ansi::Color::Spec(rgb) => Color::Rgb {
+                r: rgb.r,
+                g: rgb.g,
+                b: rgb.b,
+            },
+            vte::ansi::Color::Indexed(i) => Color::Indexed(i),
+        }
+    }
+}
+
+impl NamedColor {
+    pub fn from_vte(n: vte::ansi::NamedColor) -> Self {
+        use vte::ansi::NamedColor as V;
+        match n {
+            V::Black => NamedColor::Black,
+            V::Red => NamedColor::Red,
+            V::Green => NamedColor::Green,
+            V::Yellow => NamedColor::Yellow,
+            V::Blue => NamedColor::Blue,
+            V::Magenta => NamedColor::Magenta,
+            V::Cyan => NamedColor::Cyan,
+            V::White => NamedColor::White,
+            V::BrightBlack => NamedColor::BrightBlack,
+            V::BrightRed => NamedColor::BrightRed,
+            V::BrightGreen => NamedColor::BrightGreen,
+            V::BrightYellow => NamedColor::BrightYellow,
+            V::BrightBlue => NamedColor::BrightBlue,
+            V::BrightMagenta => NamedColor::BrightMagenta,
+            V::BrightCyan => NamedColor::BrightCyan,
+            V::BrightWhite => NamedColor::BrightWhite,
+            V::Foreground | V::BrightForeground | V::DimForeground => NamedColor::Foreground,
+            V::Background => NamedColor::Background,
+            V::Cursor => NamedColor::Cursor,
+            V::DimBlack => NamedColor::DimBlack,
+            V::DimRed => NamedColor::DimRed,
+            V::DimGreen => NamedColor::DimGreen,
+            V::DimYellow => NamedColor::DimYellow,
+            V::DimBlue => NamedColor::DimBlue,
+            V::DimMagenta => NamedColor::DimMagenta,
+            V::DimCyan => NamedColor::DimCyan,
+            V::DimWhite => NamedColor::DimWhite,
+        }
+    }
+}
+
 impl Default for Color {
     fn default() -> Self {
         Color::Named(NamedColor::Foreground)
