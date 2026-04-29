@@ -71,4 +71,16 @@ impl<H: Handler> vte::ansi::Handler for Bridge<'_, H> {
     fn unset_private_mode(&mut self, mode: vte::ansi::PrivateMode) {
         self.inner.unset_private_mode(mode);
     }
+
+    fn device_status(&mut self, n: usize) {
+        // Replies accumulate on the Term itself; Crane's PTY
+        // reader thread drains them via Term::take_pty_replies()
+        // after each parse pass. One place owns outbound
+        // bookkeeping.
+        self.inner.device_status(n);
+    }
+
+    fn identify_terminal(&mut self, intermediate: Option<char>) {
+        self.inner.identify_terminal(intermediate);
+    }
 }

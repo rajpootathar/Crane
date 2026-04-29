@@ -119,6 +119,19 @@ pub trait Handler {
     fn set_title(&mut self, title: Option<String>) {}
     fn bell(&mut self) {}
 
+    // ---- queries the parser asks us to answer back to the PTY ----
+
+    /// CSI Ps n. The implementation should push the appropriate
+    /// reply bytes onto its outbound queue (e.g. `\e[<row>;<col>R`
+    /// for `n == 6`). The Processor / PTY reader drains the queue
+    /// after each parse pass.
+    fn device_status(&mut self, _n: usize) {}
+
+    /// CSI Ps c. Primary device-attribute reply; default impl
+    /// answers with VT102 (`\e[?6c`). Override only if you need
+    /// to advertise specific capabilities.
+    fn identify_terminal(&mut self, _intermediate: Option<char>) {}
+
     // ---- lifecycle ----
 
     /// Called once per non-sync byte chunk and again after a sync

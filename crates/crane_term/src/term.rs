@@ -5,9 +5,11 @@
 use crate::cell::{Color, Flags};
 use crate::grid::{Cursor, Grid};
 use crate::handler::{Handler, ProcessorInput, ScrollDelta};
+use crate::index::{Column, Line, Point};
 use crate::mode::TermMode;
 use crate::row::Row;
 use crate::scrollback::Scrollback;
+use crate::selection::Selection;
 
 #[derive(Debug)]
 pub struct Term {
@@ -27,6 +29,13 @@ pub struct Term {
     pub dirty_epoch: u64,
     /// DECSC cursor save slot. `None` until the first `save_cursor`.
     pub saved_cursor: Option<Cursor>,
+    /// Active mouse selection (drag / double-click / triple-click).
+    /// Populated by view.rs's input handlers; cleared on click.
+    pub selection: Option<Selection>,
+    /// Outbound bytes the parser produced as replies to PTY queries
+    /// (DSR, DA, title acks, etc.). Drained by the PTY reader thread
+    /// via [`Term::take_pty_replies`] after each parse pass.
+    pty_replies: Vec<u8>,
 }
 
 impl Term {
@@ -38,7 +47,22 @@ impl Term {
             in_sync_frame: false,
             dirty_epoch: 0,
             saved_cursor: None,
+            selection: None,
+            pty_replies: Vec::new(),
         }
+    }
+
+    /// Drain accumulated outbound bytes (DSR / DA / title-ack
+    /// replies) so the PTY reader thread can write them back to
+    /// the master fd. Returns an empty Vec when nothing is queued.
+    pub fn take_pty_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pty_replies)
+    }
+
+    /// Append bytes to the outbound reply queue. Used by the
+    /// Handler impl when the parser triggers a query response.
+    fn reply(&mut self, bytes: &[u8]) {
+        self.pty_replies.extend_from_slice(bytes);
     }
 
     /// Resize the viewport. Scrollback rows are widened/narrowed to
@@ -101,6 +125,30 @@ impl Term {
         if self.grid.display_offset != 0 {
             self.grid.display_offset = 0;
             self.mark_dirty();
+        }
+    }
+
+    /// Iterator over every cell currently presentable, with each
+    /// cell paired to its `(line, column)` Point. Includes
+    /// scrollback rows when `display_offset > 0`. Live viewport
+    /// rows occupy lines `0..visible_rows`; scrollback rows live
+    /// at negative line indices, with `-1` being the most recent
+    /// row evicted off the top of the live viewport.
+    ///
+    /// Used by the renderer to walk the visible area in row-major
+    /// order without poking into Grid / Scrollback internals.
+    pub fn renderable_content(&self) -> RenderableContent<'_> {
+        let cursor_line = self.grid.cursor.row as i32 - self.grid.display_offset as i32;
+        RenderableContent {
+            term: self,
+            cursor: RenderableCursor {
+                point: Point::new(Line(cursor_line), Column(self.grid.cursor.col)),
+                visible: self.mode.contains(TermMode::SHOW_CURSOR),
+            },
+            display_offset: self.grid.display_offset,
+            selection_range: self.selection.as_ref().map(|s| s.to_range()),
+            row: 0,
+            col: 0,
         }
     }
 
@@ -752,6 +800,36 @@ impl Handler for Term {
         self.mark_dirty();
     }
 
+    fn device_status(&mut self, n: usize) {
+        // CSI 6n: cursor position report — `\e[<row>;<col>R` with
+        // 1-based indices. CSI 5n: ready report — `\e[0n`. Only the
+        // two DEC-standard queries are answered here; anything else
+        // is dropped.
+        match n {
+            5 => self.reply(b"\x1b[0n"),
+            6 => {
+                let row = self.grid.cursor.row + 1;
+                let col = self.grid.cursor.col + 1;
+                let s = format!("\x1b[{};{}R", row, col);
+                self.reply(s.as_bytes());
+            }
+            _ => {}
+        }
+    }
+
+    fn identify_terminal(&mut self, intermediate: Option<char>) {
+        // Primary DA: `\e[?6c` advertises VT102. Secondary DA
+        // (intermediate `>`): `\e[>0;0;0c` reports terminal type 0
+        // / firmware 0. Tertiary DA (`=`): not supported, ignored.
+        // Most TUIs only check the primary form; matching alacritty
+        // behavior is close enough.
+        match intermediate {
+            None => self.reply(b"\x1b[?6c"),
+            Some('>') => self.reply(b"\x1b[>0;0;0c"),
+            _ => {}
+        }
+    }
+
     fn on_finish_byte_processing(&mut self, _input: &ProcessorInput) {
         // Frame boundary marker. Renderer hookup lives in Crane's
         // pane_view, not here — `Term` just exposes the grid +
@@ -990,6 +1068,43 @@ mod tests {
     }
 
     #[test]
+    fn device_status_5_replies_ready() {
+        let mut t = Term::new(5, 10);
+        t.device_status(5);
+        assert_eq!(t.take_pty_replies(), b"\x1b[0n");
+    }
+
+    #[test]
+    fn device_status_6_replies_cursor_position() {
+        let mut t = Term::new(5, 10);
+        t.goto(2, 4);
+        t.device_status(6);
+        // 1-based; row 2 col 4 → "\e[3;5R".
+        assert_eq!(t.take_pty_replies(), b"\x1b[3;5R");
+    }
+
+    #[test]
+    fn identify_terminal_replies_vt102() {
+        let mut t = Term::new(5, 10);
+        t.identify_terminal(None);
+        assert_eq!(t.take_pty_replies(), b"\x1b[?6c");
+    }
+
+    #[test]
+    fn renderable_content_walks_visible_cells() {
+        let mut t = Term::new(2, 3);
+        t.input('a');
+        t.input('b');
+        t.input('c');
+        let cells: Vec<_> = t.renderable_content().collect();
+        assert_eq!(cells.len(), 6); // 2 rows × 3 cols
+        assert_eq!(cells[0].point.line.0, 0);
+        assert_eq!(cells[0].point.column.0, 0);
+        assert_eq!(cells[0].cell.ch, 'a');
+        assert_eq!(cells[2].cell.ch, 'c');
+    }
+
+    #[test]
     fn insert_blank_lines_does_not_pollute_scrollback() {
         let mut t = Term::new(5, 5);
         for _ in 0..5 {
@@ -1005,6 +1120,96 @@ mod tests {
         t.goto(0, 0);
         t.insert_blank_lines(2);
         assert_eq!(t.scrollback.len(), before);
+    }
+}
+
+/// Where a renderable cell lives: viewport (live grid row index)
+/// or scrollback (negative line index relative to the live grid).
+#[derive(Clone, Copy, Debug)]
+pub struct RenderableCursor {
+    pub point: Point,
+    pub visible: bool,
+}
+
+/// Iterator returned by [`Term::renderable_content`]. Walks the
+/// visible viewport row-major, sourcing rows from scrollback while
+/// the user has scrolled up and from the live grid below the
+/// scrollback portion.
+pub struct RenderableContent<'a> {
+    term: &'a Term,
+    pub cursor: RenderableCursor,
+    pub display_offset: usize,
+    pub selection_range: Option<crate::selection::SelectionRange>,
+    row: usize,
+    col: usize,
+}
+
+/// One element of [`RenderableContent`]. Mirrors alacritty's
+/// shape so the renderer in `src/terminal/view.rs` can swap to
+/// crane_term with minimal rewriting.
+#[derive(Clone, Debug)]
+pub struct RenderableCell<'a> {
+    pub point: Point,
+    pub cell: &'a crate::cell::Cell,
+}
+
+impl<'a> Iterator for RenderableContent<'a> {
+    type Item = RenderableCell<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cols = self.term.grid.columns;
+        let visible_rows = self.term.grid.visible_rows;
+        loop {
+            if self.col >= cols {
+                self.col = 0;
+                self.row += 1;
+            }
+            if self.row >= visible_rows {
+                return None;
+            }
+            // Map presentation row → either scrollback (when the
+            // user has scrolled up) or live grid row.
+            //
+            // `display_offset` rows of scrollback show at the top
+            // of the viewport. Their line numbers go negative so
+            // selection / cursor math can address the same point
+            // without a separate "scrollback row" coordinate.
+            let line: i32 = self.row as i32 - self.display_offset as i32;
+            let cell = if line >= 0 {
+                self.term.grid.cell_at(line as usize, self.col)
+            } else {
+                // -1 is the most recent scrollback row. Index from
+                // the back of the deque.
+                let from_back = (-line) as usize;
+                let idx = self
+                    .term
+                    .scrollback
+                    .len()
+                    .checked_sub(from_back);
+                idx.and_then(|i| {
+                    self.term
+                        .scrollback
+                        .iter()
+                        .nth(i)
+                        .and_then(|r| r.cells.get(self.col))
+                })
+            };
+            let col_idx = self.col;
+            self.col += 1;
+            if let Some(cell) = cell {
+                return Some(RenderableCell {
+                    point: Point::new(Line(line), Column(col_idx)),
+                    cell,
+                });
+            }
+            // Out-of-history hole — render nothing for this cell
+            // (just advance). The renderer fills empty space with
+            // the theme background, so a None mid-iter means the
+            // viewport row is shorter than the live grid (only
+            // happens when scrollback is shallower than
+            // display_offset, which is clamped by scroll_display
+            // to never happen in normal flow).
+        }
     }
 }
 
