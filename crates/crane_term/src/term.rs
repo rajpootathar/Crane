@@ -65,12 +65,50 @@ impl Term {
         self.pty_replies.extend_from_slice(bytes);
     }
 
-    /// Resize the viewport. Scrollback rows are widened/narrowed to
-    /// match so painting stored history at the new width is one
-    /// memcpy per row.
+    /// Resize the viewport with full reflow of the live grid.
+    ///
+    /// Plain row-by-row resize (truncate-or-pad) leaves wrapped
+    /// content garbled across multi-resize sequences — content that
+    /// was wrapped at col K stays at col K even when the new width
+    /// could fit it on one line, and content past the new right
+    /// margin is silently dropped on shrink. Reflow walks
+    /// `WRAPLINE`-joined logical lines and re-wraps them to
+    /// `cols`-wide rows, keeping the cursor anchored to its
+    /// logical position.
+    ///
+    /// Scrollback rows still pass through with a column-only
+    /// resize for now — historical wrapped lines won't reflow
+    /// retroactively. v2 work.
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        if rows == self.grid.visible_rows && cols == self.grid.columns {
+            return;
+        }
         let template = self.grid.cursor.template.clone();
-        self.grid.resize(rows, cols);
+        let result = crate::reflow::reflow_grid(
+            &self.grid.rows,
+            &self.grid.cursor,
+            cols,
+            rows,
+            &template,
+        );
+
+        // Push reflow overflow to scrollback so the cursor's
+        // logical line keeps its visible position when the height
+        // drops. Alt screen never feeds scrollback.
+        if !self.mode.contains(TermMode::ALT_SCREEN) {
+            for row in result.overflow_to_scrollback {
+                self.scrollback.push(row);
+            }
+        }
+
+        self.grid.rows = result.rows;
+        self.grid.columns = cols;
+        self.grid.visible_rows = rows;
+        self.grid.scroll_region = 0..rows;
+        self.grid.cursor.row = result.cursor_row;
+        self.grid.cursor.col = result.cursor_col;
+        self.grid.cursor.input_needs_wrap = false;
+
         self.scrollback.resize_columns(cols, &template);
         self.mark_dirty();
     }
@@ -499,6 +537,17 @@ impl Handler for Term {
         if self.grid.cursor.col + advance >= self.grid.columns {
             self.grid.cursor.col = self.grid.columns - 1;
             self.grid.cursor.input_needs_wrap = true;
+            // Mark this row as continuing into the next on auto-
+            // wrap. Reflow on resize uses WRAPLINE on the last cell
+            // to identify which physical rows belong to a single
+            // logical line, so widening the terminal can re-join
+            // wrapped content into one row.
+            let row_idx = self.grid.cursor.row.min(self.grid.rows.len() - 1);
+            if let Some(row) = self.grid.rows.get_mut(row_idx) {
+                if let Some(last) = row.cells.last_mut() {
+                    last.flags.insert(Flags::WRAPLINE);
+                }
+            }
         } else {
             self.grid.cursor.col += advance;
             self.grid.cursor.input_needs_wrap = false;

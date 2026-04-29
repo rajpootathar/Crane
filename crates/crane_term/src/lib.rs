@@ -41,6 +41,7 @@ pub mod term;
 pub mod alt_screen;
 pub mod perform;
 pub mod processor;
+pub mod reflow;
 pub mod sync;
 pub mod index;
 pub mod selection;
