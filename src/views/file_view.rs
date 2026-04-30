@@ -339,8 +339,10 @@ fn render_scoped(
         }
     }
     // Cmd+H toggles the replace row inside the find bar.
-    let replace_toggle = active_is_file && ui.input(|i| {
-        (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::H)
+    let replace_toggle = active_is_file && ui.input_mut(|i| {
+        let pressed = (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::H);
+        if pressed { i.consume_key(egui::Modifiers::COMMAND, egui::Key::H); }
+        pressed
     });
     if replace_toggle {
         let t = pane.tabs[active_idx].as_file_mut().unwrap();
@@ -418,7 +420,7 @@ fn render_scoped(
         }
 
         // Save error banner
-        if let Some(err) = tab.save_error.take() {
+        if let Some(err) = &tab.save_error {
             let t = theme::current();
             egui::Frame::NONE
                 .fill(Color32::from_rgba_unmultiplied(220, 100, 100, 28))
@@ -583,7 +585,12 @@ fn render_scoped(
                                 .desired_width(80.0)
                                 .font(egui::FontId::new(12.0, FontFamily::Monospace)),
                         );
-                        response.request_focus();
+                        let goto_focus_id = egui::Id::new(("goto_focused", &tab.path));
+                        let needs_focus = !ui.memory(|m| m.data.get_temp::<bool>(goto_focus_id).unwrap_or(false));
+                        if needs_focus {
+                            response.request_focus();
+                            ui.memory_mut(|m| m.data.insert_temp(goto_focus_id, true));
+                        }
                         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
                         if enter {
@@ -594,10 +601,12 @@ fn render_scoped(
                             }
                             tab.goto_line_active = false;
                             tab.goto_line_input.clear();
+                            ui.memory_mut(|m| m.data.remove_temp::<bool>(goto_focus_id));
                         }
                         if escape {
                             tab.goto_line_active = false;
                             tab.goto_line_input.clear();
+                            ui.memory_mut(|m| m.data.remove_temp::<bool>(goto_focus_id));
                         }
                     });
                 });
@@ -957,10 +966,10 @@ fn render_scoped(
                             }
 
                             // Helper: strip one indent level from a string
-                            fn remove_one_indent(s: &str) -> String {
+                            fn remove_one_indent(s: &str, max_spaces: usize) -> String {
                                 let chars: Vec<char> = s.chars().collect();
                                 let mut i = 0;
-                                while i < chars.len() && i < 4 && chars[i] == ' ' {
+                                while i < chars.len() && i < max_spaces && chars[i] == ' ' {
                                     i += 1;
                                 }
                                 if i == 0 && chars.first() == Some(&'\t') {
@@ -988,7 +997,7 @@ fn render_scoped(
                                     .get(byte)
                                     .map(|c| matches!(c, b'}' | b')' | b']'))
                                     .unwrap_or(false);
-                                let dedented_indent = remove_one_indent(&prev_indent);
+                                let dedented_indent = remove_one_indent(&prev_indent, indent.chars().count());
                                 let body_indent = if bump {
                                     format!("{prev_indent}{indent}")
                                 } else if dedent && next_is_close {
@@ -1077,17 +1086,23 @@ fn render_scoped(
                             // Alt+Up/Down: move current line (or selection) up/down.
                             // Alt+Shift+Down: duplicate line down.
                             {
-                                let alt_up = ui.input(|i| {
-                                    i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp)
-                                        && !i.modifiers.shift && !i.modifiers.command && !i.modifiers.mac_cmd
+                                let alt_up = ui.input_mut(|i| {
+                                    let pressed = i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp)
+                                        && !i.modifiers.shift && !i.modifiers.command && !i.modifiers.mac_cmd;
+                                    if pressed { i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp); }
+                                    pressed
                                 });
-                                let alt_down = ui.input(|i| {
-                                    i.modifiers.alt && i.key_pressed(egui::Key::ArrowDown)
-                                        && !i.modifiers.shift && !i.modifiers.command && !i.modifiers.mac_cmd
+                                let alt_down = ui.input_mut(|i| {
+                                    let pressed = i.modifiers.alt && i.key_pressed(egui::Key::ArrowDown)
+                                        && !i.modifiers.shift && !i.modifiers.command && !i.modifiers.mac_cmd;
+                                    if pressed { i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown); }
+                                    pressed
                                 });
-                                let alt_shift_down = ui.input(|i| {
-                                    i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown)
-                                        && !i.modifiers.command && !i.modifiers.mac_cmd
+                                let alt_shift_down = ui.input_mut(|i| {
+                                    let pressed = i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown)
+                                        && !i.modifiers.command && !i.modifiers.mac_cmd;
+                                    if pressed { i.consume_key(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::ArrowDown); }
+                                    pressed
                                 });
                                 if alt_up || alt_down {
                                     if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id) {

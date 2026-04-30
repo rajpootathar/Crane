@@ -530,12 +530,9 @@ fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
     // Use staged content as left side when the file has staged changes,
     // otherwise use HEAD content. This makes the diff show only
     // *unstaged* changes, and per-hunk staging removes hunks from view.
-    let left_text = git::staged_content(repo, rel_path)
-        .unwrap_or_else(|| git::head_content(repo, rel_path));
-    let left_label = if git::staged_content(repo, rel_path).is_some() {
-        format!("staged:{rel_path}")
-    } else {
-        format!("HEAD:{rel_path}")
+    let (left_text, left_label) = match git::staged_content(repo, rel_path) {
+        Some(text) => (text, format!("staged:{rel_path}")),
+        None => (git::head_content(repo, rel_path), format!("HEAD:{rel_path}")),
     };
     let title = format!(
         "diff: {}",
@@ -1195,15 +1192,25 @@ fn move_path(app: &mut App, src: &std::path::Path, dst_dir: &std::path::Path) {
 }
 
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    copy_dir_recursive_inner(src, dst, 0)
+}
+
+fn copy_dir_recursive_inner(src: &std::path::Path, dst: &std::path::Path, depth: usize) -> std::io::Result<()> {
+    if depth > 32 {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "max depth exceeded"));
+    }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        let ty = entry.file_type()?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            copy_dir_recursive_inner(&src_path, &dst_path, depth + 1)?;
+        } else if ft.is_file() {
             std::fs::copy(&src_path, &dst_path)?;
         }
     }
