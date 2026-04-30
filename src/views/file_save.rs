@@ -75,6 +75,14 @@ pub fn poll_external_change(tab: &mut crate::state::layout::FileTab) {
         tab.disk_mtime = Some(disk_mtime);
         return;
     }
+    // No unsaved edits — auto-reload silently instead of showing the banner.
+    if tab.content == tab.original_content {
+        tab.content = disk_content.clone();
+        tab.original_content = disk_content;
+        tab.line_changes_key = 0;
+        tab.disk_mtime = Some(disk_mtime);
+        return;
+    }
     tab.external_change = true;
 }
 

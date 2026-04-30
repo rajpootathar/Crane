@@ -121,7 +121,7 @@ DEVELOPER_ID="..."  make signed-dmg-universal
 - **Naming**: use the canonical terms above everywhere (code, commit messages, comments, docstrings, UI strings). Call out drift.
 - **Red ID-clash markers**: every `egui::ScrollArea` in a reusable widget needs `.id_salt(…)` and repeating rows need `ui.push_id((key, id), …)`.
 - **Cursor icons**: plain `ui.label(…)` picks the text cursor — for clickable text use `Label::new(…).sense(Sense::click())` and `ctx.set_cursor_icon(CursorIcon::PointingHand)` on hover.
-- **Inner pane padding**: panes get a 5×3px interior shrink so content doesn't kiss the border.
+- **Inner pane padding**: panes render edge-to-edge (no inner shrink).
 - **Focus border**: 2px accent on the active Pane; other Panes get a subtle border.
 - **Panel toggles**: visible buttons in the Main Panel top bar for both Left and Right Panel collapse.
 - **Icons — NEVER use Unicode glyphs (▲ ▼ ✕ ▎ · 🔍 etc.)** in buttons or text. Our bundled `JetBrains Mono` + `egui` default proportional font don't cover those ranges, so they render as tofu boxes. **Always use `egui_phosphor::regular::*`** (examples: `ARROW_UP`, `ARROW_DOWN`, `X_CIRCLE`, `MAGNIFYING_GLASS`, `FLOPPY_DISK`, `FOLDER_OPEN`, `COPY`, `PENCIL_SIMPLE`, `EYE`, `X`, `PLUS`, `MINUS`, `CARET_UP`, `CARET_DOWN`, `GIT_BRANCH`, `GIT_DIFF`, `INFO`, `WARNING`, `X_CIRCLE`, `CUBE`, `ARROW_RIGHT`, `ARROW_COUNTER_CLOCKWISE`, `DOWNLOAD_SIMPLE`, `FILE`, `FOLDER`, `FOLDER_PLUS`, `PAINT_BRUSH`, `CODE`, `TERMINAL_WINDOW`, `KEYBOARD`, `LIGHTNING`, `ARROW_CIRCLE_UP`, `TRASH`).

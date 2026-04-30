@@ -370,7 +370,7 @@ fn render_pane(
     let inner = rect.shrink(BORDER_W);
     let header_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), HEADER_H));
     let body_outer = Rect::from_min_max(Pos2::new(inner.min.x, inner.min.y + HEADER_H), inner.max);
-    let body_rect = body_outer.shrink2(Vec2::new(5.0, 3.0));
+    let body_rect = body_outer;
 
     render_header(ui, layout, id, header_rect, is_focus, action);
 
