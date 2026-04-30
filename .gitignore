@@ -5,6 +5,8 @@ Cargo.lock
 # Local signing env (DEVELOPER_ID, NOTARY_PROFILE). Never committed.
 .env.local
 
+.idea/
+
 # Local checkout of our alacritty fork, used as a path dep during
 # development. Tracked in the fork's own repo; referenced from
 # Cargo.toml via path so edits are picked up on cargo build without

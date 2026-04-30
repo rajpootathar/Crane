@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn shellexpand_home(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
+    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\"))
+        && let Some(home) = crate::util::home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
         }
     s.to_string()
 }
@@ -284,8 +284,9 @@ impl NewWorkspaceModal {
     pub fn resolved_parent(&self, project_path: &Path, project_name: &str) -> PathBuf {
         match self.mode {
             LocationMode::Global => {
-                let home = std::env::var("HOME").unwrap_or_default();
-                PathBuf::from(format!("{home}/.crane-worktrees/{project_name}"))
+                crate::util::home_dir()
+                    .map(|h| h.join(".crane-worktrees").join(project_name))
+                    .unwrap_or_default()
             }
             LocationMode::ProjectLocal => project_path.join(".crane-worktrees"),
             LocationMode::Custom => PathBuf::from(shellexpand_home(&self.custom_path)),
@@ -1632,7 +1633,7 @@ impl App {
             Some(p) => p,
             None => return,
         };
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::util::home_dir_or_cwd();
         // Sanitize the project name for use as a path segment: drop any
         // character that could break out of ~/.crane-worktrees (leading
         // dots, slashes, backslashes). Prevents a project folder named
@@ -1650,7 +1651,7 @@ impl App {
         // Seed the modal from this project's remembered preferences so
         // the second + N-th worktree for a project defaults to the
         // mode + path the user picked the first time.
-        let default_custom = format!("{home}/.crane-worktrees/{safe}");
+        let default_custom = home.join(".crane-worktrees").join(safe).to_string_lossy().into_owned();
         let custom_path = project
             .preferred_custom_path
             .clone()

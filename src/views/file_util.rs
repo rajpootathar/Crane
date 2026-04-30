@@ -25,10 +25,10 @@ pub fn short_path(path: &str, workspace_root: Option<&Path>) -> String {
     {
         return rel.to_string_lossy().to_string();
     }
-    if let Ok(home) = std::env::var("HOME")
-        && let Some(stripped) = path.strip_prefix(&home)
+    if let Some(home) = crate::util::home_dir()
+        && let Ok(rel) = Path::new(path).strip_prefix(&home)
     {
-        return format!("~{stripped}");
+        return format!("~{}", rel.to_string_lossy());
     }
     path.to_string()
 }
@@ -104,4 +104,20 @@ pub fn reveal_in_file_manager(path: &str) {
     let _ = std::process::Command::new("explorer")
         .arg(format!("/select,{path}"))
         .spawn();
+}
+
+/// Platform-appropriate label for the "reveal file" context-menu item.
+pub fn reveal_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Reveal in Finder"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "Reveal in Files"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Reveal in Explorer"
+    }
 }

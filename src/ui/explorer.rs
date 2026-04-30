@@ -936,7 +936,7 @@ fn render_fs_dir(
     workspace_root: &std::path::Path,
     git_status_map: &HashMap<String, (git::ChangeStatus, bool, bool)>,
 ) {
-    if depth > 6 {
+    if depth > 64 {
         return;
     }
     // Pending-entry editor lives in exactly one directory at a time

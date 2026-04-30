@@ -249,8 +249,9 @@ impl Updater {
 // ---------------------------------------------------------------------------
 
 fn update_dir() -> std::io::Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| std::io::Error::other("no HOME"))?;
-    let dir = PathBuf::from(home).join(".crane").join("update");
+    let home = crate::util::home_dir()
+        .ok_or_else(|| std::io::Error::other("no HOME dir"))?;
+    let dir = home.join(".crane").join("update");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

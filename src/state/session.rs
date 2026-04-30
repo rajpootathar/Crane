@@ -215,8 +215,9 @@ pub struct SDiffTab {
 }
 
 pub fn session_file() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(format!("{home}/.crane/session.json"))
+    crate::util::home_dir()
+        .map(|h| h.join(".crane").join("session.json"))
+        .unwrap_or_default()
 }
 
 pub fn load() -> Option<Session> {

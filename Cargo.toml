@@ -129,6 +129,12 @@ wry = "0.55"
 raw-window-handle = "0.6"
 gtk = "0.18"
 
+# Windows browser pane. wry uses WebView2 (Edge Chromium), which ships
+# with Windows 10+ and is auto-installed on older Windows if missing.
+[target.'cfg(target_os = "windows")'.dependencies]
+wry = "0.55"
+raw-window-handle = "0.6"
+
 [profile.dev]
 opt-level = 1
 

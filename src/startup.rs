@@ -12,6 +12,10 @@ use crate::theme;
 /// and import it. Login mode (`-l`) is deliberate: `-i` would source
 /// `.zshrc` / `.bashrc`, which triggers nvm / brew shellenv / banners
 /// and can add seconds of startup time.
+///
+/// Unix-only: Windows GUI apps inherit PATH correctly from the
+/// environment, so this function is a no-op there.
+#[cfg(unix)]
 pub fn fix_path_for_gui_launch() {
     let original = std::env::var("PATH").unwrap_or_default();
     let looks_gui = !original.contains("/usr/local/bin")
@@ -98,16 +102,20 @@ pub fn fix_path_for_gui_launch() {
     unsafe { std::env::set_var("PATH", parts.join(":")) };
 }
 
+/// No-op on non-Unix platforms (Windows inherits PATH correctly).
+#[cfg(not(unix))]
+pub fn fix_path_for_gui_launch() {}
+
 /// Earlier builds stored config under `~/.config/crane`; we moved to
 /// `~/.crane` so Crane's files sit alongside other dev tools the user
 /// typically keeps at the home root. One-shot rename at startup.
 pub fn migrate_config_dir() {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
+    let home = match crate::util::home_dir() {
+        Some(h) => h,
+        None => return,
     };
-    let old_dir = std::path::PathBuf::from(format!("{home}/.config/crane"));
-    let new_dir = std::path::PathBuf::from(format!("{home}/.crane"));
+    let old_dir = home.join(".config").join("crane");
+    let new_dir = home.join(".crane");
     if old_dir.is_dir() && !new_dir.exists() {
         let _ = std::fs::rename(&old_dir, &new_dir);
     }
