@@ -669,6 +669,7 @@ impl eframe::App for CraneApp {
                     }
                     PaneAction::ShowFilesPanel => {
                         self.app.show_right = true;
+                        self.app.right_tab = state::RightTab::Files;
                     }
                     PaneAction::OpenFile(path) => {
                         let path_str = path.to_string_lossy().to_string();
