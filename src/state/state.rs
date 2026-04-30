@@ -1073,20 +1073,22 @@ impl App {
     }
 
     fn active_file_path_str(&self) -> Option<String> {
-        use crate::state::layout::PaneContent;
+        use crate::state::layout::{PaneContent, TabKind};
         let layout = self.active_layout_ref()?;
         if let Some(id) = layout.focus
             && let Some(p) = layout.panes.get(&id)
             && let PaneContent::Files(files) = &p.content
             && let Some(t) = files.tabs.get(files.active)
+            && let TabKind::File(ft) = t
         {
-            return Some(t.path.clone());
+            return Some(ft.path.clone());
         }
         for p in layout.panes.values() {
             if let PaneContent::Files(files) = &p.content
                 && let Some(t) = files.tabs.get(files.active)
+                && let TabKind::File(ft) = t
             {
-                return Some(t.path.clone());
+                return Some(ft.path.clone());
             }
         }
         None
@@ -1098,22 +1100,22 @@ impl App {
     /// between opens. `new_text` is the freshly-saved buffer so we avoid
     /// an extra disk read when the caller already has it.
     pub fn refresh_diff_panes_for_path(&mut self, path: &str, new_text: &str) {
-        use crate::state::layout::PaneContent;
+        use crate::state::layout::{PaneContent, TabKind};
         for project in &mut self.projects {
             for workspace in &mut project.workspaces {
                 for tab in &mut workspace.tabs {
                     for (_, pane) in tab.layout.panes.iter_mut() {
-                        let PaneContent::Diff(diff) = &mut pane.content else {
+                        let PaneContent::Files(files) = &mut pane.content else {
                             continue;
                         };
-                        for dt in diff.tabs.iter_mut() {
+                        for tk in files.tabs.iter_mut() {
+                            let TabKind::Diff(dt) = tk else {
+                                continue;
+                            };
                             if dt.right_path != path {
                                 continue;
                             }
                             dt.right_text = new_text.to_string();
-                            // Re-read HEAD version — cheap (`git show`)
-                            // and keeps the left side correct after a
-                            // commit lands while the diff is open.
                             if let Some(left) = dt
                                 .left_path
                                 .strip_prefix("HEAD:")
@@ -1147,7 +1149,7 @@ impl App {
     /// does — paths can be opened in multiple Layouts at once and we
     /// want to clean them all.
     pub fn close_file_tabs_for_path(&mut self, path: &Path) {
-        use crate::state::layout::PaneContent;
+        use crate::state::layout::{PaneContent, TabKind};
         let path_str = path.to_string_lossy().to_string();
         for project in &mut self.projects {
             for workspace in &mut project.workspaces {
@@ -1156,19 +1158,12 @@ impl App {
                         let PaneContent::Files(files) = &mut pane.content else {
                             continue;
                         };
-                        // Iterate from the back so we can swap_remove
-                        // without shifting later indices.
                         let mut i = files.tabs.len();
                         while i > 0 {
                             i -= 1;
-                            if files.tabs[i].path == path_str {
-                                files.tabs.remove(i);
-                                if files.active >= files.tabs.len()
-                                    && !files.tabs.is_empty()
-                                {
-                                    files.active = files.tabs.len() - 1;
-                                } else if files.tabs.is_empty() {
-                                    files.active = 0;
+                            if let TabKind::File(ft) = &files.tabs[i] {
+                                if ft.path == path_str {
+                                    files.close(i);
                                 }
                             }
                         }
@@ -1183,7 +1178,7 @@ impl App {
     /// dirty state are preserved; only the path + display name
     /// change.
     pub fn rename_file_tabs_for_path(&mut self, src: &Path, dst: &Path) {
-        use crate::state::layout::PaneContent;
+        use crate::state::layout::{PaneContent, TabKind};
         let src_str = src.to_string_lossy().to_string();
         let dst_str = dst.to_string_lossy().to_string();
         let dst_name = dst
@@ -1198,10 +1193,12 @@ impl App {
                         let PaneContent::Files(files) = &mut pane.content else {
                             continue;
                         };
-                        for ft in files.tabs.iter_mut() {
-                            if ft.path == src_str {
-                                ft.path = dst_str.clone();
-                                ft.name = dst_name.clone();
+                        for tk in files.tabs.iter_mut() {
+                            if let TabKind::File(ft) = tk {
+                                if ft.path == src_str {
+                                    ft.path = dst_str.clone();
+                                    ft.name = dst_name.clone();
+                                }
                             }
                         }
                     }
@@ -1475,7 +1472,8 @@ impl App {
         let configs_snapshot = self.language_configs.clone();
         for (_, pane) in tab.layout.panes.iter_mut() {
             if let crate::state::layout::PaneContent::Files(files) = &mut pane.content {
-                for ft in files.tabs.iter_mut() {
+                for tk in files.tabs.iter_mut() {
+                    let Some(ft) = tk.as_file_mut() else { continue };
                     let path = std::path::Path::new(&ft.path);
                     if !self.lsp.is_tracked(path) {
                         self.lsp.did_open(ctx, path, &ft.content, &configs_snapshot);

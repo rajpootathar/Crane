@@ -536,7 +536,7 @@ fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
             .unwrap_or(rel_path)
     );
     if let Some(ws) = app.active_layout() {
-        ws.open_or_focus_diff(
+        ws.open_diff_in_files_pane(
             format!("HEAD:{rel_path}"),
             rel_path.to_string(),
             left_text,
@@ -823,6 +823,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
     let mut commit_pending = false;
     let mut cancel_pending = false;
     let selected_snapshot = app.selected_file.clone();
+    let mut selected_file: Option<PathBuf> = None;
     egui::ScrollArea::vertical()
         .id_salt("right_files")
         .auto_shrink([false, false])
@@ -833,6 +834,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 0,
                 &app.expanded_dirs,
                 &mut opened,
+                &mut selected_file,
                 &mut toggled,
                 &mut new_entry,
                 &mut delete_request,
@@ -876,8 +878,8 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
         try_commit_pending(app);
     }
     if let Some(p) = opened.as_ref() {
-        // Clicking a row also marks it as the active selection so
-        // Cmd+Delete (handled in shortcuts.rs) targets it.
+        app.selected_file = Some(p.clone());
+    } else if let Some(p) = &selected_file {
         app.selected_file = Some(p.clone());
     }
     if let Some(p) = delete_request {
@@ -922,6 +924,7 @@ fn render_fs_dir(
     depth: usize,
     expanded: &std::collections::HashSet<PathBuf>,
     open_file: &mut Option<PathBuf>,
+    select_file: &mut Option<PathBuf>,
     toggle_dir: &mut Option<PathBuf>,
     new_entry: &mut Option<(PathBuf, NewEntryKind)>,
     delete_request: &mut Option<PathBuf>,
@@ -1013,8 +1016,11 @@ fn render_fs_dir(
             if is_dir {
                 *toggle_dir = Some(entry_path.clone());
             } else {
-                *open_file = Some(entry_path.clone());
+                *select_file = Some(entry_path.clone());
             }
+        }
+        if row.double_clicked && !is_dir {
+            *open_file = Some(entry_path.clone());
         }
         // Drag source: any row can be dragged. dnd_set_drag_payload
         // attaches the path to egui's global drag state; pointer
@@ -1094,6 +1100,7 @@ fn render_fs_dir(
                 depth + 1,
                 expanded,
                 open_file,
+                select_file,
                 toggle_dir,
                 new_entry,
                 delete_request,

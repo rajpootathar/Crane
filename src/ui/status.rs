@@ -4,7 +4,7 @@
 //! concerns (diagnostics, cursor, indent, language) live in the Files
 //! pane's own status strip — this bar is Workspace chrome.
 
-use crate::state::layout::PaneContent;
+use crate::state::layout::{PaneContent, TabKind};
 use crate::state::App;
 use crate::theme;
 use egui::RichText;
@@ -170,14 +170,16 @@ fn active_file_path(app: &App) -> Option<String> {
         && let Some(p) = layout.panes.get(&id)
         && let PaneContent::Files(files) = &p.content
         && let Some(t) = files.tabs.get(files.active)
+        && let TabKind::File(ft) = t
     {
-        return Some(t.path.clone());
+        return Some(ft.path.clone());
     }
     for p in layout.panes.values() {
         if let PaneContent::Files(files) = &p.content
             && let Some(t) = files.tabs.get(files.active)
+            && let TabKind::File(ft) = t
         {
-            return Some(t.path.clone());
+            return Some(ft.path.clone());
         }
     }
     None

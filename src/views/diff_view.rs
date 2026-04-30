@@ -1,5 +1,6 @@
-use crate::state::layout::DiffPane;
+use crate::state::layout::DiffTabData;
 use crate::theme;
+use crate::views::file_util::is_image_path;
 use crate::views::file_view::{find_syntax_for_ext, syntaxes, themes};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, RichText, ScrollArea};
@@ -14,26 +15,71 @@ const CTX_FG: Color32 = Color32::from_rgb(180, 186, 198);
 const ADD_FG: Color32 = Color32::from_rgb(140, 220, 150);
 const DEL_FG: Color32 = Color32::from_rgb(230, 130, 130);
 const MUTED: Color32 = Color32::from_rgb(140, 146, 160);
-const HEADER: Color32 = Color32::from_rgb(200, 204, 220);
-const TAB_ACTIVE_BG: Color32 = Color32::from_rgb(32, 36, 48);
 
-pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &mut String) {
-    // Tab bar — one tab per open diff. Click to focus, × to close.
-    render_tab_bar(ui, pane);
+/// Render the diff body for a single diff tab. Called from file_view.rs
+/// when the active tab is a `TabKind::Diff`.
+pub fn render_diff_body(ui: &mut egui::Ui, tab: &mut DiffTabData, font_size: f32, _tab_index: usize) {
+    let is_image = is_image_path(&tab.right_path);
+    let left_path = tab.left_path.clone();
+    let right_path = tab.right_path.clone();
 
-    let Some(tab) = pane.active_tab() else {
-        ui.add_space(24.0);
-        ui.vertical_centered(|ui| {
-            ui.label(RichText::new("No diff loaded").size(14.0).color(HEADER));
-            ui.add_space(4.0);
+    // Image files: decode the right-side (working tree) image and display
+    // it. Binary diffs aren't meaningful as text, so we skip TextDiff
+    // entirely.
+    if is_image {
+        let active_idx = _tab_index;
+        if tab.image_texture.is_none()
+            && let Ok(bytes) = std::fs::read(&tab.right_path)
+            && let Ok(img) = image::load_from_memory(&bytes)
+        {
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+            tab.image_texture = Some(ui.ctx().load_texture(
+                format!("crane_diff_img:{}", tab.right_path),
+                color,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
             ui.label(
-                RichText::new("Click a changed file in the Changes sidebar to view its diff here.")
-                    .size(11.5)
-                    .color(MUTED),
+                RichText::new(&left_path)
+                    .size(11.0)
+                    .color(DEL_FG)
+                    .monospace(),
+            );
+            ui.label(RichText::new("->").size(11.0).color(MUTED));
+            ui.label(
+                RichText::new(&right_path)
+                    .size(11.0)
+                    .color(ADD_FG)
+                    .monospace(),
             );
         });
+        ui.add_space(4.0);
+        ui.separator();
+        ScrollArea::both()
+            .id_salt(("diff_image_scroll", active_idx))
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                if let Some(tex) = &tab.image_texture {
+                    let size = tex.size_vec2();
+                    ui.add(
+                        egui::Image::from_texture(tex)
+                            .fit_to_original_size(1.0)
+                            .max_size(size),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Couldn't decode image")
+                            .color(theme::current().error.to_color32()),
+                    );
+                }
+            });
         return;
-    };
+    }
 
     let diff = TextDiff::from_lines(&tab.left_text, &tab.right_text);
     let font = FontId::new(font_size, FontFamily::Monospace);
@@ -338,58 +384,6 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
     }
     ui.ctx()
         .data_mut(|d| d.insert_temp(hunk_state_id, hunk_idx));
-}
-
-fn render_tab_bar(ui: &mut egui::Ui, pane: &mut DiffPane) {
-    if pane.tabs.is_empty() {
-        return;
-    }
-    let mut close_idx: Option<usize> = None;
-    let mut focus_idx: Option<usize> = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        for (i, tab) in pane.tabs.iter().enumerate() {
-            let is_active = i == pane.active;
-            let bg = if is_active { TAB_ACTIVE_BG } else { Color32::TRANSPARENT };
-            ui.scope(|ui| {
-                let v = ui.visuals_mut();
-                v.widgets.inactive.weak_bg_fill = bg;
-                v.widgets.inactive.bg_fill = bg;
-                v.widgets.hovered.bg_fill = TAB_ACTIVE_BG;
-                v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                let color = if is_active { HEADER } else { MUTED };
-                let label_btn = egui::Button::new(
-                    RichText::new(&tab.title).size(11.5).color(color),
-                )
-                .min_size(egui::vec2(0.0, 22.0))
-                .sense(egui::Sense::click());
-                let resp = ui.add(label_btn);
-                if resp.clicked() {
-                    focus_idx = Some(i);
-                }
-                // Middle-click on the tab label closes it (browser
-                // convention). Saves a trip to the tiny × button.
-                if resp.middle_clicked() {
-                    close_idx = Some(i);
-                }
-                let close_btn = egui::Button::new(
-                    RichText::new(icons::X).size(10.0).color(MUTED),
-                )
-                .min_size(egui::vec2(18.0, 22.0));
-                if ui.add(close_btn).clicked() {
-                    close_idx = Some(i);
-                }
-            });
-        }
-    });
-    if let Some(i) = focus_idx {
-        pane.active = i;
-    }
-    if let Some(i) = close_idx {
-        pane.close(i);
-    }
-    ui.separator();
 }
 
 #[allow(clippy::too_many_arguments)]

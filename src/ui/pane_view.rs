@@ -1,4 +1,4 @@
-use crate::views::{browser_view, diff_view, file_view, markdown_view, welcome_view};
+use crate::views::{browser_view, file_view, markdown_view, welcome_view};
 use crate::state::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
@@ -434,9 +434,6 @@ fn render_pane(
         }
         PaneContent::Markdown(md) => {
             markdown_view::render(child, md, font_size, &mut pane.title);
-        }
-        PaneContent::Diff(diff) => {
-            diff_view::render(child, diff, font_size, &mut pane.title);
         }
         PaneContent::Browser(browser) => {
             browser_view::render(child, id, browser, &mut pane.title, is_drop_target, is_focus);

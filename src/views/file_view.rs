@@ -176,7 +176,7 @@ fn render_close_confirm(ui: &mut egui::Ui, pane: &mut crate::state::layout::File
         pane.pending_close = None;
         return;
     };
-    let name = tab.name.clone();
+    let name = tab.name().to_string();
     let mut cancel = false;
     let mut confirm = false;
     egui::Window::new("Unsaved changes")
@@ -262,10 +262,10 @@ fn render_scoped(
                 ui.add_space(4.0);
                 for (idx, tab) in pane.tabs.iter().enumerate() {
                     let is_active = idx == pane.active;
-                    let label = if tab.dirty() {
-                        format!("{}  {}", icons::CIRCLE, tab.name)
+                    let label = if tab.is_dirty() {
+                        format!("{}  {}", icons::CIRCLE, tab.name())
                     } else {
-                        tab.name.clone()
+                        tab.name().to_string()
                     };
                     let (clicked, close_clicked) = draw_file_tab(ui, &label, is_active, idx);
                     if clicked {
@@ -284,7 +284,7 @@ fn render_scoped(
         // Dirty tab: route through a confirm modal so the user isn't
         // a stray click away from losing unsaved work. Clean tabs
         // close immediately.
-        if pane.tabs.get(idx).map(|t| t.dirty()).unwrap_or(false) {
+        if pane.tabs.get(idx).map(|t| t.is_dirty()).unwrap_or(false) {
             pane.pending_close = Some(idx);
         } else {
             pane.close(idx);
@@ -302,20 +302,21 @@ fn render_scoped(
     let active_idx = pane.active.min(pane.tabs.len() - 1);
     pane.active = active_idx;
 
+    // Dispatch based on active tab kind: file editor vs diff view.
+    let active_is_file = matches!(&pane.tabs[active_idx], crate::state::layout::TabKind::File(_));
+    let active_is_diff = matches!(&pane.tabs[active_idx], crate::state::layout::TabKind::Diff(_));
+
     // Save shortcut
-    let save_pressed = ui.input(|i| {
+    let save_pressed = active_is_file && ui.input(|i| {
         (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::S)
     });
     // Cmd+F opens the find bar (or replaces the query with the current
     // selection). Esc closes it — Cmd+F never closes.
-    let find_toggle = ui.input(|i| {
+    let find_toggle = active_is_file && ui.input(|i| {
         (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::F)
     });
-    if find_toggle
-        && !pane.tabs.is_empty()
-    {
-        let idx = pane.active.min(pane.tabs.len() - 1);
-        let t = &mut pane.tabs[idx];
+    if find_toggle {
+        let t = pane.tabs[active_idx].as_file_mut().unwrap();
         let te_id = egui::Id::new(("file_editor", &t.path)).with("body");
         let selection = egui::TextEdit::load_state(ui.ctx(), te_id)
             .and_then(|s| s.cursor.char_range())
@@ -334,8 +335,16 @@ fn render_scoped(
         }
     }
 
+    if active_is_diff {
+        if let Some(dt) = pane.tabs[active_idx].as_diff_mut() {
+            *title = format!("Files · {}", dt.title);
+            crate::views::diff_view::render_diff_body(ui, dt, font_size, active_idx);
+        }
+        return;
+    }
+
     {
-        let tab = &mut pane.tabs[active_idx];
+        let tab = pane.tabs[active_idx].as_file_mut().unwrap();
         crate::views::file_save::poll_external_change(tab);
         let name_label = if tab.dirty() {
             format!("{}  {}", icons::CIRCLE, tab.name)
@@ -462,9 +471,10 @@ fn render_scoped(
             let cur_byte =
                 crate::format::char_idx_to_byte(&tab.content, cur);
             let target_byte = if find_next {
-                tab.content[cur_byte..]
+                let after = cur_byte + 1.min(tab.content.len().saturating_sub(cur_byte));
+                tab.content[after..]
                     .find(&q)
-                    .map(|p| cur_byte + p)
+                    .map(|p| after + p)
                     .or_else(|| tab.content.find(&q))
             } else {
                 tab.content[..cur_byte]
@@ -910,6 +920,68 @@ fn render_scoped(
                             .desired_rows(30)
                             .layouter(&mut layouter);
                         let out = editor.show(ui);
+
+                        // Cmd+hover: underline the token under the pointer
+                        // and switch to hand cursor (goto-definition hint).
+                        let cmd_held = ui.input(|i| {
+                            i.modifiers.command || i.modifiers.mac_cmd
+                        });
+                        if cmd_held && out.response.hovered() {
+                            if let Some(ptr) = ui.input(|i| i.pointer.latest_pos()) {
+                                let rel = egui::vec2(
+                                    ptr.x - out.galley_pos.x,
+                                    ptr.y - out.galley_pos.y,
+                                );
+                                let ccursor = out.galley.cursor_from_pos(rel);
+                                let idx = ccursor.index;
+                                let chars: Vec<char> = tab.content.chars().collect();
+                                if idx > 0 && idx <= chars.len() {
+                                    let ch = chars[idx - 1];
+                                    if ch.is_alphanumeric() || ch == '_' {
+                                        let mut start = idx - 1;
+                                        while start > 0
+                                            && (chars[start - 1].is_alphanumeric()
+                                                || chars[start - 1] == '_')
+                                        {
+                                            start -= 1;
+                                        }
+                                        let mut end = idx;
+                                        while end < chars.len()
+                                            && (chars[end].is_alphanumeric()
+                                                || chars[end] == '_')
+                                        {
+                                            end += 1;
+                                        }
+                                        let p0 = out
+                                            .galley
+                                            .pos_from_cursor(
+                                                egui::text::CCursor::new(start),
+                                            );
+                                        let p1 = out
+                                            .galley
+                                            .pos_from_cursor(
+                                                egui::text::CCursor::new(end),
+                                            );
+                                        let y = p1.max.y + 1.5;
+                                        ui.painter().line_segment(
+                                            [
+                                                egui::pos2(
+                                                    out.galley_pos.x + p0.min.x,
+                                                    out.galley_pos.y + y,
+                                                ),
+                                                egui::pos2(
+                                                    out.galley_pos.x + p1.max.x,
+                                                    out.galley_pos.y + y,
+                                                ),
+                                            ],
+                                            (1.5, theme::current().accent.to_color32()),
+                                        );
+                                    }
+                                }
+                            }
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+
                         // Capture the actual row height from the galley so the
                         // gutter aligns exactly with code lines.
                         if out.galley.rows.len() >= 2 {
@@ -954,11 +1026,6 @@ fn render_scoped(
                             && let Some(mut state) =
                                 egui::TextEdit::load_state(ui.ctx(), te_id)
                         {
-                            let cc = crate::format::char_idx_to_byte(
-                                &tab.content,
-                                line_col_to_char(&tab.content, line, ch),
-                            );
-                            let _ = cc;
                             let cursor = line_col_to_char(&tab.content, line, ch);
                             let new_cc = egui::text::CCursor::new(cursor);
                             state.cursor.set_char_range(Some(
@@ -966,6 +1033,8 @@ fn render_scoped(
                             ));
                             state.store(ui.ctx(), te_id);
                             ui.memory_mut(|m| m.request_focus(te_id));
+                            // Scroll the editor viewport to the target line.
+                            tab.find_scroll_to_line = Some(line);
                         }
 
                         // F12 or Cmd+click → goto-definition at cursor.

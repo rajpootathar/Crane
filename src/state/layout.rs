@@ -86,8 +86,60 @@ impl FileTab {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffMode {
+    Unified,
+    SideBySide,
+}
+
+pub struct DiffTabData {
+    pub title: String,
+    pub left_path: String,
+    pub right_path: String,
+    pub left_text: String,
+    pub right_text: String,
+    pub error: Option<String>,
+    pub image_texture: Option<egui::TextureHandle>,
+    pub diff_mode: DiffMode,
+}
+
+pub enum TabKind {
+    File(FileTab),
+    Diff(DiffTabData),
+}
+
+impl TabKind {
+    pub fn name(&self) -> &str {
+        match self {
+            TabKind::File(ft) => &ft.name,
+            TabKind::Diff(dt) => &dt.title,
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        match self {
+            TabKind::File(ft) => ft.dirty(),
+            TabKind::Diff(_) => false,
+        }
+    }
+
+    pub fn as_file_mut(&mut self) -> Option<&mut FileTab> {
+        match self {
+            TabKind::File(ft) => Some(ft),
+            TabKind::Diff(_) => None,
+        }
+    }
+
+    pub fn as_diff_mut(&mut self) -> Option<&mut DiffTabData> {
+        match self {
+            TabKind::File(_) => None,
+            TabKind::Diff(dt) => Some(dt),
+        }
+    }
+}
+
 pub struct FilesPane {
-    pub tabs: Vec<FileTab>,
+    pub tabs: Vec<TabKind>,
     pub active: usize,
     #[allow(dead_code)] // kept for session schema compat
     pub input_buf: String,
@@ -110,14 +162,14 @@ impl FilesPane {
     }
 
     pub fn open(&mut self, path: String, content: String, name: String) {
-        if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
+        if let Some(idx) = self.tabs.iter().position(|t| matches!(t, TabKind::File(ft) if ft.path == path)) {
             self.active = idx;
             return;
         }
         let disk_mtime = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok();
-        self.tabs.push(FileTab {
+        self.tabs.push(TabKind::File(FileTab {
             path,
             original_content: content.clone(),
             last_lsp_content: content.clone(),
@@ -134,56 +186,14 @@ impl FilesPane {
             line_changes_key: 0,
             content,
             name,
-        });
+        }));
         self.active = self.tabs.len() - 1;
-    }
-
-    pub fn close(&mut self, idx: usize) {
-        if idx < self.tabs.len() {
-            self.tabs.remove(idx);
-            if self.active >= self.tabs.len() && !self.tabs.is_empty() {
-                self.active = self.tabs.len() - 1;
-            } else if self.tabs.is_empty() {
-                self.active = 0;
-            }
-        }
-    }
-}
-
-pub struct MarkdownPane {
-    pub path: String,
-    pub content: String,
-    pub input_buf: String,
-    pub error: Option<String>,
-}
-
-pub struct DiffTab {
-    pub title: String,
-    pub left_path: String,
-    pub right_path: String,
-    pub left_text: String,
-    pub right_text: String,
-    pub error: Option<String>,
-}
-
-pub struct DiffPane {
-    pub tabs: Vec<DiffTab>,
-    pub active: usize,
-}
-
-impl DiffPane {
-    pub fn empty() -> Self {
-        Self {
-            tabs: Vec::new(),
-            active: 0,
-        }
     }
 
     /// Open a diff tab. If one already exists for the same
     /// `(left_path, right_path)` pair, refresh its contents and focus
-    /// it instead of adding a duplicate — so reopening a file's diff
-    /// doesn't spawn an endless stack of tabs.
-    pub fn open(
+    /// it instead of adding a duplicate.
+    pub fn open_diff(
         &mut self,
         title: String,
         left_path: String,
@@ -194,49 +204,49 @@ impl DiffPane {
         if let Some(idx) = self
             .tabs
             .iter()
-            .position(|t| t.left_path == left_path && t.right_path == right_path)
+            .position(|t| matches!(t, TabKind::Diff(dt) if dt.left_path == left_path && dt.right_path == right_path))
         {
-            let t = &mut self.tabs[idx];
+            let t = self.tabs[idx].as_diff_mut().unwrap();
             t.title = title;
             t.left_text = left_text;
             t.right_text = right_text;
             t.error = None;
+            t.image_texture = None;
             self.active = idx;
             return;
         }
-        self.tabs.push(DiffTab {
+        self.tabs.push(TabKind::Diff(DiffTabData {
             title,
             left_path,
             right_path,
             left_text,
             right_text,
             error: None,
-        });
+            image_texture: None,
+            diff_mode: DiffMode::Unified,
+        }));
         self.active = self.tabs.len() - 1;
     }
 
     pub fn close(&mut self, idx: usize) {
-        if idx >= self.tabs.len() {
-            return;
+        if idx < self.tabs.len() {
+            self.tabs.remove(idx);
+            if self.active >= self.tabs.len() && !self.tabs.is_empty() {
+                self.active = self.tabs.len() - 1;
+            } else if self.tabs.is_empty() {
+                self.active = 0;
+            } else if self.active > idx {
+                self.active -= 1;
+            }
         }
-        self.tabs.remove(idx);
-        if self.tabs.is_empty() {
-            self.active = 0;
-        } else if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        } else if self.active > idx {
-            self.active -= 1;
-        }
     }
+}
 
-    pub fn active_tab(&self) -> Option<&DiffTab> {
-        self.tabs.get(self.active)
-    }
-
-    #[allow(dead_code)]
-    pub fn active_tab_mut(&mut self) -> Option<&mut DiffTab> {
-        self.tabs.get_mut(self.active)
-    }
+pub struct MarkdownPane {
+    pub path: String,
+    pub content: String,
+    pub input_buf: String,
+    pub error: Option<String>,
 }
 
 pub struct BrowserTab {
@@ -403,7 +413,6 @@ pub enum PaneContent {
     Terminal(TerminalPane),
     Files(FilesPane),
     Markdown(MarkdownPane),
-    Diff(DiffPane),
     Browser(BrowserPane),
     Welcome(WelcomePane),
 }
@@ -414,7 +423,6 @@ impl PaneContent {
             PaneContent::Terminal(_) => "Terminal",
             PaneContent::Files(_) => "Files",
             PaneContent::Markdown(_) => "Markdown",
-            PaneContent::Diff(_) => "Diff",
             PaneContent::Browser(_) => "Browser",
             PaneContent::Welcome(_) => "New Tab",
         }
@@ -533,7 +541,7 @@ impl Layout {
         self.next_id = id.max(self.next_id);
     }
 
-    pub fn open_or_focus_diff(
+    pub fn open_diff_in_files_pane(
         &mut self,
         left_path: String,
         right_path: String,
@@ -544,38 +552,26 @@ impl Layout {
         let existing = self
             .panes
             .iter()
-            .find(|(_, p)| matches!(p.content, PaneContent::Diff(_)))
+            .find(|(_, p)| matches!(p.content, PaneContent::Files(_)))
             .map(|(id, _)| *id);
         match existing {
             Some(pid) => {
-                if let Some(pane) = self.panes.get_mut(&pid) {
-                    if let PaneContent::Diff(diff) = &mut pane.content {
-                        diff.open(
-                            title.clone(),
-                            left_path,
-                            right_path,
-                            left_text,
-                            right_text,
-                        );
-                    }
-                    pane.title = title;
+                if let Some(pane) = self.panes.get_mut(&pid)
+                    && let PaneContent::Files(files) = &mut pane.content
+                {
+                    files.open_diff(title.clone(), left_path, right_path, left_text, right_text);
                 }
                 self.focus = Some(pid);
             }
             None => {
-                let mut diff = DiffPane::empty();
-                diff.open(
-                    title.clone(),
-                    left_path,
-                    right_path,
-                    left_text,
-                    right_text,
-                );
-                self.add_pane(PaneContent::Diff(diff), Some(Dir::Horizontal));
+                let mut files = FilesPane::empty();
+                files.open_diff(title.clone(), left_path, right_path, left_text, right_text);
+                self.add_pane(PaneContent::Files(files), Some(Dir::Horizontal));
                 if let Some(focus) = self.focus
-                    && let Some(pane) = self.panes.get_mut(&focus) {
-                        pane.title = title;
-                    }
+                    && let Some(pane) = self.panes.get_mut(&focus)
+                {
+                    pane.title = title;
+                }
             }
         }
     }

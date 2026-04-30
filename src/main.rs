@@ -175,7 +175,9 @@ impl CraneApp {
             for (_, pane) in layout.panes.iter_mut() {
                 if let state::layout::PaneContent::Files(files) = &mut pane.content {
                     // Make sure the target file is a tab in this pane.
-                    let idx = files.tabs.iter().position(|t| t.path == path_str);
+                    let idx = files.tabs.iter().position(|t| {
+                        matches!(t, state::layout::TabKind::File(ft) if ft.path == path_str)
+                    });
                     let idx = match idx {
                         Some(i) => i,
                         None => {
@@ -192,7 +194,9 @@ impl CraneApp {
                         }
                     };
                     files.active = idx;
-                    files.tabs[idx].pending_cursor = Some((loc.line, loc.character));
+                    if let Some(ft) = files.tabs[idx].as_file_mut() {
+                        ft.pending_cursor = Some((loc.line, loc.character));
+                    }
                     break;
                 }
             }
@@ -537,10 +541,12 @@ impl eframe::App for CraneApp {
             for p in layout_ref.panes.values() {
                 if let state::layout::PaneContent::Files(f) = &p.content {
                     for t in &f.tabs {
-                        diag_map.insert(
-                            t.path.clone(),
-                            self.app.lsp.diagnostics(std::path::Path::new(&t.path)),
-                        );
+                        if let state::layout::TabKind::File(ft) = t {
+                            diag_map.insert(
+                                ft.path.clone(),
+                                self.app.lsp.diagnostics(std::path::Path::new(&ft.path)),
+                            );
+                        }
                     }
                 }
             }

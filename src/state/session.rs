@@ -3,8 +3,8 @@ use crate::state::{
 };
 use crate::update::check::{PromptState, UpdateCheck};
 use crate::state::layout::{
-    self, BrowserPane, DiffPane, Dir, FileTab, FilesPane, Layout, MarkdownPane, Node, Pane,
-    PaneContent, PaneId,
+    BrowserPane, Dir, FileTab, FilesPane, Layout, MarkdownPane, Node, Pane,
+    PaneContent, PaneId, TabKind,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -159,12 +159,6 @@ pub enum SPaneContent {
     Markdown {
         path: String,
     },
-    Diff {
-        #[serde(default)]
-        tabs: Vec<SDiffTab>,
-        #[serde(default)]
-        active: usize,
-    },
     Browser {
         /// Legacy single-URL field — populated for old session files.
         /// Newer writes use `tabs` + `active` below.
@@ -205,13 +199,6 @@ fn path_is_empty(p: &PathBuf) -> bool {
 pub struct SFile {
     pub path: String,
     pub name: String,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct SDiffTab {
-    pub title: String,
-    pub left_path: String,
-    pub right_path: String,
 }
 
 pub fn session_file() -> PathBuf {
@@ -422,39 +409,21 @@ impl Session {
 
 impl STab {
     fn from_tab(t: &Tab) -> Self {
-        // Diff panes are transient by design — never persist them. Prune their
-        // IDs from both the pane map and the layout tree so we never restore
-        // with an empty Diff pane hanging around.
-        let diff_ids: Vec<PaneId> = t
-            .layout
-            .panes
-            .iter()
-            .filter(|(_, p)| matches!(p.content, PaneContent::Diff(_)))
-            .map(|(id, _)| *id)
-            .collect();
-
+        // Diff tabs are transient — never persist them. They live inside
+        // FilesPanes as TabKind::Diff entries. We prune them from the
+        // serialized tab list and adjust active index accordingly.
         let panes: Vec<SPane> = t
             .layout
             .panes
             .iter()
-            .filter(|(id, _)| !diff_ids.contains(id))
             .map(|(id, p)| SPane::from_pane(*id, p))
             .collect();
-
-        let mut pruned_root = t.layout.root.clone();
-        for id in &diff_ids {
-            if let Some(root) = pruned_root.take() {
-                let (new_root, _) = layout::prune_leaf(root, *id);
-                pruned_root = new_root;
-            }
-        }
-        let pruned_focus = t.layout.focus.filter(|f| !diff_ids.contains(f));
 
         STab {
             id: t.id,
             name: t.name.clone(),
-            layout: pruned_root.as_ref().map(SNode::from_node),
-            focus: pruned_focus,
+            layout: t.layout.root.as_ref().map(SNode::from_node),
+            focus: t.layout.focus,
             next_pane_id: t.layout.next_pane_id(),
             panes,
             tint: t.tint,
@@ -546,30 +515,25 @@ impl SPane {
                 }
             }
             PaneContent::Files(f) => SPaneContent::Files {
+                // Only persist file tabs — diff tabs are ephemeral.
                 files: f
                     .tabs
                     .iter()
-                    .map(|ft| SFile {
-                        path: ft.path.clone(),
-                        name: ft.name.clone(),
+                    .filter_map(|tk| {
+                        if let TabKind::File(ft) = tk {
+                            Some(SFile {
+                                path: ft.path.clone(),
+                                name: ft.name.clone(),
+                            })
+                        } else {
+                            None
+                        }
                     })
                     .collect(),
                 active: f.active,
             },
             PaneContent::Markdown(m) => SPaneContent::Markdown {
                 path: m.path.clone(),
-            },
-            PaneContent::Diff(d) => SPaneContent::Diff {
-                tabs: d
-                    .tabs
-                    .iter()
-                    .map(|t| SDiffTab {
-                        title: t.title.clone(),
-                        left_path: t.left_path.clone(),
-                        right_path: t.right_path.clone(),
-                    })
-                    .collect(),
-                active: d.active,
             },
             PaneContent::Browser(b) => SPaneContent::Browser {
                 url: String::new(),
@@ -665,14 +629,14 @@ impl SPane {
                 }
             }
             SPaneContent::Files { files, active } => {
-                let tabs: Vec<FileTab> = files
+                let tabs: Vec<TabKind> = files
                     .into_iter()
                     .map(|sf| {
                         let content = std::fs::read_to_string(&sf.path).unwrap_or_default();
                         let disk_mtime = std::fs::metadata(&sf.path)
                             .and_then(|m| m.modified())
                             .ok();
-                        FileTab {
+                        TabKind::File(FileTab {
                             path: sf.path,
                             name: sf.name,
                             original_content: content.clone(),
@@ -689,7 +653,7 @@ impl SPane {
                             line_changes: None,
                             line_changes_key: 0,
                             content,
-                        }
+                        })
                     })
                     .collect();
                 let len = tabs.len();
@@ -709,22 +673,6 @@ impl SPane {
                     input_buf: String::new(),
                     error: None,
                 })
-            }
-            SPaneContent::Diff { tabs, active } => {
-                let mut pane = DiffPane::empty();
-                for st in tabs {
-                    let right_text = std::fs::read_to_string(&st.right_path).unwrap_or_default();
-                    let left_text = if let Some(rel) = st.left_path.strip_prefix("HEAD:") {
-                        crate::git::head_content(cwd, rel)
-                    } else {
-                        std::fs::read_to_string(&st.left_path).unwrap_or_default()
-                    };
-                    pane.open(st.title, st.left_path, st.right_path, left_text, right_text);
-                }
-                if !pane.tabs.is_empty() {
-                    pane.active = active.min(pane.tabs.len() - 1);
-                }
-                PaneContent::Diff(pane)
             }
             SPaneContent::Browser { url, tabs, active } => {
                 if tabs.is_empty() {
