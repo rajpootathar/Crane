@@ -1,9 +1,7 @@
 //! Grid coordinate types.
 //!
-//! Mirrors alacritty's `index` module shape so the renderer in
-//! `src/terminal/view.rs` can address grid cells with the same
-//! pattern. `Line` is signed because rows in scrollback live at
-//! negative indices relative to the live viewport.
+//! `Line` is signed because rows in scrollback live at negative
+//! indices relative to the live viewport.
 
 use std::ops::{Add, Sub};
 

@@ -24,7 +24,7 @@ pub struct Term {
     /// Bumped on every grid / scrollback mutation. Crane's PTY
     /// reader thread reads this after each parse pass and only
     /// requests a repaint when it actually changed — avoids the
-    /// per-byte repaint storm that the old alacritty-based path
+    /// per-byte repaint storm that traditional VT terminal cores
     /// hit with Ink-style TUIs.
     pub dirty_epoch: u64,
     /// DECSC cursor save slot. `None` until the first `save_cursor`.
@@ -269,8 +269,8 @@ impl Term {
     /// no selection is set or the selection is empty. Wide-char
     /// spacers are skipped — their glyph belongs to the preceding
     /// `WIDE_CHAR` cell — and trailing whitespace per row is
-    /// trimmed (matches iTerm2/WezTerm copy semantics so the right-
-    /// padding TUIs apply doesn't show up in clipboard text).
+    /// trimmed so the right-padding TUIs apply doesn't show up in
+    /// clipboard text.
     pub fn selection_to_string(&self) -> Option<String> {
         let sel = self.selection.as_ref()?;
         if sel.is_empty() {
@@ -484,13 +484,12 @@ impl Term {
 impl Handler for Term {
     /// THE fix.
     ///
-    /// Alacritty pushes a row to scrollback whenever cursor advance
-    /// past the visible bottom collides with auto-wrap; that's
-    /// correct for streaming stdout but wrong for TUIs that step
-    /// down through their own redraw region. We only push when the
-    /// cursor sits at the bottom of the active scroll region — a
-    /// `cursor-up + LF + LF + LF` redraw lands mid-region and
-    /// touches no history.
+    /// Most VT cores push a row to scrollback whenever cursor advance
+    /// past the visible bottom collides with auto-wrap; that's correct
+    /// for streaming stdout but wrong for TUIs that step down through
+    /// their own redraw region. We only push when the cursor sits at
+    /// the bottom of the active scroll region — a `cursor-up + LF + LF
+    /// + LF` redraw lands mid-region and touches no history.
     fn linefeed(&mut self) -> ScrollDelta {
         let delta = if self.grid.cursor_at_scroll_bottom() {
             self.scroll_up_one();
@@ -1017,8 +1016,8 @@ impl Handler for Term {
         // Primary DA: `\e[?6c` advertises VT102. Secondary DA
         // (intermediate `>`): `\e[>0;0;0c` reports terminal type 0
         // / firmware 0. Tertiary DA (`=`): not supported, ignored.
-        // Most TUIs only check the primary form; matching alacritty
-        // behavior is close enough.
+        // Most TUIs only check the primary form; this minimal
+        // response is enough.
         match intermediate {
             None => self.reply(b"\x1b[?6c"),
             Some('>') => self.reply(b"\x1b[>0;0;0c"),
@@ -1417,9 +1416,7 @@ pub struct RenderableContent<'a> {
     col: usize,
 }
 
-/// One element of [`RenderableContent`]. Mirrors alacritty's
-/// shape so the renderer in `src/terminal/view.rs` can swap to
-/// crane_term with minimal rewriting.
+/// One element of [`RenderableContent`].
 #[derive(Clone, Debug)]
 pub struct RenderableCell<'a> {
     pub point: Point,

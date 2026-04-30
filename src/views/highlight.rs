@@ -24,8 +24,8 @@
 //!
 //! For the common case of typing near the bottom of a file, step 3 is a
 //! single line. For typing near the top, step 3 re-runs from that point to
-//! the end, which is still far cheaper than the whole buffer and matches
-//! what editors like Sublime / bat / delta do.
+//! the end, which is still far cheaper than re-highlighting the whole
+//! buffer.
 //!
 //! ## What this does NOT address
 //!

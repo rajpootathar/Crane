@@ -625,7 +625,7 @@ impl LspServer {
         let uri = protocol::path_to_uri(path);
         // rust-analyzer's `checkOnSave` hook triggers `cargo check` on this
         // notification — that's what produces real compile errors (the
-        // kind you see underlined in VSCode). Without it, rust-analyzer
+        // kind you see underlined in editors). Without it, rust-analyzer
         // only reports a handful of info-level diagnostics.
         self.send(&json!({
             "jsonrpc": "2.0",

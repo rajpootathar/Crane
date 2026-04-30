@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod browser;
 mod format;
 #[cfg(target_os = "macos")]
@@ -111,7 +111,7 @@ struct CraneApp {
     last_saved_settings_snapshot: String,
     last_save_at: std::time::Instant,
     pending_close: Option<state::layout::PaneId>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     browser_host: browser::BrowserHost,
 }
 
@@ -141,7 +141,7 @@ impl CraneApp {
             last_saved_settings_snapshot: String::new(),
             last_save_at: std::time::Instant::now(),
             pending_close: None,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             browser_host: browser::BrowserHost::new(),
         }
     }
@@ -286,7 +286,7 @@ impl CraneApp {
                 Ok(())
             })();
             if written.is_ok()
-                && std::fs::rename(&tmp, &path).is_ok()
+                && crate::util::replace_file(&tmp, &path).is_ok()
                 && let Some(parent) = path.parent()
                 && let Ok(dir) = std::fs::File::open(parent)
             {
@@ -373,7 +373,7 @@ impl eframe::App for CraneApp {
         // server process now instead of waiting for app exit. Cheap no-op
         // when every running server is still enabled.
         self.app.lsp.shutdown_disabled(&self.app.language_configs);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         {
             // Fold any URL changes the webview reported (redirects,
             // link clicks, history manipulation) back into each tab's
@@ -682,6 +682,40 @@ impl eframe::App for CraneApp {
                             &ctx, path_str, name, content,
                         );
                     }
+                    PaneAction::MoveTab { src_pane, tab_idx, dst_pane, insert_idx, kind } => {
+                        ws.move_tab(src_pane, tab_idx, dst_pane, insert_idx, kind);
+                    }
+                    PaneAction::DetachTabAsNewPane { src_pane, tab_idx, neighbor, edge, kind } => {
+                        let content = ws.take_tab_as_content(src_pane, tab_idx, kind);
+                        if let Some(content) = content {
+                            if src_pane == neighbor {
+                                // Self-split: take_tab left the source pane
+                                // possibly empty. If empty, replace it in the
+                                // tree with the new content directly instead
+                                // of creating a split with an empty side.
+                                let src_empty = ws.panes.get(&src_pane)
+                                    .map(|p| match &p.content {
+                                        state::layout::PaneContent::Files(f) => f.tabs.is_empty(),
+                                        state::layout::PaneContent::Terminal(tp) => tp.tabs.is_empty(),
+                                        state::layout::PaneContent::Browser(bp) => bp.tabs.is_empty(),
+                                        _ => false,
+                                    })
+                                    .unwrap_or(false);
+                                if src_empty {
+                                    // Replace the empty pane's content with the
+                                    // dragged-out tab's content. No split needed.
+                                    if let Some(pane) = ws.panes.get_mut(&src_pane) {
+                                        pane.content = content;
+                                    }
+                                } else {
+                                    ws.add_pane_with_content(content, neighbor, edge);
+                                }
+                            } else {
+                                ws.add_pane_with_content(content, neighbor, edge);
+                                ws.remove_pane_if_empty(src_pane);
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -771,7 +805,7 @@ impl eframe::App for CraneApp {
         // reported during render_layout, then reconcile webview
         // positions / creations / destructions against the hosting
         // OS window (NSWindow on macOS, X11 child window on Linux).
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         {
             let bridge = browser::take_bridge();
             // WKWebView always paints above egui. Any overlay (modal,
@@ -803,7 +837,7 @@ impl eframe::App for CraneApp {
             self.browser_host
                 .sync(frame, &ctx, bridge, overlay_visible, &all_keys);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = frame;
         }

@@ -1,14 +1,13 @@
 //! Crane's in-house terminal core.
 //!
-//! Replaces `alacritty_terminal` so we own the `linefeed` /
-//! scroll-into-history decision. The TUI scrollback duplication we
-//! hit with alacritty (Claude Code, Ink, neovim cmdline rewriting
-//! their UI region) is fixed at this layer: `linefeed` only pushes a
-//! row into scrollback when the cursor sits at the bottom of the
-//! active scroll region. A cursor mid-region just moves down — no
-//! history write. `?2026` synchronized output is buffer-and-replay
-//! at the [`processor`] layer; the live-grid scroll routing in
-//! [`term`] is what actually prevents pollution.
+//! Owns the `linefeed` / scroll-into-history decision so TUI scrollback
+//! duplication (Claude Code, Ink, neovim cmdline rewriting their UI
+//! region) is fixed at this layer: `linefeed` only pushes a row into
+//! scrollback when the cursor sits at the bottom of the active scroll
+//! region. A cursor mid-region just moves down — no history write.
+//! `?2026` synchronized output is buffer-and-replay at the
+//! [`processor`] layer; the live-grid scroll routing in [`term`] is
+//! what actually prevents pollution.
 //!
 //! Module roles:
 //! * [`cell`] — single grid cell (char + colors + flag bits).

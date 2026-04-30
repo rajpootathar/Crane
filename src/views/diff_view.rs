@@ -108,7 +108,7 @@ pub fn render(ui: &mut egui::Ui, pane: &mut DiffPane, font_size: f32, _title: &m
 
     // Hunk starts: indices of the first changed row in each run of
     // consecutive non-Equal rows. Used by the prev/next arrows in the
-    // header to jump between change blocks (JetBrains-style).
+    // header to jump between change blocks.
     let hunk_starts: Vec<usize> = {
         let mut starts = Vec::new();
         let mut in_hunk = false;

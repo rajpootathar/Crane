@@ -11,9 +11,9 @@
 //! default trait methods are no-ops. Any method we don't override
 //! here silently swallows the parsed event, which is how `\e[2J`
 //! (clear screen) and SGR colors went missing in the first
-//! integration cut. Anything we DON'T need (kitty image protocol,
-//! tmux control mode, etc.) intentionally falls through to the
-//! no-op default — those have no Crane equivalent.
+//! integration cut. Anything we DON'T need (image protocols, tmux
+//! control mode, etc.) intentionally falls through to the no-op
+//! default — those have no Crane equivalent.
 
 use crate::handler::Handler;
 

@@ -350,8 +350,8 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     // label (e.g. a verbose git branch name) can't overrun into them.
     // We clip the label paint to the allowable rect rather than
     // elide with "…" — the clean right-edge cutoff is enough of a
-    // visual hint that the text continues, matches how VS Code /
-    // Finder truncate narrow sidebar labels, and avoids the measure-
+    // visual hint that the text continues, matches how native file
+    // managers truncate narrow sidebar labels, and avoids the measure-
     // and-shrink loop that an ellipsis pass would need.
     let badge_reserve: f32 = if cfg.badge.is_some() { 64.0 } else { 0.0 };
     let trailing_reserve = (cfg.trailing_count as f32) * 22.0;

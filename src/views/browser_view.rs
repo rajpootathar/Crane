@@ -5,8 +5,9 @@
 //! here only draws the tab strip + URL toolbar + reserves a rect for
 //! the webview.
 
-use crate::state::layout::{BrowserPane, PaneId};
+use crate::state::layout::{BrowserPane, PaneId, TabKind};
 use crate::theme;
+use crate::views::file_view::TabDragAction;
 use egui::RichText;
 use egui_phosphor::regular as icons;
 
@@ -26,8 +27,9 @@ pub fn render(
     // to `browser::report_focused_pane` so Cmd+C/V/X/A routes to the
     // embedded WKWebView via mac_keys's NSEvent monitor.
     is_focus: bool,
-) {
+) -> Option<TabDragAction> {
     // Tab strip (always visible). Left-to-right chips + a trailing `+`.
+    let mut tab_rects: Vec<egui::Rect> = Vec::new();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         let mut to_activate: Option<usize> = None;
@@ -53,7 +55,7 @@ pub fn render(
                 .inner_margin(egui::Margin::symmetric(8, 3))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        #[cfg(any(target_os = "macos", target_os = "linux"))]
+                        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
                         {
                             let key = composite_id(pane_id, tab.id);
                             if crate::browser::is_loading(key) {
@@ -114,7 +116,25 @@ pub fn render(
                         }
                     });
                 });
-            let _ = chip;
+            let chip_rect = chip.response.rect;
+            tab_rects.push(chip_rect);
+
+            // Tab drag-start
+            let drag_resp = ui.interact(
+                chip_rect,
+                egui::Id::new(("browser_tab_drag", pane_id, idx)),
+                egui::Sense::click_and_drag(),
+            );
+            if drag_resp.drag_started() {
+                egui::DragAndDrop::set_payload(
+                    ui.ctx(),
+                    crate::ui::pane_view::TabDragPayload {
+                        source_pane_id: pane_id,
+                        tab_index: idx,
+                        kind: TabKind::Browser,
+                    },
+                );
+            }
         }
         if ui
             .add(
@@ -131,7 +151,7 @@ pub fn render(
             pane.active = idx;
         }
         if let Some(idx) = to_close {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             if let Some(removed_tab_id) = pane.tabs.get(idx).map(|t| t.id) {
                 crate::browser::queue_action(
                     composite_id(pane_id, removed_tab_id),
@@ -142,8 +162,13 @@ pub fn render(
         }
     });
 
+    // Tab drag-and-drop detection (reorder + merge).
+    if let Some(tda) = detect_browser_tab_drop(ui, pane_id, pane, &tab_rects) {
+        return Some(tda);
+    }
+
     let Some(tab) = pane.active_tab_mut() else {
-        return;
+        return None;
     };
     let tab_id = tab.id;
 
@@ -159,7 +184,7 @@ pub fn render(
             .on_hover_text(tip)
             .clicked()
         };
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         {
             let key = composite_id(pane_id, tab_id);
             if btn(ui, icons::ARROW_LEFT, "Back") {
@@ -172,7 +197,7 @@ pub fn render(
                 crate::browser::queue_action(key, crate::browser::Action::Reload);
             }
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = btn;
         }
@@ -190,7 +215,7 @@ pub fn render(
                 tab.url = url.clone();
                 tab.title = url.clone();
                 *title = url.clone();
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
                 crate::browser::queue_action(
                     composite_id(pane_id, tab_id),
                     crate::browser::Action::Load(url),
@@ -199,7 +224,7 @@ pub fn render(
                 // uses winit/X11 — we can't embed there. Go / Enter
                 // falls through to the system browser instead of
                 // silently doing nothing.
-                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
                 {
                     let _ = pane_id;
                     let _ = tab_id;
@@ -233,7 +258,7 @@ pub fn render(
     );
     ui.allocate_rect(rect, egui::Sense::hover());
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         let inner = rect.shrink(1.0);
         // Report only the active tab's rect — that's the one whose
@@ -258,7 +283,7 @@ pub fn render(
             theme::current().surface.to_color32(),
         );
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         // Centered launcher card — fallback for platforms without an
         // embedded-webview backend wired up (Windows WebView2 etc.).
@@ -318,7 +343,7 @@ pub fn render(
 
     // Keep every other tab's webview alive (reported, but hidden). We
     // do this AFTER the active tab so it takes precedence for focus.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     for (idx, t) in pane.tabs.iter().enumerate() {
         if idx == pane.active {
             continue;
@@ -333,7 +358,7 @@ pub fn render(
     // it sits above the webview's reserved rect. On Linux the memory
     // Monitor returns zero (no `sample_webkit_processes` equivalent
     // wired up yet), which renders as "WebKit memory: —".
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         ui.painter().rect_filled(
             footer_rect,
@@ -383,11 +408,21 @@ pub fn render(
             theme::current().text_muted.to_color32(),
         );
         // Right: memory + process count.
+        let engine_label = {
+            #[cfg(target_os = "windows")]
+            {
+                "WebView2"
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                "WebKit"
+            }
+        };
         let right_label = if snap.total_bytes == 0 {
-            "WebKit memory: —".to_string()
+            format!("{engine_label} memory: —")
         } else {
             format!(
-                "WebKit: {}  ·  {} process{proc_suffix}",
+                "{engine_label}: {}  ·  {} process{proc_suffix}",
                 mem_label, snap.process_count
             )
         };
@@ -415,14 +450,109 @@ pub fn render(
             ));
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = footer_rect;
         let _ = pane;
     }
+    None
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Detect tab drag-drop on this pane's tab bar.
+fn detect_browser_tab_drop(
+    ui: &mut egui::Ui,
+    pane_id: PaneId,
+    pane: &mut BrowserPane,
+    tab_rects: &[egui::Rect],
+) -> Option<TabDragAction> {
+    let drag = egui::DragAndDrop::payload::<crate::ui::pane_view::TabDragPayload>(ui.ctx())?;
+    if drag.kind != TabKind::Browser {
+        return None;
+    }
+    let pointer = ui.input(|i| i.pointer.hover_pos())?;
+    let released = ui.input(|i| i.pointer.any_released());
+
+    // Pointer must be within this pane's tab bar area (x AND y).
+    // Without x-bounds, a sibling pane with the same y-range steals the payload.
+    let bar_rect = tab_rects.first().map(|first| {
+        let last = tab_rects.last().unwrap_or(first);
+        egui::Rect::from_min_max(first.left_top(), last.right_bottom())
+    }).unwrap_or(egui::Rect::NOTHING);
+    if !bar_rect.expand(4.0).contains(pointer) {
+        return None;
+    }
+
+    let insert_idx = insertion_index(tab_rects, pointer.x);
+
+    if drag.source_pane_id == pane_id {
+        if let Some(&hit_rect) = tab_rects.get(insert_idx) {
+            let x = hit_rect.left();
+            let y_min = tab_rects.first().map(|r| r.top()).unwrap_or(0.0);
+            let y_max = tab_rects.first().map(|r| r.bottom()).unwrap_or(0.0);
+            ui.painter().line_segment(
+                [egui::pos2(x, y_min), egui::pos2(x, y_max)],
+                egui::Stroke::new(2.0, theme::current().accent.to_color32()),
+            );
+        } else if let Some(&last) = tab_rects.last() {
+            let x = last.right();
+            let y_min = tab_rects.first().map(|r| r.top()).unwrap_or(0.0);
+            let y_max = tab_rects.first().map(|r| r.bottom()).unwrap_or(0.0);
+            ui.painter().line_segment(
+                [egui::pos2(x, y_min), egui::pos2(x, y_max)],
+                egui::Stroke::new(2.0, theme::current().accent.to_color32()),
+            );
+        }
+
+        if released {
+            egui::DragAndDrop::take_payload::<crate::ui::pane_view::TabDragPayload>(ui.ctx());
+            let from = drag.tab_index;
+            if from != insert_idx && insert_idx != from + 1 && from < pane.tabs.len() {
+                let tab = pane.tabs.remove(from);
+                let insert_at = if insert_idx > from { insert_idx - 1 } else { insert_idx };
+                pane.tabs.insert(insert_at, tab);
+                pane.active = insert_at;
+            }
+        }
+        return None;
+    }
+
+    // Cross-pane merge highlight.
+    if let Some(&first) = tab_rects.first() {
+        let bar_rect = egui::Rect::from_min_max(
+            first.min,
+            tab_rects.last().map(|r| r.right_bottom()).unwrap_or(first.right_bottom()),
+        );
+        ui.painter().rect_filled(
+            bar_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(100, 149, 237, 40),
+        );
+    }
+
+    if released {
+        egui::DragAndDrop::take_payload::<crate::ui::pane_view::TabDragPayload>(ui.ctx());
+        return Some(TabDragAction {
+            src_pane: drag.source_pane_id,
+            tab_idx: drag.tab_index,
+            dst_pane: pane_id,
+            insert_idx,
+            kind: TabKind::Browser,
+        });
+    }
+
+    None
+}
+
+fn insertion_index(rects: &[egui::Rect], pointer_x: f32) -> usize {
+    for (i, r) in rects.iter().enumerate() {
+        if pointer_x < r.center().x {
+            return i;
+        }
+    }
+    rects.len()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn composite_id(pane_id: PaneId, tab_id: u32) -> crate::browser::SlotKey {
     (pane_id, tab_id)
 }

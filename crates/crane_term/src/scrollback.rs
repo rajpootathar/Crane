@@ -1,7 +1,7 @@
 //! Capped FIFO of evicted rows.
 //!
-//! v1 storage is a simple `VecDeque<Row>`. Warp's flat-storage
-//! (UTF-8 byte buffer + interval maps for attributes) is a v2
+//! v1 storage is a simple `VecDeque<Row>`. A flat-storage layout
+//! (UTF-8 byte buffer + interval maps for attributes) would be a v2
 //! memory optimization for very long histories — skipped here in
 //! favor of straightforward per-row storage that maps cleanly to
 //! the renderer's per-row painter loop.
@@ -9,8 +9,7 @@
 use crate::row::Row;
 use std::collections::VecDeque;
 
-/// Default cap. Matches alacritty's pre-config default and is
-/// large enough for typical interactive sessions.
+/// Default cap. Large enough for typical interactive sessions.
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
 
 #[derive(Debug)]

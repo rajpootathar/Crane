@@ -7,7 +7,7 @@
 
 Native, GPU-rendered desktop development environment for orchestrating terminals, file browsing, diffs, and git workflows across isolated git workspaces.
 
-Built in pure Rust on [egui](https://github.com/emilk/egui) + [wgpu](https://github.com/gfx-rs/wgpu), with an in-house terminal core (`crates/crane_term`) wrapping [vte](https://github.com/alacritty/vte) for VT parsing and [portable-pty](https://github.com/wez/wezterm/tree/main/pty) for cross-platform PTY.
+Built in pure Rust on [egui](https://github.com/emilk/egui) + [wgpu](https://github.com/gfx-rs/wgpu), with an in-house terminal core (`crates/crane_term`) wrapping [vte](https://crates.io/crates/vte) for VT parsing and [portable-pty](https://crates.io/crates/portable-pty) for cross-platform PTY.
 
 ---
 
@@ -80,7 +80,7 @@ sudo apt install \
 
 ### Windows
 
-Needs the MSVC toolchain (via Visual Studio Build Tools). No other prerequisites.
+Needs the MSVC C++ build toolchain. No other prerequisites.
 
 ---
 

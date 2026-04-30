@@ -18,19 +18,22 @@ const HISTORY_MAX: usize = 256 * 1024;
 // rows into scrollback.
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 const CRANE_TERMINFO_SRC: &[u8] = b"xterm-crane|Crane terminal emulator,\n\
     \tuse=xterm-256color,\n\
     \tSync=\\E[?2026h\\E[?2026l,\n";
 
+#[cfg(unix)]
 static CRANE_TERMINFO_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+#[cfg(unix)]
 fn use_crane_terminfo() -> bool {
     *CRANE_TERMINFO_OK.get_or_init(|| {
-        let home = match std::env::var("HOME") {
-            Ok(h) => h,
-            Err(_) => return false,
+        let home = match crate::util::home_dir() {
+            Some(h) => h,
+            None => return false,
         };
-        let terminfo_dir = std::path::PathBuf::from(format!("{home}/.terminfo"));
+        let terminfo_dir = home.join(".terminfo");
         if !std::path::Path::new(&format!("{}/x", terminfo_dir.display())).exists() {
             let _ = std::fs::create_dir_all(&terminfo_dir);
         }
@@ -38,9 +41,6 @@ fn use_crane_terminfo() -> bool {
         if probe.exists() {
             return true;
         }
-        // tic compiles a terminfo source file and emits a binary
-        // entry under ~/.terminfo. Stdin doesn't work cross-version
-        // on macOS, so write a temp file and pass the path.
         let tmp = std::env::temp_dir().join("crane-terminfo.src");
         if std::fs::write(&tmp, CRANE_TERMINFO_SRC).is_err() {
             return false;
@@ -56,6 +56,11 @@ fn use_crane_terminfo() -> bool {
             _ => false,
         }
     })
+}
+
+#[cfg(not(unix))]
+fn use_crane_terminfo() -> bool {
+    false
 }
 
 pub struct Terminal {
@@ -169,8 +174,17 @@ impl Terminal {
             })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        let mut cmd = CommandBuilder::new(shell);
+        let mut cmd = {
+            #[cfg(unix)]
+            {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+                CommandBuilder::new(shell)
+            }
+            #[cfg(not(unix))]
+            {
+                CommandBuilder::new_default_prog()
+            }
+        };
         // Ink-based TUIs (Claude Code, etc.) check terminfo for the
         // `Sync` capability and wrap their redraws in
         // \e[?2026h .. \e[?2026l when present. Our Processor handles
@@ -187,13 +201,13 @@ impl Terminal {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Crane");
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        // Inherited from gnome-terminal / VTE-based parents. Leaks
-        // confuse TUIs that pick feature flags meant for VTE's grid
-        // semantics. Cleared, matching Ghostty / Wezterm / kitty.
+        // Inherited from VTE-based parent terminals. Leaks confuse
+        // TUIs that pick feature flags meant for VTE's grid semantics.
+        // Clear it so we look like a non-VTE terminal.
         cmd.env_remove("VTE_VERSION");
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
-        } else if let Ok(home) = std::env::var("HOME") {
+        } else if let Some(home) = crate::util::home_dir() {
             cmd.cwd(home);
         }
         let child = pair
@@ -252,8 +266,9 @@ impl Terminal {
         // to ~/.crane/vt-trace-<pid>.log. Cheap branch when unset.
         let trace_file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> = {
             if std::env::var("CRANE_VT_TRACE").ok().as_deref() == Some("1") {
-                let home = std::env::var("HOME").unwrap_or_default();
-                let dir = std::path::PathBuf::from(format!("{home}/.crane"));
+                let dir = crate::util::home_dir()
+                    .map(|h| h.join(".crane"))
+                    .unwrap_or_default();
                 let _ = std::fs::create_dir_all(&dir);
                 let pid = std::process::id();
                 let path = dir.join(format!("vt-trace-{pid}.log"));

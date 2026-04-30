@@ -1,10 +1,10 @@
-use crate::state::layout::FilesPane;
+use crate::state::layout::{FilesPane, PaneId, TabKind};
 use crate::lsp::Diagnostic;
 use crate::theme;
 use crate::views::diagnostics_overlay;
 use crate::views::file_util::{
     char_idx_to_line_col, is_image_path, line_col_to_char, reveal_in_file_manager,
-    short_path,
+    reveal_label, short_path,
 };
 use crate::views::highlight::{rehighlight, LineHighlightCache};
 use egui::text::{LayoutJob, TextFormat};
@@ -13,6 +13,17 @@ use egui_phosphor::regular as icons;
 use std::path::Path;
 use std::sync::OnceLock;
 use syntect::highlighting::ThemeSet;
+
+/// Action returned by file_view::render when a tab drag-drop completes
+/// on this pane's tab bar. The caller (pane_view) converts it to a
+/// PaneAction for dispatch.
+pub struct TabDragAction {
+    pub src_pane: PaneId,
+    pub tab_idx: usize,
+    pub dst_pane: PaneId,
+    pub insert_idx: usize,
+    pub kind: TabKind,
+}
 use syntect::parsing::SyntaxSet;
 
 static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
@@ -30,13 +41,13 @@ struct CachedGalley {
 
 pub fn syntaxes() -> &'static SyntaxSet {
     SYNTAXES.get_or_init(|| {
-        // two-face ships ~250 Sublime-grade syntaxes: TypeScript, TSX, JSX,
-        // Dockerfile, Astro, Svelte, GraphQL, Prisma, Nix, Zig, etc. — a
-        // big step up from syntect's bundled set for modern dev work.
+        // two-face ships ~250 production-grade syntaxes: TypeScript, TSX,
+        // JSX, Dockerfile, Astro, Svelte, GraphQL, Prisma, Nix, Zig, etc.
+        // — a big step up from syntect's bundled set for modern dev work.
         let mut builder = two_face::syntax::extra_newlines().into_builder();
         // User-dropped packages still fold in on top.
-        if let Ok(home) = std::env::var("HOME") {
-            let dir = std::path::PathBuf::from(format!("{home}/.crane/syntaxes"));
+        if let Some(home) = crate::util::home_dir() {
+            let dir = home.join(".crane").join("syntaxes");
             if dir.is_dir() {
                 let _ = builder.add_from_folder(&dir, true);
             }
@@ -141,13 +152,12 @@ pub fn render(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: EditorPrefs,
-) {
-    // Scope widget ids by pane so unrelated Files panes don't share
-    // state (undo history, scroll positions, etc.) — the real work
-    // lives entirely in this function; there's no separate inner.
+) -> Option<TabDragAction> {
+    let mut action = None;
     ui.push_id(("files_pane", pane_id), |ui| {
-        render_scoped(
+        action = render_scoped(
             ui,
+            pane_id,
             pane,
             font_size,
             title,
@@ -160,6 +170,7 @@ pub fn render(
             prefs,
         );
     });
+    action
 }
 
 /// Confirm modal for closing a dirty file tab. "Discard" drops the
@@ -217,6 +228,7 @@ fn render_close_confirm(ui: &mut egui::Ui, pane: &mut crate::state::layout::File
 
 fn render_scoped(
     ui: &mut egui::Ui,
+    pane_id: PaneId,
     pane: &mut FilesPane,
     font_size: f32,
     title: &mut String,
@@ -227,7 +239,7 @@ fn render_scoped(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: EditorPrefs,
-) {
+) -> Option<TabDragAction> {
     if pane.tabs.is_empty() {
         let t = theme::current();
         ui.add_space(8.0);
@@ -245,13 +257,20 @@ fn render_scoped(
                     .size(11.5),
             );
         });
-        return;
+
+        // Accept drops from other file panes even when empty (creates
+        // a tab in this otherwise-empty pane).
+        if let Some(action) = detect_file_tab_drop(ui, pane_id, pane, &[]) {
+            return Some(action);
+        }
+        return None;
     }
 
     // Tab bar — horizontal scroll so many-open-file cases don't hide
     // tabs past the viewport edge.
     let mut close_idx: Option<usize> = None;
     let mut activate_idx: Option<usize> = None;
+    let mut tab_rects: Vec<egui::Rect> = Vec::new();
     ScrollArea::horizontal()
         .id_salt("file_tab_bar")
         .auto_shrink([false, true])
@@ -267,7 +286,26 @@ fn render_scoped(
                     } else {
                         tab.name.clone()
                     };
-                    let (clicked, close_clicked) = draw_file_tab(ui, &label, is_active, idx);
+                    let (clicked, close_clicked, tab_rect) = draw_file_tab(ui, &label, is_active, idx);
+                    tab_rects.push(tab_rect);
+
+                    // Detect drag-start on this tab chip.
+                    let drag_resp = ui.interact(
+                        tab_rect,
+                        egui::Id::new(("file_tab_drag", pane_id, idx)),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if drag_resp.drag_started() {
+                        egui::DragAndDrop::set_payload(
+                            ui.ctx(),
+                            crate::ui::pane_view::TabDragPayload {
+                                source_pane_id: pane_id,
+                                tab_index: idx,
+                                kind: TabKind::File,
+                            },
+                        );
+                    }
+
                     if clicked {
                         activate_idx = Some(idx);
                     }
@@ -289,14 +327,20 @@ fn render_scoped(
         } else {
             pane.close(idx);
             if pane.tabs.is_empty() {
-                return;
+                return None;
             }
         }
     }
     render_close_confirm(ui, pane);
     if pane.tabs.is_empty() {
-        return;
+        return None;
     }
+
+    // Tab drag-and-drop detection (reorder + merge).
+    if let Some(action) = detect_file_tab_drop(ui, pane_id, pane, &tab_rects) {
+        return Some(action);
+    }
+
     ui.add_space(2.0);
 
     let active_idx = pane.active.min(pane.tabs.len() - 1);
@@ -661,7 +705,7 @@ fn render_scoped(
                         );
                     }
                 });
-            return;
+            return None;
         }
 
         // Markdown preview mode: render formatted HTML instead of the
@@ -678,7 +722,7 @@ fn render_scoped(
                         font_size,
                     );
                 });
-            return;
+            return None;
         }
 
         // Two-column layout: fixed gutter on the left, horizontally-
@@ -821,10 +865,9 @@ fn render_scoped(
                             }
                         }
                         // Cmd+X on an empty selection cuts the whole line
-                        // (trailing newline included). Matches VS Code /
-                        // JetBrains behavior. Intercepted before TextEdit
-                        // runs so its default no-op path doesn't swallow
-                        // the shortcut.
+                        // (trailing newline included), the standard editor
+                        // behavior. Intercepted before TextEdit runs so its
+                        // default no-op path doesn't swallow the shortcut.
                         // macOS: egui synthesizes Event::Cut from Cmd+X
                         // without emitting a Key event, so `consume_key`
                         // never fires. Detect the Cut event directly and
@@ -1010,7 +1053,7 @@ fn render_scoped(
                                 cs.set(true);
                                 ui.close();
                             }
-                            if ui.button(format!("{}  Reveal in Finder", icons::FOLDER_OPEN)).clicked() {
+                            if ui.button(format!("{}  {}", icons::FOLDER_OPEN, reveal_label())).clicked() {
                                 cr.set(true);
                                 ui.close();
                             }
@@ -1296,17 +1339,122 @@ fn render_scoped(
 
         crate::views::file_status::render_status_strip(ui, tab, &diagnostics, status_h);
     }
+    None
 }
 
 
+/// Detect tab drag-drop on this pane's tab bar. Handles both same-pane
+/// reorder (done in-place) and cross-pane merge (returned as action).
+fn detect_file_tab_drop(
+    ui: &mut egui::Ui,
+    pane_id: PaneId,
+    pane: &mut FilesPane,
+    tab_rects: &[egui::Rect],
+) -> Option<TabDragAction> {
+    let drag = egui::DragAndDrop::payload::<crate::ui::pane_view::TabDragPayload>(ui.ctx())?;
+    if drag.kind != TabKind::File {
+        return None;
+    }
 
+    // Cursor feedback while dragging.
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+
+    let pointer = ui.input(|i| i.pointer.hover_pos())?;
+    let released = ui.input(|i| i.pointer.any_released());
+
+    // Pointer must be within this pane's tab bar area (x AND y).
+    // Without x-bounds, a sibling pane with the same y-range steals the payload.
+    let bar_rect = tab_rects.first().map(|first| {
+        let last = tab_rects.last().unwrap_or(first);
+        egui::Rect::from_min_max(first.left_top(), last.right_bottom())
+    }).unwrap_or(egui::Rect::NOTHING);
+    if !bar_rect.expand(4.0).contains(pointer) {
+        return None;
+    }
+
+    // Compute insertion index from pointer x-position among tab rects.
+    let insertion_idx = insertion_index_from_rects(tab_rects, pointer.x);
+
+    if drag.source_pane_id == pane_id {
+
+        // Same-pane reorder: paint insertion indicator, reorder on release.
+        if let Some(&hit_rect) = tab_rects.get(insertion_idx) {
+            let x = hit_rect.left();
+            let y_min = tab_rects.first().map(|r| r.top()).unwrap_or(0.0);
+            let y_max = tab_rects.first().map(|r| r.bottom()).unwrap_or(0.0);
+            ui.painter().line_segment(
+                [egui::pos2(x, y_min), egui::pos2(x, y_max)],
+                egui::Stroke::new(2.0, theme::current().accent.to_color32()),
+            );
+        } else if let Some(&last) = tab_rects.last() {
+            let x = last.right();
+            let y_min = tab_rects.first().map(|r| r.top()).unwrap_or(0.0);
+            let y_max = tab_rects.first().map(|r| r.bottom()).unwrap_or(0.0);
+            ui.painter().line_segment(
+                [egui::pos2(x, y_min), egui::pos2(x, y_max)],
+                egui::Stroke::new(2.0, theme::current().accent.to_color32()),
+            );
+        }
+
+        if released {
+            egui::DragAndDrop::take_payload::<crate::ui::pane_view::TabDragPayload>(ui.ctx());
+            let from = drag.tab_index;
+            if from != insertion_idx && from < pane.tabs.len() {
+                let tab = pane.tabs.remove(from);
+                let insert_at = if insertion_idx > from {
+                    insertion_idx - 1
+                } else {
+                    insertion_idx
+                };
+                pane.tabs.insert(insert_at, tab);
+                pane.active = insert_at;
+            }
+        }
+        return None; // Reorder handled in-place, no action needed.
+    }
+
+    // Cross-pane merge: highlight this tab bar as drop target.
+    if let Some(&first) = tab_rects.first() {
+        let bar_rect = egui::Rect::from_min_max(
+            first.min,
+            tab_rects.last().map(|r| r.right_bottom()).unwrap_or(first.right_bottom()),
+        );
+        ui.painter().rect_filled(
+            bar_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(100, 149, 237, 40),
+        );
+    }
+
+    if released {
+        egui::DragAndDrop::take_payload::<crate::ui::pane_view::TabDragPayload>(ui.ctx());
+        return Some(TabDragAction {
+            src_pane: drag.source_pane_id,
+            tab_idx: drag.tab_index,
+            dst_pane: pane_id,
+            insert_idx: insertion_idx,
+            kind: TabKind::File,
+        });
+    }
+
+    None
+}
+
+fn insertion_index_from_rects(rects: &[egui::Rect], pointer_x: f32) -> usize {
+    for (i, r) in rects.iter().enumerate() {
+        if pointer_x < r.center().x {
+            return i;
+        }
+    }
+    rects.len()
+}
 
 fn draw_file_tab(
     ui: &mut egui::Ui,
     name: &str,
     is_active: bool,
     idx: usize,
-) -> (bool, bool) {
+) -> (bool, bool, egui::Rect) {
     let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
     let close_font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
     let text_w = ui
@@ -1382,5 +1530,6 @@ fn draw_file_tab(
     (
         response.clicked() && !close_response.hovered(),
         closed,
+        rect,
     )
 }

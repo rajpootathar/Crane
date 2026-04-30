@@ -11,8 +11,8 @@
 //! * **Size cap** (`MAX_SYNC_BUFFER_BYTES`, 2 MiB): a buffer
 //!   exceeding this gets force-flushed.
 //!
-//! Both caps mirror Warp's behavior — same trade-off (partial
-//! state on the live grid is better than indefinite freeze).
+//! Both caps reflect the same trade-off (partial state on the live
+//! grid is better than indefinite freeze).
 
 use std::time::{Duration, Instant};
 

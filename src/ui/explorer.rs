@@ -936,7 +936,7 @@ fn render_fs_dir(
     workspace_root: &std::path::Path,
     git_status_map: &HashMap<String, (git::ChangeStatus, bool, bool)>,
 ) {
-    if depth > 6 {
+    if depth > 64 {
         return;
     }
     // Pending-entry editor lives in exactly one directory at a time
@@ -1041,9 +1041,8 @@ fn render_fs_dir(
         }
         let path_owned = entry_path.clone();
         // New entries land in the directory itself for folder rows,
-        // and in the file's parent directory for file rows — same
-        // affordance as VS Code so right-clicking any nearby row
-        // creates the entry next to it.
+        // and in the file's parent directory for file rows — so
+        // right-clicking any nearby row creates the entry next to it.
         let create_parent: PathBuf = if is_dir {
             path_owned.clone()
         } else {
@@ -1159,8 +1158,7 @@ fn push_file_op(app: &mut App, op: FileOp) {
 /// Inline TextEdit row for the pending new-file/folder editor.
 /// Looks like a tree row at the right indent, no leading expander.
 /// Enter commits via `*commit = true`, Escape cancels via
-/// `*cancel = true`. Focus loss with empty input also cancels —
-/// matches JetBrains.
+/// `*cancel = true`. Focus loss with empty input also cancels.
 fn render_pending_editor_row(
     ui: &mut egui::Ui,
     depth: usize,
@@ -1204,7 +1202,7 @@ fn render_pending_editor_row(
                 *commit = true;
             }
         } else if resp.lost_focus() && pending.name.trim().is_empty() {
-            // Clicked away with no name typed → cancel (JetBrains).
+            // Clicked away with no name typed → cancel.
             *cancel = true;
         }
     });

@@ -191,11 +191,10 @@ mod tests {
     }
 
     /// THE actual bug we're fixing: an Ink-style redraw block whose
-    /// last LF lands the cursor at the screen bottom row. In a
-    /// terminal without sync-frame suppression (alacritty 0.25 OR
-    /// the pre-fix crane_term), this pushes the top row into
-    /// scrollback for every redraw — that's the duplicate-prompt
-    /// artifact in CLAUDE.md.
+    /// last LF lands the cursor at the screen bottom row. Without
+    /// sync-frame suppression, this pushes the top row into
+    /// scrollback for every redraw — the duplicate-prompt artifact
+    /// in CLAUDE.md.
     #[test]
     fn sync_block_landing_at_screen_bottom_does_not_evict() {
         let mut term = Term::new(5, 10);
@@ -227,7 +226,7 @@ mod tests {
     fn parser_preserves_ascii_input_byte_for_byte() {
         let mut t = Term::new(3, 80);
         let mut p = Processor::new();
-        let input = b"  feat(terminal): replace alacritty_terminal with crane_term";
+        let input = b"  feat(terminal): introduce crane_term VT core";
         p.parse_bytes(&mut t, input);
         let row = &t.grid.rows[0];
         let s: String = row.cells.iter().take(input.len()).map(|c| c.ch).collect();

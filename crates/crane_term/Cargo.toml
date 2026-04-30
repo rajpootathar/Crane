@@ -7,17 +7,16 @@ license = "MIT"
 publish = false
 
 [dependencies]
-# Upstream alacritty/vte parser. The `ansi` feature exposes the typed
-# Handler trait (cursor moves, scroll, modes, colors as typed methods)
-# plus the parsed Mode / PrivateMode enums including SyncUpdate. We
-# wrap that with our own Handler in `handler.rs` so scroll-producing
-# methods can return delta info to the grid layer.
+# VT parser. The `ansi` feature exposes the typed Handler trait (cursor
+# moves, scroll, modes, colors as typed methods) plus the parsed Mode /
+# PrivateMode enums including SyncUpdate. We wrap that with our own
+# Handler in `handler.rs` so scroll-producing methods can return delta
+# info to the grid layer.
 vte = { version = "0.15", features = ["ansi"] }
 bitflags = "2"
 cursor-icon = "1"
 log = "0.4"
-# East-Asian-Wide / emoji column-width detection. Already in the
-# workspace's lock file via alacritty's transitive deps; adding
-# directly so wide-char handling in [`Term::input`] doesn't need
-# an ad-hoc range table.
+# East-Asian-Wide / emoji column-width detection. Pulled in directly
+# so wide-char handling in [`Term::input`] doesn't need an ad-hoc
+# range table.
 unicode-width = "0.2"

@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 /// Root for all per-project caches (`~/.crane/projects/`). Missing dirs
 /// are created on demand by callers via [`ensure_project_dir`].
 pub fn root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(format!("{home}/.crane/projects")))
+    Some(crate::util::home_dir()?.join(".crane").join("projects"))
 }
 
 /// Stable slug for a project path — last path component plus an 8-char

@@ -1,5 +1,5 @@
 use crate::views::{browser_view, diff_view, file_view, markdown_view, welcome_view};
-use crate::state::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
+use crate::state::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId, TabKind};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
 use egui_phosphor::regular as icons;
@@ -40,6 +40,13 @@ fn pane_body_bg() -> Color32 {
 #[derive(Clone, Copy)]
 struct DragPayload(PaneId);
 
+#[derive(Clone)]
+pub(crate) struct TabDragPayload {
+    pub source_pane_id: PaneId,
+    pub tab_index: usize,
+    pub kind: crate::state::layout::TabKind,
+}
+
 pub enum PaneAction {
     None,
     Focus(PaneId),
@@ -60,14 +67,30 @@ pub enum PaneAction {
     /// Terminal → Files Pane: user clicked a local path that's inside the
     /// workspace. Open it in Crane's file editor instead of the system app.
     OpenFile(PathBuf),
+    /// Move a tab from one pane to another (same type merge).
+    MoveTab {
+        src_pane: PaneId,
+        tab_idx: usize,
+        dst_pane: PaneId,
+        insert_idx: usize,
+        kind: crate::state::layout::TabKind,
+    },
+    /// Drag a tab onto a non-matching pane body — creates a new split pane.
+    DetachTabAsNewPane {
+        src_pane: PaneId,
+        tab_idx: usize,
+        neighbor: PaneId,
+        edge: DockEdge,
+        kind: crate::state::layout::TabKind,
+    },
 }
 
 fn dock_zone(rect: Rect, pos: Pos2) -> DockEdge {
     let rel_x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
     let rel_y = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
     // A small 30 %× 30 % center square means the outer 35 % on any side
-    // docks to that edge. This matches VS Code / Warp's feel — if the
-    // pointer is clearly closer to one edge, that edge wins.
+    // docks to that edge. If the pointer is clearly closer to one
+    // edge, that edge wins.
     let center_min = 0.35;
     let center_max = 0.65;
     if rel_x >= center_min
@@ -364,8 +387,60 @@ fn render_pane(
         };
     }
 
-    // No visible border on panes (Warp-style). Active/inactive is shown by
-    // a subtle dim overlay painted after content renders, below.
+    // Tab drag-and-drop onto a pane body:
+    // 1. Non-matching type → creates a new split pane.
+    // 2. Same pane's own body (below tab bar) → splits the tab out.
+    // Same-type tab bar merges are handled inside each view's
+    // detect_*_tab_drop instead.
+    let tab_payload = egui::DragAndDrop::payload::<TabDragPayload>(ui.ctx());
+    let pane_content_kind = layout.panes.get(&id).map(|p| match &p.content {
+        PaneContent::Files(_) => TabKind::File,
+        PaneContent::Terminal(_) => TabKind::Terminal,
+        PaneContent::Browser(_) => TabKind::Browser,
+        _ => TabKind::File,
+    });
+    let tab_drop_target = tab_payload
+        .as_ref()
+        .map(|p| {
+            pointer_in
+            && (p.source_pane_id != id && pane_content_kind != Some(p.kind))
+        })
+        .unwrap_or(false);
+    // Also allow dragging a tab onto its own pane body (below the tab
+    // bar) to split it out. The header_rect check ensures we don't
+    // intercept drops aimed at the tab bar itself.
+    let header_rect = Rect::from_min_size(
+        rect.shrink(BORDER_W).min,
+        Vec2::new(rect.shrink(BORDER_W).width(), HEADER_H),
+    );
+    let self_split_target = tab_payload
+        .as_ref()
+        .map(|p| {
+            p.source_pane_id == id
+            && pointer_in
+            && pointer.map(|pp| !header_rect.contains(pp)).unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let tab_drop_edge = if tab_drop_target || self_split_target {
+        pointer.map(|p| dock_zone(rect, p))
+    } else {
+        None
+    };
+    if (tab_drop_target || self_split_target) && released
+        && let Some(payload) = egui::DragAndDrop::take_payload::<TabDragPayload>(ui.ctx())
+    {
+        let edge = tab_drop_edge.unwrap_or(DockEdge::Right);
+        *action = PaneAction::DetachTabAsNewPane {
+            src_pane: payload.source_pane_id,
+            tab_idx: payload.tab_index,
+            neighbor: id,
+            edge,
+            kind: payload.kind,
+        };
+    }
+
+    // No visible border on panes. Active/inactive is shown by a
+    // subtle dim overlay painted after content renders, below.
     let _ = border_color;
     let inner = rect.shrink(BORDER_W);
     let header_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), HEADER_H));
@@ -409,15 +484,24 @@ fn render_pane(
     // to detect them, so this helps both speed and the "red flash" bug.
     child.push_id(("pane_body", id), |child| match &mut pane.content {
         PaneContent::Terminal(tp) => {
-            let opened = crate::terminal::view::render_terminal_pane(
+            let result = crate::terminal::view::render_terminal_pane(
                 child, tp, font_size, is_focus, id, workspace_root,
             );
-            if let Some(path) = opened {
-                *action = PaneAction::OpenFile(path);
+            if let Some(act) = result {
+                *action = match act {
+                    crate::terminal::view::TerminalAction::OpenFile(path) => {
+                        PaneAction::OpenFile(path)
+                    }
+                    crate::terminal::view::TerminalAction::MoveTab {
+                        src_pane, tab_idx, dst_pane, insert_idx, kind,
+                    } => PaneAction::MoveTab {
+                        src_pane, tab_idx, dst_pane, insert_idx, kind,
+                    },
+                };
             }
         }
         PaneContent::Files(files) => {
-            file_view::render(
+            if let Some(tda) = file_view::render(
                 child,
                 id,
                 files,
@@ -430,7 +514,15 @@ fn render_pane(
                 goto_request,
                 workspace_root,
                 prefs,
-            );
+            ) {
+                *action = PaneAction::MoveTab {
+                    src_pane: tda.src_pane,
+                    tab_idx: tda.tab_idx,
+                    dst_pane: tda.dst_pane,
+                    insert_idx: tda.insert_idx,
+                    kind: tda.kind,
+                };
+            }
         }
         PaneContent::Markdown(md) => {
             markdown_view::render(child, md, font_size, &mut pane.title);
@@ -439,7 +531,15 @@ fn render_pane(
             diff_view::render(child, diff, font_size, &mut pane.title);
         }
         PaneContent::Browser(browser) => {
-            browser_view::render(child, id, browser, &mut pane.title, is_drop_target, is_focus);
+            if let Some(tda) = browser_view::render(child, id, browser, &mut pane.title, is_drop_target, is_focus) {
+                *action = PaneAction::MoveTab {
+                    src_pane: tda.src_pane,
+                    tab_idx: tda.tab_idx,
+                    dst_pane: tda.dst_pane,
+                    insert_idx: tda.insert_idx,
+                    kind: tda.kind,
+                };
+            }
         }
         PaneContent::Welcome(_) => {
             if let Some(act) = welcome_view::render(child) {
@@ -459,7 +559,7 @@ fn render_pane(
         };
     }
 
-    // Warp-style active/inactive: dim inactive panes with a translucent
+    // Active/inactive treatment: dim inactive panes with a translucent
     // black overlay. No border, no highlight ring — just a subtle value
     // shift so your eye goes to the one you're working in.
     if !is_focus && drop_edge.is_none() {
@@ -481,6 +581,18 @@ fn render_pane(
             zone,
             4.0,
             Stroke::new(2.0, Color32::from_rgb(96, 140, 220)),
+            StrokeKind::Inside,
+        );
+    }
+    // Tab drop-zone overlay (for dragging a tab onto a pane body).
+    if let Some(edge) = tab_drop_edge {
+        let zone = zone_rect(rect, edge);
+        let painter = ui.painter();
+        painter.rect_filled(zone, 4.0, Color32::from_rgba_unmultiplied(96, 140, 220, 70));
+        painter.rect_stroke(
+            zone,
+            4.0,
+            Stroke::new(1.5, Color32::from_rgb(96, 140, 220)),
             StrokeKind::Inside,
         );
     }

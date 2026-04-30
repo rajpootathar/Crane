@@ -1,12 +1,10 @@
 //! Mouse selection state.
 //!
-//! Mirrors the surface alacritty's `selection` module exposes to
-//! `src/terminal/view.rs`: anchor + active end with a side hint,
-//! `update()` drag, `to_range()` materialization, point-in-range
-//! containment via `SelectionRange`. Block selection (column-
-//! constrained) is a separate kind so dragging through TUI sidebar
-//! dividers doesn't pull adjacent column text along with the
-//! intended selection.
+//! Anchor + active end with a side hint, `update()` drag,
+//! `to_range()` materialization, point-in-range containment via
+//! `SelectionRange`. Block selection (column-constrained) is a
+//! separate kind so dragging through TUI sidebar dividers doesn't
+//! pull adjacent column text along with the intended selection.
 
 use crate::index::{Point, Side};
 

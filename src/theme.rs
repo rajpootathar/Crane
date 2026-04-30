@@ -549,6 +549,138 @@ impl Theme {
         }
     }
 
+    pub fn rose_pine() -> Self {
+        // Rosé Pine — warm dusty rose/magenta palette. Soft, romantic,
+        // yet readable. Popular with the "aesthetic terminal" crowd.
+        Self {
+            name: "rose-pine".into(),
+            bg: Rgb::new(25, 23, 36),
+            sidebar_bg: Rgb::new(30, 28, 42),
+            topbar_bg: Rgb::new(30, 28, 42),
+            surface: Rgb::new(38, 35, 58),
+            surface_alt: Rgb::new(52, 48, 74),
+            surface_hi: Rgb::new(68, 62, 96),
+            border: Rgb::new(38, 35, 58),
+            border_strong: Rgb::new(82, 76, 112),
+            divider: Rgb::new(34, 32, 52),
+            text: Rgb::new(224, 222, 242),
+            text_hover: Rgb::new(238, 236, 255),
+            text_muted: Rgb::new(144, 140, 170),
+            text_header: Rgb::new(160, 156, 186),
+            accent: Rgb::new(196, 167, 231),
+            row_hover: Rgb::new(34, 32, 52),
+            row_active: Rgb::new(52, 48, 74),
+            focus_border: Rgb::new(196, 167, 231),
+            inactive_border: Rgb::new(38, 35, 58),
+            error: Rgb::new(235, 111, 146),
+            success: Rgb::new(49, 173, 119),
+            warning: Rgb::new(246, 193, 68),
+            terminal_bg: Rgb::new(25, 23, 36),
+            terminal_fg: Rgb::new(224, 222, 242),
+            selection: Rgb::new(52, 48, 74),
+            syntax_theme: "Dracula".into(),
+        }
+    }
+
+    pub fn catppuccin_latte() -> Self {
+        // Catppuccin Latte — warm light theme with muted pastel accents.
+        // Easy on the eyes for daytime use, no harsh whites.
+        Self {
+            name: "catppuccin-latte".into(),
+            bg: Rgb::new(239, 237, 231),
+            sidebar_bg: Rgb::new(230, 227, 220),
+            topbar_bg: Rgb::new(221, 218, 212),
+            surface: Rgb::new(204, 199, 190),
+            surface_alt: Rgb::new(186, 181, 172),
+            surface_hi: Rgb::new(166, 161, 153),
+            border: Rgb::new(186, 181, 172),
+            border_strong: Rgb::new(140, 135, 127),
+            divider: Rgb::new(204, 199, 190),
+            text: Rgb::new(76, 79, 105),
+            text_hover: Rgb::new(30, 32, 54),
+            text_muted: Rgb::new(140, 143, 161),
+            text_header: Rgb::new(92, 95, 119),
+            accent: Rgb::new(136, 57, 239),
+            row_hover: Rgb::new(221, 218, 212),
+            row_active: Rgb::new(204, 199, 190),
+            focus_border: Rgb::new(136, 57, 239),
+            inactive_border: Rgb::new(186, 181, 172),
+            error: Rgb::new(210, 15, 57),
+            success: Rgb::new(64, 160, 112),
+            warning: Rgb::new(223, 142, 29),
+            terminal_bg: Rgb::new(239, 237, 231),
+            terminal_fg: Rgb::new(76, 79, 105),
+            selection: Rgb::new(204, 199, 190),
+            syntax_theme: "OneHalfLight".into(),
+        }
+    }
+
+    pub fn coffee() -> Self {
+        // Coffee — deep warm brown palette. Dark roast vibes, amber
+        // accent, cream text. Cozy for late-night coding.
+        Self {
+            name: "coffee".into(),
+            bg: Rgb::new(31, 25, 20),
+            sidebar_bg: Rgb::new(38, 30, 24),
+            topbar_bg: Rgb::new(38, 30, 24),
+            surface: Rgb::new(58, 46, 36),
+            surface_alt: Rgb::new(78, 62, 48),
+            surface_hi: Rgb::new(100, 80, 62),
+            border: Rgb::new(58, 46, 36),
+            border_strong: Rgb::new(116, 94, 72),
+            divider: Rgb::new(48, 38, 30),
+            text: Rgb::new(226, 210, 186),
+            text_hover: Rgb::new(244, 230, 210),
+            text_muted: Rgb::new(166, 146, 122),
+            text_header: Rgb::new(186, 166, 142),
+            accent: Rgb::new(222, 158, 64),
+            row_hover: Rgb::new(48, 38, 30),
+            row_active: Rgb::new(78, 62, 48),
+            focus_border: Rgb::new(222, 158, 64),
+            inactive_border: Rgb::new(58, 46, 36),
+            error: Rgb::new(218, 100, 80),
+            success: Rgb::new(160, 180, 72),
+            warning: Rgb::new(222, 158, 64),
+            terminal_bg: Rgb::new(31, 25, 20),
+            terminal_fg: Rgb::new(226, 210, 186),
+            selection: Rgb::new(78, 62, 48),
+            syntax_theme: "TwoDark".into(),
+        }
+    }
+
+    pub fn warm_neon() -> Self {
+        // Warm Neon — dark charcoal base with warm undertones and
+        // bright amber/orange accent. Electric but not cold.
+        Self {
+            name: "warm-neon".into(),
+            bg: Rgb::new(22, 20, 24),
+            sidebar_bg: Rgb::new(28, 25, 30),
+            topbar_bg: Rgb::new(28, 25, 30),
+            surface: Rgb::new(42, 38, 46),
+            surface_alt: Rgb::new(58, 52, 64),
+            surface_hi: Rgb::new(76, 68, 84),
+            border: Rgb::new(42, 38, 46),
+            border_strong: Rgb::new(90, 80, 100),
+            divider: Rgb::new(36, 32, 40),
+            text: Rgb::new(232, 220, 204),
+            text_hover: Rgb::new(255, 245, 230),
+            text_muted: Rgb::new(158, 144, 132),
+            text_header: Rgb::new(178, 164, 150),
+            accent: Rgb::new(255, 176, 46),
+            row_hover: Rgb::new(36, 32, 40),
+            row_active: Rgb::new(58, 52, 64),
+            focus_border: Rgb::new(255, 176, 46),
+            inactive_border: Rgb::new(42, 38, 46),
+            error: Rgb::new(255, 96, 72),
+            success: Rgb::new(96, 224, 128),
+            warning: Rgb::new(255, 176, 46),
+            terminal_bg: Rgb::new(22, 20, 24),
+            terminal_fg: Rgb::new(232, 220, 204),
+            selection: Rgb::new(58, 52, 64),
+            syntax_theme: "TwoDark".into(),
+        }
+    }
+
     pub fn high_contrast_dark() -> Self {
         // WCAG AAA contrast: pure white text on pure black bg, with
         // high-saturation accent colours. For low-vision users and
@@ -625,6 +757,11 @@ impl Theme {
             Self::catppuccin_mocha(),
             Self::gruvbox_dark(),
             Self::nord(),
+            // Warm tones — cozy amber/rose/brown palettes.
+            Self::rose_pine(),
+            Self::catppuccin_latte(),
+            Self::coffee(),
+            Self::warm_neon(),
             // Tier 2 — classics + editor brand themes.
             Self::one_dark(),
             Self::solarized_dark(),
@@ -659,8 +796,9 @@ pub fn current() -> Theme {
 }
 
 pub fn themes_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(format!("{home}/.crane/themes"))
+    crate::util::home_dir()
+        .map(|h| h.join(".crane").join("themes"))
+        .unwrap_or_default()
 }
 
 /// Scan `~/.config/crane/themes/*.toml` and return all successfully parsed

@@ -136,8 +136,7 @@ impl Downloader {
     }
 
     fn expected_path(key: ServerKey) -> Option<PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        let base = PathBuf::from(home).join(".crane").join("lsp");
+        let base = crate::util::home_dir()?.join(".crane").join("lsp");
         match key {
             ServerKey::RustAnalyzer => {
                 let bin = if cfg!(windows) {
@@ -181,9 +180,20 @@ pub fn has_node() -> bool {
     which_on_path("node").is_some()
 }
 
+fn path_separator() -> char {
+    #[cfg(unix)]
+    {
+        ':'
+    }
+    #[cfg(not(unix))]
+    {
+        ';'
+    }
+}
+
 fn which_on_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var("PATH").unwrap_or_default();
-    for dir in path.split(':') {
+    for dir in path.split(path_separator()) {
         if dir.is_empty() {
             continue;
         }
@@ -280,9 +290,9 @@ fn install_npm_server(
     install_subdir: &str,
     packages: &[&str],
 ) -> std::io::Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .map_err(|_| std::io::Error::other("no HOME dir"))?;
-    let dir = PathBuf::from(home).join(".crane").join("lsp").join(install_subdir);
+    let home = crate::util::home_dir()
+        .ok_or_else(|| std::io::Error::other("no HOME dir"))?;
+    let dir = home.join(".crane").join("lsp").join(install_subdir);
     std::fs::create_dir_all(&dir)?;
 
     // Seed a package.json so `npm install` doesn't complain.
@@ -365,7 +375,7 @@ pub fn binary_exists_on_path_or_downloaded(cmd: &str, key: ServerKey, dl: &Downl
     }
     // Check PATH.
     let path = std::env::var("PATH").unwrap_or_default();
-    for dir in path.split(':') {
+    for dir in path.split(path_separator()) {
         if dir.is_empty() {
             continue;
         }

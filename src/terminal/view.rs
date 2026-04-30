@@ -1,5 +1,6 @@
 use crate::terminal::Terminal;
 use crate::theme;
+use crate::state::layout::{PaneId, TabKind};
 use crane_term::{
     Cell as CtCell, Column, Flags as CellFlags, Line, Point, Selection, SelectionRange,
     SelectionType, Side,
@@ -33,6 +34,11 @@ struct PathHit {
     line: Option<u32>,
     #[allow(dead_code)]
     col: Option<u32>,
+}
+
+pub enum TerminalAction {
+    OpenFile(std::path::PathBuf),
+    MoveTab { src_pane: PaneId, tab_idx: usize, dst_pane: PaneId, insert_idx: usize, kind: TabKind },
 }
 
 /// Scan a row of plain text for `http://` / `https://` URLs. Stops at
@@ -316,7 +322,7 @@ fn pixel_to_point(
     let line_f = rel_y / cell_h;
     let col = (col_f.floor() as usize).min(cols.saturating_sub(1));
     let viewport_line = (line_f.floor() as usize).min(rows.saturating_sub(1));
-    // Alacritty's Selection wants grid-absolute Line: negative into
+    // The Selection model wants grid-absolute Line: negative into
     // scrollback, 0..screen_lines-1 for the current screen. At
     // display_offset=0 the viewport IS the current screen; as the
     // user scrolls up each display_offset step shifts what's visible
@@ -341,9 +347,9 @@ pub fn render_terminal_pane(
     tp: &mut crate::state::layout::TerminalPane,
     font_size: f32,
     has_focus: bool,
-    pane_id: crate::state::layout::PaneId,
+    pane_id: PaneId,
     workspace_root: Option<&std::path::Path>,
-) -> Option<std::path::PathBuf> {
+) -> Option<TerminalAction> {
     if tp.tabs.is_empty() {
         return None;
     }
@@ -360,6 +366,7 @@ pub fn render_terminal_pane(
     let mut start_rename: Option<usize> = None;
     let mut commit_rename: Option<(usize, String)> = None;
     let mut cancel_rename = false;
+    let mut tab_rects: Vec<egui::Rect> = Vec::new();
 
     // Borrow `tp.renaming` out for the duration of the strip so the
     // TextEdit can mutate the buffer. Put it back at the end (only if
@@ -447,6 +454,20 @@ pub fn render_terminal_pane(
                     pane_id,
                     idx,
                 );
+                tab_rects.push(tab_resp.rect);
+
+                // Tab drag-start
+                if tab_resp.drag_started() {
+                    egui::DragAndDrop::set_payload(
+                        strip_ui.ctx(),
+                        crate::ui::pane_view::TabDragPayload {
+                            source_pane_id: pane_id,
+                            tab_index: idx,
+                            kind: crate::state::layout::TabKind::Terminal,
+                        },
+                    );
+                }
+
                 if clicked {
                     activate = Some(idx);
                 }
@@ -627,13 +648,25 @@ pub fn render_terminal_pane(
         }
     }
 
+    // Tab drag-and-drop detection (reorder + merge).
+    if let Some(tda) = detect_terminal_tab_drop(ui, pane_id, tp, &tab_rects) {
+        return Some(TerminalAction::MoveTab {
+            src_pane: tda.src_pane,
+            tab_idx: tda.tab_idx,
+            dst_pane: tda.dst_pane,
+            insert_idx: tda.insert_idx,
+            kind: tda.kind,
+        });
+    }
+
     let active = tp.active.min(tp.tabs.len().saturating_sub(1));
     tp.active = active;
-    if let Some(tab) = tp.tabs.get_mut(active) {
+    let opened = if let Some(tab) = tp.tabs.get_mut(active) {
         render_terminal(ui, &mut tab.terminal, font_size, has_focus, workspace_root)
     } else {
         None
-    }
+    };
+    opened.map(TerminalAction::OpenFile)
 }
 
 fn tab_label(tab: &crate::state::layout::TerminalTab, idx: usize) -> String {
@@ -836,7 +869,7 @@ pub fn render_terminal(
             let mut guard = terminal.term.lock();
             let off = guard.display_offset();
             let (point, side) = pixel_to_point(pos, origin, cell_w, cell_h, cols, rows, off, scroll_pixel_offset);
-            // Ghostty-style column-aware selection: if the start cell
+            // Column-aware selection: if the start cell
             // sits between two columns that contain vertical
             // box-drawing characters on most visible rows (i.e. the TUI
             // has a real vertical separator on either side, like Ink's
@@ -1366,10 +1399,9 @@ pub fn render_terminal(
                             // right-pad cells to a fixed width with
                             // spaces, so a plain cell-range copy drags
                             // that padding into the clipboard along
-                            // with the real text. iTerm2 / WezTerm /
-                            // Terminal.app all trim per-row on copy,
+                            // with the real text. Trim per-row on copy,
                             // which is what makes "just drag and copy"
-                            // feel right in TUIs like llm-party.
+                            // feel right in cell-grid TUIs.
                             let trimmed: String = t
                                 .split('\n')
                                 .map(|line| line.trim_end_matches([' ', '\t']))
@@ -1534,8 +1566,8 @@ pub fn render_terminal(
         //    (`\x1b[3J`). A full clear would home the cursor and wipe
         //    the alt-screen widget; the TUI's next write would then
         //    land at (0,0) instead of where it left off, leaving its
-        //    UI broken until a manual redraw. Match iTerm2's "Clear
-        //    Buffer" semantics here.
+        //    UI broken until a manual redraw. Use scrollback-only
+        //    "Clear Buffer" semantics here.
         let tui_active = terminal.has_foreground_process();
         {
             let mut p = terminal.parser.lock();
@@ -1554,6 +1586,105 @@ pub fn render_terminal(
     }
 
     file_to_open
+}
+
+/// Detect tab drag-drop on this pane's tab bar.
+fn detect_terminal_tab_drop(
+    ui: &mut egui::Ui,
+    pane_id: PaneId,
+    pane: &mut crate::state::layout::TerminalPane,
+    tab_rects: &[egui::Rect],
+) -> Option<crate::views::file_view::TabDragAction> {
+    use crate::views::file_view::TabDragAction;
+
+    let drag = egui::DragAndDrop::payload::<crate::ui::pane_view::TabDragPayload>(ui.ctx())?;
+    if drag.kind != TabKind::Terminal {
+        return None;
+    }
+
+    let pointer = ui.input(|i| i.pointer.hover_pos())?;
+    let released = ui.input(|i| i.pointer.any_released());
+
+    // Pointer must be within this pane's tab bar area (x AND y).
+    // Without x-bounds, a sibling pane with the same y-range steals the payload.
+    let bar_rect = tab_rects.first().map(|first| {
+        let last = tab_rects.last().unwrap_or(first);
+        egui::Rect::from_min_max(first.left_top(), last.right_bottom())
+    }).unwrap_or(egui::Rect::NOTHING);
+    if !bar_rect.expand(4.0).contains(pointer) {
+        return None;
+    }
+
+    let insert_idx = insertion_index(tab_rects, pointer.x);
+
+    if drag.source_pane_id == pane_id {
+        // Same-pane reorder: paint insertion indicator.
+        if let Some(&hit_rect) = tab_rects.get(insert_idx) {
+            let x = hit_rect.left();
+            let y_min = tab_rects.first().map(|r| r.top()).unwrap_or(0.0);
+            let y_max = tab_rects.first().map(|r| r.bottom()).unwrap_or(0.0);
+            ui.painter().line_segment(
+                [egui::pos2(x, y_min), egui::pos2(x, y_max)],
+                egui::Stroke::new(2.0, theme::current().accent.to_color32()),
+            );
+        } else if let Some(&last) = tab_rects.last() {
+            let x = last.right();
+            let y_min = tab_rects.first().map(|r| r.top()).unwrap_or(0.0);
+            let y_max = tab_rects.first().map(|r| r.bottom()).unwrap_or(0.0);
+            ui.painter().line_segment(
+                [egui::pos2(x, y_min), egui::pos2(x, y_max)],
+                egui::Stroke::new(2.0, theme::current().accent.to_color32()),
+            );
+        }
+
+        if released {
+            egui::DragAndDrop::take_payload::<crate::ui::pane_view::TabDragPayload>(ui.ctx());
+            let from = drag.tab_index;
+            if from != insert_idx && insert_idx != from + 1 && from < pane.tabs.len() {
+                let tab = pane.tabs.remove(from);
+                let insert_at = if insert_idx > from { insert_idx - 1 } else { insert_idx };
+                pane.tabs.insert(insert_at, tab);
+                pane.active = insert_at;
+                pane.renaming = None;
+            }
+        }
+        return None;
+    }
+
+    // Cross-pane merge: highlight this tab bar as drop target.
+    if let Some(&first) = tab_rects.first() {
+        let bar_rect = egui::Rect::from_min_max(
+            first.min,
+            tab_rects.last().map(|r| r.right_bottom()).unwrap_or(first.right_bottom()),
+        );
+        ui.painter().rect_filled(
+            bar_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(100, 149, 237, 40),
+        );
+    }
+
+    if released {
+        egui::DragAndDrop::take_payload::<crate::ui::pane_view::TabDragPayload>(ui.ctx());
+        return Some(TabDragAction {
+            src_pane: drag.source_pane_id,
+            tab_idx: drag.tab_index,
+            dst_pane: pane_id,
+            insert_idx,
+            kind: TabKind::Terminal,
+        });
+    }
+
+    None
+}
+
+fn insertion_index(rects: &[egui::Rect], pointer_x: f32) -> usize {
+    for (i, r) in rects.iter().enumerate() {
+        if pointer_x < r.center().x {
+            return i;
+        }
+    }
+    rects.len()
 }
 
 fn color_to_egui(color: TermColor, is_fg: bool) -> Color32 {

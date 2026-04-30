@@ -6,7 +6,7 @@ Native GPU-rendered desktop development environment built in pure Rust with egui
 
 - **Language**: Rust edition 2024
 - **GUI**: eframe 0.34 + egui 0.34 + wgpu backend
-- **Terminal**: in-house `crane_term` crate (`crates/crane_term`) wrapping `vte` 0.15 (parser only) + portable-pty 0.9 (cross-platform PTY). Owns the grid, scrollback, ?2026 sync replay, and resize reflow. Replaced `alacritty_terminal` end-to-end on the `feat/crane-term` branch.
+- **Terminal**: in-house `crane_term` crate (`crates/crane_term`) wrapping `vte` 0.15 (parser only) + portable-pty 0.9 (cross-platform PTY). Owns the grid, scrollback, ?2026 sync replay, and resize reflow.
 - **Concurrency**: parking_lot mutexes, `std::thread` for PTY reader; no async runtime
 - **Git**: shell out to the `git` binary via `std::process::Command` — never `git2`, never `libgit2`
 - **Text / markdown / diff**: syntect (syntax highlighting), pulldown-cmark (markdown), similar (diff)
@@ -182,11 +182,10 @@ User-facing persistence: `~/.crane/` (planned for config, sessions, themes). Not
 
 - **Diagnostic probe**: `CRANE_VT_TRACE=1` dumps raw PTY bytes to
   `~/.crane/vt-trace-<pid>.log` for offline replay. The
-  `?2026` Synchronized Output duplicate-prompt bug that drove the
-  alacritty_terminal → crane_term migration is fixed at the
-  Processor/Term layer (sync-frame replay suppresses scrollback
-  eviction). 38 unit tests in `crates/crane_term` pin the
-  behavior.
+  `?2026` Synchronized Output duplicate-prompt bug is fixed in
+  `crane_term` at the Processor/Term layer (sync-frame replay
+  suppresses scrollback eviction). 38 unit tests in
+  `crates/crane_term` pin the behavior.
 
 ## Pending major work
 

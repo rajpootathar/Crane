@@ -82,8 +82,9 @@ impl Default for Settings {
 }
 
 pub fn settings_file() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(format!("{home}/.crane/settings.json"))
+    crate::util::home_dir()
+        .map(|h| h.join(".crane").join("settings.json"))
+        .unwrap_or_default()
 }
 
 impl Settings {
@@ -103,7 +104,7 @@ impl Settings {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::util::replace_file(&tmp, &path)?;
         Ok(())
     }
 

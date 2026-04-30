@@ -5,7 +5,7 @@
 //!   Cmd+V, which returns None for image clipboards. We detect that
 //!   case, write the image to a PNG under
 //!   `~/.crane/paste-images/<uuid>.png`, and queue the path for the
-//!   next render frame. Same mechanism Ghostty / iTerm2 / Warp use.
+//!   next render frame. Same mechanism native macOS apps use.
 //!
 //! * **Cmd+C / Cmd+V / Cmd+X / Cmd+A (Browser pane clipboard)** —
 //!   when a Browser pane is focused we forward the corresponding

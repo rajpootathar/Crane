@@ -107,11 +107,11 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
     if modal_resp.should_close() || cancel {
         app.new_workspace_modal = None;
     } else if let Some(current) = browse {
-        let start = std::path::PathBuf::from(if current.is_empty() {
-            std::env::var("HOME").unwrap_or_default()
+        let start = if current.is_empty() {
+            crate::util::home_dir_or_cwd()
         } else {
-            current
-        });
+            std::path::PathBuf::from(current)
+        };
         if let Some(p) = rfd::FileDialog::new()
             .set_title("Choose worktree parent folder")
             .set_directory(start)

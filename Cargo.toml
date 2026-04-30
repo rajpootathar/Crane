@@ -60,7 +60,7 @@ eframe = { version = "0.34", features = ["wgpu", "persistence"] }
 egui = "0.34"
 # In-house terminal core. Owns VT parsing, grid, scrollback, and
 # the linefeed routing that fixes TUI scrollback duplication
-# (Claude Code splash etc.). Replaces alacritty_terminal entirely.
+# (Claude Code splash etc.).
 crane_term = { path = "crates/crane_term" }
 portable-pty = "0.9"
 parking_lot = "0.12"
@@ -128,6 +128,12 @@ raw-window-handle = "0.6"
 wry = "0.55"
 raw-window-handle = "0.6"
 gtk = "0.18"
+
+# Windows browser pane. wry uses WebView2 (Edge Chromium), which ships
+# with Windows 10+ and is auto-installed on older Windows if missing.
+[target.'cfg(target_os = "windows")'.dependencies]
+wry = "0.55"
+raw-window-handle = "0.6"
 
 [profile.dev]
 opt-level = 1

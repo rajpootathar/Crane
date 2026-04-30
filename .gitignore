@@ -5,15 +5,11 @@ Cargo.lock
 # Local signing env (DEVELOPER_ID, NOTARY_PROFILE). Never committed.
 .env.local
 
-# Local checkout of our alacritty fork, used as a path dep during
-# development. Tracked in the fork's own repo; referenced from
-# Cargo.toml via path so edits are picked up on cargo build without
-# a git push.
-/alacritty-fork
+.idea/
 
-# Local read-only checkouts used as research references when designing
-# the in-house terminal core. Both are AGPL (warp-terminal) or
-# MIT/Apache (warp-vte) third-party code — never committed into Crane.
+# Local third-party checkouts kept on disk for research / reference.
+# Their own repos own the source — never committed into Crane.
+/alacritty-fork
 /warp-terminal
 /warp-vte
 /vte

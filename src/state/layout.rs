@@ -5,6 +5,13 @@ use std::path::PathBuf;
 pub type PaneId = u64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabKind {
+    File,
+    Terminal,
+    Browser,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dir {
     Horizontal,
     Vertical,
@@ -147,6 +154,25 @@ impl FilesPane {
                 self.active = 0;
             }
         }
+    }
+
+    pub fn take_tab(&mut self, idx: usize) -> Option<FileTab> {
+        if idx >= self.tabs.len() {
+            return None;
+        }
+        let tab = self.tabs.remove(idx);
+        if self.active >= self.tabs.len() && !self.tabs.is_empty() {
+            self.active = self.tabs.len() - 1;
+        } else if self.tabs.is_empty() {
+            self.active = 0;
+        }
+        Some(tab)
+    }
+
+    pub fn insert_tab(&mut self, idx: usize, tab: FileTab) {
+        let idx = idx.min(self.tabs.len());
+        self.tabs.insert(idx, tab);
+        self.active = idx;
     }
 }
 
@@ -303,6 +329,29 @@ impl BrowserPane {
         Some(removed)
     }
 
+    pub fn take_tab(&mut self, idx: usize) -> Option<BrowserTab> {
+        if idx >= self.tabs.len() {
+            return None;
+        }
+        let tab = self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if self.active > idx {
+            self.active -= 1;
+        }
+        Some(tab)
+    }
+
+    pub fn insert_tab(&mut self, idx: usize, mut tab: BrowserTab) {
+        let idx = idx.min(self.tabs.len());
+        tab.id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.insert(idx, tab);
+        self.active = idx;
+    }
+
     pub fn active_tab_mut(&mut self) -> Option<&mut BrowserTab> {
         self.tabs.get_mut(self.active)
     }
@@ -396,6 +445,36 @@ impl TerminalPane {
         } else if self.active > idx {
             self.active -= 1;
         }
+    }
+
+    pub fn take_tab(&mut self, idx: usize) -> Option<TerminalTab> {
+        if idx >= self.tabs.len() {
+            return None;
+        }
+        let tab = self.tabs.remove(idx);
+        let rid = self.renaming.as_ref().map(|(r, _)| *r);
+        if let Some(rid) = rid {
+            if rid == idx {
+                self.renaming = None;
+            } else if rid > idx
+                && let Some((r, _)) = self.renaming.as_mut() {
+                    *r -= 1;
+                }
+        }
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if self.active > idx {
+            self.active -= 1;
+        }
+        Some(tab)
+    }
+
+    pub fn insert_tab(&mut self, idx: usize, tab: TerminalTab) {
+        let idx = idx.min(self.tabs.len());
+        self.tabs.insert(idx, tab);
+        self.active = idx;
     }
 }
 
@@ -581,6 +660,25 @@ impl Layout {
     }
 
     pub fn open_file_in_files_pane(&mut self, path: String, name: String, content: String) {
+        // If the file is already open in any Files pane, focus that tab.
+        let found = self.panes.iter().find_map(|(id, p)| {
+            if let PaneContent::Files(files) = &p.content {
+                if let Some(idx) = files.tabs.iter().position(|t| t.path == path) {
+                    return Some((*id, idx));
+                }
+            }
+            None
+        });
+        if let Some((pid, tab_idx)) = found {
+            if let Some(pane) = self.panes.get_mut(&pid)
+                && let PaneContent::Files(files) = &mut pane.content {
+                    files.active = tab_idx;
+                }
+            self.focus = Some(pid);
+            return;
+        }
+
+        // Not open anywhere — open in the first Files pane (or create one).
         let existing = self
             .panes
             .iter()
@@ -676,6 +774,178 @@ impl Layout {
         };
         self.root = Some(wrap_target(root_without_src, target, src, edge));
         self.focus = Some(src);
+    }
+
+    /// Extract a tab from a pane and wrap it in a fresh single-tab
+    /// PaneContent of the appropriate type.
+    pub fn take_tab_as_content(
+        &mut self,
+        pane_id: PaneId,
+        tab_idx: usize,
+        kind: TabKind,
+    ) -> Option<PaneContent> {
+        let pane = self.panes.get_mut(&pane_id)?;
+        match kind {
+            TabKind::File => {
+                let PaneContent::Files(f) = &mut pane.content else {
+                    return None;
+                };
+                let tab = f.take_tab(tab_idx)?;
+                let mut fp = FilesPane::empty();
+                fp.tabs.push(tab);
+                fp.active = 0;
+                Some(PaneContent::Files(fp))
+            }
+            TabKind::Terminal => {
+                let PaneContent::Terminal(tp) = &mut pane.content else {
+                    return None;
+                };
+                let tab = tp.take_tab(tab_idx)?;
+                let mut new_tp = TerminalPane { tabs: Vec::new(), active: 0, renaming: None };
+                new_tp.tabs.push(tab);
+                new_tp.active = 0;
+                Some(PaneContent::Terminal(new_tp))
+            }
+            TabKind::Browser => {
+                let PaneContent::Browser(bp) = &mut pane.content else {
+                    return None;
+                };
+                let tab = bp.take_tab(tab_idx)?;
+                let mut new_bp = BrowserPane { tabs: Vec::new(), active: 0, next_tab_id: 1 };
+                new_bp.tabs.push(BrowserTab {
+                    id: new_bp.next_tab_id,
+                    url: tab.url,
+                    input_buf: tab.input_buf,
+                    title: tab.title,
+                });
+                new_bp.next_tab_id += 1;
+                new_bp.active = 0;
+                Some(PaneContent::Browser(new_bp))
+            }
+        }
+    }
+
+    /// Create a new pane with any content, split adjacent to `neighbor`.
+    pub fn add_pane_with_content(
+        &mut self,
+        content: PaneContent,
+        neighbor: PaneId,
+        edge: DockEdge,
+    ) -> PaneId {
+        let id = self.next_id;
+        self.next_id += 1;
+        let title = match &content {
+            PaneContent::Files(_) => "Files",
+            PaneContent::Terminal(_) => "Terminal",
+            PaneContent::Browser(_) => "Browser",
+            _ => "Pane",
+        }.to_string();
+        self.panes.insert(id, Pane {
+            id,
+            title,
+            content,
+        });
+        let root = match self.root.take() {
+            Some(r) => r,
+            None => Node::Leaf(neighbor),
+        };
+        self.root = Some(wrap_target(root, neighbor, id, edge));
+        self.focus = Some(id);
+        id
+    }
+
+    /// Move a tab between two same-type panes. If the source pane is left
+    /// with zero tabs, remove it from the layout tree.
+    pub fn move_tab(
+        &mut self,
+        src_pane: PaneId,
+        tab_idx: usize,
+        dst_pane: PaneId,
+        insert_idx: usize,
+        kind: TabKind,
+    ) {
+        let tab_content = match kind {
+            TabKind::File => {
+                let pane = match self.panes.get_mut(&src_pane) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let PaneContent::Files(f) = &mut pane.content else { return };
+                let tab = match f.take_tab(tab_idx) {
+                    Some(t) => t,
+                    None => return,
+                };
+                let pane = match self.panes.get_mut(&dst_pane) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let PaneContent::Files(f) = &mut pane.content else { return };
+                f.insert_tab(insert_idx, tab);
+            }
+            TabKind::Terminal => {
+                let pane = match self.panes.get_mut(&src_pane) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let PaneContent::Terminal(tp) = &mut pane.content else { return };
+                let tab = match tp.take_tab(tab_idx) {
+                    Some(t) => t,
+                    None => return,
+                };
+                let pane = match self.panes.get_mut(&dst_pane) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let PaneContent::Terminal(tp) = &mut pane.content else { return };
+                tp.insert_tab(insert_idx, tab);
+            }
+            TabKind::Browser => {
+                let pane = match self.panes.get_mut(&src_pane) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let PaneContent::Browser(bp) = &mut pane.content else { return };
+                let tab = match bp.take_tab(tab_idx) {
+                    Some(t) => t,
+                    None => return,
+                };
+                let pane = match self.panes.get_mut(&dst_pane) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let PaneContent::Browser(bp) = &mut pane.content else { return };
+                bp.insert_tab(insert_idx, tab);
+            }
+        };
+        let _ = tab_content;
+
+        // Close source pane if it's now empty.
+        self.remove_pane_if_empty(src_pane);
+        self.focus = Some(dst_pane);
+    }
+
+    /// Remove a pane from the layout tree if it has zero tabs (or is
+    /// a non-tabbed type — those are never removed here).
+    pub fn remove_pane_if_empty(&mut self, pane_id: PaneId) {
+        let empty = match self.panes.get(&pane_id) {
+            Some(p) => match &p.content {
+                PaneContent::Files(f) => f.tabs.is_empty(),
+                PaneContent::Terminal(tp) => tp.tabs.is_empty(),
+                PaneContent::Browser(bp) => bp.tabs.is_empty(),
+                _ => false,
+            },
+            None => return,
+        };
+        if !empty {
+            return;
+        }
+        self.panes.remove(&pane_id);
+        if let Some(root) = self.root.take() {
+            let (new_root, _) = remove_node(root, pane_id);
+            self.root = new_root;
+        }
+        // Transfer focus to the first remaining leaf.
+        self.focus = self.root.as_ref().and_then(|r| first_leaf(Some(r)));
     }
 }
 

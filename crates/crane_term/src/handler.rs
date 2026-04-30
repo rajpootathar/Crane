@@ -5,10 +5,10 @@
 //!
 //! 1. Scroll-producing methods return [`ScrollDelta`]. The renderer
 //!    and selection layer can adjust without re-deriving how many
-//!    rows the operation actually shifted. Alacritty's trait returns
-//!    `()` here, which is why a wrapper around its `Term` can never
-//!    fix the TUI scrollback bug — the scroll decision is made
-//!    inside `Term` and not surfaced.
+//!    rows the operation actually shifted. The upstream trait returns
+//!    `()` here, which is why a wrapper around an existing `Term`
+//!    can never fix the TUI scrollback bug — the scroll decision is
+//!    made inside `Term` and not surfaced.
 //!
 //! 2. [`ProcessorInput`] carries an `is_sync_frame` flag through
 //!    [`Handler::on_finish_byte_processing`]. Used by listeners that
