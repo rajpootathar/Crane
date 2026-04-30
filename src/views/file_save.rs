@@ -34,6 +34,9 @@ pub fn save_tab(
         return;
     }
     tab.original_content = tab.content.clone();
+    // Invalidate the cached gutter diff so the next frame re-runs
+    // `git diff HEAD -- <file>` against the freshly-saved content.
+    tab.line_changes_key = 0;
     tab.disk_mtime = std::fs::metadata(&tab.path)
         .and_then(|m| m.modified())
         .ok();
@@ -82,6 +85,7 @@ pub fn reload_tab(tab: &mut crate::state::layout::FileTab) {
     };
     tab.content = disk_content.clone();
     tab.original_content = disk_content;
+    tab.line_changes_key = 0;
     tab.disk_mtime = std::fs::metadata(&tab.path)
         .and_then(|m| m.modified())
         .ok();
