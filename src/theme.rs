@@ -776,6 +776,42 @@ impl Theme {
             Self::high_contrast_light(),
         ]
     }
+
+    /// Perceived luminance of the background — used to adapt diff-marker
+    /// colours for light vs dark themes without per-theme overrides.
+    pub fn is_dark(&self) -> bool {
+        let lum = 0.299 * self.bg.r as f32
+            + 0.587 * self.bg.g as f32
+            + 0.114 * self.bg.b as f32;
+        lum < 128.0
+    }
+
+    /// Gutter / scrollbar colour for added lines (green family).
+    pub fn diff_added(&self) -> Color32 {
+        if self.is_dark() {
+            Color32::from_rgb(80, 180, 100)
+        } else {
+            Color32::from_rgb(30, 130, 55)
+        }
+    }
+
+    /// Gutter / scrollbar colour for modified lines (blue family).
+    pub fn diff_modified(&self) -> Color32 {
+        if self.is_dark() {
+            Color32::from_rgb(80, 140, 210)
+        } else {
+            Color32::from_rgb(28, 80, 170)
+        }
+    }
+
+    /// Gutter / scrollbar colour for deleted lines (red family).
+    pub fn diff_deleted(&self) -> Color32 {
+        if self.is_dark() {
+            Color32::from_rgb(200, 80, 80)
+        } else {
+            Color32::from_rgb(175, 30, 30)
+        }
+    }
 }
 
 static CURRENT: RwLock<Option<Theme>> = RwLock::new(None);

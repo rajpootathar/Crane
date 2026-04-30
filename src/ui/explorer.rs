@@ -8,23 +8,19 @@ use crate::ui::util::{
     RowConfig, accent, muted, text,
 };
 use egui::{Color32, RichText};
+use crate::theme;
 use egui_phosphor::regular as icons;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-
-const ADD: Color32 = Color32::from_rgb(120, 210, 140);
-const DEL: Color32 = Color32::from_rgb(220, 110, 110);
-const WARN: Color32 = Color32::from_rgb(220, 180, 110);
-const MODIFIED_BLUE: Color32 = Color32::from_rgb(100, 160, 230);
-
 fn status_color(status: git::ChangeStatus) -> Color32 {
+    let t = crate::theme::current();
     match status {
-        git::ChangeStatus::Added => ADD,
-        git::ChangeStatus::Modified => MODIFIED_BLUE,
-        git::ChangeStatus::Deleted => DEL,
-        git::ChangeStatus::Renamed => MODIFIED_BLUE,
-        git::ChangeStatus::Untracked => ADD,
+        git::ChangeStatus::Added => t.diff_added(),
+        git::ChangeStatus::Modified => t.diff_modified(),
+        git::ChangeStatus::Deleted => t.diff_deleted(),
+        git::ChangeStatus::Renamed => t.diff_modified(),
+        git::ChangeStatus::Untracked => t.diff_added(),
     }
 }
 
@@ -429,7 +425,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
             if let Some(err) = &app.git_error {
                 footer_ui.add_space(6.0);
                 footer_ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(err).color(DEL).size(11.0));
+                    ui.label(RichText::new(err).color(theme::current().diff_deleted()).size(11.0));
                 });
             }
         }
@@ -449,7 +445,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
             footer_ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new(format!("{}: {}", kind.label(), message))
-                        .color(ADD)
+                        .color(theme::current().diff_added())
                         .size(11.0),
                 );
             });
@@ -459,7 +455,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
             footer_ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new(format!("{} failed: {}", kind.label(), error))
-                        .color(DEL)
+                        .color(theme::current().diff_deleted())
                         .size(11.0),
                 );
             });
@@ -685,12 +681,13 @@ fn render_change_node(
         }
     }
     for (file_name, change) in &node.files {
+        let t = crate::theme::current();
         let (glyph, glyph_color) = match change.status {
-            git::ChangeStatus::Added => ("A", ADD),
-            git::ChangeStatus::Modified => ("M", accent()),
-            git::ChangeStatus::Deleted => ("D", DEL),
-            git::ChangeStatus::Renamed => ("R", accent()),
-            git::ChangeStatus::Untracked => ("?", WARN),
+            git::ChangeStatus::Added => ("A", t.diff_added()),
+            git::ChangeStatus::Modified => ("M", t.diff_modified()),
+            git::ChangeStatus::Deleted => ("D", t.diff_deleted()),
+            git::ChangeStatus::Renamed => ("R", t.diff_modified()),
+            git::ChangeStatus::Untracked => ("?", t.diff_added()),
         };
         let rename_label;
         let label: &str = if let Some(old) = change.old_path.as_ref() {
@@ -989,7 +986,7 @@ fn render_fs_dir(
                 && k != rel.as_deref().unwrap_or("")
         });
         let (leading_icon, leading_col, label_col) = if is_dir {
-            let col = if dir_has_changes { MODIFIED_BLUE } else { muted() };
+            let col = if dir_has_changes { theme::current().diff_modified() } else { muted() };
             (icons::FOLDER, col, None)
         } else if let Some((status, _staged, _unstaged)) = git_info {
             (status_glyph(*status), status_color(*status), Some(status_color(*status)))

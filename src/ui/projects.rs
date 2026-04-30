@@ -7,8 +7,6 @@ use egui_phosphor::regular as icons;
 
 
 const HEADER: Color32 = Color32::from_rgb(140, 146, 162);
-const ADD: Color32 = Color32::from_rgb(120, 210, 140);
-const DEL: Color32 = Color32::from_rgb(220, 110, 110);
 
 /// Project-tint palette for the right-click "Highlight color" picker.
 /// Hand-picked to stay legible on both light and dark themes — full
@@ -392,9 +390,10 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 if project.expanded {
                     for wt in &project.workspaces {
                         let active_wt = app.active.map(|(_, w, _)| w == wt.id).unwrap_or(false);
+                        let t = crate::theme::current();
                         let badge = wt.git_status.as_ref().and_then(|s| {
                             if s.added > 0 || s.deleted > 0 {
-                                Some((s.added, s.deleted, ADD, DEL))
+                                Some((s.added, s.deleted, t.diff_added(), t.diff_deleted()))
                             } else {
                                 None
                             }

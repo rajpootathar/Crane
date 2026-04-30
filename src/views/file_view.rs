@@ -1095,11 +1095,20 @@ fn render_scoped(
         }
         let file_diff = tab.line_changes.as_ref();
 
-        const GREEN: Color32 = Color32::from_rgb(80, 180, 100);
-        const BLUE: Color32 = Color32::from_rgb(80, 140, 210);
-        const RED: Color32 = Color32::from_rgb(200, 80, 80);
-        const DIFF_OLD: Color32 = Color32::from_rgb(200, 120, 120);
-        const DIFF_NEW: Color32 = Color32::from_rgb(120, 200, 140);
+        let t = theme::current();
+        let green = t.diff_added();
+        let blue = t.diff_modified();
+        let red = t.diff_deleted();
+        let diff_old = if t.is_dark() {
+            Color32::from_rgb(200, 120, 120)
+        } else {
+            Color32::from_rgb(160, 50, 50)
+        };
+        let diff_new = if t.is_dark() {
+            Color32::from_rgb(120, 200, 140)
+        } else {
+            Color32::from_rgb(30, 140, 60)
+        };
 
         // Paint line numbers + gutter change markers.
         let row_h = actual_row_h;
@@ -1118,8 +1127,8 @@ fn render_scoped(
             if let Some(diff) = file_diff {
                 if let Some(dl) = diff.lines.get(&n) {
                     let color = match dl.kind {
-                        crate::git::DiffLineKind::Added => GREEN,
-                        crate::git::DiffLineKind::Modified => BLUE,
+                        crate::git::DiffLineKind::Added => green,
+                        crate::git::DiffLineKind::Modified => blue,
                     };
                     let marker_rect = egui::Rect::from_min_size(
                         egui::pos2(gutter_rect.min.x, y - row_h * 0.5),
@@ -1202,7 +1211,7 @@ fn render_scoped(
                         egui::pos2(gutter_rect.min.x, gap_y - gap_h * 0.5),
                         egui::vec2(gutter_rect.width() - 8.0, gap_h),
                     );
-                    clipped.rect_filled(gap_rect, 1.0, RED);
+                    clipped.rect_filled(gap_rect, 1.0, red);
 
                     if let Some(pos) = pointer_pos {
                         let expanded = gap_rect.expand2(egui::vec2(0.0, 4.0));
@@ -1239,14 +1248,14 @@ fn render_scoped(
                         ui.add_space(2.0);
                         for line in &old_lines {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("-").monospace().size(12.0).color(DIFF_OLD));
-                                ui.label(RichText::new(line.clone()).monospace().size(12.0).color(DIFF_OLD));
+                                ui.label(RichText::new("-").monospace().size(12.0).color(diff_old));
+                                ui.label(RichText::new(line.clone()).monospace().size(12.0).color(diff_old));
                             });
                         }
                         for line in &new_lines {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("+").monospace().size(12.0).color(DIFF_NEW));
-                                ui.label(RichText::new(line.clone()).monospace().size(12.0).color(DIFF_NEW));
+                                ui.label(RichText::new("+").monospace().size(12.0).color(diff_new));
+                                ui.label(RichText::new(line.clone()).monospace().size(12.0).color(diff_new));
                             });
                         }
                     });
@@ -1272,8 +1281,8 @@ fn render_scoped(
             let total = line_count.max(1) as f32;
             for (&line_no, dl) in &diff.lines {
                 let color = match dl.kind {
-                    crate::git::DiffLineKind::Added => GREEN,
-                    crate::git::DiffLineKind::Modified => BLUE,
+                    crate::git::DiffLineKind::Added => green,
+                    crate::git::DiffLineKind::Modified => blue,
                 };
                 let y = scroll_rect.min.y + (line_no as f32 / total) * h;
                 let rect = egui::Rect::from_min_max(
@@ -1290,7 +1299,7 @@ fn render_scoped(
                     egui::pos2(x0, y - 1.0),
                     egui::pos2(x1, y + 1.0),
                 );
-                scroll_painter.rect_filled(rect, 1.0, RED);
+                scroll_painter.rect_filled(rect, 1.0, red);
             }
         }
 
