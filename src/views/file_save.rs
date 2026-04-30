@@ -30,12 +30,11 @@ pub fn save_tab(
         tab.content = formatted;
     }
     if let Err(e) = std::fs::write(&tab.path, &tab.content) {
-        eprintln!("save failed: {e}");
+        tab.save_error = Some(format!("{e}"));
         return;
     }
+    tab.save_error = None;
     tab.original_content = tab.content.clone();
-    // Invalidate the cached gutter diff so the next frame re-runs
-    // `git diff HEAD -- <file>` against the freshly-saved content.
     tab.line_changes_key = 0;
     tab.disk_mtime = std::fs::metadata(&tab.path)
         .and_then(|m| m.modified())

@@ -137,6 +137,7 @@ pub struct RowConfig<'a> {
 pub struct RowResult {
     pub rect: Rect,
     pub main_clicked: bool,
+    pub double_clicked: bool,
     pub hovered: bool,
     /// True when the user clicked the checkbox rendered by
     /// `RowConfig::checkbox`. `main_clicked` stays false in that case so
@@ -408,9 +409,11 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     // Swallow the main click when it landed on the checkbox so the row
     // doesn't fire its default action at the same time.
     let main_clicked = response.clicked() && !checkbox_clicked;
+    let double_clicked = response.double_clicked() && !checkbox_clicked;
     RowResult {
         rect,
         main_clicked,
+        double_clicked,
         hovered,
         checkbox_clicked,
         response,

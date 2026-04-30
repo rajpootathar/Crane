@@ -4,7 +4,7 @@ use crate::theme;
 use crate::views::diagnostics_overlay;
 use crate::views::file_util::{
     char_idx_to_line_col, is_image_path, line_col_to_char, reveal_in_file_manager,
-    short_path,
+    short_path, toggle_line_comments,
 };
 use crate::views::highlight::{rehighlight, LineHighlightCache};
 use egui::text::{LayoutJob, TextFormat};
@@ -262,12 +262,16 @@ fn render_scoped(
                 ui.add_space(4.0);
                 for (idx, tab) in pane.tabs.iter().enumerate() {
                     let is_active = idx == pane.active;
+                    let is_diff = matches!(tab, crate::state::layout::TabKind::Diff(_));
+                    let is_preview = tab.as_file().is_some_and(|f| f.preview);
                     let label = if tab.is_dirty() {
                         format!("{}  {}", icons::CIRCLE, tab.name())
+                    } else if is_diff {
+                        format!("{}  {}", icons::GIT_DIFF, tab.name())
                     } else {
                         tab.name().to_string()
                     };
-                    let (clicked, close_clicked) = draw_file_tab(ui, &label, is_active, idx);
+                    let (clicked, close_clicked) = draw_file_tab(ui, &label, is_active, is_diff, is_preview, idx);
                     if clicked {
                         activate_idx = Some(idx);
                     }
@@ -333,6 +337,17 @@ fn render_scoped(
         } else if t.find_query.is_none() {
             t.find_query = Some(String::new());
         }
+    }
+    // Cmd+H toggles the replace row inside the find bar.
+    let replace_toggle = active_is_file && ui.input(|i| {
+        (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::H)
+    });
+    if replace_toggle {
+        let t = pane.tabs[active_idx].as_file_mut().unwrap();
+        if t.find_query.is_none() {
+            t.find_query = Some(String::new());
+        }
+        t.show_replace = !t.show_replace;
     }
 
     if active_is_diff {
@@ -402,6 +417,29 @@ fn render_scoped(
             ui.add_space(4.0);
         }
 
+        // Save error banner
+        if let Some(err) = tab.save_error.take() {
+            let t = theme::current();
+            egui::Frame::NONE
+                .fill(Color32::from_rgba_unmultiplied(220, 100, 100, 28))
+                .stroke(egui::Stroke::new(1.0, t.error.to_color32()))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  Save failed: {err}",
+                                icons::WARNING
+                            ))
+                            .size(11.5)
+                            .color(t.text.to_color32()),
+                        );
+                    });
+                });
+            ui.add_space(4.0);
+        }
+
         let is_md = Path::new(&tab.path)
             .extension()
             .and_then(|e| e.to_str())
@@ -455,9 +493,41 @@ fn render_scoped(
             close: find_close,
             next: find_next,
             prev: find_prev,
+            replace: find_replace,
+            replace_all: find_replace_all,
         } = crate::views::file_find::render_find_bar(ui, tab);
         if find_close {
             tab.find_query = None;
+        }
+
+        // Replace at cursor
+        if find_replace && let Some(q) = tab.find_query.clone() && !q.is_empty() {
+            let te_id = egui::Id::new(("file_editor", &tab.path)).with("body");
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                let cursor = state.cursor.char_range()
+                    .map(|r| r.primary.index).unwrap_or(0);
+                let byte = crate::format::char_idx_to_byte(&tab.content, cursor);
+                let after = byte + 1.min(tab.content.len().saturating_sub(byte));
+                let found = tab.content[after..].find(&q)
+                    .map(|p| after + p)
+                    .or_else(|| tab.content.find(&q));
+                if let Some(match_byte) = found {
+                    tab.content.replace_range(match_byte..match_byte + q.len(), &tab.replace_query);
+                    let new_pos = tab.content[..match_byte].chars().count() + tab.replace_query.chars().count();
+                    let (line, _) = char_idx_to_line_col(&tab.content, new_pos);
+                    let new_cc = egui::text::CCursor::new(new_pos);
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(new_cc)));
+                    state.store(ui.ctx(), te_id);
+                    tab.find_scroll_to_line = Some(line);
+                }
+            }
+        }
+        // Replace all
+        if find_replace_all && let Some(q) = tab.find_query.clone() && !q.is_empty() {
+            let count = tab.content.matches(&q).count();
+            if count > 0 {
+                tab.content = tab.content.replace(&q, &tab.replace_query);
+            }
         }
         if (find_next || find_prev)
             && let Some(q) = tab.find_query.clone()
@@ -490,6 +560,48 @@ fn render_scoped(
                 // when it renders on the next frame.
                 tab.find_scroll_to_line = Some(line);
             }
+        }
+
+        // Go-to-line modal (Ctrl+G)
+        if tab.goto_line_active {
+            let t = theme::current();
+            egui::Frame::NONE
+                .fill(t.bg.to_color32())
+                .stroke(egui::Stroke::new(1.0, t.border.to_color32()))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Go to Line:")
+                                .size(11.5)
+                                .color(t.text.to_color32()),
+                        );
+                        let line_count = tab.content.split('\n').count();
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut tab.goto_line_input)
+                                .desired_width(80.0)
+                                .font(egui::FontId::new(12.0, FontFamily::Monospace)),
+                        );
+                        response.request_focus();
+                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if enter {
+                            if let Ok(line_num) = tab.goto_line_input.trim().parse::<u32>() {
+                                let target = line_num.saturating_sub(1).min(line_count as u32 - 1);
+                                tab.pending_cursor = Some((target, 0));
+                                tab.find_scroll_to_line = Some(target);
+                            }
+                            tab.goto_line_active = false;
+                            tab.goto_line_input.clear();
+                        }
+                        if escape {
+                            tab.goto_line_active = false;
+                            tab.goto_line_input.clear();
+                        }
+                    });
+                });
+            ui.add_space(2.0);
         }
 
         let diagnostics: Vec<Diagnostic> = diagnostics_for(&tab.path);
@@ -746,7 +858,7 @@ fn render_scoped(
                             // Don't intercept; consuming the event here
                             // actually *prevents* the native redo from
                             // seeing it.
-                            let (tab_pressed, enter_pressed) = ui.input_mut(|i| {
+                            let (tab_pressed, enter_pressed, shift_tab_pressed, cmd_slash_pressed, ctrl_g_pressed) = ui.input_mut(|i| {
                                 let t = i.key_pressed(egui::Key::Tab)
                                     && !i.modifiers.shift
                                     && !i.modifiers.command
@@ -761,7 +873,25 @@ fn render_scoped(
                                 if e {
                                     i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
                                 }
-                                (t, e)
+                                let st = i.key_pressed(egui::Key::Tab)
+                                    && i.modifiers.shift
+                                    && !i.modifiers.command
+                                    && !i.modifiers.mac_cmd;
+                                if st {
+                                    i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
+                                }
+                                let cs = (i.modifiers.command || i.modifiers.mac_cmd)
+                                    && i.key_pressed(egui::Key::Slash);
+                                if cs {
+                                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash);
+                                }
+                                let cg = i.modifiers.ctrl && !i.modifiers.shift
+                                    && !i.modifiers.command && !i.modifiers.mac_cmd
+                                    && i.key_pressed(egui::Key::G);
+                                if cg {
+                                    i.consume_key(egui::Modifiers::CTRL, egui::Key::G);
+                                }
+                                (t, e, st, cs, cg)
                             });
 
                             if tab_pressed
@@ -785,6 +915,60 @@ fn render_scoped(
                                 state.store(ui.ctx(), te_id);
                             }
 
+                            // Shift+Tab: outdent — remove one indent level
+                            if shift_tab_pressed
+                                && let Some(mut state) =
+                                    egui::TextEdit::load_state(ui.ctx(), te_id)
+                            {
+                                let cursor = state
+                                    .cursor
+                                    .char_range()
+                                    .map(|r| r.primary.index)
+                                    .unwrap_or(0);
+                                let byte =
+                                    crate::format::char_idx_to_byte(&tab.content, cursor);
+                                let bytes = tab.content.as_bytes();
+                                let line_start = bytes[..byte]
+                                    .iter()
+                                    .rposition(|b| *b == b'\n')
+                                    .map(|i| i + 1)
+                                    .unwrap_or(0);
+                                let line_prefix = tab.content[line_start..byte].to_string();
+                                let removed = if line_prefix.starts_with(&indent) {
+                                    indent.len()
+                                } else if line_prefix.starts_with('\t') {
+                                    1
+                                } else {
+                                    let spaces = line_prefix.len()
+                                        - line_prefix.trim_start_matches(' ').len();
+                                    spaces.min(indent.len()).max(indent.len() - 1)
+                                };
+                                if removed > 0 {
+                                    tab.content.replace_range(line_start..line_start + removed, "");
+                                    let line_start_char = tab.content[..line_start].chars().count();
+                                    let new_cc = egui::text::CCursor::new(
+                                        line_start_char + line_prefix[removed..].chars().count(),
+                                    );
+                                    state.cursor.set_char_range(Some(
+                                        egui::text::CCursorRange::one(new_cc),
+                                    ));
+                                    state.store(ui.ctx(), te_id);
+                                }
+                            }
+
+                            // Helper: strip one indent level from a string
+                            fn remove_one_indent(s: &str) -> String {
+                                let chars: Vec<char> = s.chars().collect();
+                                let mut i = 0;
+                                while i < chars.len() && i < 4 && chars[i] == ' ' {
+                                    i += 1;
+                                }
+                                if i == 0 && chars.first() == Some(&'\t') {
+                                    i = 1;
+                                }
+                                chars[i..].iter().collect()
+                            }
+
                             if enter_pressed
                                 && let Some(mut state) =
                                     egui::TextEdit::load_state(ui.ctx(), te_id)
@@ -796,7 +980,7 @@ fn render_scoped(
                                     .unwrap_or(0);
                                 let byte =
                                     crate::format::char_idx_to_byte(&tab.content, cursor);
-                                let (prev_indent, bump) =
+                                let (prev_indent, bump, dedent) =
                                     crate::format::auto_indent_context(&tab.content, byte);
                                 let next_is_close = tab
                                     .content
@@ -804,21 +988,26 @@ fn render_scoped(
                                     .get(byte)
                                     .map(|c| matches!(c, b'}' | b')' | b']'))
                                     .unwrap_or(false);
-                                let body_indent =
-                                    if bump { format!("{prev_indent}{indent}") } else { prev_indent.clone() };
+                                let dedented_indent = remove_one_indent(&prev_indent);
+                                let body_indent = if bump {
+                                    format!("{prev_indent}{indent}")
+                                } else if dedent && next_is_close {
+                                    // e.g. cursor between } and ) — keep at brace level
+                                    prev_indent.clone()
+                                } else if dedent {
+                                    dedented_indent
+                                } else {
+                                    prev_indent.clone()
+                                };
                                 let inserted = if bump && next_is_close {
-                                    // Sitting between { and } — split onto
-                                    // three lines, cursor on the indented
-                                    // middle one.
+                                    format!("\n{body_indent}\n{prev_indent}")
+                                } else if dedent && next_is_close {
                                     format!("\n{body_indent}\n{prev_indent}")
                                 } else {
                                     format!("\n{body_indent}")
                                 };
                                 tab.content.insert_str(byte, &inserted);
                                 let advance = if bump && next_is_close {
-                                    // cursor lands after the first newline
-                                    // + body_indent (so before the second
-                                    // newline).
                                     1 + body_indent.chars().count()
                                 } else {
                                     inserted.chars().count()
@@ -828,6 +1017,175 @@ fn render_scoped(
                                     egui::text::CCursorRange::one(new_cc),
                                 ));
                                 state.store(ui.ctx(), te_id);
+                            }
+
+                            // Bracket auto-close: typing an opener inserts the
+                            // pair and places the cursor between them.
+                            // Typing a closer when it's already the next char
+                            // just moves the cursor past it (skip-over).
+                            {
+                                let pairs: &[(&str, &str)] = &[
+                                    ("{", "}"), ("(", ")"), ("[", "]"),
+                                    ("\"", "\""), ("'", "'"),
+                                ];
+                                let typed_event = ui.input_mut(|i| {
+                                    i.events.iter().position(|e| {
+                                        matches!(e, egui::Event::Text(t) if pairs.iter().any(|(o, _)| *o == t.as_str()))
+                                    })
+                                });
+                                if let Some(ev_idx) = typed_event {
+                                    let typed = match &ui.input(|i| i.events[ev_idx].clone()) {
+                                        egui::Event::Text(t) => t.clone(),
+                                        _ => unreachable!(),
+                                    };
+                                    if let Some(mut state) =
+                                        egui::TextEdit::load_state(ui.ctx(), te_id)
+                                    {
+                                        let cursor = state
+                                            .cursor.char_range()
+                                            .map(|r| r.primary.index)
+                                            .unwrap_or(0);
+                                        let byte =
+                                            crate::format::char_idx_to_byte(&tab.content, cursor);
+                                        let (open, close) = pairs.iter().find(|(o, _)| *o == typed.as_str()).unwrap();
+                                        // Skip-over: if the next char is the same closing
+                                        // bracket, just advance the cursor.
+                                        let next_char = tab.content[byte..].chars().next();
+                                        if next_char == Some(close.chars().next().unwrap())
+                                            && open != close
+                                        {
+                                            let new_cc = egui::text::CCursor::new(cursor + 1);
+                                            state.cursor.set_char_range(Some(
+                                                egui::text::CCursorRange::one(new_cc),
+                                            ));
+                                            state.store(ui.ctx(), te_id);
+                                        } else {
+                                            // Insert pair
+                                            tab.content.insert_str(byte, &format!("{open}{close}"));
+                                            let new_cc = egui::text::CCursor::new(cursor + 1);
+                                            state.cursor.set_char_range(Some(
+                                                egui::text::CCursorRange::one(new_cc),
+                                            ));
+                                            state.store(ui.ctx(), te_id);
+                                        }
+                                        // Remove the event so TextEdit doesn't also type it
+                                        ui.input_mut(|i| { i.events.remove(ev_idx); });
+                                    }
+                                }
+                            }
+
+                            // Alt+Up/Down: move current line (or selection) up/down.
+                            // Alt+Shift+Down: duplicate line down.
+                            {
+                                let alt_up = ui.input(|i| {
+                                    i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp)
+                                        && !i.modifiers.shift && !i.modifiers.command && !i.modifiers.mac_cmd
+                                });
+                                let alt_down = ui.input(|i| {
+                                    i.modifiers.alt && i.key_pressed(egui::Key::ArrowDown)
+                                        && !i.modifiers.shift && !i.modifiers.command && !i.modifiers.mac_cmd
+                                });
+                                let alt_shift_down = ui.input(|i| {
+                                    i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::ArrowDown)
+                                        && !i.modifiers.command && !i.modifiers.mac_cmd
+                                });
+                                if alt_up || alt_down {
+                                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                                        let range = state.cursor.char_range().unwrap_or_else(||
+                                            egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+                                        let sel_start = range.primary.index.min(range.secondary.index);
+                                        let sel_end = range.primary.index.max(range.secondary.index);
+                                        let bytes = tab.content.as_bytes();
+                                        let start_byte = crate::format::char_idx_to_byte(&tab.content, sel_start);
+                                        let end_byte = crate::format::char_idx_to_byte(&tab.content, sel_end);
+                                        let line_start = bytes[..start_byte]
+                                            .iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+                                        let line_end = bytes[end_byte..]
+                                            .iter().position(|b| *b == b'\n')
+                                            .map(|i| end_byte + i + 1)
+                                            .unwrap_or(tab.content.len());
+                                        if alt_down {
+                                            if line_end < tab.content.len() {
+                                                let next_end = bytes[line_end..]
+                                                    .iter().position(|b| *b == b'\n')
+                                                    .map(|i| line_end + i + 1)
+                                                    .unwrap_or(tab.content.len());
+                                                let swapped = format!("{}{}",
+                                                    &tab.content[line_end..next_end],
+                                                    &tab.content[line_start..line_end]);
+                                                tab.content.replace_range(line_start..next_end, &swapped);
+                                                let new_cc = egui::text::CCursor::new(
+                                                    sel_start + (next_end - line_end) as usize
+                                                );
+                                                state.cursor.set_char_range(Some(
+                                                    egui::text::CCursorRange::one(new_cc),
+                                                ));
+                                                state.store(ui.ctx(), te_id);
+                                            }
+                                        } else {
+                                            if line_start > 0 {
+                                                let prev_start = bytes[..line_start.saturating_sub(1)]
+                                                    .iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+                                                let prev_len = line_start - prev_start;
+                                                tab.content.replace_range(prev_start..line_end, &format!(
+                                                    "{}{}",
+                                                    &tab.content[line_start..line_end],
+                                                    &tab.content[prev_start..line_start],
+                                                ));
+                                                let new_cc = egui::text::CCursor::new(sel_start.saturating_sub(prev_len));
+                                                state.cursor.set_char_range(Some(
+                                                    egui::text::CCursorRange::one(new_cc),
+                                                ));
+                                                state.store(ui.ctx(), te_id);
+                                            }
+                                        }
+                                    }
+                                }
+                                // Alt+Shift+Down: duplicate line
+                                if alt_shift_down {
+                                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                                        let cursor = state.cursor.char_range()
+                                            .map(|r| r.primary.index).unwrap_or(0);
+                                        let byte = crate::format::char_idx_to_byte(&tab.content, cursor);
+                                        let bytes = tab.content.as_bytes();
+                                        let line_start = bytes[..byte]
+                                            .iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+                                        let line_end = bytes[byte..]
+                                            .iter().position(|b| *b == b'\n')
+                                            .map(|i| byte + i + 1)
+                                            .unwrap_or(tab.content.len());
+                                        let line_text = tab.content[line_start..line_end].to_string();
+                                        tab.content.insert_str(line_end, &format!("\n{line_text}"));
+                                        let new_cc = egui::text::CCursor::new(
+                                            cursor + 1 + line_text.chars().count(),
+                                        );
+                                        state.cursor.set_char_range(Some(
+                                            egui::text::CCursorRange::one(new_cc),
+                                        ));
+                                        state.store(ui.ctx(), te_id);
+                                    }
+                                }
+                            }
+
+                            // Cmd+/: toggle line comment
+                            if cmd_slash_pressed
+                                && let Some(state) =
+                                    egui::TextEdit::load_state(ui.ctx(), te_id)
+                            {
+                                let range = state.cursor.char_range().unwrap_or_else(||
+                                    egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+                                let sel_start = range.primary.index.min(range.secondary.index);
+                                let sel_end = range.primary.index.max(range.secondary.index);
+                                let comment_str = crate::views::file_util::comment_prefix(&tab.path);
+                                toggle_line_comments(
+                                    &mut tab.content, sel_start, sel_end, &comment_str,
+                                );
+                                state.store(ui.ctx(), te_id);
+                            }
+
+                            // Ctrl+G: go to line
+                            if ctrl_g_pressed {
+                                tab.goto_line_active = true;
                             }
                         }
                         // Cmd+X on an empty selection cuts the whole line
@@ -999,6 +1357,17 @@ fn render_scoped(
                         // output here where the id is known correct.
                         if let Some(range) = out.state.cursor.char_range() {
                             tab.last_cursor_idx = range.primary.index;
+                            let sel_start = range.primary.index.min(range.secondary.index);
+                            let sel_end = range.primary.index.max(range.secondary.index);
+                            if sel_start != sel_end {
+                                let start_byte = crate::format::char_idx_to_byte(&tab.content, sel_start);
+                                let end_byte = crate::format::char_idx_to_byte(&tab.content, sel_end);
+                                let sel_chars = tab.content[start_byte..end_byte].chars().count();
+                                let sel_lines = tab.content[start_byte..end_byte].matches('\n').count() + 1;
+                                tab.selection_info = Some((sel_chars, sel_lines));
+                            } else {
+                                tab.selection_info = None;
+                            }
                         }
                         diagnostics_overlay::paint(
                             ui,
@@ -1063,6 +1432,44 @@ fn render_scoped(
                             let (line, ch) =
                                 char_idx_to_line_col(&tab.content, cc_idx);
                             goto_request(&tab.path, line, ch);
+                        }
+                        // Cmd+C on empty selection copies the whole line.
+                        // macOS: egui synthesizes Event::Copy from Cmd+C.
+                        let copy_line = ui.memory(|m| m.has_focus(te_id))
+                            && ui.input_mut(|i| {
+                                let idx = i.events.iter().position(|e| {
+                                    matches!(e, egui::Event::Copy)
+                                });
+                                if let Some(idx) = idx {
+                                    i.events.remove(idx);
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        if copy_line
+                            && let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id)
+                        {
+                            let range = state.cursor.char_range().unwrap_or_else(||
+                                egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+                            let empty = range.primary.index == range.secondary.index;
+                            if empty {
+                                let cursor = range.primary.index;
+                                let byte = crate::format::char_idx_to_byte(&tab.content, cursor);
+                                let bytes = tab.content.as_bytes();
+                                let line_start = bytes[..byte]
+                                    .iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+                                let line_end = bytes[byte..]
+                                    .iter().position(|b| *b == b'\n')
+                                    .map(|i| byte + i + 1)
+                                    .unwrap_or(bytes.len());
+                                let line = tab.content[line_start..line_end].to_string();
+                                if !line.is_empty() {
+                                    ui.ctx().copy_text(line);
+                                }
+                            } else {
+                                ui.input_mut(|i| i.events.push(egui::Event::Copy));
+                            }
                         }
                         // Note: egui 0.34 keeps TextEditState.undoer private,
                         // so we can't tighten Ctrl+Z granularity without
@@ -1181,6 +1588,29 @@ fn render_scoped(
 
         // Paint line numbers + gutter change markers.
         let row_h = actual_row_h;
+
+        // Current line highlight: subtle background on the line with the
+        // primary cursor. Painted over the code area (not gutter).
+        let cur_line_num = char_idx_to_line_col(&tab.content, tab.last_cursor_idx).0;
+        let code_hl_y = avail.min.y + gutter_w + code_pad + (cur_line_num as f32 + 0.5) * row_h - v_offset;
+        let code_area_left = code_left + code_pad;
+        let code_area_right = avail.min.x + avail.width();
+        if code_hl_y >= avail.min.y - row_h && code_hl_y <= avail.max.y + row_h {
+            let bg = theme::current().bg;
+            let hl_color = if bg.r as u32 + bg.g as u32 + bg.b as u32 > 128 * 3 {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 18)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+            };
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(code_area_left, code_hl_y - row_h * 0.5),
+                    egui::vec2(code_area_right - code_area_left, row_h),
+                ),
+                0.0,
+                hl_color,
+            );
+        }
         let first_visible = (v_offset / row_h).floor() as usize;
         let last_visible = ((v_offset + gutter_rect.height()) / row_h).ceil() as usize;
         let clipped = painter.with_clip_rect(gutter_rect);
@@ -1373,6 +1803,11 @@ fn render_scoped(
         }
 
         crate::views::file_status::render_status_strip(ui, tab, &diagnostics, status_h);
+
+        // Promote preview tab to permanent if content changed.
+        if tab.preview && tab.dirty() {
+            tab.preview = false;
+        }
     }
 }
 
@@ -1383,6 +1818,8 @@ fn draw_file_tab(
     ui: &mut egui::Ui,
     name: &str,
     is_active: bool,
+    is_diff: bool,
+    is_preview: bool,
     idx: usize,
 ) -> (bool, bool) {
     let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
@@ -1394,7 +1831,7 @@ fn draw_file_tab(
     let padding_x = 10.0;
     let gap = 6.0;
     let close_size = 16.0;
-    let height = 24.0;
+    let height = 26.0;
     let width = padding_x + text_w + gap + close_size + padding_x - 2.0;
 
     let (rect, response) = ui.allocate_exact_size(
@@ -1408,57 +1845,121 @@ fn draw_file_tab(
         ),
         egui::vec2(close_size, close_size),
     );
-    let close_response = ui.interact(
-        close_rect,
-        ui.id().with(("file_tab_close", idx)),
-        egui::Sense::click(),
-    );
+    let show_close = is_active || response.hovered() || close_rect_contains(&response, ui);
+    let close_response = if show_close {
+        Some(ui.interact(
+            close_rect,
+            ui.id().with(("file_tab_close", idx)),
+            egui::Sense::click(),
+        ))
+    } else {
+        None
+    };
 
     let t = theme::current();
     let accent_tint = {
         let a = t.accent;
         Color32::from_rgba_unmultiplied(a.r, a.g, a.b, 55)
     };
+    let diff_tint = Color32::from_rgba_unmultiplied(100, 180, 255, 30);
+
     let (bg, fg) = if is_active {
         (accent_tint, t.text.to_color32())
-    } else if response.hovered() || close_response.hovered() {
+    } else if response.hovered() || close_response.as_ref().is_some_and(|r| r.hovered()) {
         (t.row_hover.to_color32(), t.text.to_color32())
     } else {
         (egui::Color32::TRANSPARENT, t.text_muted.to_color32())
     };
+
+    // Paint tab background
     if bg != egui::Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 5.0, bg);
     }
+
+    // Diff tab: subtle blue tint overlay
+    if is_diff && !is_active && bg == egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 5.0, diff_tint);
+    }
+
+    // Bottom border on active tab (solid accent) and inactive tabs (subtle)
+    if is_active {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + 4.0, rect.max.y - 2.0),
+                egui::vec2(rect.width() - 8.0, 2.0),
+            ),
+            1.0,
+            t.accent.to_color32(),
+        );
+    } else {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + 4.0, rect.max.y - 1.0),
+                egui::vec2(rect.width() - 8.0, 1.0),
+            ),
+            0.0,
+            t.border.to_color32(),
+        );
+    }
+
+    // Tab label (preview tabs use dimmed color)
+    let label_fg = if is_preview && !is_active {
+        t.text_muted.to_color32()
+    } else {
+        fg
+    };
     ui.painter().text(
         egui::pos2(rect.min.x + padding_x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         name,
         font,
-        fg,
+        label_fg,
     );
-    if close_response.hovered() {
-        ui.painter().rect_filled(
-            close_rect.shrink(1.0),
-            4.0,
-            theme::current().error.to_color32(),
+
+    // Close button (only visible when appropriate)
+    if let Some(cr) = &close_response {
+        if cr.hovered() {
+            ui.painter().rect_filled(
+                close_rect.shrink(1.0),
+                4.0,
+                theme::current().error.to_color32(),
+            );
+        }
+        ui.painter().text(
+            close_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icons::X,
+            close_font,
+            fg,
         );
     }
-    ui.painter().text(
-        close_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        icons::X,
-        close_font,
-        fg,
-    );
-    if response.hovered() || close_response.hovered() {
+
+    if response.hovered() || close_response.as_ref().is_some_and(|r| r.hovered()) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    // Middle-click anywhere on the tab closes it — browser convention.
-    // Counts as a close whether the pointer is over the × button or
-    // the label body, so the user doesn't need to aim.
-    let closed = close_response.clicked() || response.middle_clicked();
+
+    let closed = close_response.as_ref().is_some_and(|r| r.clicked()) || response.middle_clicked();
     (
-        response.clicked() && !close_response.hovered(),
+        response.clicked() && !close_response.as_ref().is_some_and(|r| r.hovered()),
         closed,
     )
+}
+
+/// Check if the pointer is over the close rect area (for hover detection
+/// when the close button isn't rendered yet).
+fn close_rect_contains(response: &egui::Response, ui: &egui::Ui) -> bool {
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    let Some(pos) = pointer else { return false };
+    let rect = response.rect;
+    let padding_x = 10.0;
+    let close_size = 16.0;
+    let height = rect.height();
+    let close_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.max.x - padding_x - close_size + 2.0,
+            rect.min.y + (height - close_size) / 2.0,
+        ),
+        egui::vec2(close_size, close_size),
+    );
+    close_rect.contains(pos)
 }

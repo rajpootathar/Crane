@@ -78,6 +78,23 @@ pub struct FileTab {
     /// Content hash at the time `line_changes` was computed. We use this
     /// to avoid re-running `git diff` every frame when nothing changed.
     pub line_changes_key: u64,
+    /// When true, the go-to-line modal is shown. Toggled by Ctrl+G.
+    pub goto_line_active: bool,
+    /// Buffer for the go-to-line text input.
+    pub goto_line_input: String,
+    /// Replace bar state. None = hidden; Some(text) = shown.
+    pub replace_query: String,
+    /// When true, the replace row is visible below the find bar.
+    pub show_replace: bool,
+    /// Selection info set each frame by the editor: (selected_chars, selected_lines).
+    /// Displayed in the status strip.
+    pub selection_info: Option<(usize, usize)>,
+    /// Last save error, if any. Cleared on successful save. Displayed as a
+    /// toast/banner in the editor.
+    pub save_error: Option<String>,
+    /// Preview tabs are opened by single-click and auto-replaced by the
+    /// next single-click. They promote to permanent on first edit.
+    pub preview: bool,
 }
 
 impl FileTab {
@@ -107,6 +124,9 @@ pub struct DiffTabData {
     /// Set to true by the diff view when a hunk is staged. The main loop
     /// reads this flag and triggers a diff content refresh.
     pub pending_hunk_stage: bool,
+    /// Horizontal scroll offsets for side-by-side mode (left/right halves).
+    pub sbs_h_scroll_left: f32,
+    pub sbs_h_scroll_right: f32,
 }
 
 pub enum TabKind {
@@ -130,6 +150,13 @@ impl TabKind {
     }
 
     pub fn as_file_mut(&mut self) -> Option<&mut FileTab> {
+        match self {
+            TabKind::File(ft) => Some(ft),
+            TabKind::Diff(_) => None,
+        }
+    }
+
+    pub fn as_file(&self) -> Option<&FileTab> {
         match self {
             TabKind::File(ft) => Some(ft),
             TabKind::Diff(_) => None,
@@ -167,9 +194,13 @@ impl FilesPane {
         }
     }
 
-    pub fn open(&mut self, path: String, content: String, name: String) {
+    pub fn open(&mut self, path: String, content: String, name: String, preview: bool) {
         if let Some(idx) = self.tabs.iter().position(|t| matches!(t, TabKind::File(ft) if ft.path == path)) {
             self.active = idx;
+            // Promote preview tab to permanent on re-open
+            if let TabKind::File(ft) = &mut self.tabs[idx] {
+                ft.preview = false;
+            }
             return;
         }
         let disk_mtime = std::fs::metadata(&path)
@@ -181,6 +212,7 @@ impl FilesPane {
             last_lsp_content: content.clone(),
             last_lsp_sent_at: None,
             preview_mode: false,
+            preview,
             pending_cursor: None,
             image_texture: None,
             find_query: None,
@@ -190,6 +222,12 @@ impl FilesPane {
             last_cursor_idx: 0,
             line_changes: None,
             line_changes_key: 0,
+            goto_line_active: false,
+            goto_line_input: String::new(),
+            replace_query: String::new(),
+            show_replace: false,
+            selection_info: None,
+            save_error: None,
             content,
             name,
         }));
@@ -234,6 +272,8 @@ impl FilesPane {
             diff_mode: DiffMode::Unified,
             repo_path,
             pending_hunk_stage: false,
+            sbs_h_scroll_left: 0.0,
+            sbs_h_scroll_right: 0.0,
         }));
         self.active = self.tabs.len() - 1;
     }
@@ -248,6 +288,16 @@ impl FilesPane {
             } else if self.active > idx {
                 self.active -= 1;
             }
+        }
+    }
+
+    /// Remove any preview tab. Called before opening a new preview.
+    pub fn close_preview_tab(&mut self) {
+        self.tabs.retain(|t| {
+            !matches!(t, TabKind::File(ft) if ft.preview)
+        });
+        if self.active >= self.tabs.len() && !self.tabs.is_empty() {
+            self.active = self.tabs.len() - 1;
         }
     }
 }
@@ -587,7 +637,7 @@ impl Layout {
         }
     }
 
-    pub fn open_file_in_files_pane(&mut self, path: String, name: String, content: String) {
+    pub fn open_file_in_files_pane(&mut self, path: String, name: String, content: String, preview: bool) {
         let existing = self
             .panes
             .iter()
@@ -597,13 +647,17 @@ impl Layout {
             Some(pid) => {
                 if let Some(pane) = self.panes.get_mut(&pid)
                     && let PaneContent::Files(files) = &mut pane.content {
-                        files.open(path, content, name);
+                        // Close any existing preview tab before opening a new preview
+                        if preview {
+                            files.close_preview_tab();
+                        }
+                        files.open(path, content, name, preview);
                     }
                 self.focus = Some(pid);
             }
             None => {
                 let mut files = FilesPane::empty();
-                files.open(path, content, name);
+                files.open(path, content, name, preview);
                 self.add_pane(PaneContent::Files(files), Some(Dir::Horizontal));
             }
         }

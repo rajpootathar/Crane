@@ -420,6 +420,7 @@ pub struct App {
     pub right_panel_w: f32,
     pub editor_word_wrap: bool,
     pub editor_trim_on_save: bool,
+    pub single_click_open: bool,
     pub lsp: crate::lsp::LspManager,
     pub language_configs: crate::lsp::LanguageConfigs,
     /// Global opt-out for the LSP install prompt. Set by "Never ask for
@@ -510,6 +511,7 @@ impl App {
             left_panel_w: 240.0,
             editor_word_wrap: false,
             editor_trim_on_save: false,
+            single_click_open: false,
             right_panel_w: 300.0,
             lsp: crate::lsp::LspManager::new(),
             language_configs: crate::lsp::LanguageConfigs::default(),
@@ -1511,9 +1513,10 @@ impl App {
         path: String,
         name: String,
         content: String,
+        preview: bool,
     ) {
         if let Some(layout) = self.active_layout() {
-            layout.open_file_in_files_pane(path.clone(), name, content.clone());
+            layout.open_file_in_files_pane(path.clone(), name, content.clone(), preview);
         }
         let cfg_snapshot = self.language_configs.clone();
         self.lsp

@@ -652,6 +652,13 @@ impl SPane {
                             last_cursor_idx: 0,
                             line_changes: None,
                             line_changes_key: 0,
+                            goto_line_active: false,
+                            goto_line_input: String::new(),
+                            replace_query: String::new(),
+                            show_replace: false,
+                            selection_info: None,
+                            save_error: None,
+                            preview: false,
                             content,
                         })
                     })

@@ -826,6 +826,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
             .unwrap_or_default();
 
     let mut opened: Option<PathBuf> = None;
+    let mut opened_preview = false;
     let mut toggled: Option<PathBuf> = None;
     let mut new_entry: Option<(PathBuf, NewEntryKind)> = None;
     let mut delete_request: Option<PathBuf> = None;
@@ -845,6 +846,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 &app.expanded_dirs,
                 &mut opened,
                 &mut selected_file,
+                app.single_click_open,
                 &mut toggled,
                 &mut new_entry,
                 &mut delete_request,
@@ -855,6 +857,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 &mut cancel_pending,
                 &path,
                 &git_status_map,
+                &mut opened_preview,
             );
             // Sink for right-clicks on the empty space below entries
             // — `interact` claims the rest of the ScrollArea's height
@@ -911,7 +914,28 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
             .to_string();
         let content = std::fs::read_to_string(&p).unwrap_or_default();
         let ctx = ui.ctx().clone();
-        app.open_file_into_active_layout(&ctx, path_str, name, content);
+        app.open_file_into_active_layout(&ctx, path_str, name, content, opened_preview);
+    }
+    // External drag-drop: accept files/dirs dropped from Finder / OS and copy
+    // them into the workspace root.
+    let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
+        i.raw.dropped_files
+            .iter()
+            .filter_map(|f| f.path.clone())
+            .collect()
+    });
+    for src in &dropped {
+        if let Some(name) = src.file_name() {
+            let dst = path.join(name);
+            if src != &dst {
+                if src.is_dir() {
+                    let _ = copy_dir_recursive(src, &dst);
+                } else {
+                    let _ = std::fs::copy(src, &dst);
+                }
+                app.expanded_dirs.insert(path.clone());
+            }
+        }
     }
     if let Some((parent, kind)) = new_entry {
         // Make sure the parent is expanded so the inline editor row
@@ -935,6 +959,7 @@ fn render_fs_dir(
     expanded: &std::collections::HashSet<PathBuf>,
     open_file: &mut Option<PathBuf>,
     select_file: &mut Option<PathBuf>,
+    single_click_open: bool,
     toggle_dir: &mut Option<PathBuf>,
     new_entry: &mut Option<(PathBuf, NewEntryKind)>,
     delete_request: &mut Option<PathBuf>,
@@ -945,6 +970,7 @@ fn render_fs_dir(
     cancel: &mut bool,
     workspace_root: &std::path::Path,
     git_status_map: &HashMap<String, (git::ChangeStatus, bool, bool)>,
+    opened_preview: &mut bool,
 ) {
     if depth > 64 {
         return;
@@ -1027,10 +1053,15 @@ fn render_fs_dir(
                 *toggle_dir = Some(entry_path.clone());
             } else {
                 *select_file = Some(entry_path.clone());
+                if single_click_open {
+                    *open_file = Some(entry_path.clone());
+                    *opened_preview = true;
+                }
             }
         }
         if row.double_clicked && !is_dir {
             *open_file = Some(entry_path.clone());
+            *opened_preview = false;
         }
         // Drag source: any row can be dragged. dnd_set_drag_payload
         // attaches the path to egui's global drag state; pointer
@@ -1111,6 +1142,7 @@ fn render_fs_dir(
                 expanded,
                 open_file,
                 select_file,
+                single_click_open,
                 toggle_dir,
                 new_entry,
                 delete_request,
@@ -1121,6 +1153,7 @@ fn render_fs_dir(
                 cancel,
                 workspace_root,
                 git_status_map,
+                opened_preview,
             );
         }
     }
@@ -1159,6 +1192,22 @@ fn move_path(app: &mut App, src: &std::path::Path, dst_dir: &std::path::Path) {
             to: dst,
         },
     );
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Push an op onto the LIFO undo stack, evicting the oldest when

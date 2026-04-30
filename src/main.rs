@@ -169,7 +169,7 @@ impl CraneApp {
                 .to_string();
             let content = std::fs::read_to_string(&loc.path).unwrap_or_default();
             self.app
-                .open_file_into_active_layout(ctx, path_str.clone(), name, content);
+                .open_file_into_active_layout(ctx, path_str.clone(), name, content, false);
         }
         if let Some(layout) = self.app.active_layout() {
             for (_, pane) in layout.panes.iter_mut() {
@@ -189,7 +189,7 @@ impl CraneApp {
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(&path_str)
                                 .to_string();
-                            files.open(path_str.clone(), content, name);
+                            files.open(path_str.clone(), content, name, false);
                             files.tabs.len() - 1
                         }
                     };
@@ -686,7 +686,7 @@ impl eframe::App for CraneApp {
                             .to_string();
                         let content = std::fs::read_to_string(&path).unwrap_or_default();
                         self.app.open_file_into_active_layout(
-                            &ctx, path_str, name, content,
+                            &ctx, path_str, name, content, false,
                         );
                     }
                 }

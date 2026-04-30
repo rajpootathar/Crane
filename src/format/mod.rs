@@ -155,7 +155,7 @@ pub fn char_idx_to_byte(s: &str, char_idx: usize) -> usize {
 /// inserted at `cursor_byte`. Matches the common behaviour: copy the
 /// indent of the line the cursor is on, and add one extra level if the
 /// last non-whitespace token opens a block (`{`, `(`, `[`, `=>`).
-pub fn auto_indent_context(text: &str, cursor_byte: usize) -> (String, bool) {
+pub fn auto_indent_context(text: &str, cursor_byte: usize) -> (String, bool, bool) {
     let before = &text[..cursor_byte];
     let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
     let current_line_before = &text[line_start..cursor_byte];
@@ -168,7 +168,10 @@ pub fn auto_indent_context(text: &str, cursor_byte: usize) -> (String, bool) {
         || trimmed.ends_with('(')
         || trimmed.ends_with('[')
         || trimmed.ends_with("=>");
-    (prev_indent, bump)
+    let dedent = trimmed.ends_with('}')
+        || trimmed.ends_with(')')
+        || trimmed.ends_with(']');
+    (prev_indent, bump, dedent)
 }
 
 fn style_from_json(v: &serde_json::Value) -> FormatStyle {

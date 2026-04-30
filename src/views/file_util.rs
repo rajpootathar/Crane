@@ -121,3 +121,90 @@ pub fn reveal_label() -> &'static str {
         "Reveal in Explorer"
     }
 }
+
+/// Return the line-comment prefix for the file at `path`, based on its
+/// extension. Falls back to `"//"` when the language isn't recognised.
+pub fn comment_prefix(path: &str) -> &'static str {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" | "go" | "js" | "ts" | "jsx" | "tsx" | "mjs" | "cjs"
+        | "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" | "hh" | "hxx"
+        | "java" | "kt" | "kts" | "swift" | "dart" | "scala"
+        | "zig" | "glsl" | "hlsl" | "wgsl" | "proto" => "//",
+        "py" | "pyi" | "sh" | "bash" | "zsh" | "fish" | "yaml" | "yml"
+        | "toml" | "rb" | "rake" | "pl" | "r" | "ps1" | "lua"
+        | "conf" | "cfg" | "ini" | "env" | "dockerfile" => "#",
+        "sql" => "--",
+        "hs" | "lhs" => "-- ",
+        "ml" | "mli" => "(* ",
+        "ex" | "exs" => "#",
+        "clj" | "cljs" => ";; ",
+        _ => "//",
+    }
+}
+
+/// Toggle line comments on all lines intersecting the byte range
+/// `[sel_start..sel_end]` (char indices) in `content`. Adds the
+/// prefix if any line in the range is uncommented, removes it if all
+/// are commented.
+pub fn toggle_line_comments(
+    content: &mut String,
+    sel_start: usize,
+    sel_end: usize,
+    prefix: &str,
+) {
+    let start_byte = crate::format::char_idx_to_byte(content, sel_start);
+    let end_byte = crate::format::char_idx_to_byte(content, sel_end);
+    let bytes = content.as_bytes();
+
+    // Find first and last line boundaries
+    let first_line_start = bytes[..start_byte]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let last_line_end = bytes[end_byte..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|i| end_byte + i)
+        .unwrap_or(content.len());
+
+    // Collect (content_start, line_start) for each line
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut pos = first_line_start;
+    while pos <= last_line_end {
+        let line_end = bytes[pos..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|i| pos + i)
+            .unwrap_or(content.len());
+        let trimmed = bytes[pos..line_end]
+            .iter()
+            .position(|b| *b != b' ' && *b != b'\t')
+            .unwrap_or(line_end - pos);
+        let content_start = pos + trimmed;
+        lines.push((content_start, pos));
+        if line_end >= content.len() { break; }
+        pos = line_end + 1;
+    }
+
+    let all_commented = lines
+        .iter()
+        .all(|&(cs, _)| content[cs..].starts_with(prefix));
+
+    if all_commented {
+        for &(cs, _) in lines.iter().rev() {
+            if content[cs..].starts_with(prefix) {
+                content.replace_range(cs..cs + prefix.len(), "");
+            }
+        }
+    } else {
+        for &(_, ls) in lines.iter().rev() {
+            content.insert_str(ls, prefix);
+        }
+    }
+}

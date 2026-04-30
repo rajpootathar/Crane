@@ -17,7 +17,6 @@ const CTX_FG: Color32 = Color32::from_rgb(180, 186, 198);
 const ADD_FG: Color32 = Color32::from_rgb(140, 220, 150);
 const DEL_FG: Color32 = Color32::from_rgb(230, 130, 130);
 const MUTED: Color32 = Color32::from_rgb(140, 146, 160);
-const DIVIDER_CLR: Color32 = Color32::from_rgb(60, 62, 72);
 const MINIMAP_W: f32 = 10.0;
 
 struct Row {
@@ -351,9 +350,19 @@ pub fn render_diff_body(
 
     let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body_rect));
     body_ui.spacing_mut().item_spacing.y = 0.0;
-    let mut scroll = ScrollArea::both()
-        .auto_shrink([false; 2])
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+
+    // SBS mode uses vertical-only scroll with independent horizontal
+    // offsets per side. Unified mode scrolls both axes together.
+    let is_sbs = matches!(tab.diff_mode, DiffMode::SideBySide);
+    let mut scroll = if is_sbs {
+        ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+    } else {
+        ScrollArea::both()
+            .auto_shrink([false; 2])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+    };
     if let Some(y) = jump_y {
         scroll = scroll.vertical_scroll_offset(y);
     }
@@ -392,8 +401,10 @@ pub fn render_diff_body(
                         ChangeTag::Insert => ("+", ADD_FG, ADD_BG),
                         ChangeTag::Equal => (" ", CTX_FG, Color32::TRANSPARENT),
                     };
-                    // Stage button at hunk start
+                    // Stage button at hunk start — register interaction early,
+                    // paint after row background so the button isn't covered.
                     let is_hunk_start = hunk_starts.contains(&i);
+                    let mut stage_btn_paint: Option<(egui::Rect, bool)> = None;
                     if is_hunk_start && let Some(hi) = row_to_hunk[i] {
                         if let Some(patch) = &hunk_patches[hi] {
                             let btn_rect = egui::Rect::from_min_size(
@@ -402,13 +413,13 @@ pub fn render_diff_body(
                             );
                             let btn_id = egui::Id::new(("stage_hunk", tab.left_path.clone(), tab.right_path.clone(), hi));
                             let btn_resp = ui.interact(btn_rect, btn_id, egui::Sense::click());
-                            let hunk_clicked = btn_resp.clicked();
-                            if btn_resp.hovered() {
+                            let btn_hovered = btn_resp.hovered();
+                            let btn_clicked = btn_resp.clicked();
+                            if btn_hovered {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                ui.painter().rect_filled(btn_rect, 2.0, theme::current().row_hover.to_color32());
                             }
                             btn_resp.on_hover_text("Stage hunk");
-                            if hunk_clicked {
+                            if btn_clicked {
                                 if let Some(repo) = &tab.repo_path {
                                     let repo_path = std::path::Path::new(repo);
                                     let _ = crate::git::stage_hunk(repo_path, patch);
@@ -416,13 +427,7 @@ pub fn render_diff_body(
                                     ui.ctx().data_mut(|d| d.insert_temp(refresh_id, true));
                                 }
                             }
-                            ui.painter().text(
-                                btn_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                icons::PLUS_CIRCLE,
-                                FontId::new(11.0, FontFamily::Proportional),
-                                ADD_FG,
-                            );
+                            stage_btn_paint = Some((btn_rect, btn_hovered));
                         }
                     }
                     let mut hl = HighlightLines::new(syntax, st_theme);
@@ -447,7 +452,25 @@ pub fn render_diff_body(
                     let (rect, _resp) = ui.allocate_exact_size(egui::vec2(total_w, row_h), egui::Sense::hover());
                     let painter = ui.painter();
                     if bg != Color32::TRANSPARENT {
-                        painter.rect_filled(rect, 0.0, bg);
+                        // Exclude stage button area from background fill
+                        let bg_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.min.x + stage_btn_w, rect.min.y),
+                            rect.max,
+                        );
+                        painter.rect_filled(bg_rect, 0.0, bg);
+                    }
+                    // Paint stage button on top of row background
+                    if let Some((btn_rect, hovered)) = &stage_btn_paint {
+                        if *hovered {
+                            painter.rect_filled(*btn_rect, 2.0, theme::current().row_hover.to_color32());
+                        }
+                        painter.text(
+                            btn_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            icons::PLUS_CIRCLE,
+                            FontId::new(11.0, FontFamily::Proportional),
+                            ADD_FG,
+                        );
                     }
                     let gx = rect.min.x + stage_btn_w;
                     painter.text(
@@ -483,12 +506,69 @@ pub fn render_diff_body(
         }
         DiffMode::SideBySide => {
             let gutter_w = char_w * (ldigits as f32).max(rdigits as f32) + 10.0;
+            let stage_btn_w = 20.0;
+            let divider_w = 2.0;
+
+            // Read horizontal scroll delta before ScrollArea consumes it.
+            // Determine which side the pointer is on for horizontal scroll.
+            let inner_before = body_ui.available_rect_before_wrap();
+            let total_inner_w = inner_before.width() - stage_btn_w;
+            let half_w = ((total_inner_w - divider_w) / 2.0).floor();
+            let mid_x = inner_before.min.x + stage_btn_w + half_w + divider_w / 2.0;
+            let pointer_x = ui.input(|i| i.pointer.latest_pos()).map(|p| p.x);
+            let h_delta = ui.input(|i| i.smooth_scroll_delta.x);
+            if h_delta != 0.0 {
+                let left_side = pointer_x.map(|x| x < mid_x).unwrap_or(true);
+                if left_side {
+                    tab.sbs_h_scroll_left = (tab.sbs_h_scroll_left + h_delta).max(0.0);
+                } else {
+                    tab.sbs_h_scroll_right = (tab.sbs_h_scroll_right + h_delta).max(0.0);
+                }
+            }
+
+            let h_scroll_l = tab.sbs_h_scroll_left;
+            let h_scroll_r = tab.sbs_h_scroll_right;
+
             scroll.show_rows(&mut body_ui, row_h, sbs_rows.len(), |ui, row_range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
+                let avail = ui.available_width();
+                let content_w = avail - stage_btn_w;
+                let half_w = ((content_w - divider_w) / 2.0).floor();
+                let left_start = ui.cursor().min.x + stage_btn_w;
+                let right_start = left_start + half_w + divider_w;
+
                 for i in row_range {
                     let r = &sbs_rows[i];
-                    // Build galleys up-front before painting to avoid
-                    // mutable borrow conflict with painter
+                    // Stage button at hunk start
+                    let is_hunk_start = hunk_starts.contains(&i);
+                    let mut stage_btn_paint: Option<(egui::Rect, bool)> = None;
+                    if is_hunk_start && let Some(hi) = row_to_hunk[i] {
+                        if let Some(patch) = &hunk_patches[hi] {
+                            let btn_rect = egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                egui::vec2(stage_btn_w, row_h),
+                            );
+                            let btn_id = egui::Id::new(("stage_hunk_sbs", tab.left_path.clone(), tab.right_path.clone(), hi));
+                            let btn_resp = ui.interact(btn_rect, btn_id, egui::Sense::click());
+                            let btn_hovered = btn_resp.hovered();
+                            let btn_clicked = btn_resp.clicked();
+                            if btn_hovered {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            btn_resp.on_hover_text("Stage hunk");
+                            if btn_clicked {
+                                if let Some(repo) = &tab.repo_path {
+                                    let repo_path = std::path::Path::new(repo);
+                                    let _ = crate::git::stage_hunk(repo_path, patch);
+                                    tab.pending_hunk_stage = true;
+                                    ui.ctx().data_mut(|d| d.insert_temp(refresh_id, true));
+                                }
+                            }
+                            stage_btn_paint = Some((btn_rect, btn_hovered));
+                        }
+                    }
+
+                    // Build galleys
                     let old_galley = r.old_content.as_deref().map(|c| {
                         let mut hl = HighlightLines::new(syntax, st_theme);
                         let segs: Vec<(SynStyle, String)> = hl
@@ -513,7 +593,111 @@ pub fn render_diff_body(
                             .unwrap_or_else(|_| vec![(SynStyle::default(), c.to_string())]);
                         build_galley(ui, &font, &segs)
                     });
-                    paint_sbs_row(ui, &font, gutter_w, row_h, r, old_galley, new_galley);
+
+                    // Allocate full row
+                    let (rect, _resp) =
+                        ui.allocate_exact_size(egui::vec2(avail, row_h), egui::Sense::hover());
+                    let painter = ui.painter();
+
+                    // Paint divider
+                    let t = theme::current();
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            Pos2::new(left_start + half_w, rect.min.y),
+                            egui::vec2(divider_w, row_h),
+                        ),
+                        0.0,
+                        t.border.to_color32(),
+                    );
+
+                    // Stage button (on top)
+                    if let Some((btn_rect, hovered)) = stage_btn_paint {
+                        if hovered {
+                            painter.rect_filled(btn_rect, 2.0, t.row_hover.to_color32());
+                        }
+                        painter.text(
+                            btn_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            icons::PLUS_CIRCLE,
+                            FontId::new(11.0, FontFamily::Proportional),
+                            ADD_FG,
+                        );
+                    }
+
+                    // ── Left half ──
+                    let old_bg = match r.kind {
+                        SbsKind::DeleteOnly | SbsKind::ReplaceDelete => DEL_BG_DIM,
+                        _ => Color32::TRANSPARENT,
+                    };
+                    if old_bg != Color32::TRANSPARENT {
+                        painter.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(left_start, rect.min.y),
+                                Pos2::new(left_start + half_w, rect.max.y),
+                            ),
+                            0.0,
+                            old_bg,
+                        );
+                    }
+                    // Clip left half and paint with horizontal scroll offset
+                    let clip_left = Rect::from_min_max(
+                        Pos2::new(left_start, rect.min.y),
+                        Pos2::new(left_start + half_w, rect.max.y),
+                    );
+                    let p_left = painter.with_clip_rect(clip_left);
+                    if let Some(ln) = &r.old_ln {
+                        p_left.text(
+                            Pos2::new(left_start + gutter_w - 4.0 - h_scroll_l, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            ln,
+                            font.clone(),
+                            MUTED,
+                        );
+                    }
+                    if let Some(g) = &old_galley {
+                        p_left.galley(
+                            Pos2::new(left_start + gutter_w - h_scroll_l, rect.min.y + (row_h - g.size().y) / 2.0),
+                            g.clone(),
+                            CTX_FG,
+                        );
+                    }
+
+                    // ── Right half ──
+                    let new_bg = match r.kind {
+                        SbsKind::InsertOnly | SbsKind::ReplaceInsert => ADD_BG_DIM,
+                        _ => Color32::TRANSPARENT,
+                    };
+                    if new_bg != Color32::TRANSPARENT {
+                        painter.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(right_start, rect.min.y),
+                                Pos2::new(right_start + half_w, rect.max.y),
+                            ),
+                            0.0,
+                            new_bg,
+                        );
+                    }
+                    let clip_right = Rect::from_min_max(
+                        Pos2::new(right_start, rect.min.y),
+                        Pos2::new(right_start + half_w, rect.max.y),
+                    );
+                    let p_right = painter.with_clip_rect(clip_right);
+                    if let Some(ln) = &r.new_ln {
+                        p_right.text(
+                            Pos2::new(right_start + gutter_w - 4.0 - h_scroll_r, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            ln,
+                            font.clone(),
+                            MUTED,
+                        );
+                    }
+                    if let Some(g) = &new_galley {
+                        p_right.galley(
+                            Pos2::new(right_start + gutter_w - h_scroll_r, rect.min.y + (row_h - g.size().y) / 2.0),
+                            g.clone(),
+                            CTX_FG,
+                        );
+                    }
                 }
             })
         }
@@ -695,102 +879,4 @@ fn build_galley(
         );
     }
     ui.fonts_mut(|f| f.layout_job(job))
-}
-
-fn paint_sbs_row(
-    ui: &mut egui::Ui,
-    font: &FontId,
-    gutter_w: f32,
-    row_h: f32,
-    r: &SbsRow,
-    old_galley: Option<std::sync::Arc<egui::Galley>>,
-    new_galley: Option<std::sync::Arc<egui::Galley>>,
-) {
-    let inner_w = ui.available_width();
-    let divider_w = 1.0;
-    let half_w = ((inner_w - divider_w) / 2.0).floor();
-
-    let old_bg = match r.kind {
-        SbsKind::DeleteOnly | SbsKind::ReplaceDelete => DEL_BG_DIM,
-        _ => Color32::TRANSPARENT,
-    };
-    let new_bg = match r.kind {
-        SbsKind::InsertOnly | SbsKind::ReplaceInsert => ADD_BG_DIM,
-        _ => Color32::TRANSPARENT,
-    };
-
-    let (rect, _resp) =
-        ui.allocate_exact_size(egui::vec2(inner_w, row_h), egui::Sense::hover());
-    let painter = ui.painter();
-
-    if old_bg != Color32::TRANSPARENT {
-        painter.rect_filled(
-            Rect::from_min_max(rect.min, Pos2::new(rect.min.x + half_w, rect.max.y)),
-            0.0,
-            old_bg,
-        );
-    }
-    if new_bg != Color32::TRANSPARENT {
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(rect.min.x + half_w + divider_w, rect.min.y),
-                rect.max,
-            ),
-            0.0,
-            new_bg,
-        );
-    }
-    painter.rect_filled(
-        Rect::from_min_size(
-            Pos2::new(rect.min.x + half_w, rect.min.y),
-            egui::vec2(divider_w, row_h),
-        ),
-        0.0,
-        DIVIDER_CLR,
-    );
-
-    // Left gutter
-    if let Some(ln) = &r.old_ln {
-        painter.text(
-            Pos2::new(rect.min.x + gutter_w - 4.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            ln,
-            font.clone(),
-            MUTED,
-        );
-    }
-    // Left content
-    if let Some(g) = &old_galley {
-        painter.galley(
-            Pos2::new(
-                rect.min.x + gutter_w,
-                rect.min.y + (row_h - g.size().y) / 2.0,
-            ),
-            g.clone(),
-            CTX_FG,
-        );
-    }
-
-    // Right gutter
-    let right_x = rect.min.x + half_w + divider_w;
-    if let Some(ln) = &r.new_ln {
-        painter.text(
-            Pos2::new(right_x + gutter_w - 4.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            ln,
-            font.clone(),
-            MUTED,
-        );
-    }
-    // Right content
-    if let Some(g) = &new_galley {
-        painter.galley(
-            Pos2::new(
-                right_x + gutter_w,
-                rect.min.y + (row_h - g.size().y) / 2.0,
-            ),
-            g.clone(),
-            CTX_FG,
-        );
-    }
 }

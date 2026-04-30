@@ -86,6 +86,14 @@ pub fn render_status_strip(
                             .size(11.0)
                             .color(t.text_muted.to_color32()),
                     );
+                    if let Some((chars, lines)) = tab.selection_info {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new(format!("({chars} sel, {lines} ln)"))
+                                .size(10.5)
+                                .color(t.text_muted.to_color32()),
+                        );
+                    }
                 },
             );
         });

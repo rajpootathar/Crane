@@ -348,6 +348,11 @@ fn render_editor(ui: &mut egui::Ui, app: &mut App) {
         &mut app.editor_trim_on_save,
         "Trim trailing whitespace on save",
     );
+    ui.add_space(2.0);
+    ui.checkbox(
+        &mut app.single_click_open,
+        "Single-click to open files (preview tab)",
+    );
     ui.add_space(10.0);
     placeholder(
         ui,
