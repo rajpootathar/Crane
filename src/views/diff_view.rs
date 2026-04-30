@@ -54,6 +54,9 @@ pub fn render_diff_body(
     let left_path = tab.left_path.clone();
     let right_path = tab.right_path.clone();
 
+    // Side-by-side is disabled — force unified mode.
+    tab.diff_mode = DiffMode::Unified;
+
     if is_image {
         render_image_block(ui, tab, &left_path, &right_path, _tab_index);
         return;
@@ -262,19 +265,35 @@ pub fn render_diff_body(
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(6.0);
-        ui.label(
-            RichText::new(&left_path)
-                .size(11.0)
-                .color(DEL_FG)
-                .monospace(),
-        );
-        ui.label(RichText::new("->").size(11.0).color(MUTED));
-        ui.label(
-            RichText::new(&right_path)
-                .size(11.0)
-                .color(ADD_FG)
-                .monospace(),
-        );
+        // Strip "staged:" / "HEAD:" prefix to get the bare path for comparison
+        let left_bare = left_path.strip_prefix("staged:").or_else(|| left_path.strip_prefix("HEAD:")).unwrap_or(&left_path);
+        let right_bare = right_path.strip_prefix("staged:").or_else(|| right_path.strip_prefix("HEAD:")).unwrap_or(&right_path);
+        if left_bare == right_bare {
+            let display = std::path::Path::new(left_bare)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(left_bare);
+            ui.label(
+                RichText::new(display)
+                    .size(11.0)
+                    .color(ADD_FG)
+                    .monospace(),
+            );
+        } else {
+            ui.label(
+                RichText::new(&left_path)
+                    .size(11.0)
+                    .color(DEL_FG)
+                    .monospace(),
+            );
+            ui.label(RichText::new(" -> ").size(11.0).color(MUTED));
+            ui.label(
+                RichText::new(&right_path)
+                    .size(11.0)
+                    .color(ADD_FG)
+                    .monospace(),
+            );
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             let nav_enabled = !hunk_starts.is_empty();
@@ -315,27 +334,6 @@ pub fn render_diff_body(
                 };
                 ui.add_space(6.0);
                 ui.label(RichText::new(label).size(11.0).color(MUTED).monospace());
-            }
-            // Mode toggle
-            ui.add_space(4.0);
-            let is_sbs = matches!(tab.diff_mode, DiffMode::SideBySide);
-            let clicked;
-            let mode_resp = ui.add(
-                egui::Button::new(
-                    RichText::new(if is_sbs { icons::LIST } else { icons::COLUMNS }).size(13.0),
-                )
-                .frame(false)
-                .min_size(egui::vec2(24.0, 22.0)),
-            );
-            if mode_resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            clicked = mode_resp.clicked();
-            let tooltip = if is_sbs { "Unified" } else { "Side by side" };
-            mode_resp.on_hover_text(tooltip);
-            if clicked {
-                tab.diff_mode = if is_sbs { DiffMode::Unified } else { DiffMode::SideBySide };
-                hunk_idx = None;
             }
         });
     });

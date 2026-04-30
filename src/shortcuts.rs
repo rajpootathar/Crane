@@ -172,22 +172,17 @@ pub fn handle(
     if toggle_left {
         app.show_left = !app.show_left;
     }
-    if toggle_right {
+
+    // Whether any widget currently holds keyboard focus — used to
+    // guard shortcuts that would otherwise steal keystrokes from a
+    // TextEdit or terminal pane.
+    let any_focus = ctx.memory(|m| m.focused().is_some());
+    if toggle_left && !any_focus {
+        app.show_left = !app.show_left;
+    }
+    if toggle_right && !any_focus {
         app.show_right = !app.show_right;
     }
-
-    // Trash the currently-selected file in the Files Pane.
-    // macOS: Cmd+Backspace (the "Move to Trash" Finder shortcut).
-    // Linux/Windows: Delete key alone (matches Nautilus / Explorer).
-    //
-    // Guards:
-    //   - Requires `app.selected_file` to be Some — without selection
-    //     there's nothing to delete and we don't want surprise fires.
-    //   - Requires no widget to currently hold keyboard focus —
-    //     otherwise the shortcut would steal Backspace from a
-    //     terminal pane (where ⌘⌫ commonly means "delete word") or
-    //     from a TextEdit in a modal/composer.
-    let any_focus = ctx.memory(|m| m.focused().is_some());
     let delete_selected = ctx.input(|i| {
         let cmd = i.modifiers.command;
         cmd && i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete)
