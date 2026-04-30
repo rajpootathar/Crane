@@ -101,6 +101,12 @@ pub struct DiffTabData {
     pub error: Option<String>,
     pub image_texture: Option<egui::TextureHandle>,
     pub diff_mode: DiffMode,
+    /// Absolute path to the git repo root. Used by the diff view to
+    /// call `git apply --cached` for per-hunk staging.
+    pub repo_path: Option<String>,
+    /// Set to true by the diff view when a hunk is staged. The main loop
+    /// reads this flag and triggers a diff content refresh.
+    pub pending_hunk_stage: bool,
 }
 
 pub enum TabKind {
@@ -200,6 +206,7 @@ impl FilesPane {
         right_path: String,
         left_text: String,
         right_text: String,
+        repo_path: Option<String>,
     ) {
         if let Some(idx) = self
             .tabs
@@ -212,6 +219,7 @@ impl FilesPane {
             t.right_text = right_text;
             t.error = None;
             t.image_texture = None;
+            t.repo_path = repo_path;
             self.active = idx;
             return;
         }
@@ -224,6 +232,8 @@ impl FilesPane {
             error: None,
             image_texture: None,
             diff_mode: DiffMode::Unified,
+            repo_path,
+            pending_hunk_stage: false,
         }));
         self.active = self.tabs.len() - 1;
     }
@@ -548,6 +558,7 @@ impl Layout {
         left_text: String,
         right_text: String,
         title: String,
+        repo_path: Option<String>,
     ) {
         let existing = self
             .panes
@@ -559,13 +570,13 @@ impl Layout {
                 if let Some(pane) = self.panes.get_mut(&pid)
                     && let PaneContent::Files(files) = &mut pane.content
                 {
-                    files.open_diff(title.clone(), left_path, right_path, left_text, right_text);
+                    files.open_diff(title.clone(), left_path, right_path, left_text, right_text, repo_path.clone());
                 }
                 self.focus = Some(pid);
             }
             None => {
                 let mut files = FilesPane::empty();
-                files.open_diff(title.clone(), left_path, right_path, left_text, right_text);
+                files.open_diff(title.clone(), left_path, right_path, left_text, right_text, repo_path.clone());
                 self.add_pane(PaneContent::Files(files), Some(Dir::Horizontal));
                 if let Some(focus) = self.focus
                     && let Some(pane) = self.panes.get_mut(&focus)

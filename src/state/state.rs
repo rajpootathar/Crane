@@ -1118,6 +1118,18 @@ impl App {
                             dt.right_text = new_text.to_string();
                             if let Some(left) = dt
                                 .left_path
+                                .strip_prefix("staged:")
+                                .and_then(|rel| {
+                                    crate::git::find_git_root(std::path::Path::new(path))
+                                        .map(|root| (root, rel.to_string()))
+                                })
+                            {
+                                let (root, rel) = left;
+                                dt.left_text =
+                                    crate::git::staged_content(&root, &rel)
+                                        .unwrap_or_else(|| crate::git::head_content(&root, &rel));
+                            } else if let Some(left) = dt
+                                .left_path
                                 .strip_prefix("HEAD:")
                                 .and_then(|rel| {
                                     crate::git::find_git_root(std::path::Path::new(path))
@@ -1127,6 +1139,66 @@ impl App {
                                 let (root, rel) = left;
                                 dt.left_text =
                                     crate::git::head_content(&root, &rel);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// After a hunk is staged via the diff view, refresh the diff tab's
+    /// content: re-read the staged content (new left side) and working
+    /// tree (right side), then reset the `pending_hunk_stage` flag.
+    pub fn refresh_diff_panes_after_hunk_stage(&mut self) {
+        use crate::state::layout::{PaneContent, TabKind};
+        for project in &mut self.projects {
+            for workspace in &mut project.workspaces {
+                for tab in &mut workspace.tabs {
+                    for (_, pane) in tab.layout.panes.iter_mut() {
+                        let PaneContent::Files(files) = &mut pane.content else {
+                            continue;
+                        };
+                        for tk in files.tabs.iter_mut() {
+                            let TabKind::Diff(dt) = tk else {
+                                continue;
+                            };
+                            if !dt.pending_hunk_stage {
+                                continue;
+                            }
+                            dt.pending_hunk_stage = false;
+                            // Re-read working tree content
+                            dt.right_text =
+                                std::fs::read_to_string(&dt.right_path)
+                                    .unwrap_or_default();
+                            // Re-read staged content as new left side
+                            if let Some(left) = dt
+                                .left_path
+                                .strip_prefix("staged:")
+                                .and_then(|rel| {
+                                    crate::git::find_git_root(
+                                        std::path::Path::new(&dt.right_path),
+                                    )
+                                    .map(|root| (root, rel.to_string()))
+                                })
+                            {
+                                let (root, rel) = left;
+                                dt.left_text = crate::git::staged_content(&root, &rel)
+                                    .unwrap_or_else(|| {
+                                        crate::git::head_content(&root, &rel)
+                                    });
+                            } else if let Some(left) = dt
+                                .left_path
+                                .strip_prefix("HEAD:")
+                                .and_then(|rel| {
+                                    crate::git::find_git_root(
+                                        std::path::Path::new(&dt.right_path),
+                                    )
+                                    .map(|root| (root, rel.to_string()))
+                                })
+                            {
+                                let (root, rel) = left;
+                                dt.left_text = crate::git::head_content(&root, &rel);
                             }
                         }
                     }

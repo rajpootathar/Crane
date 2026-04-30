@@ -527,7 +527,16 @@ fn force_status_refresh(app: &mut App) {
 fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
     let full = repo.join(rel_path);
     let right_text = std::fs::read_to_string(&full).unwrap_or_default();
-    let left_text = git::head_content(repo, rel_path);
+    // Use staged content as left side when the file has staged changes,
+    // otherwise use HEAD content. This makes the diff show only
+    // *unstaged* changes, and per-hunk staging removes hunks from view.
+    let left_text = git::staged_content(repo, rel_path)
+        .unwrap_or_else(|| git::head_content(repo, rel_path));
+    let left_label = if git::staged_content(repo, rel_path).is_some() {
+        format!("staged:{rel_path}")
+    } else {
+        format!("HEAD:{rel_path}")
+    };
     let title = format!(
         "diff: {}",
         std::path::Path::new(rel_path)
@@ -537,11 +546,12 @@ fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
     );
     if let Some(ws) = app.active_layout() {
         ws.open_diff_in_files_pane(
-            format!("HEAD:{rel_path}"),
+            left_label,
             rel_path.to_string(),
             left_text,
             right_text,
             title,
+            Some(repo.to_string_lossy().to_string()),
         );
     }
 }

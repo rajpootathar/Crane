@@ -230,6 +230,171 @@ pub fn unstage(repo: &Path, path: &str) -> Result<(), String> {
     run(repo, &["restore", "--staged", "--", path])
 }
 
+/// Stage a single hunk by piping a unified-diff patch through
+/// `git apply --cached`. The patch must be a valid hunk fragment
+/// including its `@@ ... @@` header and trailing context.
+pub fn stage_hunk(repo: &Path, patch: &str) -> Result<(), String> {
+    let mut child = Command::new("git")
+        .args(["apply", "--cached", "-"])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(patch.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).to_string())
+    }
+}
+
+/// Unstage a single hunk by piping the patch through
+/// `git apply --reverse --cached`.
+pub fn unstage_hunk(repo: &Path, patch: &str) -> Result<(), String> {
+    let mut child = Command::new("git")
+        .args(["apply", "--reverse", "--cached", "-"])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(patch.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).to_string())
+    }
+}
+
+/// Get the content of a file as it exists in the staging area (index).
+/// Runs `git show :<path>`. Returns None if the path is not in the index.
+pub fn staged_content(repo: &Path, rel_path: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["show", &format!(":{rel_path}")])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Get the unified diff between HEAD and the working tree for a file.
+/// Returns the raw diff text including hunk headers and context lines.
+pub fn file_diff_raw(repo: &Path, rel_path: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["diff", "--", rel_path])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if out.status.success() && !out.stdout.is_empty() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Get the unified diff between the staging area and the working tree
+/// (i.e. unstaged changes only).
+pub fn file_diff_unstaged(repo: &Path, rel_path: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["diff", "--", rel_path])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if out.status.success() && !out.stdout.is_empty() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Get the unified diff between HEAD and the staging area
+/// (i.e. staged changes only).
+pub fn file_diff_staged(repo: &Path, rel_path: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["diff", "--cached", "--", rel_path])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if out.status.success() && !out.stdout.is_empty() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Parse a unified diff into individual hunk patches. Each patch
+/// includes the `diff --git` header, the hunk header `@@ ... @@`,
+/// and the content lines. Returns (hunk_index, patch_text) pairs.
+pub fn parse_hunks(diff: &str) -> Vec<(usize, String)> {
+    let mut hunks = Vec::new();
+    // Find the diff header line (first line starting with "diff --git")
+    let header_end = diff.find('\n').unwrap_or(0);
+    let header = if diff.starts_with("diff --git") {
+        &diff[..header_end]
+    } else {
+        ""
+    };
+    // Find old/new mode lines or index lines between header and first hunk
+    let mut first_hunk = 0;
+    for (i, line) in diff.lines().enumerate() {
+        if line.starts_with("@@") {
+            first_hunk = i;
+            break;
+        }
+    }
+    let prefix: &str = if !header.is_empty() {
+        // Include header + any index/mode lines before first hunk
+        &diff[..diff
+            .lines()
+            .take(first_hunk)
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            .min(diff.len())]
+    } else {
+        ""
+    };
+
+    let lines: Vec<&str> = diff.lines().collect();
+    let mut i = first_hunk;
+    let mut hunk_idx = 0;
+    while i < lines.len() {
+        if lines[i].starts_with("@@") {
+            // Collect this hunk's lines until next hunk or end
+            let start = i;
+            i += 1;
+            while i < lines.len() && !lines[i].starts_with("@@") {
+                i += 1;
+            }
+            let hunk_content: String = lines[start..i].join("\n");
+            let patch = if prefix.is_empty() {
+                hunk_content
+            } else {
+                format!("{}\n{}", prefix, hunk_content)
+            };
+            hunks.push((hunk_idx, patch));
+            hunk_idx += 1;
+        } else {
+            i += 1;
+        }
+    }
+    hunks
+}
+
 pub fn commit(repo: &Path, message: &str) -> Result<(), String> {
     run(repo, &["commit", "-m", message])
 }

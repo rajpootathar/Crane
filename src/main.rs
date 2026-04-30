@@ -724,6 +724,9 @@ impl eframe::App for CraneApp {
             // user committed between opens.
             self.app.refresh_diff_panes_for_path(&path, &text);
         }
+        // Handle per-hunk staging: when a diff tab staged a hunk,
+        // refresh its content (re-read staged content + working tree).
+        self.app.refresh_diff_panes_after_hunk_stage();
         // Dispatch any goto-definition requests queued this frame
         // without blocking on a response. The LSP reader thread will
         // wake us via ctx.request_repaint() when the result arrives.
