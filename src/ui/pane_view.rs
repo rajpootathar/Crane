@@ -417,7 +417,7 @@ fn render_pane(
             }
         }
         PaneContent::Files(files) => {
-            file_view::render(
+            if file_view::render(
                 child,
                 id,
                 files,
@@ -430,7 +430,9 @@ fn render_pane(
                 goto_request,
                 workspace_root,
                 prefs,
-            );
+            ) {
+                *action = PaneAction::Close(id);
+            }
         }
         PaneContent::Markdown(md) => {
             markdown_view::render(child, md, font_size, &mut pane.title);

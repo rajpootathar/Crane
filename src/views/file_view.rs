@@ -141,12 +141,10 @@ pub fn render(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: EditorPrefs,
-) {
-    // Scope widget ids by pane so unrelated Files panes don't share
-    // state (undo history, scroll positions, etc.) — the real work
-    // lives entirely in this function; there's no separate inner.
+) -> bool {
+    let mut should_close = false;
     ui.push_id(("files_pane", pane_id), |ui| {
-        render_scoped(
+        should_close = render_scoped(
             ui,
             pane,
             font_size,
@@ -160,6 +158,7 @@ pub fn render(
             prefs,
         );
     });
+    should_close
 }
 
 /// Confirm modal for closing a dirty file tab. "Discard" drops the
@@ -227,7 +226,7 @@ fn render_scoped(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: EditorPrefs,
-) {
+) -> bool {
     if pane.tabs.is_empty() {
         let t = theme::current();
         ui.add_space(8.0);
@@ -245,7 +244,7 @@ fn render_scoped(
                     .size(11.5),
             );
         });
-        return;
+        return false;
     }
 
     // Tab bar — horizontal scroll so many-open-file cases don't hide
@@ -293,13 +292,13 @@ fn render_scoped(
         } else {
             pane.close(idx);
             if pane.tabs.is_empty() {
-                return;
+                return true;
             }
         }
     }
     render_close_confirm(ui, pane);
     if pane.tabs.is_empty() {
-        return;
+        return true;
     }
     ui.add_space(2.0);
 
@@ -357,7 +356,7 @@ fn render_scoped(
             *title = format!("Files · {}", dt.title);
             crate::views::diff_view::render_diff_body(ui, dt, font_size, active_idx);
         }
-        return;
+        return false;
     }
 
     {
@@ -792,7 +791,7 @@ fn render_scoped(
                         );
                     }
                 });
-            return;
+            return false;
         }
 
         // Markdown preview mode: render formatted HTML instead of the
@@ -809,7 +808,7 @@ fn render_scoped(
                         font_size,
                     );
                 });
-            return;
+            return false;
         }
 
         // Two-column layout: fixed gutter on the left, horizontally-
@@ -1824,6 +1823,7 @@ fn render_scoped(
             tab.preview = false;
         }
     }
+    false
 }
 
 

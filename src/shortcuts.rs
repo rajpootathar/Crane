@@ -169,9 +169,6 @@ pub fn handle(
     if zoom_reset {
         app.font_size = 14.0;
     }
-    if toggle_left {
-        app.show_left = !app.show_left;
-    }
 
     // Whether any widget currently holds keyboard focus — used to
     // guard shortcuts that would otherwise steal keystrokes from a
