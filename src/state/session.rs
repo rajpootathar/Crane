@@ -514,24 +514,33 @@ impl SPane {
                     active: tp.active,
                 }
             }
-            PaneContent::Files(f) => SPaneContent::Files {
+            PaneContent::Files(f) => {
                 // Only persist file tabs — diff tabs are ephemeral.
-                files: f
+                // Adjust active index to account for removed diff tabs.
+                let mut adjusted_active = f.active;
+                let files: Vec<SFile> = f
                     .tabs
                     .iter()
-                    .filter_map(|tk| {
+                    .enumerate()
+                    .filter_map(|(i, tk)| {
                         if let TabKind::File(ft) = tk {
                             Some(SFile {
                                 path: ft.path.clone(),
                                 name: ft.name.clone(),
                             })
                         } else {
+                            if i < adjusted_active {
+                                adjusted_active = adjusted_active.saturating_sub(1);
+                            }
                             None
                         }
                     })
-                    .collect(),
-                active: f.active,
-            },
+                    .collect();
+                SPaneContent::Files {
+                    files,
+                    active: adjusted_active,
+                }
+            }
             PaneContent::Markdown(m) => SPaneContent::Markdown {
                 path: m.path.clone(),
             },

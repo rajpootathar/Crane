@@ -271,9 +271,15 @@ pub fn render_diff_body(
                     if btn_clicked {
                         if let Some(repo) = &tab.repo_path {
                             let repo_path = std::path::Path::new(repo);
-                            let _ = crate::git::stage_hunk(repo_path, patch);
-                            tab.pending_hunk_stage = true;
-                            ui.ctx().data_mut(|d| d.insert_temp(refresh_id, true));
+                            match crate::git::stage_hunk(repo_path, patch) {
+                                Ok(()) => {
+                                    tab.pending_hunk_stage = true;
+                                    ui.ctx().data_mut(|d| d.insert_temp(refresh_id, true));
+                                }
+                                Err(e) => {
+                                    tab.error = Some(format!("Stage hunk failed: {e}"));
+                                }
+                            }
                         }
                     }
                     stage_btn_paint = Some((btn_rect, btn_hovered));

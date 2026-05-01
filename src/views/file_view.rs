@@ -594,7 +594,11 @@ fn render_scoped(
                         let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
                         if enter {
                             if let Ok(line_num) = tab.goto_line_input.trim().parse::<u32>() {
-                                let target = line_num.saturating_sub(1).min(line_count as u32 - 1);
+                                let target = if line_count <= 1 {
+                                    0u32
+                                } else {
+                                    line_num.saturating_sub(1).min(line_count as u32 - 1)
+                                };
                                 tab.pending_cursor = Some((target, 0));
                                 tab.find_scroll_to_line = Some(target);
                             }
@@ -1034,7 +1038,6 @@ fn render_scoped(
                             {
                                 let pairs: &[(&str, &str)] = &[
                                     ("{", "}"), ("(", ")"), ("[", "]"),
-                                    ("\"", "\""), ("'", "'"),
                                 ];
                                 let typed_event = ui.input_mut(|i| {
                                     i.events.iter().position(|e| {
