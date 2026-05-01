@@ -344,6 +344,11 @@ impl eframe::App for CraneApp {
                         self.app.open_external_file(&ctx, &path);
                     }
                 }
+                platform_menu::ID_OPEN_FOLDER => {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.app.add_project_from_path(path, &ctx);
+                    }
+                }
                 _ => {}
             }
         }

@@ -32,6 +32,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
         ui.add_space(6.0);
         let rows: &[(&str, &str)] = &[
             ("Cmd+O", "Open file (external files open as read-only)"),
+            ("Cmd+Shift+O", "Open folder as project workspace"),
             ("Cmd+T", "Split active Pane with new terminal"),
             ("Cmd+Shift+T", "New Tab in active Workspace"),
             ("Cmd+D", "Split Pane horizontally (side-by-side)"),

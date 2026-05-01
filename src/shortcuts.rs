@@ -221,6 +221,23 @@ pub fn handle(
             app.open_external_file(ctx, &path);
         }
     }
+
+    // Cmd+Shift+O: open folder as project workspace
+    let open_folder = ctx.input_mut(|i| {
+        let pressed = (i.modifiers.command || i.modifiers.mac_cmd)
+            && i.modifiers.shift
+            && i.key_pressed(egui::Key::O);
+        if pressed {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::O);
+            i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::O);
+        }
+        pressed
+    });
+    if open_folder {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            app.add_project_from_path(path, ctx);
+        }
+    }
 }
 
 fn terminal_is_running(app: &App, id: PaneId) -> bool {

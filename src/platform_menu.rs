@@ -16,6 +16,7 @@ mod mac {
     pub const ID_SHORTCUTS: &str = "crane.shortcuts";
     pub const ID_CHECK_UPDATES: &str = "crane.check_updates";
     pub const ID_OPEN_FILE: &str = "crane.open_file";
+    pub const ID_OPEN_FOLDER: &str = "crane.open_folder";
 
     // muda::Menu wraps an Rc internally and isn't Sync — can't live in
     // a static. We Box::leak after init (menu must outlive the app
@@ -95,6 +96,15 @@ mod mac {
                     muda::accelerator::Code::KeyO,
                 )),
             ),
+            &MenuItem::with_id(
+                MenuId::new(ID_OPEN_FOLDER),
+                "Open Folder as Project…",
+                true,
+                Some(muda::accelerator::Accelerator::new(
+                    Some(muda::accelerator::Modifiers::SUPER | muda::accelerator::Modifiers::SHIFT),
+                    muda::accelerator::Code::KeyO,
+                )),
+            ),
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::close_window(None),
         ]);
@@ -158,3 +168,6 @@ pub const ID_CHECK_UPDATES: &str = "crane.check_updates";
 
 #[cfg(not(target_os = "macos"))]
 pub const ID_OPEN_FILE: &str = "crane.open_file";
+
+#[cfg(not(target_os = "macos"))]
+pub const ID_OPEN_FOLDER: &str = "crane.open_folder";
