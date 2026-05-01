@@ -339,6 +339,11 @@ impl eframe::App for CraneApp {
                     self.app.update_check.manual_check = true;
                     self.app.update_check.spawn_check(ctx.clone());
                 }
+                platform_menu::ID_OPEN_FILE => {
+                    if let Some(path) = rfd::FileDialog::new().pick_file() {
+                        self.app.open_external_file(&ctx, &path);
+                    }
+                }
                 _ => {}
             }
         }

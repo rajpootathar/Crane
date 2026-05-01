@@ -1500,7 +1500,11 @@ impl App {
             .unwrap_or("unknown")
             .to_string();
         let path_str = path.to_string_lossy().to_string();
-        self.open_file_into_active_layout(ctx, path_str, name, content, false, true);
+        // Files inside the workspace open as normal editable tabs;
+        // only files outside the workspace are read-only.
+        let inside_workspace = self.active_workspace_path()
+            .is_some_and(|ws| path.starts_with(ws));
+        self.open_file_into_active_layout(ctx, path_str, name, content, false, !inside_workspace);
     }
 
     /// Per-frame sync, scoped to the ACTIVE layout only. Was iterating every

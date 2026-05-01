@@ -399,6 +399,7 @@ fn render_shortcuts(ui: &mut egui::Ui) {
     section_title(ui, "Keyboard Shortcuts");
     ui.add_space(8.0);
     let rows: &[(&str, &str)] = &[
+        ("Cmd+O", "Open file (external files open as read-only)"),
         ("Cmd+T", "Split active Pane with new terminal"),
         ("Cmd+Shift+T", "New Tab in active Workspace"),
         ("Cmd+D", "Split Pane horizontally (side-by-side)"),

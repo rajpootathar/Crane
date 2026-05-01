@@ -15,6 +15,7 @@ mod mac {
     pub const ID_SETTINGS: &str = "crane.settings";
     pub const ID_SHORTCUTS: &str = "crane.shortcuts";
     pub const ID_CHECK_UPDATES: &str = "crane.check_updates";
+    pub const ID_OPEN_FILE: &str = "crane.open_file";
 
     // muda::Menu wraps an Rc internally and isn't Sync — can't live in
     // a static. We Box::leak after init (menu must outlive the app
@@ -83,6 +84,21 @@ mod mac {
         // focused WKWebView (so the embedded browser can copy/paste),
         // and otherwise passes the event through untouched so egui
         // emits its normal Event::Copy / Event::Paste / Event::Cut.
+        let file_menu = Submenu::new("File", true);
+        let _ = file_menu.append_items(&[
+            &MenuItem::with_id(
+                MenuId::new(ID_OPEN_FILE),
+                "Open…",
+                true,
+                Some(muda::accelerator::Accelerator::new(
+                    Some(muda::accelerator::Modifiers::SUPER),
+                    muda::accelerator::Code::KeyO,
+                )),
+            ),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::close_window(None),
+        ]);
+
         let window = Submenu::new("Window", true);
         let _ = window.append_items(&[
             &PredefinedMenuItem::minimize(None),
@@ -99,7 +115,7 @@ mod mac {
             None,
         )]);
 
-        let _ = menu.append_items(&[&app_submenu, &window, &help]);
+        let _ = menu.append_items(&[&app_submenu, &file_menu, &window, &help]);
         menu.init_for_nsapp();
         // Intentionally leak: NSApp holds a weak-ish reference to the
         // menu via init_for_nsapp, and muda's Menu Drop would tear
@@ -139,3 +155,6 @@ pub const ID_SHORTCUTS: &str = "crane.shortcuts";
 
 #[cfg(not(target_os = "macos"))]
 pub const ID_CHECK_UPDATES: &str = "crane.check_updates";
+
+#[cfg(not(target_os = "macos"))]
+pub const ID_OPEN_FILE: &str = "crane.open_file";

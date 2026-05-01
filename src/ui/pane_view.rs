@@ -417,7 +417,20 @@ fn render_pane(
     // Markdown panes' ScrollAreas don't fight over the same auto-id. egui
     // paints a red outline on id-collision and also pays a hashing cost
     // to detect them, so this helps both speed and the "red flash" bug.
-    child.push_id(("pane_body", id), |child| match &mut pane.content {
+    child.push_id(("pane_body", id), |child| {
+        // External file drop works on ANY pane type (terminal, welcome,
+        // etc.), not just Files panes. Detect drops before the match so
+        // a Terminal pane can accept them too.
+        if !external_drop_handled {
+            let dropped: Vec<std::path::PathBuf> = child.ctx().input(|i| {
+                i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+            });
+            if let Some(path) = dropped.into_iter().next() {
+                *action = PaneAction::OpenFileExternal(path);
+            }
+        }
+
+        match &mut pane.content {
         PaneContent::Terminal(tp) => {
             let opened = crate::terminal::view::render_terminal_pane(
                 child, tp, font_size, is_focus, id, workspace_root,
@@ -461,6 +474,7 @@ fn render_pane(
                 welcome_action_holder = Some((id, act));
             }
         }
+    };
     });
     if let Some((pid, wact)) = welcome_action_holder {
         *action = match wact {
