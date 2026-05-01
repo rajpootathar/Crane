@@ -1,0 +1,49 @@
+{
+	"name": "admin",
+	"version": "1.0.2",
+	"description": "",
+	"main": "index.js",
+	"scripts": {
+		"dev": "cross-env NODE_ENV=dev nodemon src/index.js",
+		"prod": "cross-env NODE_ENV=prod node src/index.js",
+		"release": "release-it",
+		"lint": "eslint src",
+		"lint:fix": "eslint --fix src"
+	},
+	"author": "",
+	"license": "ISC",
+	"dependencies": {
+		"@sendgrid/mail": "^7.7.0",
+		"amqplib": "^0.10.3",
+		"aws-sdk": "^2.1392.0",
+		"axios": "^1.4.0",
+		"bcryptjs": "^2.4.3",
+		"compression": "^1.7.4",
+		"cors": "^2.8.5",
+		"dotenv": "^16.1.4",
+		"ejs": "^3.1.9",
+		"express": "^4.18.2",
+		"express-session": "^1.17.3",
+		"joi": "^17.9.2",
+		"jsonwebtoken": "^9.0.0",
+		"moment": "^2.29.4",
+		"nodemailer": "^6.9.16",
+		"pg": "^8.11.0",
+		"qrcode": "^1.5.3",
+		"redis": "^4.6.7",
+		"sequelize": "^6.32.0",
+		"swagger-jsdoc": "^6.2.8",
+		"swagger-ui-express": "^4.6.3",
+		"twilio": "^4.11.2",
+		"winston": "^3.9.0"
+	},
+	"devDependencies": {
+		"cross-env": "^7.0.3",
+		"eslint": "^8.54.0",
+		"eslint-plugin-jest": "^27.6.0",
+		"eslint-plugin-node": "^11.1.0",
+		"eslint-plugin-react": "^7.33.2",
+		"nodemon": "^2.0.22",
+		"release-it": "^17.0.0"
+	}
+}

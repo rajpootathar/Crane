@@ -1,0 +1,37 @@
+require("dotenv").config();
+
+module.exports = {
+  PORT: process.env.PORT,
+  PG_DB: process.env.PG_DB,
+  PG_USER: process.env.PG_USER,
+  PG_PASSWORD: process.env.PG_PASSWORD,
+  PG_PORT: process.env.PG_PORT,
+  PG_HOST: process.env.PG_HOST,
+  PG_DIALECT: process.env.PG_DIALECT,
+  PG_SCHEMA: process.env.PG_SCHEMA,
+
+  AUTH_TOKEN_KEY: process.env.AUTH_TOKEN_KEY,
+  AUTH_TOKEN_EXPIRES: process.env.AUTH_TOKEN_EXPIRES,
+  REFRESH_TOKEN_KEY: process.env.REFRESH_TOKEN_KEY,
+  REFRESH_TOKEN_EXPIRES: process.env.REFERSH_TOKEN_EXPIRES,
+  SENDGRID_API_KEY: process.env.SENDGRID_API_KEY,
+  SENDGRID_SENDER_EMAIL: process.env.SENDGRID_SENDER_EMAIL,
+
+  MAILER_USERNAME: process.env.MAILER_USERNAME,
+  MAILER_PASSWORD: process.env.MAILER_PASSWORD,
+
+  AUTH_PROXY: process.env.AUTH_PROXY_URL,
+  USER_PROXY: process.env.USER_PROXY_URL,
+  FEED_PROXY: process.env.FEED_PROXY_URL,
+  FOLLOW_PROXY: process.env.FOLLOW_PROXY_URL,
+  NOTIFICATION_PROXY: process.env.NOTIFICATION_PROXY_URL,
+  CHAT_PROXY: process.env.CHAT_PROXY_URL,
+
+  AWS_ACCESS_KEY: process.env.AWS_ACCESS_KEY,
+  AWS_SECRET_KEY: process.env.AWS_SECRET_KEY,
+  AWS_BUCKET_NAME: process.env.AWS_BUCKET_NAME,
+  AWS_CLOUDFRONT_URL: process.env.AWS_CLOUDFRONT_URL,
+  AWS_REGION: process.env.AWS_REGION,
+
+  SESSION_KEY:process.env.SESSION_KEY
+};
