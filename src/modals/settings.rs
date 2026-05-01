@@ -348,6 +348,11 @@ fn render_editor(ui: &mut egui::Ui, app: &mut App) {
         &mut app.editor_trim_on_save,
         "Trim trailing whitespace on save",
     );
+    ui.add_space(2.0);
+    ui.checkbox(
+        &mut app.single_click_open,
+        "Single-click to open files (preview tab)",
+    );
     ui.add_space(10.0);
     placeholder(
         ui,
@@ -394,6 +399,8 @@ fn render_shortcuts(ui: &mut egui::Ui) {
     section_title(ui, "Keyboard Shortcuts");
     ui.add_space(8.0);
     let rows: &[(&str, &str)] = &[
+        ("Cmd+O", "Open file (external files open as read-only)"),
+        ("Cmd+Shift+O", "Open folder as project workspace"),
         ("Cmd+T", "Split active Pane with new terminal"),
         ("Cmd+Shift+T", "New Tab in active Workspace"),
         ("Cmd+D", "Split Pane horizontally (side-by-side)"),

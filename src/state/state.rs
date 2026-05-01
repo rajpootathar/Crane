@@ -420,6 +420,7 @@ pub struct App {
     pub right_panel_w: f32,
     pub editor_word_wrap: bool,
     pub editor_trim_on_save: bool,
+    pub single_click_open: bool,
     pub lsp: crate::lsp::LspManager,
     pub language_configs: crate::lsp::LanguageConfigs,
     /// Global opt-out for the LSP install prompt. Set by "Never ask for
@@ -456,6 +457,10 @@ pub struct App {
     /// projects pane — closing a tab drops its terminal / pane
     /// contents, so we always confirm first.
     pub pending_close_tab: Option<(ProjectId, WorkspaceId, TabId)>,
+    /// Set to true each frame when the explorer tree handles an external
+    /// drag-drop (copy into workspace). The file pane checks this to
+    /// avoid double-handling the same drop event.
+    pub external_drop_handled: bool,
     /// MRU (most-recently-used) list of tabs across all projects /
     /// workspaces, front = most recent. Updated when `active` changes.
     /// Drives the Cmd+~ tab switcher — just like alt+tab, the first
@@ -510,6 +515,7 @@ impl App {
             left_panel_w: 240.0,
             editor_word_wrap: false,
             editor_trim_on_save: false,
+            single_click_open: false,
             right_panel_w: 300.0,
             lsp: crate::lsp::LspManager::new(),
             language_configs: crate::lsp::LanguageConfigs::default(),
@@ -523,6 +529,7 @@ impl App {
             pending_remove_worktree: None,
             pending_delete_file: None,
             pending_close_tab: None,
+            external_drop_handled: false,
             tab_mru: Vec::new(),
             tab_switcher: None,
             group_tints: std::collections::HashMap::new(),
@@ -1073,20 +1080,22 @@ impl App {
     }
 
     fn active_file_path_str(&self) -> Option<String> {
-        use crate::state::layout::PaneContent;
+        use crate::state::layout::{PaneContent, TabKind};
         let layout = self.active_layout_ref()?;
         if let Some(id) = layout.focus
             && let Some(p) = layout.panes.get(&id)
             && let PaneContent::Files(files) = &p.content
             && let Some(t) = files.tabs.get(files.active)
+            && let TabKind::File(ft) = t
         {
-            return Some(t.path.clone());
+            return Some(ft.path.clone());
         }
         for p in layout.panes.values() {
             if let PaneContent::Files(files) = &p.content
                 && let Some(t) = files.tabs.get(files.active)
+                && let TabKind::File(ft) = t
             {
-                return Some(t.path.clone());
+                return Some(ft.path.clone());
             }
         }
         None
@@ -1098,34 +1107,66 @@ impl App {
     /// between opens. `new_text` is the freshly-saved buffer so we avoid
     /// an extra disk read when the caller already has it.
     pub fn refresh_diff_panes_for_path(&mut self, path: &str, new_text: &str) {
-        use crate::state::layout::PaneContent;
+        use crate::state::layout::{PaneContent, TabKind};
         for project in &mut self.projects {
             for workspace in &mut project.workspaces {
                 for tab in &mut workspace.tabs {
                     for (_, pane) in tab.layout.panes.iter_mut() {
-                        let PaneContent::Diff(diff) = &mut pane.content else {
+                        let PaneContent::Files(files) = &mut pane.content else {
                             continue;
                         };
-                        for dt in diff.tabs.iter_mut() {
-                            if dt.right_path != path {
+                        for tk in files.tabs.iter_mut() {
+                            let TabKind::Diff(dt) = tk else {
+                                continue;
+                            };
+                            // right_path may be repo-relative; resolve
+                            // via repo_path before comparing with the
+                            // absolute path from the save callback.
+                            let abs_right = dt.repo_path.as_ref().and_then(|repo| {
+                                std::path::Path::new(repo).join(&dt.right_path)
+                                    .canonicalize()
+                                    .ok()
+                                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                            }).unwrap_or_else(|| dt.right_path.clone());
+                            if abs_right != path {
                                 continue;
                             }
                             dt.right_text = new_text.to_string();
-                            // Re-read HEAD version — cheap (`git show`)
-                            // and keeps the left side correct after a
-                            // commit lands while the diff is open.
-                            if let Some(left) = dt
-                                .left_path
-                                .strip_prefix("HEAD:")
-                                .and_then(|rel| {
-                                    crate::git::find_git_root(std::path::Path::new(path))
-                                        .map(|root| (root, rel.to_string()))
-                                })
-                            {
-                                let (root, rel) = left;
-                                dt.left_text =
-                                    crate::git::head_content(&root, &rel);
+                            dt.reload_left_text();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// After a hunk is staged via the diff view, refresh the diff tab's
+    /// content: re-read the staged content (new left side) and working
+    /// tree (right side), then reset the `pending_hunk_stage` flag.
+    pub fn refresh_diff_panes_after_hunk_stage(&mut self) {
+        use crate::state::layout::{PaneContent, TabKind};
+        for project in &mut self.projects {
+            for workspace in &mut project.workspaces {
+                for tab in &mut workspace.tabs {
+                    for (_, pane) in tab.layout.panes.iter_mut() {
+                        let PaneContent::Files(files) = &mut pane.content else {
+                            continue;
+                        };
+                        for tk in files.tabs.iter_mut() {
+                            let TabKind::Diff(dt) = tk else {
+                                continue;
+                            };
+                            if !dt.pending_hunk_stage {
+                                continue;
                             }
+                            dt.pending_hunk_stage = false;
+                            let read_path = dt.repo_path.as_ref()
+                                .map(|repo| std::path::Path::new(repo).join(&dt.right_path))
+                                .unwrap_or_else(|| std::path::PathBuf::from(&dt.right_path));
+                            dt.right_text =
+                                std::fs::read_to_string(&read_path)
+                                    .unwrap_or_default();
+                            dt.reload_left_text();
                         }
                     }
                 }
@@ -1147,7 +1188,7 @@ impl App {
     /// does — paths can be opened in multiple Layouts at once and we
     /// want to clean them all.
     pub fn close_file_tabs_for_path(&mut self, path: &Path) {
-        use crate::state::layout::PaneContent;
+        use crate::state::layout::{PaneContent, TabKind};
         let path_str = path.to_string_lossy().to_string();
         for project in &mut self.projects {
             for workspace in &mut project.workspaces {
@@ -1156,19 +1197,12 @@ impl App {
                         let PaneContent::Files(files) = &mut pane.content else {
                             continue;
                         };
-                        // Iterate from the back so we can swap_remove
-                        // without shifting later indices.
                         let mut i = files.tabs.len();
                         while i > 0 {
                             i -= 1;
-                            if files.tabs[i].path == path_str {
-                                files.tabs.remove(i);
-                                if files.active >= files.tabs.len()
-                                    && !files.tabs.is_empty()
-                                {
-                                    files.active = files.tabs.len() - 1;
-                                } else if files.tabs.is_empty() {
-                                    files.active = 0;
+                            if let TabKind::File(ft) = &files.tabs[i] {
+                                if ft.path == path_str {
+                                    files.close(i);
                                 }
                             }
                         }
@@ -1183,7 +1217,7 @@ impl App {
     /// dirty state are preserved; only the path + display name
     /// change.
     pub fn rename_file_tabs_for_path(&mut self, src: &Path, dst: &Path) {
-        use crate::state::layout::PaneContent;
+        use crate::state::layout::{PaneContent, TabKind};
         let src_str = src.to_string_lossy().to_string();
         let dst_str = dst.to_string_lossy().to_string();
         let dst_name = dst
@@ -1198,10 +1232,12 @@ impl App {
                         let PaneContent::Files(files) = &mut pane.content else {
                             continue;
                         };
-                        for ft in files.tabs.iter_mut() {
-                            if ft.path == src_str {
-                                ft.path = dst_str.clone();
-                                ft.name = dst_name.clone();
+                        for tk in files.tabs.iter_mut() {
+                            if let TabKind::File(ft) = tk {
+                                if ft.path == src_str {
+                                    ft.path = dst_str.clone();
+                                    ft.name = dst_name.clone();
+                                }
                             }
                         }
                     }
@@ -1442,13 +1478,33 @@ impl App {
         path: String,
         name: String,
         content: String,
+        preview: bool,
+        read_only: bool,
     ) {
         if let Some(layout) = self.active_layout() {
-            layout.open_file_in_files_pane(path.clone(), name, content.clone());
+            layout.open_file_in_files_pane(path.clone(), name, content.clone(), preview, read_only);
         }
-        let cfg_snapshot = self.language_configs.clone();
-        self.lsp
-            .did_open(ctx, std::path::Path::new(&path), &content, &cfg_snapshot);
+        if !read_only {
+            let cfg_snapshot = self.language_configs.clone();
+            self.lsp
+                .did_open(ctx, std::path::Path::new(&path), &content, &cfg_snapshot);
+        }
+    }
+
+    /// Open any file on disk as a read-only tab. Does not notify LSP.
+    pub fn open_external_file(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let path_str = path.to_string_lossy().to_string();
+        // Files inside the workspace open as normal editable tabs;
+        // only files outside the workspace are read-only.
+        let inside_workspace = self.active_workspace_path()
+            .is_some_and(|ws| path.starts_with(ws));
+        self.open_file_into_active_layout(ctx, path_str, name, content, false, !inside_workspace);
     }
 
     /// Per-frame sync, scoped to the ACTIVE layout only. Was iterating every
@@ -1475,7 +1531,8 @@ impl App {
         let configs_snapshot = self.language_configs.clone();
         for (_, pane) in tab.layout.panes.iter_mut() {
             if let crate::state::layout::PaneContent::Files(files) = &mut pane.content {
-                for ft in files.tabs.iter_mut() {
+                for tk in files.tabs.iter_mut() {
+                    let Some(ft) = tk.as_file_mut() else { continue };
                     let path = std::path::Path::new(&ft.path);
                     if !self.lsp.is_tracked(path) {
                         self.lsp.did_open(ctx, path, &ft.content, &configs_snapshot);

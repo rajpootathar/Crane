@@ -20,6 +20,9 @@ pub fn save_tab(
     notify_saved: &dyn Fn(&str, &str),
     force: bool,
 ) {
+    if tab.read_only {
+        return;
+    }
     if tab.external_change && !force {
         return;
     }
@@ -30,12 +33,11 @@ pub fn save_tab(
         tab.content = formatted;
     }
     if let Err(e) = std::fs::write(&tab.path, &tab.content) {
-        eprintln!("save failed: {e}");
+        tab.save_error = Some(format!("{e}"));
         return;
     }
+    tab.save_error = None;
     tab.original_content = tab.content.clone();
-    // Invalidate the cached gutter diff so the next frame re-runs
-    // `git diff HEAD -- <file>` against the freshly-saved content.
     tab.line_changes_key = 0;
     tab.disk_mtime = std::fs::metadata(&tab.path)
         .and_then(|m| m.modified())
@@ -72,6 +74,14 @@ pub fn poll_external_change(tab: &mut crate::state::layout::FileTab) {
     };
     if disk_content == tab.original_content {
         // Content matches our baseline: silently catch up the mtime.
+        tab.disk_mtime = Some(disk_mtime);
+        return;
+    }
+    // No unsaved edits — auto-reload silently instead of showing the banner.
+    if tab.content == tab.original_content {
+        tab.content = disk_content.clone();
+        tab.original_content = disk_content;
+        tab.line_changes_key = 0;
         tab.disk_mtime = Some(disk_mtime);
         return;
     }

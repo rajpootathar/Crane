@@ -1,10 +1,5 @@
-//! Cmd+F find bar and per-match highlight overlay for the Files pane.
-//!
-//! Extracted from `file_view.rs` to keep the main editor loop readable.
-//! `render_find_bar` renders the bar + consumes keys (Enter / Shift+Enter
-//! / Esc) and returns which nav action fired this frame. The caller
-//! (file_view::render) is responsible for clearing `tab.find_query` on
-//! close and doing the actual cursor jump on `next` / `prev`.
+//! Cmd+F find bar (with optional Cmd+H replace) and per-match highlight
+//! overlay for the Files pane.
 
 use crate::theme;
 use egui::{Color32, RichText};
@@ -14,6 +9,8 @@ pub struct FindBarOutcome {
     pub close: bool,
     pub next: bool,
     pub prev: bool,
+    pub replace: bool,
+    pub replace_all: bool,
 }
 
 pub fn render_find_bar(
@@ -23,14 +20,15 @@ pub fn render_find_bar(
     let mut close = false;
     let mut next = false;
     let mut prev = false;
+    let mut replace = false;
+    let mut replace_all = false;
     let Some(query) = tab.find_query.as_mut() else {
-        // Bar just closed — reset the one-shot focus flag so the next
-        // Cmd+F will refocus cleanly.
         let focus_flag = egui::Id::new(("find_focused", &tab.path));
         ui.memory_mut(|m| {
             m.data.remove::<bool>(focus_flag);
         });
-        return FindBarOutcome { close, next, prev };
+        tab.show_replace = false;
+        return FindBarOutcome { close: false, next: false, prev: false, replace: false, replace_all: false };
     };
     ui.horizontal(|ui| {
         ui.add_space(4.0);
@@ -44,13 +42,11 @@ pub fn render_find_bar(
             egui::TextEdit::singleline(query)
                 .id(input_id)
                 .desired_width(ui.available_width() - 180.0)
-                .hint_text("type to search…"),
+                .hint_text("type to search\u{2026}"),
         );
         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             next = true;
         }
-        // Focus ONCE when the bar opens — per-frame request_focus was
-        // stealing clicks from the nav/close buttons.
         let focus_flag = egui::Id::new(("find_focused", &tab.path));
         let already_focused = ui
             .memory(|m| m.data.get_temp::<bool>(focus_flag))
@@ -65,7 +61,7 @@ pub fn render_find_bar(
             tab.content.matches(query.as_str()).count()
         };
         ui.label(
-            RichText::new(format!("{hits} hits"))
+            RichText::new(format!("{hits}"))
                 .size(10.5)
                 .color(theme::current().text_muted.to_color32()),
         );
@@ -77,34 +73,52 @@ pub fn render_find_bar(
             )
             .min_size(egui::vec2(22.0, 22.0))
         };
-        if ui
-            .add(btn(icons::ARROW_UP))
-            .on_hover_text("Previous (Shift+Enter)")
-            .clicked()
-        {
+        if ui.add(btn(icons::ARROW_UP)).on_hover_text("Previous (Shift+Enter)").clicked() {
             prev = true;
         }
-        if ui
-            .add(btn(icons::ARROW_DOWN))
-            .on_hover_text("Next (Enter)")
-            .clicked()
-        {
+        if ui.add(btn(icons::ARROW_DOWN)).on_hover_text("Next (Enter)").clicked() {
             next = true;
         }
-        ui.with_layout(
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                ui.add_space(6.0);
-                if ui
-                    .add(btn(icons::X_CIRCLE))
-                    .on_hover_text("Close (Esc)")
-                    .clicked()
-                {
-                    close = true;
-                }
-            },
-        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(6.0);
+            if ui.add(btn(icons::X_CIRCLE)).on_hover_text("Close (Esc)").clicked() {
+                close = true;
+            }
+        });
     });
+
+    // Replace row — shown when Cmd+H toggles it.
+    if tab.show_replace {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("{}  Replace", icons::PENCIL_SIMPLE))
+                    .size(11.0)
+                    .color(theme::current().text_muted.to_color32()),
+            );
+            let replace_id = egui::Id::new(("replace_input", &tab.path));
+            ui.add(
+                egui::TextEdit::singleline(&mut tab.replace_query)
+                    .id(replace_id)
+                    .desired_width(ui.available_width() - 260.0)
+                    .hint_text("replace with\u{2026}"),
+            );
+            let t = theme::current();
+            let rbtn = |label: &str| {
+                egui::Button::new(
+                    RichText::new(label).size(11.0).color(t.text.to_color32()),
+                )
+                .min_size(egui::vec2(0.0, 22.0))
+            };
+            if ui.add(rbtn("Replace")).clicked() && !query.is_empty() {
+                replace = true;
+            }
+            if ui.add(rbtn("Replace All")).clicked() && !query.is_empty() {
+                replace_all = true;
+            }
+        });
+    }
+
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         close = true;
     }
@@ -112,12 +126,11 @@ pub fn render_find_bar(
         prev = true;
     }
     ui.add_space(2.0);
-    FindBarOutcome { close, next, prev }
+    FindBarOutcome { close, next, prev, replace, replace_all }
 }
 
 /// Paint a soft amber fill behind every occurrence of `query` in the
-/// visible galley. Called from the editor render path after the
-/// TextEdit output is available so the highlight sits under the text.
+/// visible galley.
 pub fn paint_find_matches(
     ui: &egui::Ui,
     galley: &std::sync::Arc<egui::Galley>,
@@ -135,9 +148,6 @@ pub fn paint_find_matches(
         let char_end = char_start + text[abs..end].chars().count();
         let r_start = galley.pos_from_cursor(egui::text::CCursor::new(char_start));
         let r_end = galley.pos_from_cursor(egui::text::CCursor::new(char_end));
-        // Only paint matches that fit on a single visual line (the common
-        // case for a user-typed query; skipping multi-line avoids ugly
-        // cross-row rectangles).
         if (r_start.max.y - r_end.max.y).abs() < 1.0 {
             let rect = egui::Rect::from_min_max(
                 egui::pos2(origin.x + r_start.min.x, origin.y + r_start.min.y),

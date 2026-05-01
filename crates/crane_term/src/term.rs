@@ -173,6 +173,10 @@ impl Term {
         self.grid.cursor.col = cursor_col;
         self.grid.cursor.input_needs_wrap = false;
 
+        // Clamp scroll position to the new scrollback size so
+        // rows don't go blank after a height change.
+        self.grid.display_offset = self.grid.display_offset.min(self.scrollback.len());
+
         self.mark_dirty();
     }
 

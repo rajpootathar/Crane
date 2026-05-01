@@ -758,8 +758,10 @@ pub fn render_terminal(
         galley.rect.width() / 32.0
     };
 
+    let pad_left = 2.0;
     let available = ui.available_size();
-    let cols = ((available.x / cell_w).floor() as usize).max(20);
+    let text_w = available.x - pad_left;
+    let cols = ((text_w / cell_w).floor() as usize).max(20);
     let rows = ((available.y / cell_h).floor() as usize).max(5);
     terminal.resize(cols, rows);
     // Drain any VT replies the parser queued (CSI 6n cursor
@@ -772,7 +774,7 @@ pub fn render_terminal(
         Vec2::new(cols as f32 * cell_w, rows as f32 * cell_h),
         Sense::click_and_drag().union(Sense::focusable_noninteractive()),
     );
-    let origin = response.rect.min;
+    let origin = response.rect.min + egui::vec2(pad_left, 0.0);
 
     let bg_theme = term_bg();
     painter.rect_filled(response.rect, 0.0, bg_theme);
@@ -795,8 +797,35 @@ pub fn render_terminal(
     // below. Whole-row crossings still get committed to the term
     // so the grid actually advances; the carry persists between
     // frames so the view stays where the user left it.
-    if response.hovered() {
-        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+    // When Crane is embedded inside another egui window, egui
+    // attributes `smooth_scroll_delta` to the outer container, so
+    // Crane sees zero.  Collect raw `MouseWheel` events so we
+    // still get the delta.  Accumulate into `terminal_scroll` only
+    // when the pointer is over the terminal rect.
+    let mut terminal_scroll: f32 = 0.0;
+    {
+        let (ptr, scroll_delta) = ui.input(|i| {
+            let delta: f32 = i.events.iter()
+                .filter_map(|e| match e {
+                    egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                    _ => None,
+                })
+                .sum();
+            (i.pointer.interact_pos(), delta)
+        });
+        if response.rect.contains(ptr.unwrap_or(response.rect.min)) {
+            terminal_scroll = scroll_delta;
+        }
+    }
+    let clip = ui.clip_rect();
+    let pointer_in_pane = ui.input(|i| {
+        i.pointer
+            .interact_pos()
+            .map(|p| clip.contains(p))
+            .unwrap_or(false)
+    }) || response.hovered();
+    if pointer_in_pane {
+        let wheel = ui.input(|i| i.smooth_scroll_delta.y) + terminal_scroll;
         if wheel.abs() > 0.01 {
             let (disp, hist) = {
                 let g = terminal.term.lock();
@@ -1252,9 +1281,10 @@ pub fn render_terminal(
     let total = history_size + rows;
     if history_size > 0 && total > rows {
         let track_w = 6.0;
+        let right_edge = ui.clip_rect().max.x;
         let track_rect = Rect::from_min_max(
-            Pos2::new(response.rect.max.x - track_w, response.rect.min.y),
-            Pos2::new(response.rect.max.x, response.rect.max.y),
+            Pos2::new(right_edge - track_w, response.rect.min.y),
+            Pos2::new(right_edge, response.rect.max.y),
         );
         let thumb_h = (track_rect.height() * rows as f32 / total as f32).max(20.0);
         // display_offset = 0 → thumb at bottom; display_offset = history
@@ -1264,22 +1294,26 @@ pub fn render_terminal(
         let y_from_top =
             scrollable * (1.0 - display_offset as f32 / history_size as f32);
         let thumb_rect = Rect::from_min_size(
-            Pos2::new(track_rect.min.x, track_rect.min.y + y_from_top),
+            Pos2::new(right_edge - track_w, track_rect.min.y + y_from_top),
             Vec2::new(track_w, thumb_h),
         );
         let t = theme::current();
-        let track_col = Color32::from_rgba_unmultiplied(255, 255, 255, 8);
-        painter.rect_filled(track_rect, 3.0, track_col);
         let scroll_id = ui.id().with("terminal_scrollbar");
         let thumb_resp = ui.interact(thumb_rect, scroll_id, egui::Sense::drag());
+        let hovered = thumb_resp.hovered() || thumb_resp.dragged();
+        let active_w = if hovered { 8.0 } else { 4.0 };
+        let active_rect = Rect::from_min_max(
+            Pos2::new(right_edge - active_w, thumb_rect.min.y),
+            Pos2::new(right_edge, thumb_rect.max.y),
+        );
         let thumb_col = if thumb_resp.dragged() {
             t.accent.to_color32()
-        } else if thumb_resp.hovered() {
+        } else if hovered {
             Color32::from_rgba_unmultiplied(255, 255, 255, 90)
         } else {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 55)
+            Color32::from_rgba_unmultiplied(255, 255, 255, 30)
         };
-        painter.rect_filled(thumb_rect, 3.0, thumb_col);
+        ui.painter().rect_filled(active_rect, (active_w / 2.0).round(), thumb_col);
         if thumb_resp.hovered() || thumb_resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
         }

@@ -1,4 +1,4 @@
-use crate::views::{browser_view, diff_view, file_view, markdown_view, welcome_view};
+use crate::views::{browser_view, file_view, markdown_view, welcome_view};
 use crate::state::layout::{Dir, DockEdge, Layout, Node, PaneContent, PaneId};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
@@ -60,6 +60,8 @@ pub enum PaneAction {
     /// Terminal → Files Pane: user clicked a local path that's inside the
     /// workspace. Open it in Crane's file editor instead of the system app.
     OpenFile(PathBuf),
+    /// External file dropped on file pane: open as read-only tab.
+    OpenFileExternal(PathBuf),
 }
 
 fn dock_zone(rect: Rect, pos: Pos2) -> DockEdge {
@@ -125,6 +127,7 @@ pub fn render_layout(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: crate::views::file_view::EditorPrefs,
+    external_drop_handled: bool,
 ) -> PaneAction {
     let mut action = PaneAction::None;
     // When a pane is maximized we bypass the layout tree entirely and
@@ -147,6 +150,7 @@ pub fn render_layout(
             goto_request,
             workspace_root,
             prefs,
+            external_drop_handled,
         );
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             action = PaneAction::ToggleMaximize(id);
@@ -170,6 +174,7 @@ pub fn render_layout(
             goto_request,
             workspace_root,
             prefs,
+            external_drop_handled,
         );
         layout.root = Some(root);
     }
@@ -191,6 +196,7 @@ fn render_node(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: crate::views::file_view::EditorPrefs,
+    external_drop_handled: bool,
 ) {
     match node {
         Node::Leaf(id) => {
@@ -208,6 +214,7 @@ fn render_node(
                 goto_request,
                 workspace_root,
                 prefs,
+                external_drop_handled,
             );
         }
         Node::Split {
@@ -236,6 +243,7 @@ fn render_node(
                 goto_request,
                 workspace_root,
                 prefs,
+                external_drop_handled,
             );
             render_node(
                 ui,
@@ -252,6 +260,7 @@ fn render_node(
                 goto_request,
                 workspace_root,
                 prefs,
+                external_drop_handled,
             );
             render_splitter(ui, splitter, *direction, path, rect, action);
         }
@@ -329,6 +338,7 @@ fn render_pane(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: crate::views::file_view::EditorPrefs,
+    external_drop_handled: bool,
 ) {
     let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
@@ -370,7 +380,7 @@ fn render_pane(
     let inner = rect.shrink(BORDER_W);
     let header_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), HEADER_H));
     let body_outer = Rect::from_min_max(Pos2::new(inner.min.x, inner.min.y + HEADER_H), inner.max);
-    let body_rect = body_outer.shrink2(Vec2::new(5.0, 3.0));
+    let body_rect = body_outer;
 
     render_header(ui, layout, id, header_rect, is_focus, action);
 
@@ -407,7 +417,20 @@ fn render_pane(
     // Markdown panes' ScrollAreas don't fight over the same auto-id. egui
     // paints a red outline on id-collision and also pays a hashing cost
     // to detect them, so this helps both speed and the "red flash" bug.
-    child.push_id(("pane_body", id), |child| match &mut pane.content {
+    child.push_id(("pane_body", id), |child| {
+        // External file drop works on ANY pane type (terminal, welcome,
+        // etc.), not just Files panes. Detect drops before the match so
+        // a Terminal pane can accept them too.
+        if !external_drop_handled {
+            let dropped: Vec<std::path::PathBuf> = child.ctx().input(|i| {
+                i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+            });
+            if let Some(path) = dropped.into_iter().next() {
+                *action = PaneAction::OpenFileExternal(path);
+            }
+        }
+
+        match &mut pane.content {
         PaneContent::Terminal(tp) => {
             let opened = crate::terminal::view::render_terminal_pane(
                 child, tp, font_size, is_focus, id, workspace_root,
@@ -417,7 +440,8 @@ fn render_pane(
             }
         }
         PaneContent::Files(files) => {
-            file_view::render(
+            let mut dropped_external_files = Vec::new();
+            if file_view::render(
                 child,
                 id,
                 files,
@@ -430,13 +454,17 @@ fn render_pane(
                 goto_request,
                 workspace_root,
                 prefs,
-            );
+                external_drop_handled,
+                &mut dropped_external_files,
+            ) {
+                *action = PaneAction::Close(id);
+            }
+            for path in dropped_external_files {
+                *action = PaneAction::OpenFileExternal(path);
+            }
         }
         PaneContent::Markdown(md) => {
             markdown_view::render(child, md, font_size, &mut pane.title);
-        }
-        PaneContent::Diff(diff) => {
-            diff_view::render(child, diff, font_size, &mut pane.title);
         }
         PaneContent::Browser(browser) => {
             browser_view::render(child, id, browser, &mut pane.title, is_drop_target, is_focus);
@@ -446,6 +474,7 @@ fn render_pane(
                 welcome_action_holder = Some((id, act));
             }
         }
+    };
     });
     if let Some((pid, wact)) = welcome_action_holder {
         *action = match wact {

@@ -278,6 +278,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     let mut stage_paths: Vec<String> = Vec::new();
     let mut unstage_paths: Vec<String> = Vec::new();
     let mut open_diff: Option<String> = None;
+    let mut open_file: Option<String> = None;
     let mut toggle_dir: Option<String> = None;
     let collapsed = app.collapsed_change_dirs.clone();
 
@@ -315,6 +316,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                     &mut unstage_paths,
                     &mut stage_paths,
                     &mut open_diff,
+                    &mut open_file,
                     &mut toggle_dir,
                 );
             } else {
@@ -501,6 +503,17 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     if let Some(path) = open_diff {
         open_file_diff(app, &repo_path, &path);
     }
+    if let Some(path) = open_file {
+        let full = repo_path.join(&path);
+        let content = std::fs::read_to_string(&full).unwrap_or_default();
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&path)
+            .to_string();
+        let ctx = ui.ctx().clone();
+        app.open_file_into_active_layout(&ctx, full.to_string_lossy().to_string(), name, content, false, false);
+    }
     if action_commit || keyboard_commit {
         let msg = app.commit_message.clone();
         app.dispatch_git_op(
@@ -527,7 +540,13 @@ fn force_status_refresh(app: &mut App) {
 fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
     let full = repo.join(rel_path);
     let right_text = std::fs::read_to_string(&full).unwrap_or_default();
-    let left_text = git::head_content(repo, rel_path);
+    // Use staged content as left side when the file has staged changes,
+    // otherwise use HEAD content. This makes the diff show only
+    // *unstaged* changes, and per-hunk staging removes hunks from view.
+    let (left_text, left_label) = match git::staged_content(repo, rel_path) {
+        Some(text) => (text, format!("staged:{rel_path}")),
+        None => (git::head_content(repo, rel_path), format!("HEAD:{rel_path}")),
+    };
     let title = format!(
         "diff: {}",
         std::path::Path::new(rel_path)
@@ -536,12 +555,13 @@ fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
             .unwrap_or(rel_path)
     );
     if let Some(ws) = app.active_layout() {
-        ws.open_or_focus_diff(
-            format!("HEAD:{rel_path}"),
+        ws.open_diff_in_files_pane(
+            left_label,
             rel_path.to_string(),
             left_text,
             right_text,
             title,
+            Some(repo.to_string_lossy().to_string()),
         );
     }
 }
@@ -594,6 +614,7 @@ fn render_change_tree(
     unstage_paths: &mut Vec<String>,
     stage_paths: &mut Vec<String>,
     open_diff: &mut Option<String>,
+    open_file: &mut Option<String>,
     toggle_dir: &mut Option<String>,
 ) {
     let tree = build_tree(changes);
@@ -606,6 +627,7 @@ fn render_change_tree(
         unstage_paths,
         stage_paths,
         open_diff,
+        open_file,
         toggle_dir,
     );
 }
@@ -620,6 +642,7 @@ fn render_change_node(
     unstage_paths: &mut Vec<String>,
     stage_paths: &mut Vec<String>,
     open_diff: &mut Option<String>,
+    open_file: &mut Option<String>,
     toggle_dir: &mut Option<String>,
 ) {
     for (dir_name, child) in &node.dirs {
@@ -676,6 +699,7 @@ fn render_change_node(
                 unstage_paths,
                 stage_paths,
                 open_diff,
+                open_file,
                 toggle_dir,
             );
         }
@@ -753,6 +777,10 @@ fn render_change_node(
                 *open_diff = Some(change_path.clone());
                 ui.close();
             }
+            if ui.button(format!("{}  Open as File", icons::FILE)).clicked() {
+                *open_file = Some(change_path.clone());
+                ui.close();
+            }
             ui.separator();
             if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
                 ui.ctx().copy_text(change_path.clone());
@@ -816,13 +844,16 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
             .unwrap_or_default();
 
     let mut opened: Option<PathBuf> = None;
+    let mut opened_preview = false;
     let mut toggled: Option<PathBuf> = None;
     let mut new_entry: Option<(PathBuf, NewEntryKind)> = None;
     let mut delete_request: Option<PathBuf> = None;
     let mut drop_request: Option<(PathBuf, PathBuf)> = None;
     let mut commit_pending = false;
     let mut cancel_pending = false;
+    let mut open_diff: Option<String> = None;
     let selected_snapshot = app.selected_file.clone();
+    let mut selected_file: Option<PathBuf> = None;
     egui::ScrollArea::vertical()
         .id_salt("right_files")
         .auto_shrink([false, false])
@@ -833,6 +864,9 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 0,
                 &app.expanded_dirs,
                 &mut opened,
+                &mut open_diff,
+                &mut selected_file,
+                app.single_click_open,
                 &mut toggled,
                 &mut new_entry,
                 &mut delete_request,
@@ -843,6 +877,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 &mut cancel_pending,
                 &path,
                 &git_status_map,
+                &mut opened_preview,
             );
             // Sink for right-clicks on the empty space below entries
             // — `interact` claims the rest of the ScrollArea's height
@@ -876,8 +911,8 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
         try_commit_pending(app);
     }
     if let Some(p) = opened.as_ref() {
-        // Clicking a row also marks it as the active selection so
-        // Cmd+Delete (handled in shortcuts.rs) targets it.
+        app.selected_file = Some(p.clone());
+    } else if let Some(p) = &selected_file {
         app.selected_file = Some(p.clone());
     }
     if let Some(p) = delete_request {
@@ -899,7 +934,32 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
             .to_string();
         let content = std::fs::read_to_string(&p).unwrap_or_default();
         let ctx = ui.ctx().clone();
-        app.open_file_into_active_layout(&ctx, path_str, name, content);
+        app.open_file_into_active_layout(&ctx, path_str, name, content, opened_preview, false);
+    }
+    if let Some(rel) = open_diff {
+        open_file_diff(app, &path, &rel);
+    }
+    // External drag-drop: accept files/dirs dropped from Finder / OS and copy
+    // them into the workspace root.
+    let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
+        i.raw.dropped_files
+            .iter()
+            .filter_map(|f| f.path.clone())
+            .collect()
+    });
+    for src in &dropped {
+        if let Some(name) = src.file_name() {
+            let dst = path.join(name);
+            if src != &dst {
+                if src.is_dir() {
+                    let _ = copy_dir_recursive(src, &dst);
+                } else {
+                    let _ = std::fs::copy(src, &dst);
+                }
+                app.expanded_dirs.insert(path.clone());
+                app.external_drop_handled = true;
+            }
+        }
     }
     if let Some((parent, kind)) = new_entry {
         // Make sure the parent is expanded so the inline editor row
@@ -922,6 +982,9 @@ fn render_fs_dir(
     depth: usize,
     expanded: &std::collections::HashSet<PathBuf>,
     open_file: &mut Option<PathBuf>,
+    open_diff: &mut Option<String>,
+    select_file: &mut Option<PathBuf>,
+    single_click_open: bool,
     toggle_dir: &mut Option<PathBuf>,
     new_entry: &mut Option<(PathBuf, NewEntryKind)>,
     delete_request: &mut Option<PathBuf>,
@@ -932,6 +995,7 @@ fn render_fs_dir(
     cancel: &mut bool,
     workspace_root: &std::path::Path,
     git_status_map: &HashMap<String, (git::ChangeStatus, bool, bool)>,
+    opened_preview: &mut bool,
 ) {
     if depth > 64 {
         return;
@@ -1013,8 +1077,16 @@ fn render_fs_dir(
             if is_dir {
                 *toggle_dir = Some(entry_path.clone());
             } else {
-                *open_file = Some(entry_path.clone());
+                *select_file = Some(entry_path.clone());
+                if single_click_open {
+                    *open_file = Some(entry_path.clone());
+                    *opened_preview = true;
+                }
             }
+        }
+        if row.double_clicked && !is_dir {
+            *open_file = Some(entry_path.clone());
+            *opened_preview = false;
         }
         // Drag source: any row can be dragged. dnd_set_drag_payload
         // attaches the path to egui's global drag state; pointer
@@ -1053,6 +1125,26 @@ fn render_fs_dir(
             if !is_dir && ui.button(format!("{}  Open", icons::FILE)).clicked() {
                 *open_file = Some(path_owned.clone());
                 ui.close();
+            }
+            // Show "Open as Diff" for files with git changes
+            let rel_for_diff = path_owned
+                .strip_prefix(workspace_root)
+                .ok()
+                .and_then(|p| p.to_str())
+                .map(|s| s.to_string());
+            let has_changes = rel_for_diff
+                .as_deref()
+                .and_then(|r| git_status_map.get(r))
+                .is_some_and(|(_, _, u)| *u);
+            if !is_dir && has_changes {
+                if ui.button(format!("{}  Open Diff", icons::GIT_DIFF)).clicked() {
+                    let rel = path_owned
+                        .strip_prefix(workspace_root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    *open_diff = Some(rel);
+                    ui.close();
+                }
             }
             if ui.button(format!("{}  New File…", icons::FILE)).clicked() {
                 *new_entry = Some((create_parent.clone(), NewEntryKind::File));
@@ -1094,6 +1186,9 @@ fn render_fs_dir(
                 depth + 1,
                 expanded,
                 open_file,
+                open_diff,
+                select_file,
+                single_click_open,
                 toggle_dir,
                 new_entry,
                 delete_request,
@@ -1104,6 +1199,7 @@ fn render_fs_dir(
                 cancel,
                 workspace_root,
                 git_status_map,
+                opened_preview,
             );
         }
     }
@@ -1142,6 +1238,32 @@ fn move_path(app: &mut App, src: &std::path::Path, dst_dir: &std::path::Path) {
             to: dst,
         },
     );
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    copy_dir_recursive_inner(src, dst, 0)
+}
+
+fn copy_dir_recursive_inner(src: &std::path::Path, dst: &std::path::Path, depth: usize) -> std::io::Result<()> {
+    if depth > 32 {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "max depth exceeded"));
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            copy_dir_recursive_inner(&src_path, &dst_path, depth + 1)?;
+        } else if ft.is_file() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Push an op onto the LIFO undo stack, evicting the oldest when

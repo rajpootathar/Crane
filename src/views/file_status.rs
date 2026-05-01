@@ -68,6 +68,14 @@ pub fn render_status_strip(
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     ui.add_space(10.0);
+                    if tab.read_only {
+                        ui.label(
+                            RichText::new(format!("{}  Read Only", icons::LOCK))
+                                .size(11.0)
+                                .color(t.text_muted.to_color32()),
+                        );
+                        ui.add_space(12.0);
+                    }
                     ui.label(
                         RichText::new(lang)
                             .size(11.0)
@@ -86,6 +94,14 @@ pub fn render_status_strip(
                             .size(11.0)
                             .color(t.text_muted.to_color32()),
                     );
+                    if let Some((chars, lines)) = tab.selection_info {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new(format!("({chars} sel, {lines} ln)"))
+                                .size(10.5)
+                                .color(t.text_muted.to_color32()),
+                        );
+                    }
                 },
             );
         });

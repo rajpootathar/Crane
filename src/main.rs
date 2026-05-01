@@ -169,13 +169,15 @@ impl CraneApp {
                 .to_string();
             let content = std::fs::read_to_string(&loc.path).unwrap_or_default();
             self.app
-                .open_file_into_active_layout(ctx, path_str.clone(), name, content);
+                .open_file_into_active_layout(ctx, path_str.clone(), name, content, false, false);
         }
         if let Some(layout) = self.app.active_layout() {
             for (_, pane) in layout.panes.iter_mut() {
                 if let state::layout::PaneContent::Files(files) = &mut pane.content {
                     // Make sure the target file is a tab in this pane.
-                    let idx = files.tabs.iter().position(|t| t.path == path_str);
+                    let idx = files.tabs.iter().position(|t| {
+                        matches!(t, state::layout::TabKind::File(ft) if ft.path == path_str)
+                    });
                     let idx = match idx {
                         Some(i) => i,
                         None => {
@@ -187,12 +189,14 @@ impl CraneApp {
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(&path_str)
                                 .to_string();
-                            files.open(path_str.clone(), content, name);
+                            files.open(path_str.clone(), content, name, false, false);
                             files.tabs.len() - 1
                         }
                     };
                     files.active = idx;
-                    files.tabs[idx].pending_cursor = Some((loc.line, loc.character));
+                    if let Some(ft) = files.tabs[idx].as_file_mut() {
+                        ft.pending_cursor = Some((loc.line, loc.character));
+                    }
                     break;
                 }
             }
@@ -334,6 +338,16 @@ impl eframe::App for CraneApp {
                     self.app.update_check.available = None;
                     self.app.update_check.manual_check = true;
                     self.app.update_check.spawn_check(ctx.clone());
+                }
+                platform_menu::ID_OPEN_FILE => {
+                    if let Some(path) = rfd::FileDialog::new().pick_file() {
+                        self.app.open_external_file(&ctx, &path);
+                    }
+                }
+                platform_menu::ID_OPEN_FOLDER => {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.app.add_project_from_path(path, &ctx);
+                    }
                 }
                 _ => {}
             }
@@ -537,10 +551,12 @@ impl eframe::App for CraneApp {
             for p in layout_ref.panes.values() {
                 if let state::layout::PaneContent::Files(f) = &p.content {
                     for t in &f.tabs {
-                        diag_map.insert(
-                            t.path.clone(),
-                            self.app.lsp.diagnostics(std::path::Path::new(&t.path)),
-                        );
+                        if let state::layout::TabKind::File(ft) = t {
+                            diag_map.insert(
+                                ft.path.clone(),
+                                self.app.lsp.diagnostics(std::path::Path::new(&ft.path)),
+                            );
+                        }
                     }
                 }
             }
@@ -589,6 +605,8 @@ impl eframe::App for CraneApp {
             center_ui.disable();
         }
         if self.app.active_layout().is_some() {
+            let drop_handled = self.app.external_drop_handled;
+            self.app.external_drop_handled = false;
             if let Some(ws) = self.app.active_layout() {
                 let action = ui::pane_view::render_layout(
                     &mut center_ui,
@@ -602,6 +620,7 @@ impl eframe::App for CraneApp {
                     &goto_request,
                     workspace_root.as_deref(),
                     editor_prefs,
+                    drop_handled,
                 );
                 match action {
                     PaneAction::None => {}
@@ -680,8 +699,11 @@ impl eframe::App for CraneApp {
                             .to_string();
                         let content = std::fs::read_to_string(&path).unwrap_or_default();
                         self.app.open_file_into_active_layout(
-                            &ctx, path_str, name, content,
+                            &ctx, path_str, name, content, false, false,
                         );
+                    }
+                    PaneAction::OpenFileExternal(path) => {
+                        self.app.open_external_file(&ctx, &path);
                     }
                 }
             }
@@ -718,6 +740,9 @@ impl eframe::App for CraneApp {
             // user committed between opens.
             self.app.refresh_diff_panes_for_path(&path, &text);
         }
+        // Handle per-hunk staging: when a diff tab staged a hunk,
+        // refresh its content (re-read staged content + working tree).
+        self.app.refresh_diff_panes_after_hunk_stage();
         // Dispatch any goto-definition requests queued this frame
         // without blocking on a response. The LSP reader thread will
         // wake us via ctx.request_repaint() when the result arrives.

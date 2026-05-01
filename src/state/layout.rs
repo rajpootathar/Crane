@@ -78,6 +78,26 @@ pub struct FileTab {
     /// Content hash at the time `line_changes` was computed. We use this
     /// to avoid re-running `git diff` every frame when nothing changed.
     pub line_changes_key: u64,
+    /// When true, the go-to-line modal is shown. Toggled by Ctrl+G.
+    pub goto_line_active: bool,
+    /// Buffer for the go-to-line text input.
+    pub goto_line_input: String,
+    /// Replace bar state. None = hidden; Some(text) = shown.
+    pub replace_query: String,
+    /// When true, the replace row is visible below the find bar.
+    pub show_replace: bool,
+    /// Selection info set each frame by the editor: (selected_chars, selected_lines).
+    /// Displayed in the status strip.
+    pub selection_info: Option<(usize, usize)>,
+    /// Last save error, if any. Cleared on successful save. Displayed as a
+    /// toast/banner in the editor.
+    pub save_error: Option<String>,
+    /// Preview tabs are opened by single-click and auto-replaced by the
+    /// next single-click. They promote to permanent on first edit.
+    pub preview: bool,
+    /// When true, the file was opened from outside the workspace and
+    /// cannot be edited until the user explicitly unlocks it.
+    pub read_only: bool,
 }
 
 impl FileTab {
@@ -86,8 +106,110 @@ impl FileTab {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffMode {
+    Unified,
+    SideBySide,
+}
+
+pub struct DiffTabData {
+    pub title: String,
+    pub left_path: String,
+    pub right_path: String,
+    pub left_text: String,
+    pub right_text: String,
+    pub error: Option<String>,
+    pub image_texture: Option<egui::TextureHandle>,
+    pub diff_mode: DiffMode,
+    /// Absolute path to the git repo root. Used by the diff view to
+    /// call `git apply --cached` for per-hunk staging.
+    pub repo_path: Option<String>,
+    /// Set to true by the diff view when a hunk is staged. The main loop
+    /// reads this flag and triggers a diff content refresh.
+    pub pending_hunk_stage: bool,
+    /// Horizontal scroll offsets for side-by-side mode (left/right halves).
+    pub sbs_h_scroll_left: f32,
+    pub sbs_h_scroll_right: f32,
+}
+
+impl DiffTabData {
+    /// Reload the left-side content from git (staged or HEAD) using
+    /// `right_path` to resolve the repo root. Shared by both
+    /// save-triggered and hunk-stage diff refreshes.
+    pub fn reload_left_text(&mut self) {
+        let right = std::path::Path::new(&self.right_path);
+        if let Some((root, rel)) = self
+            .left_path
+            .strip_prefix("staged:")
+            .and_then(|rel| {
+                crate::git::find_git_root(right).map(|root| (root, rel.to_string()))
+            })
+        {
+            self.left_text = crate::git::staged_content(&root, &rel)
+                .unwrap_or_else(|| crate::git::head_content(&root, &rel));
+        } else if let Some((root, rel)) = self
+            .left_path
+            .strip_prefix("HEAD:")
+            .and_then(|rel| {
+                crate::git::find_git_root(right).map(|root| (root, rel.to_string()))
+            })
+        {
+            self.left_text = crate::git::head_content(&root, &rel);
+        }
+    }
+}
+
+pub enum TabKind {
+    File(FileTab),
+    Diff(DiffTabData),
+}
+
+impl TabKind {
+    pub fn name(&self) -> &str {
+        match self {
+            TabKind::File(ft) => &ft.name,
+            TabKind::Diff(dt) => &dt.title,
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        match self {
+            TabKind::File(ft) => ft.dirty(),
+            TabKind::Diff(_) => false,
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            TabKind::File(ft) => ft.read_only,
+            TabKind::Diff(_) => false,
+        }
+    }
+
+    pub fn as_file_mut(&mut self) -> Option<&mut FileTab> {
+        match self {
+            TabKind::File(ft) => Some(ft),
+            TabKind::Diff(_) => None,
+        }
+    }
+
+    pub fn as_file(&self) -> Option<&FileTab> {
+        match self {
+            TabKind::File(ft) => Some(ft),
+            TabKind::Diff(_) => None,
+        }
+    }
+
+    pub fn as_diff_mut(&mut self) -> Option<&mut DiffTabData> {
+        match self {
+            TabKind::File(_) => None,
+            TabKind::Diff(dt) => Some(dt),
+        }
+    }
+}
+
 pub struct FilesPane {
-    pub tabs: Vec<FileTab>,
+    pub tabs: Vec<TabKind>,
     pub active: usize,
     #[allow(dead_code)] // kept for session schema compat
     pub input_buf: String,
@@ -109,20 +231,25 @@ impl FilesPane {
         }
     }
 
-    pub fn open(&mut self, path: String, content: String, name: String) {
-        if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
+    pub fn open(&mut self, path: String, content: String, name: String, preview: bool, read_only: bool) {
+        if let Some(idx) = self.tabs.iter().position(|t| matches!(t, TabKind::File(ft) if ft.path == path)) {
             self.active = idx;
+            // Promote preview tab to permanent on re-open
+            if let TabKind::File(ft) = &mut self.tabs[idx] {
+                ft.preview = false;
+            }
             return;
         }
         let disk_mtime = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok();
-        self.tabs.push(FileTab {
+        self.tabs.push(TabKind::File(FileTab {
             path,
             original_content: content.clone(),
             last_lsp_content: content.clone(),
             last_lsp_sent_at: None,
             preview_mode: false,
+            preview,
             pending_cursor: None,
             image_texture: None,
             find_query: None,
@@ -132,9 +259,60 @@ impl FilesPane {
             last_cursor_idx: 0,
             line_changes: None,
             line_changes_key: 0,
+            goto_line_active: false,
+            goto_line_input: String::new(),
+            replace_query: String::new(),
+            show_replace: false,
+            selection_info: None,
+            save_error: None,
             content,
             name,
-        });
+            read_only,
+        }));
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Open a diff tab. If one already exists for the same
+    /// `(left_path, right_path)` pair, refresh its contents and focus
+    /// it instead of adding a duplicate.
+    pub fn open_diff(
+        &mut self,
+        title: String,
+        left_path: String,
+        right_path: String,
+        left_text: String,
+        right_text: String,
+        repo_path: Option<String>,
+    ) {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(t, TabKind::Diff(dt) if dt.left_path == left_path && dt.right_path == right_path))
+        {
+            let t = self.tabs[idx].as_diff_mut().unwrap();
+            t.title = title;
+            t.left_text = left_text;
+            t.right_text = right_text;
+            t.error = None;
+            t.image_texture = None;
+            t.repo_path = repo_path;
+            self.active = idx;
+            return;
+        }
+        self.tabs.push(TabKind::Diff(DiffTabData {
+            title,
+            left_path,
+            right_path,
+            left_text,
+            right_text,
+            error: None,
+            image_texture: None,
+            diff_mode: DiffMode::Unified,
+            repo_path,
+            pending_hunk_stage: false,
+            sbs_h_scroll_left: 0.0,
+            sbs_h_scroll_right: 0.0,
+        }));
         self.active = self.tabs.len() - 1;
     }
 
@@ -145,7 +323,19 @@ impl FilesPane {
                 self.active = self.tabs.len() - 1;
             } else if self.tabs.is_empty() {
                 self.active = 0;
+            } else if self.active > idx {
+                self.active -= 1;
             }
+        }
+    }
+
+    /// Remove any preview tab. Called before opening a new preview.
+    pub fn close_preview_tab(&mut self) {
+        self.tabs.retain(|t| {
+            !matches!(t, TabKind::File(ft) if ft.preview)
+        });
+        if self.active >= self.tabs.len() && !self.tabs.is_empty() {
+            self.active = self.tabs.len() - 1;
         }
     }
 }
@@ -155,88 +345,6 @@ pub struct MarkdownPane {
     pub content: String,
     pub input_buf: String,
     pub error: Option<String>,
-}
-
-pub struct DiffTab {
-    pub title: String,
-    pub left_path: String,
-    pub right_path: String,
-    pub left_text: String,
-    pub right_text: String,
-    pub error: Option<String>,
-}
-
-pub struct DiffPane {
-    pub tabs: Vec<DiffTab>,
-    pub active: usize,
-}
-
-impl DiffPane {
-    pub fn empty() -> Self {
-        Self {
-            tabs: Vec::new(),
-            active: 0,
-        }
-    }
-
-    /// Open a diff tab. If one already exists for the same
-    /// `(left_path, right_path)` pair, refresh its contents and focus
-    /// it instead of adding a duplicate — so reopening a file's diff
-    /// doesn't spawn an endless stack of tabs.
-    pub fn open(
-        &mut self,
-        title: String,
-        left_path: String,
-        right_path: String,
-        left_text: String,
-        right_text: String,
-    ) {
-        if let Some(idx) = self
-            .tabs
-            .iter()
-            .position(|t| t.left_path == left_path && t.right_path == right_path)
-        {
-            let t = &mut self.tabs[idx];
-            t.title = title;
-            t.left_text = left_text;
-            t.right_text = right_text;
-            t.error = None;
-            self.active = idx;
-            return;
-        }
-        self.tabs.push(DiffTab {
-            title,
-            left_path,
-            right_path,
-            left_text,
-            right_text,
-            error: None,
-        });
-        self.active = self.tabs.len() - 1;
-    }
-
-    pub fn close(&mut self, idx: usize) {
-        if idx >= self.tabs.len() {
-            return;
-        }
-        self.tabs.remove(idx);
-        if self.tabs.is_empty() {
-            self.active = 0;
-        } else if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        } else if self.active > idx {
-            self.active -= 1;
-        }
-    }
-
-    pub fn active_tab(&self) -> Option<&DiffTab> {
-        self.tabs.get(self.active)
-    }
-
-    #[allow(dead_code)]
-    pub fn active_tab_mut(&mut self) -> Option<&mut DiffTab> {
-        self.tabs.get_mut(self.active)
-    }
 }
 
 pub struct BrowserTab {
@@ -403,7 +511,6 @@ pub enum PaneContent {
     Terminal(TerminalPane),
     Files(FilesPane),
     Markdown(MarkdownPane),
-    Diff(DiffPane),
     Browser(BrowserPane),
     Welcome(WelcomePane),
 }
@@ -414,7 +521,6 @@ impl PaneContent {
             PaneContent::Terminal(_) => "Terminal",
             PaneContent::Files(_) => "Files",
             PaneContent::Markdown(_) => "Markdown",
-            PaneContent::Diff(_) => "Diff",
             PaneContent::Browser(_) => "Browser",
             PaneContent::Welcome(_) => "New Tab",
         }
@@ -533,54 +639,43 @@ impl Layout {
         self.next_id = id.max(self.next_id);
     }
 
-    pub fn open_or_focus_diff(
+    pub fn open_diff_in_files_pane(
         &mut self,
         left_path: String,
         right_path: String,
         left_text: String,
         right_text: String,
         title: String,
+        repo_path: Option<String>,
     ) {
         let existing = self
             .panes
             .iter()
-            .find(|(_, p)| matches!(p.content, PaneContent::Diff(_)))
+            .find(|(_, p)| matches!(p.content, PaneContent::Files(_)))
             .map(|(id, _)| *id);
         match existing {
             Some(pid) => {
-                if let Some(pane) = self.panes.get_mut(&pid) {
-                    if let PaneContent::Diff(diff) = &mut pane.content {
-                        diff.open(
-                            title.clone(),
-                            left_path,
-                            right_path,
-                            left_text,
-                            right_text,
-                        );
-                    }
-                    pane.title = title;
+                if let Some(pane) = self.panes.get_mut(&pid)
+                    && let PaneContent::Files(files) = &mut pane.content
+                {
+                    files.open_diff(title.clone(), left_path, right_path, left_text, right_text, repo_path.clone());
                 }
                 self.focus = Some(pid);
             }
             None => {
-                let mut diff = DiffPane::empty();
-                diff.open(
-                    title.clone(),
-                    left_path,
-                    right_path,
-                    left_text,
-                    right_text,
-                );
-                self.add_pane(PaneContent::Diff(diff), Some(Dir::Horizontal));
+                let mut files = FilesPane::empty();
+                files.open_diff(title.clone(), left_path, right_path, left_text, right_text, repo_path.clone());
+                self.add_pane(PaneContent::Files(files), Some(Dir::Horizontal));
                 if let Some(focus) = self.focus
-                    && let Some(pane) = self.panes.get_mut(&focus) {
-                        pane.title = title;
-                    }
+                    && let Some(pane) = self.panes.get_mut(&focus)
+                {
+                    pane.title = title;
+                }
             }
         }
     }
 
-    pub fn open_file_in_files_pane(&mut self, path: String, name: String, content: String) {
+    pub fn open_file_in_files_pane(&mut self, path: String, name: String, content: String, preview: bool, read_only: bool) {
         let existing = self
             .panes
             .iter()
@@ -590,13 +685,17 @@ impl Layout {
             Some(pid) => {
                 if let Some(pane) = self.panes.get_mut(&pid)
                     && let PaneContent::Files(files) = &mut pane.content {
-                        files.open(path, content, name);
+                        // Close any existing preview tab before opening a new preview
+                        if preview {
+                            files.close_preview_tab();
+                        }
+                        files.open(path, content, name, preview, read_only);
                     }
                 self.focus = Some(pid);
             }
             None => {
                 let mut files = FilesPane::empty();
-                files.open(path, content, name);
+                files.open(path, content, name, preview, read_only);
                 self.add_pane(PaneContent::Files(files), Some(Dir::Horizontal));
             }
         }
