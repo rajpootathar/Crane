@@ -93,7 +93,8 @@ pub fn render_diff_body(
             let parsed = crate::git::parse_hunks(&raw);
             hunk_starts
                 .iter()
-                .map(|&idx| parsed.get(idx).map(|(_, patch)| patch.clone()))
+                .enumerate()
+                .map(|(hi, _)| parsed.get(hi).map(|(_, patch)| patch.clone()))
                 .collect()
         } else {
             vec![None; hunk_starts.len()]
@@ -425,7 +426,12 @@ fn render_image_block(
     active_idx: usize,
 ) {
     if tab.image_texture.is_none()
-        && let Ok(bytes) = std::fs::read(&tab.right_path)
+        && let Ok(bytes) = {
+            let read_path = tab.repo_path.as_ref()
+                .map(|repo| std::path::Path::new(repo).join(&tab.right_path))
+                .unwrap_or_else(|| std::path::PathBuf::from(&tab.right_path));
+            std::fs::read(&read_path)
+        }
         && let Ok(img) = image::load_from_memory(&bytes)
     {
         let rgba = img.to_rgba8();

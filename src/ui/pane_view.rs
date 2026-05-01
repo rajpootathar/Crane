@@ -60,6 +60,8 @@ pub enum PaneAction {
     /// Terminal → Files Pane: user clicked a local path that's inside the
     /// workspace. Open it in Crane's file editor instead of the system app.
     OpenFile(PathBuf),
+    /// External file dropped on file pane: open as read-only tab.
+    OpenFileExternal(PathBuf),
 }
 
 fn dock_zone(rect: Rect, pos: Pos2) -> DockEdge {
@@ -125,6 +127,7 @@ pub fn render_layout(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: crate::views::file_view::EditorPrefs,
+    external_drop_handled: bool,
 ) -> PaneAction {
     let mut action = PaneAction::None;
     // When a pane is maximized we bypass the layout tree entirely and
@@ -147,6 +150,7 @@ pub fn render_layout(
             goto_request,
             workspace_root,
             prefs,
+            external_drop_handled,
         );
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             action = PaneAction::ToggleMaximize(id);
@@ -170,6 +174,7 @@ pub fn render_layout(
             goto_request,
             workspace_root,
             prefs,
+            external_drop_handled,
         );
         layout.root = Some(root);
     }
@@ -191,6 +196,7 @@ fn render_node(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: crate::views::file_view::EditorPrefs,
+    external_drop_handled: bool,
 ) {
     match node {
         Node::Leaf(id) => {
@@ -208,6 +214,7 @@ fn render_node(
                 goto_request,
                 workspace_root,
                 prefs,
+                external_drop_handled,
             );
         }
         Node::Split {
@@ -236,6 +243,7 @@ fn render_node(
                 goto_request,
                 workspace_root,
                 prefs,
+                external_drop_handled,
             );
             render_node(
                 ui,
@@ -252,6 +260,7 @@ fn render_node(
                 goto_request,
                 workspace_root,
                 prefs,
+                external_drop_handled,
             );
             render_splitter(ui, splitter, *direction, path, rect, action);
         }
@@ -329,6 +338,7 @@ fn render_pane(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: crate::views::file_view::EditorPrefs,
+    external_drop_handled: bool,
 ) {
     let is_focus = layout.focus == Some(id);
     let border_color = if is_focus {
@@ -417,6 +427,7 @@ fn render_pane(
             }
         }
         PaneContent::Files(files) => {
+            let mut dropped_external_files = Vec::new();
             if file_view::render(
                 child,
                 id,
@@ -430,8 +441,13 @@ fn render_pane(
                 goto_request,
                 workspace_root,
                 prefs,
+                external_drop_handled,
+                &mut dropped_external_files,
             ) {
                 *action = PaneAction::Close(id);
+            }
+            for path in dropped_external_files {
+                *action = PaneAction::OpenFileExternal(path);
             }
         }
         PaneContent::Markdown(md) => {

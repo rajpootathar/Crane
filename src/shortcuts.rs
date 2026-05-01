@@ -204,6 +204,23 @@ pub fn handle(
     if undo_pressed && !any_focus {
         app.undo_last_file_op();
     }
+
+    // Cmd+O: open external file via native file picker
+    let open_file = ctx.input_mut(|i| {
+        let pressed = (i.modifiers.command || i.modifiers.mac_cmd)
+            && i.key_pressed(egui::Key::O)
+            && !i.modifiers.shift;
+        if pressed {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::O);
+            i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::O);
+        }
+        pressed
+    });
+    if open_file {
+        if let Some(path) = rfd::FileDialog::new().pick_file() {
+            app.open_external_file(ctx, &path);
+        }
+    }
 }
 
 fn terminal_is_running(app: &App, id: PaneId) -> bool {

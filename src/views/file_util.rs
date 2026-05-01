@@ -140,7 +140,6 @@ pub fn comment_prefix(path: &str) -> &'static str {
         | "conf" | "cfg" | "ini" | "env" | "dockerfile" => "#",
         "sql" => "--",
         "hs" | "lhs" => "-- ",
-        "ml" | "mli" => "(* ",
         "ex" | "exs" => "#",
         "clj" | "cljs" => ";; ",
         _ => "//",
@@ -203,8 +202,8 @@ pub fn toggle_line_comments(
             }
         }
     } else {
-        for &(_, ls) in lines.iter().rev() {
-            content.insert_str(ls, prefix);
+        for &(cs, _) in lines.iter().rev() {
+            content.insert_str(cs, prefix);
         }
     }
 }

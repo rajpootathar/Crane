@@ -804,14 +804,17 @@ pub fn render_terminal(
     // when the pointer is over the terminal rect.
     let mut terminal_scroll: f32 = 0.0;
     {
-        let events = ui.input(|i| i.events.clone());
-        let ptr = ui.input(|i| i.pointer.interact_pos());
-        for e in &events {
-            if let egui::Event::MouseWheel { delta, .. } = e {
-                if response.rect.contains(ptr.unwrap_or(response.rect.min)) {
-                    terminal_scroll += delta.y;
-                }
-            }
+        let (ptr, scroll_delta) = ui.input(|i| {
+            let delta: f32 = i.events.iter()
+                .filter_map(|e| match e {
+                    egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                    _ => None,
+                })
+                .sum();
+            (i.pointer.interact_pos(), delta)
+        });
+        if response.rect.contains(ptr.unwrap_or(response.rect.min)) {
+            terminal_scroll = scroll_delta;
         }
     }
     let clip = ui.clip_rect();

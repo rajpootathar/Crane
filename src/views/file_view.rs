@@ -141,6 +141,8 @@ pub fn render(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: EditorPrefs,
+    external_drop_handled: bool,
+    dropped_external_files: &mut Vec<std::path::PathBuf>,
 ) -> bool {
     let mut should_close = false;
     ui.push_id(("files_pane", pane_id), |ui| {
@@ -156,6 +158,8 @@ pub fn render(
             goto_request,
             workspace_root,
             prefs,
+            external_drop_handled,
+            dropped_external_files,
         );
     });
     should_close
@@ -226,7 +230,21 @@ fn render_scoped(
     goto_request: &dyn Fn(&str, u32, u32),
     workspace_root: Option<&std::path::Path>,
     prefs: EditorPrefs,
+    external_drop_handled: bool,
+    dropped_external_files: &mut Vec<std::path::PathBuf>,
 ) -> bool {
+    // External drag-drop on file pane: open as read-only tabs.
+    // Only handle if the explorer tree didn't already handle the drop.
+    if !external_drop_handled {
+        let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
+            i.raw.dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        dropped_external_files.extend(dropped);
+    }
+
     if pane.tabs.is_empty() {
         let t = theme::current();
         ui.add_space(8.0);
@@ -263,14 +281,17 @@ fn render_scoped(
                     let is_active = idx == pane.active;
                     let is_diff = matches!(tab, crate::state::layout::TabKind::Diff(_));
                     let is_preview = tab.as_file().is_some_and(|f| f.preview);
+                    let is_read_only = tab.is_read_only();
                     let label = if tab.is_dirty() {
                         format!("{}  {}", icons::CIRCLE, tab.name())
                     } else if is_diff {
                         format!("{}  {}", icons::GIT_DIFF, tab.name())
+                    } else if is_read_only {
+                        format!("{}  {}", icons::LOCK, tab.name())
                     } else {
                         tab.name().to_string()
                     };
-                    let (clicked, close_clicked) = draw_file_tab(ui, &label, is_active, is_diff, is_preview, idx);
+                    let (clicked, close_clicked) = draw_file_tab(ui, &label, is_active, is_diff, is_preview, is_read_only, idx);
                     if clicked {
                         activate_idx = Some(idx);
                     }
@@ -308,14 +329,15 @@ fn render_scoped(
     // Dispatch based on active tab kind: file editor vs diff view.
     let active_is_file = matches!(&pane.tabs[active_idx], crate::state::layout::TabKind::File(_));
     let active_is_diff = matches!(&pane.tabs[active_idx], crate::state::layout::TabKind::Diff(_));
+    let active_read_only = pane.tabs.get(active_idx).map(|t| t.is_read_only()).unwrap_or(false);
 
-    // Save shortcut
-    let save_pressed = active_is_file && ui.input(|i| {
+    // Save shortcut (blocked for read-only files)
+    let save_pressed = active_is_file && !active_read_only && ui.input(|i| {
         (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::S)
     });
     // Cmd+F opens the find bar (or replaces the query with the current
     // selection). Esc closes it — Cmd+F never closes.
-    let find_toggle = active_is_file && ui.input(|i| {
+    let find_toggle = active_is_file && !active_read_only && ui.input(|i| {
         (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::F)
     });
     if find_toggle {
@@ -340,7 +362,10 @@ fn render_scoped(
     // Cmd+H toggles the replace row inside the find bar.
     let replace_toggle = active_is_file && ui.input_mut(|i| {
         let pressed = (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::H);
-        if pressed { i.consume_key(egui::Modifiers::COMMAND, egui::Key::H); }
+        if pressed {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::H);
+            i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::H);
+        }
         pressed
     });
     if replace_toggle {
@@ -459,16 +484,34 @@ fn render_scoped(
             ui.with_layout(
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    let save_btn = ui.add_enabled(
-                        tab.dirty(),
-                        egui::Button::new(
-                            RichText::new(format!("{}  Save", icons::FLOPPY_DISK))
-                                .size(11.5),
-                        )
-                        .min_size(egui::vec2(0.0, 24.0)),
-                    );
-                    if save_btn.clicked() || (save_pressed && tab.dirty()) {
-                        crate::views::file_save::save_tab(tab, prefs, format_before_save, notify_saved, false);
+                    if tab.read_only {
+                        let unlock_btn = ui.add(
+                            egui::Button::new(
+                                RichText::new(format!("{}  Unlock", icons::LOCK_OPEN))
+                                    .size(11.5),
+                            )
+                            .min_size(egui::vec2(0.0, 24.0)),
+                        );
+                        if unlock_btn.clicked() {
+                            tab.read_only = false;
+                            tab.save_error = None;
+                            tab.original_content = tab.content.clone();
+                            tab.disk_mtime = std::fs::metadata(&tab.path)
+                                .and_then(|m| m.modified())
+                                .ok();
+                        }
+                    } else {
+                        let save_btn = ui.add_enabled(
+                            tab.dirty(),
+                            egui::Button::new(
+                                RichText::new(format!("{}  Save", icons::FLOPPY_DISK))
+                                    .size(11.5),
+                            )
+                            .min_size(egui::vec2(0.0, 24.0)),
+                        );
+                        if save_btn.clicked() || (save_pressed && tab.dirty()) {
+                            crate::views::file_save::save_tab(tab, prefs, format_before_save, notify_saved, false);
+                        }
                     }
                     if is_md {
                         let label = if tab.preview_mode {
@@ -863,7 +906,7 @@ fn render_scoped(
                         let style = crate::format::discover(Path::new(&tab.path));
                         let indent = style.indent_unit();
                         let focused = ui.memory(|m| m.has_focus(te_id));
-                        if focused {
+                        if focused && !tab.read_only {
                             // Cmd+Shift+Z → redo is already handled by egui
                             // 0.34's TextEdit (checked in its builder.rs —
                             // matches Modifiers::SHIFT | COMMAND with Z).
@@ -896,6 +939,7 @@ fn render_scoped(
                                     && i.key_pressed(egui::Key::Slash);
                                 if cs {
                                     i.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash);
+                                    i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::Slash);
                                 }
                                 let cg = i.modifiers.ctrl && !i.modifiers.shift
                                     && !i.modifiers.command && !i.modifiers.mac_cmd
@@ -953,7 +997,7 @@ fn render_scoped(
                                 } else {
                                     let spaces = line_prefix.len()
                                         - line_prefix.trim_start_matches(' ').len();
-                                    spaces.min(indent.len()).max(indent.len() - 1)
+                                    spaces.min(indent.len())
                                 };
                                 if removed > 0 {
                                     tab.content.replace_range(line_start..line_start + removed, "");
@@ -1284,6 +1328,7 @@ fn render_scoped(
                         }
                         let editor = egui::TextEdit::multiline(&mut tab.content)
                             .id(te_id)
+                            .interactive(!tab.read_only)
                             .code_editor()
                             .lock_focus(true)
                             .frame(egui::Frame::NONE)
@@ -1452,25 +1497,26 @@ fn render_scoped(
                         }
                         // Cmd+C on empty selection copies the whole line.
                         // macOS: egui synthesizes Event::Copy from Cmd+C.
-                        let copy_line = ui.memory(|m| m.has_focus(te_id))
-                            && ui.input_mut(|i| {
-                                let idx = i.events.iter().position(|e| {
-                                    matches!(e, egui::Event::Copy)
-                                });
-                                if let Some(idx) = idx {
-                                    i.events.remove(idx);
-                                    true
-                                } else {
-                                    false
-                                }
+                        // Only consume the event when the selection is empty so
+                        // normal selected-text copy still works.
+                        let has_copy_event = ui.memory(|m| m.has_focus(te_id))
+                            && ui.input(|i| {
+                                i.events.iter().any(|e| matches!(e, egui::Event::Copy))
                             });
-                        if copy_line
+                        if has_copy_event
                             && let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id)
                         {
                             let range = state.cursor.char_range().unwrap_or_else(||
                                 egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
                             let empty = range.primary.index == range.secondary.index;
                             if empty {
+                                ui.input_mut(|i| {
+                                    if let Some(idx) = i.events.iter().position(|e| {
+                                        matches!(e, egui::Event::Copy)
+                                    }) {
+                                        i.events.remove(idx);
+                                    }
+                                });
                                 let cursor = range.primary.index;
                                 let byte = crate::format::char_idx_to_byte(&tab.content, cursor);
                                 let bytes = tab.content.as_bytes();
@@ -1484,9 +1530,8 @@ fn render_scoped(
                                 if !line.is_empty() {
                                     ui.ctx().copy_text(line);
                                 }
-                            } else {
-                                ui.input_mut(|i| i.events.push(egui::Event::Copy));
                             }
+                            // else: leave Copy event in queue for TextEdit to handle
                         }
                         // Note: egui 0.34 keeps TextEditState.undoer private,
                         // so we can't tighten Ctrl+Z granularity without
@@ -1499,9 +1544,21 @@ fn render_scoped(
                         let cr = ctx_reveal.clone();
                         let cc = ctx_copy.clone();
                         out.response.context_menu(|ui| {
-                            if ui.button(format!("{}  Save", icons::FLOPPY_DISK)).clicked() {
-                                cs.set(true);
-                                ui.close();
+                            if tab.read_only {
+                                if ui.button(format!("{}  Unlock for Editing", icons::LOCK_OPEN)).clicked() {
+                                    tab.read_only = false;
+                                    tab.save_error = None;
+                                    tab.original_content = tab.content.clone();
+                                    tab.disk_mtime = std::fs::metadata(&tab.path)
+                                        .and_then(|m| m.modified())
+                                        .ok();
+                                    ui.close();
+                                }
+                            } else {
+                                if ui.button(format!("{}  Save", icons::FLOPPY_DISK)).clicked() {
+                                    cs.set(true);
+                                    ui.close();
+                                }
                             }
                             if ui.button(format!("{}  Reveal in Finder", icons::FOLDER_OPEN)).clicked() {
                                 cr.set(true);
@@ -1838,6 +1895,7 @@ fn draw_file_tab(
     is_active: bool,
     is_diff: bool,
     is_preview: bool,
+    is_read_only: bool,
     idx: usize,
 ) -> (bool, bool) {
     let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
@@ -1921,7 +1979,7 @@ fn draw_file_tab(
     }
 
     // Tab label (preview tabs use dimmed color)
-    let label_fg = if is_preview && !is_active {
+    let label_fg = if (is_preview || is_read_only) && !is_active {
         t.text_muted.to_color32()
     } else {
         fg

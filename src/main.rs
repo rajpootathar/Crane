@@ -169,7 +169,7 @@ impl CraneApp {
                 .to_string();
             let content = std::fs::read_to_string(&loc.path).unwrap_or_default();
             self.app
-                .open_file_into_active_layout(ctx, path_str.clone(), name, content, false);
+                .open_file_into_active_layout(ctx, path_str.clone(), name, content, false, false);
         }
         if let Some(layout) = self.app.active_layout() {
             for (_, pane) in layout.panes.iter_mut() {
@@ -189,7 +189,7 @@ impl CraneApp {
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(&path_str)
                                 .to_string();
-                            files.open(path_str.clone(), content, name, false);
+                            files.open(path_str.clone(), content, name, false, false);
                             files.tabs.len() - 1
                         }
                     };
@@ -595,6 +595,8 @@ impl eframe::App for CraneApp {
             center_ui.disable();
         }
         if self.app.active_layout().is_some() {
+            let drop_handled = self.app.external_drop_handled;
+            self.app.external_drop_handled = false;
             if let Some(ws) = self.app.active_layout() {
                 let action = ui::pane_view::render_layout(
                     &mut center_ui,
@@ -608,6 +610,7 @@ impl eframe::App for CraneApp {
                     &goto_request,
                     workspace_root.as_deref(),
                     editor_prefs,
+                    drop_handled,
                 );
                 match action {
                     PaneAction::None => {}
@@ -686,8 +689,11 @@ impl eframe::App for CraneApp {
                             .to_string();
                         let content = std::fs::read_to_string(&path).unwrap_or_default();
                         self.app.open_file_into_active_layout(
-                            &ctx, path_str, name, content, false,
+                            &ctx, path_str, name, content, false, false,
                         );
+                    }
+                    PaneAction::OpenFileExternal(path) => {
+                        self.app.open_external_file(&ctx, &path);
                     }
                 }
             }

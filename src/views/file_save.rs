@@ -20,6 +20,9 @@ pub fn save_tab(
     notify_saved: &dyn Fn(&str, &str),
     force: bool,
 ) {
+    if tab.read_only {
+        return;
+    }
     if tab.external_change && !force {
         return;
     }

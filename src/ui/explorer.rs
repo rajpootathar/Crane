@@ -278,6 +278,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     let mut stage_paths: Vec<String> = Vec::new();
     let mut unstage_paths: Vec<String> = Vec::new();
     let mut open_diff: Option<String> = None;
+    let mut open_file: Option<String> = None;
     let mut toggle_dir: Option<String> = None;
     let collapsed = app.collapsed_change_dirs.clone();
 
@@ -315,6 +316,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                     &mut unstage_paths,
                     &mut stage_paths,
                     &mut open_diff,
+                    &mut open_file,
                     &mut toggle_dir,
                 );
             } else {
@@ -501,6 +503,17 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
     if let Some(path) = open_diff {
         open_file_diff(app, &repo_path, &path);
     }
+    if let Some(path) = open_file {
+        let full = repo_path.join(&path);
+        let content = std::fs::read_to_string(&full).unwrap_or_default();
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&path)
+            .to_string();
+        let ctx = ui.ctx().clone();
+        app.open_file_into_active_layout(&ctx, full.to_string_lossy().to_string(), name, content, false, false);
+    }
     if action_commit || keyboard_commit {
         let msg = app.commit_message.clone();
         app.dispatch_git_op(
@@ -601,6 +614,7 @@ fn render_change_tree(
     unstage_paths: &mut Vec<String>,
     stage_paths: &mut Vec<String>,
     open_diff: &mut Option<String>,
+    open_file: &mut Option<String>,
     toggle_dir: &mut Option<String>,
 ) {
     let tree = build_tree(changes);
@@ -613,6 +627,7 @@ fn render_change_tree(
         unstage_paths,
         stage_paths,
         open_diff,
+        open_file,
         toggle_dir,
     );
 }
@@ -627,6 +642,7 @@ fn render_change_node(
     unstage_paths: &mut Vec<String>,
     stage_paths: &mut Vec<String>,
     open_diff: &mut Option<String>,
+    open_file: &mut Option<String>,
     toggle_dir: &mut Option<String>,
 ) {
     for (dir_name, child) in &node.dirs {
@@ -683,6 +699,7 @@ fn render_change_node(
                 unstage_paths,
                 stage_paths,
                 open_diff,
+                open_file,
                 toggle_dir,
             );
         }
@@ -760,6 +777,10 @@ fn render_change_node(
                 *open_diff = Some(change_path.clone());
                 ui.close();
             }
+            if ui.button(format!("{}  Open as File", icons::FILE)).clicked() {
+                *open_file = Some(change_path.clone());
+                ui.close();
+            }
             ui.separator();
             if ui.button(format!("{}  Copy Path", icons::COPY)).clicked() {
                 ui.ctx().copy_text(change_path.clone());
@@ -830,6 +851,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
     let mut drop_request: Option<(PathBuf, PathBuf)> = None;
     let mut commit_pending = false;
     let mut cancel_pending = false;
+    let mut open_diff: Option<String> = None;
     let selected_snapshot = app.selected_file.clone();
     let mut selected_file: Option<PathBuf> = None;
     egui::ScrollArea::vertical()
@@ -842,6 +864,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 0,
                 &app.expanded_dirs,
                 &mut opened,
+                &mut open_diff,
                 &mut selected_file,
                 app.single_click_open,
                 &mut toggled,
@@ -911,7 +934,10 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
             .to_string();
         let content = std::fs::read_to_string(&p).unwrap_or_default();
         let ctx = ui.ctx().clone();
-        app.open_file_into_active_layout(&ctx, path_str, name, content, opened_preview);
+        app.open_file_into_active_layout(&ctx, path_str, name, content, opened_preview, false);
+    }
+    if let Some(rel) = open_diff {
+        open_file_diff(app, &path, &rel);
     }
     // External drag-drop: accept files/dirs dropped from Finder / OS and copy
     // them into the workspace root.
@@ -931,6 +957,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                     let _ = std::fs::copy(src, &dst);
                 }
                 app.expanded_dirs.insert(path.clone());
+                app.external_drop_handled = true;
             }
         }
     }
@@ -955,6 +982,7 @@ fn render_fs_dir(
     depth: usize,
     expanded: &std::collections::HashSet<PathBuf>,
     open_file: &mut Option<PathBuf>,
+    open_diff: &mut Option<String>,
     select_file: &mut Option<PathBuf>,
     single_click_open: bool,
     toggle_dir: &mut Option<PathBuf>,
@@ -1098,6 +1126,26 @@ fn render_fs_dir(
                 *open_file = Some(path_owned.clone());
                 ui.close();
             }
+            // Show "Open as Diff" for files with git changes
+            let rel_for_diff = path_owned
+                .strip_prefix(workspace_root)
+                .ok()
+                .and_then(|p| p.to_str())
+                .map(|s| s.to_string());
+            let has_changes = rel_for_diff
+                .as_deref()
+                .and_then(|r| git_status_map.get(r))
+                .is_some_and(|(_, _, u)| *u);
+            if !is_dir && has_changes {
+                if ui.button(format!("{}  Open Diff", icons::GIT_DIFF)).clicked() {
+                    let rel = path_owned
+                        .strip_prefix(workspace_root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    *open_diff = Some(rel);
+                    ui.close();
+                }
+            }
             if ui.button(format!("{}  New File…", icons::FILE)).clicked() {
                 *new_entry = Some((create_parent.clone(), NewEntryKind::File));
                 ui.close();
@@ -1138,6 +1186,7 @@ fn render_fs_dir(
                 depth + 1,
                 expanded,
                 open_file,
+                open_diff,
                 select_file,
                 single_click_open,
                 toggle_dir,

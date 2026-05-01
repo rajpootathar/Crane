@@ -457,6 +457,10 @@ pub struct App {
     /// projects pane — closing a tab drops its terminal / pane
     /// contents, so we always confirm first.
     pub pending_close_tab: Option<(ProjectId, WorkspaceId, TabId)>,
+    /// Set to true each frame when the explorer tree handles an external
+    /// drag-drop (copy into workspace). The file pane checks this to
+    /// avoid double-handling the same drop event.
+    pub external_drop_handled: bool,
     /// MRU (most-recently-used) list of tabs across all projects /
     /// workspaces, front = most recent. Updated when `active` changes.
     /// Drives the Cmd+~ tab switcher — just like alt+tab, the first
@@ -525,6 +529,7 @@ impl App {
             pending_remove_worktree: None,
             pending_delete_file: None,
             pending_close_tab: None,
+            external_drop_handled: false,
             tab_mru: Vec::new(),
             tab_switcher: None,
             group_tints: std::collections::HashMap::new(),
@@ -1114,7 +1119,16 @@ impl App {
                             let TabKind::Diff(dt) = tk else {
                                 continue;
                             };
-                            if dt.right_path != path {
+                            // right_path may be repo-relative; resolve
+                            // via repo_path before comparing with the
+                            // absolute path from the save callback.
+                            let abs_right = dt.repo_path.as_ref().and_then(|repo| {
+                                std::path::Path::new(repo).join(&dt.right_path)
+                                    .canonicalize()
+                                    .ok()
+                                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                            }).unwrap_or_else(|| dt.right_path.clone());
+                            if abs_right != path {
                                 continue;
                             }
                             dt.right_text = new_text.to_string();
@@ -1146,8 +1160,11 @@ impl App {
                                 continue;
                             }
                             dt.pending_hunk_stage = false;
+                            let read_path = dt.repo_path.as_ref()
+                                .map(|repo| std::path::Path::new(repo).join(&dt.right_path))
+                                .unwrap_or_else(|| std::path::PathBuf::from(&dt.right_path));
                             dt.right_text =
-                                std::fs::read_to_string(&dt.right_path)
+                                std::fs::read_to_string(&read_path)
                                     .unwrap_or_default();
                             dt.reload_left_text();
                         }
@@ -1462,13 +1479,28 @@ impl App {
         name: String,
         content: String,
         preview: bool,
+        read_only: bool,
     ) {
         if let Some(layout) = self.active_layout() {
-            layout.open_file_in_files_pane(path.clone(), name, content.clone(), preview);
+            layout.open_file_in_files_pane(path.clone(), name, content.clone(), preview, read_only);
         }
-        let cfg_snapshot = self.language_configs.clone();
-        self.lsp
-            .did_open(ctx, std::path::Path::new(&path), &content, &cfg_snapshot);
+        if !read_only {
+            let cfg_snapshot = self.language_configs.clone();
+            self.lsp
+                .did_open(ctx, std::path::Path::new(&path), &content, &cfg_snapshot);
+        }
+    }
+
+    /// Open any file on disk as a read-only tab. Does not notify LSP.
+    pub fn open_external_file(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let path_str = path.to_string_lossy().to_string();
+        self.open_file_into_active_layout(ctx, path_str, name, content, false, true);
     }
 
     /// Per-frame sync, scoped to the ACTIVE layout only. Was iterating every

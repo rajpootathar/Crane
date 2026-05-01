@@ -95,6 +95,9 @@ pub struct FileTab {
     /// Preview tabs are opened by single-click and auto-replaced by the
     /// next single-click. They promote to permanent on first edit.
     pub preview: bool,
+    /// When true, the file was opened from outside the workspace and
+    /// cannot be edited until the user explicitly unlocks it.
+    pub read_only: bool,
 }
 
 impl FileTab {
@@ -176,6 +179,13 @@ impl TabKind {
         }
     }
 
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            TabKind::File(ft) => ft.read_only,
+            TabKind::Diff(_) => false,
+        }
+    }
+
     pub fn as_file_mut(&mut self) -> Option<&mut FileTab> {
         match self {
             TabKind::File(ft) => Some(ft),
@@ -221,7 +231,7 @@ impl FilesPane {
         }
     }
 
-    pub fn open(&mut self, path: String, content: String, name: String, preview: bool) {
+    pub fn open(&mut self, path: String, content: String, name: String, preview: bool, read_only: bool) {
         if let Some(idx) = self.tabs.iter().position(|t| matches!(t, TabKind::File(ft) if ft.path == path)) {
             self.active = idx;
             // Promote preview tab to permanent on re-open
@@ -257,6 +267,7 @@ impl FilesPane {
             save_error: None,
             content,
             name,
+            read_only,
         }));
         self.active = self.tabs.len() - 1;
     }
@@ -664,7 +675,7 @@ impl Layout {
         }
     }
 
-    pub fn open_file_in_files_pane(&mut self, path: String, name: String, content: String, preview: bool) {
+    pub fn open_file_in_files_pane(&mut self, path: String, name: String, content: String, preview: bool, read_only: bool) {
         let existing = self
             .panes
             .iter()
@@ -678,13 +689,13 @@ impl Layout {
                         if preview {
                             files.close_preview_tab();
                         }
-                        files.open(path, content, name, preview);
+                        files.open(path, content, name, preview, read_only);
                     }
                 self.focus = Some(pid);
             }
             None => {
                 let mut files = FilesPane::empty();
-                files.open(path, content, name, preview);
+                files.open(path, content, name, preview, read_only);
                 self.add_pane(PaneContent::Files(files), Some(Dir::Horizontal));
             }
         }

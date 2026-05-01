@@ -60,6 +60,11 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         if icon_button(ui, right_label, 16.0, "Toggle Right Panel (Cmd+/)").clicked() {
             app.show_right = !app.show_right;
         }
+        if icon_button(ui, icons::FOLDER_OPEN, 16.0, "Open File (Cmd+O)").clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                app.open_external_file(ctx, &path);
+            }
+        }
         // Settings / Help live in the status bar bottom-right now;
         // top bar stays focused on layout chrome.
         ui.separator();

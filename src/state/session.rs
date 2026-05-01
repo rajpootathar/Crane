@@ -669,6 +669,7 @@ impl SPane {
                             save_error: None,
                             preview: false,
                             content,
+                            read_only: false,
                         })
                     })
                     .collect();
