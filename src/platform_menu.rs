@@ -88,7 +88,7 @@ mod mac {
         let _ = file_menu.append_items(&[
             &MenuItem::with_id(
                 MenuId::new(ID_OPEN_FILE),
-                "Open…",
+                "Open File…",
                 true,
                 Some(muda::accelerator::Accelerator::new(
                     Some(muda::accelerator::Modifiers::SUPER),
