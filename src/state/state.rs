@@ -1118,30 +1118,7 @@ impl App {
                                 continue;
                             }
                             dt.right_text = new_text.to_string();
-                            if let Some(left) = dt
-                                .left_path
-                                .strip_prefix("staged:")
-                                .and_then(|rel| {
-                                    crate::git::find_git_root(std::path::Path::new(path))
-                                        .map(|root| (root, rel.to_string()))
-                                })
-                            {
-                                let (root, rel) = left;
-                                dt.left_text =
-                                    crate::git::staged_content(&root, &rel)
-                                        .unwrap_or_else(|| crate::git::head_content(&root, &rel));
-                            } else if let Some(left) = dt
-                                .left_path
-                                .strip_prefix("HEAD:")
-                                .and_then(|rel| {
-                                    crate::git::find_git_root(std::path::Path::new(path))
-                                        .map(|root| (root, rel.to_string()))
-                                })
-                            {
-                                let (root, rel) = left;
-                                dt.left_text =
-                                    crate::git::head_content(&root, &rel);
-                            }
+                            dt.reload_left_text();
                         }
                     }
                 }
@@ -1169,39 +1146,10 @@ impl App {
                                 continue;
                             }
                             dt.pending_hunk_stage = false;
-                            // Re-read working tree content
                             dt.right_text =
                                 std::fs::read_to_string(&dt.right_path)
                                     .unwrap_or_default();
-                            // Re-read staged content as new left side
-                            if let Some(left) = dt
-                                .left_path
-                                .strip_prefix("staged:")
-                                .and_then(|rel| {
-                                    crate::git::find_git_root(
-                                        std::path::Path::new(&dt.right_path),
-                                    )
-                                    .map(|root| (root, rel.to_string()))
-                                })
-                            {
-                                let (root, rel) = left;
-                                dt.left_text = crate::git::staged_content(&root, &rel)
-                                    .unwrap_or_else(|| {
-                                        crate::git::head_content(&root, &rel)
-                                    });
-                            } else if let Some(left) = dt
-                                .left_path
-                                .strip_prefix("HEAD:")
-                                .and_then(|rel| {
-                                    crate::git::find_git_root(
-                                        std::path::Path::new(&dt.right_path),
-                                    )
-                                    .map(|root| (root, rel.to_string()))
-                                })
-                            {
-                                let (root, rel) = left;
-                                dt.left_text = crate::git::head_content(&root, &rel);
-                            }
+                            dt.reload_left_text();
                         }
                     }
                 }

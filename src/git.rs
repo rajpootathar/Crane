@@ -234,31 +234,23 @@ pub fn unstage(repo: &Path, path: &str) -> Result<(), String> {
 /// `git apply --cached`. The patch must be a valid hunk fragment
 /// including its `@@ ... @@` header and trailing context.
 pub fn stage_hunk(repo: &Path, patch: &str) -> Result<(), String> {
-    let mut child = Command::new("git")
-        .args(["apply", "--cached", "-"])
-        .current_dir(repo)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(patch.as_bytes());
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).to_string())
-    }
+    apply_hunk(repo, patch, false)
 }
 
 /// Unstage a single hunk by piping the patch through
 /// `git apply --reverse --cached`.
 pub fn unstage_hunk(repo: &Path, patch: &str) -> Result<(), String> {
+    apply_hunk(repo, patch, true)
+}
+
+fn apply_hunk(repo: &Path, patch: &str, reverse: bool) -> Result<(), String> {
+    let args = if reverse {
+        vec!["apply", "--reverse", "--cached", "-"]
+    } else {
+        vec!["apply", "--cached", "-"]
+    };
     let mut child = Command::new("git")
-        .args(["apply", "--reverse", "--cached", "-"])
+        .args(&args)
         .current_dir(repo)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -295,21 +287,6 @@ pub fn staged_content(repo: &Path, rel_path: &str) -> Option<String> {
 /// Get the unified diff between HEAD and the working tree for a file.
 /// Returns the raw diff text including hunk headers and context lines.
 pub fn file_diff_raw(repo: &Path, rel_path: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["diff", "--", rel_path])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-    if out.status.success() && !out.stdout.is_empty() {
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        None
-    }
-}
-
-/// Get the unified diff between the staging area and the working tree
-/// (i.e. unstaged changes only).
-pub fn file_diff_unstaged(repo: &Path, rel_path: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["diff", "--", rel_path])
         .current_dir(repo)

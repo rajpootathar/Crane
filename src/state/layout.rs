@@ -129,6 +129,33 @@ pub struct DiffTabData {
     pub sbs_h_scroll_right: f32,
 }
 
+impl DiffTabData {
+    /// Reload the left-side content from git (staged or HEAD) using
+    /// `right_path` to resolve the repo root. Shared by both
+    /// save-triggered and hunk-stage diff refreshes.
+    pub fn reload_left_text(&mut self) {
+        let right = std::path::Path::new(&self.right_path);
+        if let Some((root, rel)) = self
+            .left_path
+            .strip_prefix("staged:")
+            .and_then(|rel| {
+                crate::git::find_git_root(right).map(|root| (root, rel.to_string()))
+            })
+        {
+            self.left_text = crate::git::staged_content(&root, &rel)
+                .unwrap_or_else(|| crate::git::head_content(&root, &rel));
+        } else if let Some((root, rel)) = self
+            .left_path
+            .strip_prefix("HEAD:")
+            .and_then(|rel| {
+                crate::git::find_git_root(right).map(|root| (root, rel.to_string()))
+            })
+        {
+            self.left_text = crate::git::head_content(&root, &rel);
+        }
+    }
+}
+
 pub enum TabKind {
     File(FileTab),
     Diff(DiffTabData),
