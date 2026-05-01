@@ -1938,6 +1938,7 @@ fn draw_file_tab(
         Color32::from_rgba_unmultiplied(a.r, a.g, a.b, 55)
     };
     let diff_tint = Color32::from_rgba_unmultiplied(100, 180, 255, 30);
+    let readonly_tint = Color32::from_rgba_unmultiplied(220, 80, 80, 35);
 
     let (bg, fg) = if is_active {
         (accent_tint, t.text.to_color32())
@@ -1955,6 +1956,14 @@ fn draw_file_tab(
     // Diff tab: subtle blue tint overlay
     if is_diff && !is_active && bg == egui::Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 5.0, diff_tint);
+    }
+
+    // Read-only tab: subtle red tint overlay
+    if is_read_only && !is_active && bg == egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 5.0, readonly_tint);
+    } else if is_read_only && is_active {
+        // Active read-only: blend red into the accent background
+        ui.painter().rect_filled(rect, 5.0, readonly_tint);
     }
 
     // Bottom border on active tab (solid accent) and inactive tabs (subtle)
