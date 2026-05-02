@@ -393,11 +393,21 @@ impl Terminal {
         self.history.lock().clone()
     }
 
+    /// ANSI snapshot of the terminal's scrollback + visible grid.
+    /// Preserves every cell's color and SGR flag (bold, italic,
+    /// underline, inverse, dim, strikethrough, hidden, double-
+    /// underline) so a restored session looks visually identical
+    /// to what was saved. Used for session save in preference to
+    /// `snapshot_text` whenever style preservation matters.
+    pub fn snapshot_ansi(&self) -> String {
+        self.term.lock().snapshot_ansi()
+    }
+
     /// Plain-text snapshot of the terminal's scrollback + visible
-    /// grid, joined with CRLF. Used for session save — replaying
-    /// raw PTY bytes doesn't survive width changes (shell prompts
-    /// use absolute cursor-positioning escapes baked against the
-    /// original width). Trailing empties trimmed.
+    /// grid. Retained as a fallback / debugging tool — session save
+    /// uses [`Terminal::snapshot_ansi`] so colors and decorations
+    /// survive a restore.
+    #[allow(dead_code)]
     pub fn snapshot_text(&self) -> String {
         self.term.lock().snapshot_text()
     }
