@@ -1800,6 +1800,41 @@ impl App {
         }
     }
 
+    // `new_index` is the desired position computed from the *pre-removal*
+    // list (the index of the row dropped above, or that index + 1 when
+    // dropped below). Because we remove the source first, every position
+    // strictly after `pos` shifts down by one, so a downward drag must
+    // land at `new_index - 1` to actually appear where the user dropped it.
+    fn move_in_vec<T>(vec: &mut Vec<T>, pos: usize, new_index: usize) {
+        let target = if pos < new_index { new_index - 1 } else { new_index };
+        let target = target.min(vec.len().saturating_sub(1));
+        if pos != target {
+            let item = vec.remove(pos);
+            vec.insert(target, item);
+        }
+    }
+
+    pub fn reorder_project(&mut self, project_id: ProjectId, new_index: usize) {
+        if let Some(pos) = self.projects.iter().position(|p| p.id == project_id) {
+            Self::move_in_vec(&mut self.projects, pos, new_index);
+        }
+    }
+
+    pub fn reorder_workspace(&mut self, project_id: ProjectId, ws_id: WorkspaceId, new_index: usize) {
+        let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) else { return };
+        if let Some(pos) = project.workspaces.iter().position(|w| w.id == ws_id) {
+            Self::move_in_vec(&mut project.workspaces, pos, new_index);
+        }
+    }
+
+    pub fn reorder_tab(&mut self, project_id: ProjectId, ws_id: WorkspaceId, tab_id: TabId, new_index: usize) {
+        let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) else { return };
+        let Some(ws) = project.workspaces.iter_mut().find(|w| w.id == ws_id) else { return };
+        if let Some(pos) = ws.tabs.iter().position(|t| t.id == tab_id) {
+            Self::move_in_vec(&mut ws.tabs, pos, new_index);
+        }
+    }
+
     pub fn remove_project(&mut self, pid: ProjectId) {
         // Remember the removed project's group so we can rebalance the
         // group afterwards (promote a lone survivor out of the folder,
