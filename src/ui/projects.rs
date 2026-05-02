@@ -5,6 +5,42 @@ use crate::ui::util::{
 use egui::{Color32, Pos2, Rect, RichText, Stroke};
 use egui_phosphor::regular as icons;
 
+/// Payload stored in egui's drag state when a tree row is being
+/// dragged.  Identifies the item and its parent scope so drop targets
+/// can validate same-level, same-parent scope.
+#[derive(Clone)]
+enum TreeDrag {
+    Project { id: u64 },
+    Workspace { project_id: u64, id: u64 },
+    Tab { project_id: u64, workspace_id: u64, id: u64 },
+}
+
+/// Drop-scope tag for a single row's hit region. Collected during the
+/// tree walk and used by the post-walk dispatcher to figure out which
+/// rows count as siblings for the in-flight drag.
+#[derive(Clone)]
+enum DropScope {
+    Project,
+    Workspace { project_id: u64 },
+    Tab { project_id: u64, workspace_id: u64 },
+}
+
+struct DropZone {
+    rect: Rect,
+    scope: DropScope,
+}
+
+/// Paint a 2px accent line at the top or bottom edge of `rect` so the
+/// user can see exactly where a release will land. Inset horizontally
+/// so the line sits inside the row's padding rather than against the
+/// scroll-area gutter.
+fn paint_drop_line(ui: &egui::Ui, rect: Rect, above: bool) {
+    let y = if above { rect.min.y } else { rect.max.y - 1.0 };
+    ui.painter().line_segment(
+        [Pos2::new(rect.min.x + 6.0, y), Pos2::new(rect.max.x - 6.0, y)],
+        Stroke::new(2.0, accent()),
+    );
+}
 
 const HEADER: Color32 = Color32::from_rgb(140, 146, 162);
 
@@ -128,6 +164,19 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut set_tab_tint: Option<(u64, u64, u64, Option<[u8; 3]>)> = None;
     // Pending "toggle folder group collapse" from a folder-header click.
     let mut toggle_group_collapsed: Option<std::path::PathBuf> = None;
+    let mut reorder_project: Option<(u64, usize)> = None;
+    let mut reorder_workspace: Option<(u64, u64, usize)> = None;
+    let mut reorder_tab: Option<(u64, u64, u64, usize)> = None;
+    // Each visible row registers its hit rect + scope here. Drop dispatch
+    // happens once after the walk so inter-row gaps and the empty space
+    // above the first / below the last sibling all resolve to a sane
+    // target index instead of getting swallowed by a per-row hit-test.
+    let mut drop_zones: Vec<DropZone> = Vec::new();
+    // Pointer position (used by the indicator to decide above/below).
+    // Read once from input so detection works during drag, when egui's
+    // per-widget `contains_pointer` can be suppressed by the captured
+    // drag interaction.
+    let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
 
     // Precompute group member counts so individual-project "Remove"
     // can be suppressed when the group has siblings. Atomic unload
@@ -168,7 +217,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let mut last_group: Option<std::path::PathBuf> = None;
-            for project in &app.projects {
+            for project in app.projects.iter() {
                 // Render a group header row whenever we enter a new
                 // group. Projects without a group render flush-left as
                 // before; grouped Projects nest one level deeper under
@@ -336,6 +385,33 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 } else if row.main_clicked {
                     toggle_project = Some(project.id);
                 }
+                // Drag source. Setting payload every frame while
+                // dragged keeps it alive so the post-walk dispatcher can
+                // read it on the release frame.
+                if row.response.dragged() {
+                    row.response.dnd_set_drag_payload(TreeDrag::Project { id: project.id });
+                }
+                // Indicator: paint a drop-line preview while a same-
+                // scope drag is in flight and the pointer is over this
+                // row's rect. Use input-based hover detection — egui
+                // can suppress per-widget `contains_pointer` during an
+                // active drag because the interaction is captured.
+                if let Some(p) = pointer_pos {
+                    if row.rect.contains(p) {
+                        if let Some(payload) = egui::DragAndDrop::payload::<TreeDrag>(ctx) {
+                            if let TreeDrag::Project { id: src_id } = payload.as_ref() {
+                                if *src_id != project.id {
+                                    let above = p.y < row.rect.center().y;
+                                    paint_drop_line(ui, row.rect, above);
+                                }
+                            }
+                        }
+                    }
+                }
+                drop_zones.push(DropZone {
+                    rect: row.rect,
+                    scope: DropScope::Project,
+                });
                 let pid = project.id;
                 let proj_path = project.path.clone();
                 row.response.context_menu(|ui| {
@@ -388,7 +464,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 });
 
                 if project.expanded {
-                    for wt in &project.workspaces {
+                    for wt in project.workspaces.iter() {
                         let active_wt = app.active.map(|(_, w, _)| w == wt.id).unwrap_or(false);
                         let t = crate::theme::current();
                         let badge = wt.git_status.as_ref().and_then(|s| {
@@ -519,6 +595,26 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         } else if wt_row.main_clicked {
                             toggle_worktree = Some((project.id, wt.id));
                         }
+                        if wt_row.response.dragged() {
+                            wt_row.response.dnd_set_drag_payload(TreeDrag::Workspace {
+                                project_id: project.id, id: wt.id });
+                        }
+                        if let Some(p) = pointer_pos {
+                            if wt_row.rect.contains(p) {
+                                if let Some(payload) = egui::DragAndDrop::payload::<TreeDrag>(ctx) {
+                                    if let TreeDrag::Workspace { project_id: src_pid, id: src_id } = payload.as_ref() {
+                                        if *src_id != wt.id && *src_pid == project.id {
+                                            let above = p.y < wt_row.rect.center().y;
+                                            paint_drop_line(ui, wt_row.rect, above);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        drop_zones.push(DropZone {
+                            rect: wt_row.rect,
+                            scope: DropScope::Workspace { project_id: project.id },
+                        });
                         let wt_pid = project.id;
                         let wt_id = wt.id;
                         let wt_path = wt.path.clone();
@@ -576,7 +672,7 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         });
 
                         if wt.expanded {
-                            for tab in &wt.tabs {
+                            for tab in wt.tabs.iter() {
                                 let is_active = app
                                     .active
                                     .map(|(_, w, t)| w == wt.id && t == tab.id)
@@ -708,6 +804,29 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                                 } else if tab_row.main_clicked {
                                     set_active = Some((project.id, wt.id, tab.id));
                                 }
+                                if tab_row.response.dragged() {
+                                    tab_row.response.dnd_set_drag_payload(TreeDrag::Tab {
+                                        project_id: project.id, workspace_id: wt.id, id: tab.id });
+                                }
+                                if let Some(p) = pointer_pos {
+                                    if tab_row.rect.contains(p) {
+                                        if let Some(payload) = egui::DragAndDrop::payload::<TreeDrag>(ctx) {
+                                            if let TreeDrag::Tab { project_id: src_pid, workspace_id: src_wid, id: src_id } = payload.as_ref() {
+                                                if *src_id != tab.id && *src_pid == project.id && *src_wid == wt.id {
+                                                    let above = p.y < tab_row.rect.center().y;
+                                                    paint_drop_line(ui, tab_row.rect, above);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                drop_zones.push(DropZone {
+                                    rect: tab_row.rect,
+                                    scope: DropScope::Tab {
+                                        project_id: project.id,
+                                        workspace_id: wt.id,
+                                    },
+                                });
                                 // F2 / Cmd+R on the active tab starts
                                 // rename. Scoped to the active tab so
                                 // the keys only affect the tab you're
@@ -952,6 +1071,79 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     if let Some(target) = close_tab {
         // Stage the close — the confirm modal handles the actual drop.
         app.pending_close_tab = Some(target);
+    }
+    // Global drop dispatch. Runs once per release frame and works
+    // regardless of which row (or inter-row gap) the pointer was over —
+    // the per-row `dnd_release_payload` approach swallowed releases
+    // that landed in the ~3px spacing between rows. We:
+    //   1) wait for an actual pointer release with a payload still set,
+    //   2) filter the collected drop_zones to siblings of the source,
+    //   3) require the release Y to fall within the visible sibling
+    //      range (with a small pad so dropping just-below-last appends
+    //      cleanly), and
+    //   4) compute the new index by counting how many sibling row
+    //      centers sit at-or-above the release Y. That count maps
+    //      directly to the same `pi` / `pi + 1` semantics the per-row
+    //      branch used, and `move_in_vec` corrects for the source's
+    //      removal so downward drags land where the user dropped them.
+    let release_pos = ctx.input(|i| {
+        if i.pointer.any_released() {
+            i.pointer.interact_pos()
+        } else {
+            None
+        }
+    });
+    if let Some(release_pos) = release_pos {
+        if let Some(payload) = egui::DragAndDrop::take_payload::<TreeDrag>(ctx) {
+            let candidates: Vec<&DropZone> = drop_zones
+                .iter()
+                .filter(|z| match (payload.as_ref(), &z.scope) {
+                    (TreeDrag::Project { .. }, DropScope::Project) => true,
+                    (
+                        TreeDrag::Workspace { project_id: pid, .. },
+                        DropScope::Workspace { project_id: zpid },
+                    ) => zpid == pid,
+                    (
+                        TreeDrag::Tab { project_id: pid, workspace_id: wid, .. },
+                        DropScope::Tab { project_id: zpid, workspace_id: zwid },
+                    ) => zpid == pid && zwid == wid,
+                    _ => false,
+                })
+                .collect();
+
+            if !candidates.is_empty() {
+                let pad = 8.0;
+                let first_y = candidates.first().unwrap().rect.min.y - pad;
+                let last_y = candidates.last().unwrap().rect.max.y + pad;
+                if release_pos.y >= first_y && release_pos.y <= last_y {
+                    let new_index = candidates
+                        .iter()
+                        .filter(|z| z.rect.center().y <= release_pos.y)
+                        .count();
+                    match payload.as_ref() {
+                        TreeDrag::Project { id } => {
+                            reorder_project = Some((*id, new_index));
+                        }
+                        TreeDrag::Workspace { project_id, id } => {
+                            reorder_workspace = Some((*project_id, *id, new_index));
+                        }
+                        TreeDrag::Tab { project_id, workspace_id, id } => {
+                            reorder_tab = Some((*project_id, *workspace_id, *id, new_index));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((pid, idx)) = reorder_project {
+        app.reorder_project(pid, idx);
+    }
+    if let Some((pid, wid, idx)) = reorder_workspace {
+        app.reorder_workspace(pid, wid, idx);
+    }
+    if let Some((pid, wid, tid, idx)) = reorder_tab {
+        app.reorder_tab(pid, wid, tid, idx);
     }
 }
 

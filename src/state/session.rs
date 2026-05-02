@@ -495,14 +495,22 @@ impl SPane {
     fn from_pane(id: PaneId, p: &Pane) -> Self {
         let content = match &p.content {
             PaneContent::Terminal(tp) => {
-                // Rendered-grid text snapshot instead of the raw PTY byte
-                // log — see Terminal::snapshot_text for the reasoning.
+                // Rendered-grid ANSI snapshot instead of the raw PTY
+                // byte log — replaying raw bytes does not survive
+                // width changes (shell prompts use absolute cursor-
+                // positioning escapes baked against the original
+                // width). The ANSI form preserves every cell's
+                // colors and SGR flags so a restored session looks
+                // visually identical to the saved one. Older sessions
+                // saved as plain text still load — `history_text` is
+                // fed through the parser either way, plain text just
+                // produces default-styled cells.
                 let tabs: Vec<STerminalTab> = tp
                     .tabs
                     .iter()
                     .map(|t| STerminalTab {
                         cwd: t.terminal.cwd.clone(),
-                        history_text: t.terminal.snapshot_text(),
+                        history_text: t.terminal.snapshot_ansi(),
                         name: t.name.clone().unwrap_or_default(),
                     })
                     .collect();

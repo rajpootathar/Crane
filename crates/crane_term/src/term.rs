@@ -2,7 +2,7 @@
 //! implements the [`Handler`] trait. This is where the
 //! TUI-scrollback fix lives — see [`Term::linefeed`].
 
-use crate::cell::{Color, Flags};
+use crate::cell::{Cell, Color, Flags, NamedColor};
 use crate::grid::{Cursor, Grid};
 use crate::handler::{Handler, ProcessorInput, ScrollDelta};
 use crate::index::{Column, Line, Point};
@@ -343,6 +343,48 @@ impl Term {
             out.pop();
         }
         out.join("\r\n")
+    }
+
+    /// ANSI snapshot: same coverage as [`Term::snapshot_text`] but
+    /// preserves every cell's foreground / background color and SGR
+    /// flag (bold, italic, underline, inverse, dim, strikethrough,
+    /// hidden, double-underline). Emitted as raw bytes the parser can
+    /// replay end-to-end, so a restored session looks visually
+    /// identical to what was saved.
+    ///
+    /// Style transitions are emitted as a single fresh-from-default
+    /// `\x1b[0;…m` sequence so the replay never carries phantom state
+    /// across cells. The whole snapshot is bracketed by a leading and
+    /// trailing reset so the live shell that boots after replay
+    /// starts on a clean SGR slate.
+    pub fn snapshot_ansi(&self) -> String {
+        let cap = (self.scrollback.len() + self.grid.rows.len()) * (self.grid.columns + 8);
+        let mut out = String::with_capacity(cap);
+        out.push_str(SGR_RESET);
+
+        let mut rows: Vec<&Row> = Vec::with_capacity(self.scrollback.len() + self.grid.rows.len());
+        rows.extend(self.scrollback.iter());
+        rows.extend(self.grid.rows.iter());
+
+        // Trailing empty rows look the same in plain text and ANSI —
+        // a row whose cells all match the default template. Strip
+        // them off the end before emitting so a scrollback that
+        // ended on a dozen blank lines doesn't restore as a wall of
+        // padding above the new shell prompt.
+        let mut last_keep = rows.len();
+        while last_keep > 0 && row_is_blank(rows[last_keep - 1]) {
+            last_keep -= 1;
+        }
+
+        let mut prev = CellStyle::default_style();
+        for (i, row) in rows.iter().take(last_keep).enumerate() {
+            append_row_ansi(&mut out, row, &mut prev);
+            if i + 1 < last_keep {
+                out.push_str("\r\n");
+            }
+        }
+        out.push_str(SGR_RESET);
+        out
     }
 
     /// Evict the row at the top of the active scroll region into
@@ -1254,6 +1296,64 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_ansi_round_trips_styles() {
+        // Drive the parser end-to-end so the cells pick up real
+        // styles, then snapshot, replay into a fresh Term, and
+        // confirm both the characters and their colors / flags
+        // survived the round trip.
+        use crate::processor::Processor;
+
+        let mut p = Processor::new();
+        let mut t = Term::new(2, 16);
+        // Bold red "RED" then reset, then italic underlined "ok".
+        let script = b"\x1b[1;31mRED\x1b[0m \x1b[3;4mok\x1b[0m";
+        p.parse_bytes(&mut t, script);
+        let saved = t.snapshot_ansi();
+        // Saved bytes carry the SGR escapes verbatim — sanity-check
+        // a few markers without locking in the exact emission shape.
+        assert!(saved.contains("\x1b[0"));
+        assert!(saved.contains("RED"));
+        assert!(saved.contains("ok"));
+
+        // Replay the snapshot into a fresh terminal and verify
+        // styling sticks on the relevant cells.
+        let mut p2 = Processor::new();
+        let mut t2 = Term::new(2, 16);
+        p2.parse_bytes(&mut t2, saved.as_bytes());
+        let row = &t2.grid.rows[0];
+        // 'R' inherits bold + red.
+        assert_eq!(row.cells[0].ch, 'R');
+        assert!(row.cells[0].flags.contains(Flags::BOLD));
+        assert_eq!(
+            row.cells[0].fg,
+            Color::Named(NamedColor::Red),
+            "RED foreground should round-trip"
+        );
+        // 'o' inherits italic + underline, default color.
+        assert_eq!(row.cells[4].ch, 'o');
+        assert!(row.cells[4].flags.contains(Flags::ITALIC));
+        assert!(row.cells[4].flags.contains(Flags::UNDERLINE));
+    }
+
+    #[test]
+    fn snapshot_ansi_trims_trailing_blank_rows() {
+        let mut t = Term::new(5, 8);
+        for c in "hi".chars() {
+            t.input(c);
+        }
+        let s = t.snapshot_ansi();
+        // Should not contain CRLFs after the last visible content
+        // beyond the leading + trailing reset escapes.
+        let stripped = s
+            .trim_start_matches("\x1b[0m")
+            .trim_end_matches("\x1b[0m");
+        assert!(
+            !stripped.ends_with("\r\n"),
+            "trailing blank rows leaked into snapshot: {stripped:?}"
+        );
+    }
+
+    #[test]
     fn scroll_display_clamps_to_scrollback_size() {
         let mut t = Term::new(2, 5);
         t.scroll_display(10);
@@ -1508,4 +1608,193 @@ fn row_to_text(row: &crate::row::Row) -> String {
         s.pop();
     }
     s
+}
+
+const SGR_RESET: &str = "\x1b[0m";
+
+/// SGR flag mask: only the bits that map to a real SGR parameter.
+/// Rendering-only bits (`HAS_CURSOR`, `WRAPLINE`, `WIDE_CHAR`,
+/// `WIDE_CHAR_SPACER`) are stripped before equality so a wrap marker
+/// alone never forces a redundant SGR transition during replay.
+fn sgr_flags(flags: Flags) -> Flags {
+    flags
+        & (Flags::INVERSE
+            | Flags::BOLD
+            | Flags::ITALIC
+            | Flags::UNDERLINE
+            | Flags::DIM
+            | Flags::HIDDEN
+            | Flags::STRIKEOUT
+            | Flags::DOUBLE_UNDERLINE)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CellStyle {
+    fg: Color,
+    bg: Color,
+    flags: Flags,
+}
+
+impl CellStyle {
+    fn default_style() -> Self {
+        Self {
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            flags: Flags::empty(),
+        }
+    }
+
+    fn from_cell(c: &Cell) -> Self {
+        Self {
+            fg: c.fg,
+            bg: c.bg,
+            flags: sgr_flags(c.flags),
+        }
+    }
+
+    /// Emit a fresh-from-default SGR sequence describing this style.
+    /// Always starts at `\x1b[0` so the replay does not have to track
+    /// turn-off codes for individual flags.
+    fn write_sgr(&self, out: &mut String) {
+        if self == &Self::default_style() {
+            out.push_str(SGR_RESET);
+            return;
+        }
+        out.push_str("\x1b[0");
+        if self.flags.contains(Flags::BOLD) {
+            out.push_str(";1");
+        }
+        if self.flags.contains(Flags::DIM) {
+            out.push_str(";2");
+        }
+        if self.flags.contains(Flags::ITALIC) {
+            out.push_str(";3");
+        }
+        if self.flags.contains(Flags::UNDERLINE) {
+            out.push_str(";4");
+        }
+        if self.flags.contains(Flags::DOUBLE_UNDERLINE) {
+            out.push_str(";21");
+        }
+        if self.flags.contains(Flags::INVERSE) {
+            out.push_str(";7");
+        }
+        if self.flags.contains(Flags::HIDDEN) {
+            out.push_str(";8");
+        }
+        if self.flags.contains(Flags::STRIKEOUT) {
+            out.push_str(";9");
+        }
+        write_color_sgr(out, self.fg, true);
+        write_color_sgr(out, self.bg, false);
+        out.push('m');
+    }
+}
+
+fn write_color_sgr(out: &mut String, color: Color, fg: bool) {
+    match color {
+        Color::Named(n) => {
+            let base = match n {
+                NamedColor::Foreground | NamedColor::Background
+                | NamedColor::CursorText | NamedColor::Cursor => return,
+                NamedColor::Black | NamedColor::DimBlack => 0,
+                NamedColor::Red | NamedColor::DimRed => 1,
+                NamedColor::Green | NamedColor::DimGreen => 2,
+                NamedColor::Yellow | NamedColor::DimYellow => 3,
+                NamedColor::Blue | NamedColor::DimBlue => 4,
+                NamedColor::Magenta | NamedColor::DimMagenta => 5,
+                NamedColor::Cyan | NamedColor::DimCyan => 6,
+                NamedColor::White | NamedColor::DimWhite => 7,
+                NamedColor::BrightBlack => 8,
+                NamedColor::BrightRed => 9,
+                NamedColor::BrightGreen => 10,
+                NamedColor::BrightYellow => 11,
+                NamedColor::BrightBlue => 12,
+                NamedColor::BrightMagenta => 13,
+                NamedColor::BrightCyan => 14,
+                NamedColor::BrightWhite => 15,
+            };
+            // 0..=7 → 30/40, 8..=15 → 90/100.
+            let code = if base < 8 {
+                if fg { 30 + base } else { 40 + base }
+            } else if fg {
+                90 + (base - 8)
+            } else {
+                100 + (base - 8)
+            };
+            out.push(';');
+            out.push_str(&code.to_string());
+        }
+        Color::Indexed(i) => {
+            let prefix = if fg { ";38;5;" } else { ";48;5;" };
+            out.push_str(prefix);
+            out.push_str(&i.to_string());
+        }
+        Color::Rgb { r, g, b } => {
+            let prefix = if fg { ";38;2;" } else { ";48;2;" };
+            out.push_str(prefix);
+            out.push_str(&r.to_string());
+            out.push(';');
+            out.push_str(&g.to_string());
+            out.push(';');
+            out.push_str(&b.to_string());
+        }
+    }
+}
+
+/// True when every touched cell in the row is visually
+/// indistinguishable from the default template. Used by
+/// [`Term::snapshot_ansi`] to strip trailing blank rows so a
+/// scrollback that ended on padding doesn't replay as a wall of
+/// blank lines above the new shell prompt.
+fn row_is_blank(row: &Row) -> bool {
+    let bound = row.occ.min(row.cells.len());
+    for cell in row.cells.iter().take(bound) {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let style = CellStyle::from_cell(cell);
+        let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+        if ch != ' ' || style != CellStyle::default_style() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Append one row's worth of ANSI bytes to `out`. Trailing default-
+/// styled spaces are trimmed (matching `row_to_text`) so a row's
+/// emitted line ends right after its last visible glyph.
+fn append_row_ansi(out: &mut String, row: &Row, prev: &mut CellStyle) {
+    let bound = row.occ.min(row.cells.len());
+    if bound == 0 {
+        return;
+    }
+    // Find the last column that carries a non-default-styled
+    // character. Default-styled trailing spaces are dropped — they
+    // would be visually invisible after replay anyway, and emitting
+    // them just bloats the saved transcript.
+    let mut last = 0usize;
+    for (i, cell) in row.cells.iter().take(bound).enumerate() {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let style = CellStyle::from_cell(cell);
+        let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+        if ch != ' ' || style != CellStyle::default_style() {
+            last = i + 1;
+        }
+    }
+    for cell in row.cells.iter().take(last) {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let style = CellStyle::from_cell(cell);
+        if &style != prev {
+            style.write_sgr(out);
+            *prev = style;
+        }
+        let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+        out.push(ch);
+    }
 }
