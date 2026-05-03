@@ -86,6 +86,12 @@ uuid = { version = "1", features = ["v4"] }
 # Windows. Deliberately picked over a hand-rolled `mv ~/.Trash/`
 # shell-out so files keep their "Put Back" affordance in Finder.
 trash = "5"
+# PDF viewer (Files Pane file tab). Binds to libpdfium.dylib at
+# runtime — we vendor the dylib via `make vendor-pdfium` so the bundle
+# step has full control over arch + signing. Default features cover
+# pdfium_latest + thread_safe + image (image::DynamicImage round-trip
+# into egui::ColorImage).
+pdfium-render = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

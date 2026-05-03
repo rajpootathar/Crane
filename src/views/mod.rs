@@ -8,4 +8,5 @@ pub mod file_util;
 pub mod file_view;
 pub mod highlight;
 pub mod markdown_view;
+pub mod pdf_view;
 pub mod welcome_view;

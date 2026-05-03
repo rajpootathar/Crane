@@ -678,6 +678,7 @@ impl SPane {
                             preview: false,
                             content,
                             read_only: false,
+                            pdf_state: None,
                         })
                     })
                     .collect();

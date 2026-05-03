@@ -98,6 +98,10 @@ pub struct FileTab {
     /// When true, the file was opened from outside the workspace and
     /// cannot be edited until the user explicitly unlocks it.
     pub read_only: bool,
+    /// PDF viewer state — populated lazily on first render when the
+    /// path has a `.pdf` extension. Boxed so non-PDF tabs don't pay
+    /// for the page-cache fields. Not persisted.
+    pub pdf_state: Option<Box<crate::views::pdf_view::PdfTabState>>,
 }
 
 impl FileTab {
@@ -268,6 +272,7 @@ impl FilesPane {
             content,
             name,
             read_only,
+            pdf_state: None,
         }));
         self.active = self.tabs.len() - 1;
     }

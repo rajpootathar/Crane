@@ -16,7 +16,7 @@ UNIVERSAL_DMG := $(TARGET_DIR)/$(APP_NAME)-$(VERSION)-universal.dmg
 
 .PHONY: help build test run release bundle dmg icns clean \
         release-universal bundle-universal dmg-universal \
-        install-cargo-bundle upload \
+        install-cargo-bundle upload vendor-pdfium \
         sign sign-universal notarize notarize-universal \
         staple staple-universal signed-dmg signed-dmg-universal \
         setup-notary \
@@ -80,8 +80,25 @@ icons/crane.icns: crane.png scripts/make-icns.sh
 install-cargo-bundle:
 	@command -v cargo-bundle >/dev/null 2>&1 || cargo install cargo-bundle
 
-bundle: icns install-cargo-bundle
+# Fetch libpdfium.dylib (arm64 + x86_64) into vendor/pdfium/. Idempotent
+# — re-running with the same pinned PDFIUM_TAG is a no-op. Bump the tag
+# inside scripts/vendor-pdfium.sh together with the pdfium-render dep
+# in Cargo.toml.
+vendor-pdfium:
+	@./scripts/vendor-pdfium.sh
+
+bundle: icns install-cargo-bundle vendor-pdfium
 	cargo bundle --release
+	@# Drop the host-arch libpdfium.dylib into Contents/Frameworks and
+	@# wire @rpath so the bundled binary finds it. Without this the PDF
+	@# viewer shows the "PDF rendering unavailable" fallback at runtime.
+	mkdir -p "$(APP)/Contents/Frameworks"
+	cp "vendor/pdfium/$(ARCH)/libpdfium.dylib" \
+		"$(APP)/Contents/Frameworks/libpdfium.dylib"
+	install_name_tool -id @rpath/libpdfium.dylib \
+		"$(APP)/Contents/Frameworks/libpdfium.dylib"
+	@install_name_tool -add_rpath @executable_path/../Frameworks \
+		"$(APP)/Contents/MacOS/$(BIN_NAME)" 2>/dev/null || true
 	@if [ "$$(uname)" = "Darwin" ] && [ -z "$(DEVELOPER_ID)" ]; then \
 		codesign --force --deep --sign - "$(APP)" && \
 		echo "ad-hoc signed: $(APP)"; \
@@ -110,7 +127,7 @@ dmg: bundle
 
 release: dmg
 
-bundle-universal: icns install-cargo-bundle
+bundle-universal: icns install-cargo-bundle vendor-pdfium
 	rustup target add aarch64-apple-darwin >/dev/null 2>&1 || true
 	rustup target add x86_64-apple-darwin >/dev/null 2>&1 || true
 	cargo build --release --target aarch64-apple-darwin
@@ -124,6 +141,17 @@ bundle-universal: icns install-cargo-bundle
 		"target/aarch64-apple-darwin/release/$(BIN_NAME)" \
 		"target/x86_64-apple-darwin/release/$(BIN_NAME)" \
 		-output "$(UNIVERSAL_APP)/Contents/MacOS/$(BIN_NAME)"
+	@# Fuse the two arch-specific libpdfium.dylibs into a single fat
+	@# dylib so universal DMGs run on both Apple Silicon and Intel.
+	mkdir -p "$(UNIVERSAL_APP)/Contents/Frameworks"
+	lipo -create \
+		"vendor/pdfium/arm64/libpdfium.dylib" \
+		"vendor/pdfium/x86_64/libpdfium.dylib" \
+		-output "$(UNIVERSAL_APP)/Contents/Frameworks/libpdfium.dylib"
+	install_name_tool -id @rpath/libpdfium.dylib \
+		"$(UNIVERSAL_APP)/Contents/Frameworks/libpdfium.dylib"
+	@install_name_tool -add_rpath @executable_path/../Frameworks \
+		"$(UNIVERSAL_APP)/Contents/MacOS/$(BIN_NAME)" 2>/dev/null || true
 	@if [ -z "$(DEVELOPER_ID)" ]; then \
 		codesign --force --deep --sign - "$(UNIVERSAL_APP)" && \
 		echo "ad-hoc signed: $(UNIVERSAL_APP)"; \

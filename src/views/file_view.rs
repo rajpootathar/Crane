@@ -466,6 +466,24 @@ fn render_scoped(
             ui.add_space(4.0);
         }
 
+        // PDF viewer: short-circuit the entire text-editor body. The
+        // path row above shows the breadcrumb; the PDF view paints its
+        // own toolbar (page nav + zoom + Open Externally) and the
+        // document scroll area below.
+        if crate::views::pdf_view::is_pdf_path(&tab.path) {
+            if tab.pdf_state.is_none() {
+                tab.pdf_state = Some(Box::new(
+                    crate::views::pdf_view::PdfTabState::new(
+                        std::path::PathBuf::from(&tab.path),
+                    ),
+                ));
+            }
+            if let Some(state) = tab.pdf_state.as_mut() {
+                crate::views::pdf_view::render_pdf(ui, state);
+            }
+            return false;
+        }
+
         let is_md = Path::new(&tab.path)
             .extension()
             .and_then(|e| e.to_str())
