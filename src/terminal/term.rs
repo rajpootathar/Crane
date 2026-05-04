@@ -284,6 +284,16 @@ impl Terminal {
         thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
+            // Repaint gate state. Per-batch we compare both the
+            // dirty_epoch (cell content changes) AND the cursor
+            // position — the earlier "epoch only" gate dropped
+            // cursor-only moves and left the cursor visibly stuck;
+            // an unconditional gate wakes egui hundreds of times per
+            // second under busy CLIs (Claude spinners etc.) for no
+            // visible reason. Together the two cover every case
+            // that affects the rendered grid.
+            let mut last_epoch: u64 = 0;
+            let mut last_cursor: (usize, usize) = (usize::MAX, usize::MAX);
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -293,6 +303,7 @@ impl Terminal {
                         {
                             let _ = g.write_all(&buf[..n]);
                         }
+                        let should_repaint;
                         {
                             let mut p = parser_clone.lock();
                             let mut t = term_clone.lock();
@@ -303,6 +314,12 @@ impl Terminal {
                             // Powerlevel10k width-miscount workaround
                             // depends on these arriving promptly.
                             let replies = t.take_pty_replies();
+                            let new_epoch = t.dirty_epoch;
+                            let new_cursor = (t.grid.cursor.row, t.grid.cursor.col);
+                            should_repaint =
+                                new_epoch != last_epoch || new_cursor != last_cursor;
+                            last_epoch = new_epoch;
+                            last_cursor = new_cursor;
                             drop(t);
                             drop(p);
                             if !replies.is_empty() {
@@ -318,14 +335,9 @@ impl Terminal {
                             h.drain(0..drop_n);
                         }
                         drop(h);
-                        // Wake egui per PTY batch unconditionally.
-                        // The earlier dirty_epoch gate skipped
-                        // repaints for cursor-only moves and on parse
-                        // calls whose net effect was no cell change,
-                        // which left the cursor visibly stuck. egui
-                        // coalesces multiple repaint requests within
-                        // a frame, so per-batch wakes are still cheap.
-                        ctx_clone.request_repaint();
+                        if should_repaint {
+                            ctx_clone.request_repaint();
+                        }
                     }
                     Err(_) => break,
                 }
