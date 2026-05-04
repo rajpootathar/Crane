@@ -4,6 +4,7 @@ mod format;
 #[cfg(target_os = "macos")]
 mod mac_keys;
 mod git;
+mod git_log;
 mod lsp;
 mod modals;
 mod platform_menu;
