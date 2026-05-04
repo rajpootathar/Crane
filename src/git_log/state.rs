@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-pub type Sha = String;
+use crate::git_log::data::Sha;
 
 pub struct GitLogState {
     pub height: f32,
