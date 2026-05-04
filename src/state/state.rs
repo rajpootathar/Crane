@@ -933,46 +933,7 @@ impl App {
             self.add_single_project(path, Some(group_root), Some(group_name), ctx);
         }
 
-        // Cluster each group's members contiguously, anchored at the
-        // first-occurrence slot. Without this pass, a group's existing
-        // siblings (restored from the last session) and newly-appended
-        // ones (from `add_single_project` above) can be interleaved
-        // with unrelated standalone Projects — the Left Panel then
-        // re-renders a folder header every time `group_path` flips
-        // between adjacent rows, producing the duplicate headers the
-        // reindex was supposed to collapse.
-        let n = self.projects.len();
-        let mut order: Vec<usize> = Vec::with_capacity(n);
-        let mut placed_groups: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::new();
-        for i in 0..n {
-            match &self.projects[i].group_path {
-                None => order.push(i),
-                Some(gp) => {
-                    if placed_groups.contains(gp) {
-                        continue;
-                    }
-                    let gp = gp.clone();
-                    placed_groups.insert(gp.clone());
-                    for j in 0..n {
-                        if self.projects[j].group_path.as_ref() == Some(&gp) {
-                            order.push(j);
-                        }
-                    }
-                }
-            }
-        }
-        if order.len() == n {
-            let mut slots: Vec<Option<Project>> =
-                std::mem::take(&mut self.projects).into_iter().map(Some).collect();
-            let mut reordered: Vec<Project> = Vec::with_capacity(n);
-            for idx in order {
-                if let Some(p) = slots[idx].take() {
-                    reordered.push(p);
-                }
-            }
-            self.projects = reordered;
-        }
+        self.consolidate_groups();
 
         // Demote any group whose live member count has dropped to ≤1.
         // Happens when a sibling repo was deleted on disk outside Crane
@@ -1814,10 +1775,176 @@ impl App {
         }
     }
 
-    pub fn reorder_project(&mut self, project_id: ProjectId, new_index: usize) {
-        if let Some(pos) = self.projects.iter().position(|p| p.id == project_id) {
-            Self::move_in_vec(&mut self.projects, pos, new_index);
+    /// Compute root-level blocks of `projects`. A block is either a
+    /// single standalone Project (`group_path == None`) or a maximal
+    /// run of contiguous Projects sharing the same `group_path`. The
+    /// rendering loop treats each block as one "root row" — folder
+    /// header for grouped blocks, project row for standalone — and
+    /// drag-drop reordering at root level must move blocks atomically.
+    fn root_blocks(&self) -> Vec<std::ops::Range<usize>> {
+        let mut blocks = Vec::new();
+        let mut i = 0;
+        while i < self.projects.len() {
+            let start = i;
+            match self.projects[i].group_path.clone() {
+                None => i += 1,
+                Some(gp) => {
+                    while i < self.projects.len()
+                        && self.projects[i].group_path.as_ref() == Some(&gp)
+                    {
+                        i += 1;
+                    }
+                }
+            }
+            blocks.push(start..i);
         }
+        blocks
+    }
+
+    /// Move root block at `src_block_idx` to slot `new_block_index`
+    /// (positions are pre-removal indices in the block sequence —
+    /// matches the same convention as `move_in_vec`).
+    fn move_block(&mut self, src_block_idx: usize, new_block_index: usize) {
+        let blocks = self.root_blocks();
+        if src_block_idx >= blocks.len() {
+            return;
+        }
+        let target = new_block_index.min(blocks.len());
+        if target == src_block_idx || target == src_block_idx + 1 {
+            return;
+        }
+
+        let mut order: Vec<usize> = (0..blocks.len()).collect();
+        let item = order.remove(src_block_idx);
+        let insert_at = if target > src_block_idx {
+            target - 1
+        } else {
+            target
+        };
+        order.insert(insert_at, item);
+
+        let n = self.projects.len();
+        let old = std::mem::take(&mut self.projects);
+        let mut taken: Vec<Option<Project>> = old.into_iter().map(Some).collect();
+        let mut new_projects: Vec<Project> = Vec::with_capacity(n);
+        for &b_idx in &order {
+            for i in blocks[b_idx].clone() {
+                if let Some(p) = taken[i].take() {
+                    new_projects.push(p);
+                }
+            }
+        }
+        self.projects = new_projects;
+    }
+
+    /// Reorder a standalone (root-level) Project among root blocks.
+    /// `new_block_index` is the target slot in the block sequence.
+    /// No-op for grouped Projects — those move only via their folder
+    /// header (`reorder_root_group`).
+    pub fn reorder_root_project(&mut self, project_id: ProjectId, new_block_index: usize) {
+        let Some(pos) = self.projects.iter().position(|p| p.id == project_id) else {
+            return;
+        };
+        if self.projects[pos].group_path.is_some() {
+            return;
+        }
+        let blocks = self.root_blocks();
+        let Some(src) = blocks.iter().position(|b| b.contains(&pos)) else {
+            return;
+        };
+        self.move_block(src, new_block_index);
+        self.consolidate_groups();
+    }
+
+    /// Reorder the folder-group block containing `anchor_id` among
+    /// root blocks. The whole group (every Project sharing its
+    /// `group_path` within the same block) moves as a unit.
+    pub fn reorder_root_group(&mut self, anchor_id: ProjectId, new_block_index: usize) {
+        let Some(pos) = self.projects.iter().position(|p| p.id == anchor_id) else {
+            return;
+        };
+        if self.projects[pos].group_path.is_none() {
+            return;
+        }
+        let blocks = self.root_blocks();
+        let Some(src) = blocks.iter().position(|b| b.contains(&pos)) else {
+            return;
+        };
+        self.move_block(src, new_block_index);
+        self.consolidate_groups();
+    }
+
+    /// Reorder `project_id` within its containing block. The block is
+    /// the contiguous run of Projects sharing a `group_path` that
+    /// includes `anchor_id`. If `project_id` is not in that block, the
+    /// move is rejected — sub-projects cannot escape their group
+    /// through drag-drop.
+    pub fn reorder_project_in_block(
+        &mut self,
+        project_id: ProjectId,
+        anchor_id: ProjectId,
+        new_index_in_block: usize,
+    ) {
+        let Some(pos) = self.projects.iter().position(|p| p.id == project_id) else {
+            return;
+        };
+        let Some(anchor_pos) = self.projects.iter().position(|p| p.id == anchor_id) else {
+            return;
+        };
+        let blocks = self.root_blocks();
+        let Some(block) = blocks.iter().find(|b| b.contains(&anchor_pos)).cloned() else {
+            return;
+        };
+        if !block.contains(&pos) {
+            return;
+        }
+        let block_len = block.end - block.start;
+        let target = new_index_in_block.min(block_len);
+        let to = block.start + target;
+        Self::move_in_vec(&mut self.projects, pos, to);
+    }
+
+    /// Cluster each group's members contiguously, anchored at the
+    /// first-occurrence slot. Standalone Projects keep their relative
+    /// order. Without this pass, a single `group_path` can render as
+    /// multiple folder headers — the rendering loop draws a header
+    /// every time `group_path` flips between adjacent rows. Run after
+    /// any operation that touches `projects` ordering (drag-drop,
+    /// reindex, restore).
+    pub fn consolidate_groups(&mut self) {
+        let n = self.projects.len();
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut placed_groups: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        for i in 0..n {
+            match &self.projects[i].group_path {
+                None => order.push(i),
+                Some(gp) => {
+                    if placed_groups.contains(gp) {
+                        continue;
+                    }
+                    let gp = gp.clone();
+                    placed_groups.insert(gp.clone());
+                    for j in 0..n {
+                        if self.projects[j].group_path.as_ref() == Some(&gp) {
+                            order.push(j);
+                        }
+                    }
+                }
+            }
+        }
+        if order.len() != n {
+            return;
+        }
+        let mut slots: Vec<Option<Project>> =
+            std::mem::take(&mut self.projects).into_iter().map(Some).collect();
+        let mut reordered: Vec<Project> = Vec::with_capacity(n);
+        for idx in order {
+            if let Some(p) = slots[idx].take() {
+                reordered.push(p);
+            }
+        }
+        self.projects = reordered;
     }
 
     pub fn reorder_workspace(&mut self, project_id: ProjectId, ws_id: WorkspaceId, new_index: usize) {

@@ -8,9 +8,20 @@ use egui_phosphor::regular as icons;
 /// Payload stored in egui's drag state when a tree row is being
 /// dragged.  Identifies the item and its parent scope so drop targets
 /// can validate same-level, same-parent scope.
+///
+/// `Project` carries `in_group: Option<u64>` — `None` for standalone
+/// (root-level) projects, `Some(anchor_id)` for sub-projects inside a
+/// folder group, where `anchor_id` is the id of the first Project in
+/// the containing block. Sub-projects can only drop on rows in the
+/// same block (matched by anchor) so they can't escape their group.
+///
+/// `Group` is dragged from a folder header and identified by its
+/// block anchor (first Project's id), since two distinct blocks may
+/// share a `group_path` until the consolidation pass merges them.
 #[derive(Clone)]
 enum TreeDrag {
-    Project { id: u64 },
+    Project { id: u64, in_group: Option<u64> },
+    Group { anchor: u64 },
     Workspace { project_id: u64, id: u64 },
     Tab { project_id: u64, workspace_id: u64, id: u64 },
 }
@@ -20,7 +31,12 @@ enum TreeDrag {
 /// rows count as siblings for the in-flight drag.
 #[derive(Clone)]
 enum DropScope {
-    Project,
+    /// Top-level row: standalone project or folder header. Root-level
+    /// drags (standalone projects, folder headers) all match here.
+    Root,
+    /// Sub-project inside a folder group, anchored at the first
+    /// Project of the block. Sub-projects only match same-anchor zones.
+    InBlock { anchor: u64 },
     Workspace { project_id: u64 },
     Tab { project_id: u64, workspace_id: u64 },
 }
@@ -164,7 +180,6 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut set_tab_tint: Option<(u64, u64, u64, Option<[u8; 3]>)> = None;
     // Pending "toggle folder group collapse" from a folder-header click.
     let mut toggle_group_collapsed: Option<std::path::PathBuf> = None;
-    let mut reorder_project: Option<(u64, usize)> = None;
     let mut reorder_workspace: Option<(u64, u64, usize)> = None;
     let mut reorder_tab: Option<(u64, u64, u64, usize)> = None;
     // Each visible row registers its hit rect + scope here. Drop dispatch
@@ -217,6 +232,10 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let mut last_group: Option<std::path::PathBuf> = None;
+            // Anchor (first Project's id) of the current contiguous
+            // group block — used to scope sub-project drag-drop so a
+            // sub-project can only reorder within its own block.
+            let mut current_block_anchor: Option<u64> = None;
             for project in app.projects.iter() {
                 // Render a group header row whenever we enter a new
                 // group. Projects without a group render flush-left as
@@ -304,6 +323,39 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                             }
                         });
                     }
+                    // Folder header acts as a draggable root-level
+                    // unit: payload anchored at this block's first
+                    // Project, drop zone scoped to root.
+                    if folder_row.response.dragged() {
+                        folder_row
+                            .response
+                            .dnd_set_drag_payload(TreeDrag::Group { anchor: project.id });
+                    }
+                    if let Some(p) = pointer_pos {
+                        if folder_row.rect.contains(p) {
+                            if let Some(payload) = egui::DragAndDrop::payload::<TreeDrag>(ctx) {
+                                let root_drag = matches!(
+                                    payload.as_ref(),
+                                    TreeDrag::Group { .. }
+                                        | TreeDrag::Project { in_group: None, .. }
+                                );
+                                let same_anchor = matches!(
+                                    payload.as_ref(),
+                                    TreeDrag::Group { anchor } if *anchor == project.id
+                                );
+                                if root_drag && !same_anchor {
+                                    let above = p.y < folder_row.rect.center().y;
+                                    paint_drop_line(ui, folder_row.rect, above);
+                                }
+                            }
+                        }
+                    }
+                    drop_zones.push(DropZone {
+                        rect: folder_row.rect,
+                        scope: DropScope::Root,
+                    });
+                    // First Project of a new block — record as anchor.
+                    current_block_anchor = Some(project.id);
                 }
                 last_group = project.group_path.clone();
                 // Skip rendering this Project (and everything under it)
@@ -385,11 +437,21 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 } else if row.main_clicked {
                     toggle_project = Some(project.id);
                 }
-                // Drag source. Setting payload every frame while
-                // dragged keeps it alive so the post-walk dispatcher can
-                // read it on the release frame.
+                // Drag source. For standalone projects, payload is
+                // root-scoped (`in_group = None`) and matches root
+                // drops only. For sub-projects, payload carries the
+                // block anchor so it matches only same-block drop
+                // zones — preventing escape from the folder group.
+                let row_in_group = if in_group {
+                    current_block_anchor
+                } else {
+                    None
+                };
                 if row.response.dragged() {
-                    row.response.dnd_set_drag_payload(TreeDrag::Project { id: project.id });
+                    row.response.dnd_set_drag_payload(TreeDrag::Project {
+                        id: project.id,
+                        in_group: row_in_group,
+                    });
                 }
                 // Indicator: paint a drop-line preview while a same-
                 // scope drag is in flight and the pointer is over this
@@ -399,19 +461,32 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                 if let Some(p) = pointer_pos {
                     if row.rect.contains(p) {
                         if let Some(payload) = egui::DragAndDrop::payload::<TreeDrag>(ctx) {
-                            if let TreeDrag::Project { id: src_id } = payload.as_ref() {
-                                if *src_id != project.id {
-                                    let above = p.y < row.rect.center().y;
-                                    paint_drop_line(ui, row.rect, above);
+                            let scope_match = match payload.as_ref() {
+                                TreeDrag::Project { id: src_id, in_group: src_grp } => {
+                                    *src_id != project.id && *src_grp == row_in_group
                                 }
+                                TreeDrag::Group { .. } => row_in_group.is_none(),
+                                _ => false,
+                            };
+                            if scope_match {
+                                let above = p.y < row.rect.center().y;
+                                paint_drop_line(ui, row.rect, above);
                             }
                         }
                     }
                 }
                 drop_zones.push(DropZone {
                     rect: row.rect,
-                    scope: DropScope::Project,
+                    scope: match row_in_group {
+                        Some(anchor) => DropScope::InBlock { anchor },
+                        None => DropScope::Root,
+                    },
                 });
+                // Clear the block anchor after every standalone row so
+                // the next group block starts fresh.
+                if !in_group {
+                    current_block_anchor = None;
+                }
                 let pid = project.id;
                 let proj_path = project.path.clone();
                 row.response.context_menu(|ui| {
@@ -1093,12 +1168,27 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
             None
         }
     });
+    // Reorder targets resolved during dispatch — applied after the
+    // tree walk so we don't borrow `app` mutably while iterating.
+    let mut reorder_root_project: Option<(u64, usize)> = None;
+    let mut reorder_root_group: Option<(u64, usize)> = None;
+    let mut reorder_in_block: Option<(u64, u64, usize)> = None;
     if let Some(release_pos) = release_pos {
         if let Some(payload) = egui::DragAndDrop::take_payload::<TreeDrag>(ctx) {
             let candidates: Vec<&DropZone> = drop_zones
                 .iter()
                 .filter(|z| match (payload.as_ref(), &z.scope) {
-                    (TreeDrag::Project { .. }, DropScope::Project) => true,
+                    // Standalone project drag matches root rows only.
+                    (TreeDrag::Project { in_group: None, .. }, DropScope::Root) => true,
+                    // Folder-group drag matches root rows only.
+                    (TreeDrag::Group { .. }, DropScope::Root) => true,
+                    // Sub-project drag matches only same-block rows
+                    // (anchor equality) — no escape to root or to a
+                    // different group's block.
+                    (
+                        TreeDrag::Project { in_group: Some(src_anchor), .. },
+                        DropScope::InBlock { anchor: zone_anchor },
+                    ) => src_anchor == zone_anchor,
                     (
                         TreeDrag::Workspace { project_id: pid, .. },
                         DropScope::Workspace { project_id: zpid },
@@ -1121,8 +1211,14 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         .filter(|z| z.rect.center().y <= release_pos.y)
                         .count();
                     match payload.as_ref() {
-                        TreeDrag::Project { id } => {
-                            reorder_project = Some((*id, new_index));
+                        TreeDrag::Project { id, in_group: None } => {
+                            reorder_root_project = Some((*id, new_index));
+                        }
+                        TreeDrag::Project { id, in_group: Some(anchor) } => {
+                            reorder_in_block = Some((*id, *anchor, new_index));
+                        }
+                        TreeDrag::Group { anchor } => {
+                            reorder_root_group = Some((*anchor, new_index));
                         }
                         TreeDrag::Workspace { project_id, id } => {
                             reorder_workspace = Some((*project_id, *id, new_index));
@@ -1136,8 +1232,14 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         }
     }
 
-    if let Some((pid, idx)) = reorder_project {
-        app.reorder_project(pid, idx);
+    if let Some((pid, idx)) = reorder_root_project {
+        app.reorder_root_project(pid, idx);
+    }
+    if let Some((anchor, idx)) = reorder_root_group {
+        app.reorder_root_group(anchor, idx);
+    }
+    if let Some((pid, anchor, idx)) = reorder_in_block {
+        app.reorder_project_in_block(pid, anchor, idx);
     }
     if let Some((pid, wid, idx)) = reorder_workspace {
         app.reorder_workspace(pid, wid, idx);
