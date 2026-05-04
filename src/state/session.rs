@@ -114,7 +114,31 @@ pub struct STab {
     pub panes: Vec<SPane>,
     #[serde(default)]
     pub tint: Option<[u8; 3]>,
+    #[serde(default)]
+    pub git_log_visible: bool,
+    #[serde(default)]
+    pub git_log_state: Option<SGitLogState>,
 }
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct SGitLogState {
+    #[serde(default = "default_git_log_height")]
+    pub height: f32,
+    #[serde(default = "default_git_log_col_refs")]
+    pub col_refs_width: f32,
+    #[serde(default = "default_git_log_col_details")]
+    pub col_details_width: f32,
+    #[serde(default)]
+    pub maximized: bool,
+    #[serde(default)]
+    pub selected_commit: Option<String>,
+    #[serde(default)]
+    pub selected_file: Option<String>,
+}
+
+fn default_git_log_height() -> f32 { 320.0 }
+fn default_git_log_col_refs() -> f32 { 220.0 }
+fn default_git_log_col_details() -> f32 { 360.0 }
 
 #[derive(Serialize, Deserialize)]
 pub enum SNode {
@@ -427,6 +451,15 @@ impl STab {
             next_pane_id: t.layout.next_pane_id(),
             panes,
             tint: t.tint,
+            git_log_visible: t.git_log_visible,
+            git_log_state: t.git_log_state.as_ref().map(|s| SGitLogState {
+                height: s.height,
+                col_refs_width: s.col_refs_width,
+                col_details_width: s.col_details_width,
+                maximized: s.maximized,
+                selected_commit: s.selected_commit.clone(),
+                selected_file: s.selected_file.as_ref().map(|p| p.to_string_lossy().to_string()),
+            }),
         }
     }
 
@@ -444,6 +477,16 @@ impl STab {
             name: self.name,
             layout,
             tint: self.tint,
+            git_log_visible: self.git_log_visible,
+            git_log_state: self.git_log_state.map(|s| crate::git_log::GitLogState {
+                height: s.height,
+                col_refs_width: s.col_refs_width,
+                col_details_width: s.col_details_width,
+                maximized: s.maximized,
+                selected_commit: s.selected_commit,
+                selected_file: s.selected_file.map(std::path::PathBuf::from),
+                last_poll: std::time::Instant::now(),
+            }),
         }
     }
 }

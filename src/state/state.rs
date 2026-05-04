@@ -27,6 +27,12 @@ pub struct Tab {
     /// tree can be colour-coded consistently. `None` → fall back to
     /// the active-tab accent (when active) or the default foreground.
     pub tint: Option<[u8; 3]>,
+    /// Whether the bottom-docked Git Log Pane is shown for this Tab.
+    /// Default false; toggled by Cmd+9 / top-bar button.
+    pub git_log_visible: bool,
+    /// Lazy-initialized on first show. None means the user has never
+    /// opened the pane on this Tab. Persisted in session.json.
+    pub git_log_state: Option<crate::git_log::GitLogState>,
 }
 
 pub struct Workspace {
@@ -687,6 +693,8 @@ impl App {
                 name: "Terminal".into(),
                 layout,
                 tint: None,
+                git_log_visible: false,
+                git_log_state: None,
             };
             if first_active.is_none() {
                 first_active = Some((wt_id, tab_id));
@@ -859,6 +867,8 @@ impl App {
                     name: "Terminal".into(),
                     layout,
                     tint: None,
+                    git_log_visible: false,
+                    git_log_state: None,
                 };
                 let new_workspace = Workspace {
                     id: wt_id,
@@ -1552,6 +1562,8 @@ impl App {
             name,
             layout,
             tint: None,
+            git_log_visible: false,
+            git_log_state: None,
         });
         wt.active_tab = Some(tab_id);
         self.active = Some((pid, wid, tab_id));
@@ -1735,6 +1747,8 @@ impl App {
                     name: "Terminal".into(),
                     layout,
                     tint: None,
+                    git_log_visible: false,
+                    git_log_state: None,
                 };
                 project.workspaces.push(Workspace {
                     id: wt_id,
