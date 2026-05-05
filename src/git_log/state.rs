@@ -1,9 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::git_log::data::{self, CommitRecord, Sha};
 use crate::git_log::graph::{self, LaneFrame};
+use crate::git_log::refresh;
 use crate::git_log::refs::{self, RefSet};
 
 /// Filter state applied at render time over the cached GraphFrame —
@@ -40,6 +43,17 @@ pub struct GitLogState {
     pub generation: u64,
     pub worker_rx: Option<mpsc::Receiver<GraphFrame>>,
     pub filter: FilterState,
+    /// Filesystem watcher on `.git/HEAD` + `.git/refs/` + packed-refs.
+    /// Lazy-init on first `maybe_reload` call so we don't pay the cost
+    /// for tabs that never open the pane.
+    pub watcher: Option<refresh::Watcher>,
+    /// True while a `git fetch --all` is running on a background
+    /// thread. The header strip swaps the Fetch button for a spinner.
+    pub fetch_in_flight: Arc<AtomicBool>,
+    /// Path of the repo this state was last reloaded against. Used to
+    /// detect Workspace switches so the watcher gets re-created on a
+    /// fresh repo.
+    pub watched_repo: Option<PathBuf>,
 }
 
 impl GitLogState {
@@ -56,7 +70,51 @@ impl GitLogState {
             generation: 0,
             worker_rx: None,
             filter: FilterState::default(),
+            watcher: None,
+            fetch_in_flight: Arc::new(AtomicBool::new(false)),
+            watched_repo: None,
         }
+    }
+
+    /// Auto-reload trigger called once per render frame. Reloads when
+    /// any of the following fire:
+    /// - filesystem watcher reports a `.git/HEAD` / `refs/` /
+    ///   `packed-refs` write (debounced 250 ms)
+    /// - 5 s poll fallback (covers FS event drops on NFS, etc.)
+    ///
+    /// Reload on first call too — that's how the pane backfills its
+    /// initial frame after toggle. If the worker is already in flight
+    /// this is a no-op.
+    pub fn maybe_reload(&mut self, repo: PathBuf, ctx: &egui::Context) {
+        // Re-create the watcher if the workspace switched.
+        if self.watched_repo.as_deref() != Some(repo.as_path()) {
+            self.watcher = refresh::Watcher::new(&repo);
+            self.watched_repo = Some(repo.clone());
+        }
+        let mut should_reload = false;
+        if self.frame.is_none() && self.worker_rx.is_none() {
+            should_reload = true;
+        }
+        if let Some(w) = self.watcher.as_mut() {
+            if w.poll(Duration::from_millis(250)) {
+                should_reload = true;
+            }
+        }
+        if self.last_poll.elapsed() >= Duration::from_secs(5) {
+            self.last_poll = Instant::now();
+            should_reload = true;
+        }
+        if should_reload {
+            self.reload(repo, ctx);
+        }
+    }
+
+    pub fn fetch_all(&self, repo: PathBuf, ctx: &egui::Context) {
+        refresh::fetch_all_async(repo, self.fetch_in_flight.clone(), ctx.clone());
+    }
+
+    pub fn is_fetching(&self) -> bool {
+        self.fetch_in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Kick off a fresh worker if none is in-flight. The worker
