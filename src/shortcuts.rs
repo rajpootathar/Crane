@@ -256,29 +256,37 @@ pub fn handle(
         app.toggle_git_log(ctx);
     }
 
-    // Cmd+F: focus the Git Log filter TextEdit when the pane is open.
-    // Only fires when no widget currently holds focus so it doesn't
-    // steal Cmd+F from the system Find menu in editors etc.
-    let focus_log_filter = ctx.input_mut(|i| {
-        let pressed = (i.modifiers.command || i.modifiers.mac_cmd)
-            && i.key_pressed(egui::Key::F)
-            && !i.modifiers.shift
-            && !i.modifiers.alt;
-        let already_focused = ctx.memory(|m| m.focused().is_some());
-        if pressed && !already_focused {
-            i.consume_key(egui::Modifiers::COMMAND, egui::Key::F);
-            i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::F);
-            true
-        } else {
-            false
-        }
-    });
-    if focus_log_filter {
-        if let Some(state) = app
-            .active_tab_mut()
-            .and_then(|t| t.git_log_state.as_mut())
-        {
-            state.pending_focus_filter = true;
+    // Cmd+F: when the Git Log pane has focus, focus its filter
+    // TextEdit. Otherwise fall through to the Files Pane's existing
+    // find-in-file handler. Both context reads (memory + git_log
+    // focus flag) are taken BEFORE input_mut so we never nest
+    // egui's global RwLock — that pattern deadlocks at startup.
+    let already_focused = ctx.memory(|m| m.focused().is_some());
+    let git_log_has_focus = app
+        .active_tab_ref()
+        .and_then(|t| t.git_log_state.as_ref().map(|s| s.has_focus))
+        .unwrap_or(false);
+    if git_log_has_focus {
+        let pressed = ctx.input_mut(|i| {
+            let p = (i.modifiers.command || i.modifiers.mac_cmd)
+                && i.key_pressed(egui::Key::F)
+                && !i.modifiers.shift
+                && !i.modifiers.alt;
+            if p && !already_focused {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::F);
+                i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::F);
+                true
+            } else {
+                false
+            }
+        });
+        if pressed {
+            if let Some(state) = app
+                .active_tab_mut()
+                .and_then(|t| t.git_log_state.as_mut())
+            {
+                state.pending_focus_filter = true;
+            }
         }
     }
 }

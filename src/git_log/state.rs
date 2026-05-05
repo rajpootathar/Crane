@@ -94,6 +94,12 @@ pub struct GitLogState {
     /// Set by the Cmd+F shortcut handler to request keyboard focus
     /// on the filter TextEdit on the next frame.
     pub pending_focus_filter: bool,
+    /// True when the user has interacted with the Git Log pane
+    /// (clicked inside its body region) more recently than any other
+    /// pane. Used to route Cmd+F: when this pane has focus, the
+    /// shortcut focuses the filter; otherwise it falls through to
+    /// the Files Pane's find-in-file handler.
+    pub has_focus: bool,
 }
 
 impl GitLogState {
@@ -121,6 +127,7 @@ impl GitLogState {
             last_visible_count: 0,
             pending_scroll_to_selected: false,
             pending_focus_filter: false,
+            has_focus: false,
         }
     }
 

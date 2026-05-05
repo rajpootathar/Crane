@@ -513,6 +513,7 @@ impl STab {
                 last_visible_count: 0,
                 pending_scroll_to_selected: false,
                 pending_focus_filter: false,
+                has_focus: false,
             }),
         }
     }

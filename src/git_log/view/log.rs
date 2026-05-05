@@ -277,21 +277,9 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                     paint_lane(ui, &row_resp.rect, lane_row, next_lane);
                 }
 
-                // Subject + ref pills + metadata.
-                let mut text_x = row_resp.rect.left() + graph_width + 4.0;
+                // Subject + metadata.
+                let text_x = row_resp.rect.left() + graph_width + 4.0;
                 let text_y = row_resp.rect.top() + 4.0;
-
-                // Inline ref pills parsed from `refs_decoration`. Each
-                // pill has a tinted bg + label (HEAD / branch / tag /
-                // remote) so the user can see refs without scanning the
-                // refs panel.
-                if !c.refs_decoration.is_empty() {
-                    text_x = paint_ref_pills(
-                        ui,
-                        &c.refs_decoration,
-                        egui::pos2(text_x, text_y),
-                    );
-                }
 
                 ui.painter().text(
                     egui::pos2(text_x, text_y),

@@ -56,6 +56,22 @@ pub fn render(
     state.poll_worker();
     state.maybe_reload(repo.to_path_buf(), ui.ctx());
 
+    // Focus tracking: clicking anywhere inside the body marks the
+    // pane as focused so Cmd+F (handled in shortcuts) routes to the
+    // filter TextEdit. clicked_elsewhere clears focus when the user
+    // clicks any other pane.
+    let body_focus_resp = ui.interact(
+        region,
+        egui::Id::new("git_log_focus_tracker"),
+        egui::Sense::click(),
+    );
+    if body_focus_resp.clicked() {
+        state.has_focus = true;
+    }
+    if body_focus_resp.clicked_elsewhere() {
+        state.has_focus = false;
+    }
+
     ui.painter().rect_filled(region, 0.0, pane_bg());
 
     // Header strip
