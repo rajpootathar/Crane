@@ -35,6 +35,7 @@ pub fn render(
     let mut effect = ViewEffect::default();
     let mut request_close = false;
     state.poll_worker();
+    state.maybe_reload(repo.to_path_buf(), ui.ctx());
 
     ui.painter()
         .rect_filled(region, 0.0, Color32::from_rgb(20, 22, 28));
@@ -81,10 +82,18 @@ pub fn render(
                 .on_hover_text("Refresh")
                 .clicked()
             {
-                // Drop the in-flight worker (if any) so reload starts
-                // fresh, then kick a new load against the active repo.
                 state.worker_rx = None;
                 state.reload(repo.to_path_buf(), ui.ctx());
+            }
+            ui.add_space(4.0);
+            if state.is_fetching() {
+                ui.spinner();
+            } else if ui
+                .button(icons::DOWNLOAD_SIMPLE)
+                .on_hover_text("Fetch all (git fetch --all --prune --tags)")
+                .clicked()
+            {
+                state.fetch_all(repo.to_path_buf(), ui.ctx());
             }
         });
     });

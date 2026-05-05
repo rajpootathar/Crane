@@ -490,6 +490,11 @@ impl STab {
                 generation: 0,
                 worker_rx: None,
                 filter: crate::git_log::state::FilterState::default(),
+                watcher: None,
+                fetch_in_flight: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
+                watched_repo: None,
             }),
         }
     }
