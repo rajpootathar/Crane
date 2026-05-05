@@ -198,10 +198,16 @@ pub fn render_pdf(ui: &mut Ui, state: &mut PdfTabState) {
         .auto_shrink([false; 2])
         .max_height(avail_h)
         .show(ui, |ui| {
-            for page_idx in 0..state.page_count {
-                render_page(ui, state, page_idx);
-                ui.add_space(PAGE_GAP);
-            }
+            // Center pages horizontally within the pane. When a page
+            // is wider than the pane the ScrollArea still scrolls
+            // horizontally; centering only kicks in when the page
+            // (at current zoom) is narrower than the available width.
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                for page_idx in 0..state.page_count {
+                    render_page(ui, state, page_idx);
+                    ui.add_space(PAGE_GAP);
+                }
+            });
         });
 
     evict_textures(state);

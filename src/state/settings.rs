@@ -29,6 +29,8 @@ pub struct Settings {
     pub editor_word_wrap: bool,
     #[serde(default)]
     pub editor_trim_on_save: bool,
+    #[serde(default)]
+    pub single_click_open: bool,
     #[serde(default = "t")]
     pub show_left: bool,
     #[serde(default = "t")]
@@ -72,6 +74,7 @@ impl Default for Settings {
             right_panel_w: default_right_w(),
             editor_word_wrap: false,
             editor_trim_on_save: false,
+            single_click_open: false,
             show_left: true,
             show_right: true,
             right_tab_files: false,
@@ -120,6 +123,7 @@ impl Settings {
             right_panel_w: app.right_panel_w,
             editor_word_wrap: app.editor_word_wrap,
             editor_trim_on_save: app.editor_trim_on_save,
+            single_click_open: app.single_click_open,
             show_left: app.show_left,
             show_right: app.show_right,
             right_tab_files: matches!(app.right_tab, RightTab::Files),
@@ -139,6 +143,7 @@ impl Settings {
         app.right_panel_w = self.right_panel_w.clamp(200.0, 700.0);
         app.editor_word_wrap = self.editor_word_wrap;
         app.editor_trim_on_save = self.editor_trim_on_save;
+        app.single_click_open = self.single_click_open;
         app.show_left = self.show_left;
         app.show_right = self.show_right;
         app.right_tab = if self.right_tab_files {
