@@ -137,6 +137,36 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
     let mut clicked_sha: Option<String> = None;
     let mut picked_op: Option<GitLogOp> = None;
 
+    // Keyboard nav: arrow keys move the selection through the
+    // currently visible (filtered) row list. Only fires when the log
+    // column has focus — we approximate that by checking that no
+    // egui widget currently holds keyboard focus (so Arrow keys
+    // don't fight the filter TextEdit).
+    let any_focus = ui.ctx().memory(|m| m.focused().is_some());
+    if !any_focus && !visible.is_empty() {
+        let cur_visible = state
+            .selected_commit
+            .as_ref()
+            .and_then(|sha| {
+                visible
+                    .iter()
+                    .position(|&i| frame.commits[i].sha == *sha)
+            });
+        let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::J));
+        let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::K));
+        if down || up {
+            let next_idx = match cur_visible {
+                Some(idx) if down => (idx + 1).min(visible.len() - 1),
+                Some(idx) if up => idx.saturating_sub(1),
+                None => 0,
+                _ => 0,
+            };
+            state.selected_commit =
+                Some(frame.commits[visible[next_idx]].sha.clone());
+            state.selected_file = None;
+        }
+    }
+
     egui::ScrollArea::vertical()
         .id_salt("git_log_commits")
         .auto_shrink([false, false])
