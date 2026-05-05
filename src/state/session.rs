@@ -486,6 +486,9 @@ impl STab {
                 selected_commit: s.selected_commit,
                 selected_file: s.selected_file.map(std::path::PathBuf::from),
                 last_poll: std::time::Instant::now(),
+                frame: None,
+                generation: 0,
+                worker_rx: None,
             }),
         }
     }
