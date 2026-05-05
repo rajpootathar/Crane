@@ -107,6 +107,52 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
     let needle = state.filter.text.to_lowercase();
     let branch_filter = state.filter.branch.clone();
     let user_filter = state.filter.user.clone();
+
+    // For the branch / tag filter we want every commit REACHABLE from
+    // that ref's tip via parents, not just the one decorated with the
+    // ref name (which is only the tip itself). Resolve the tip SHA
+    // from frame.refs and BFS the parent graph in-memory; ~10k
+    // commits fit in microseconds.
+    let reachable: Option<std::collections::HashSet<String>> =
+        branch_filter.as_ref().and_then(|name| {
+            let tip = frame
+                .refs
+                .local
+                .iter()
+                .chain(frame.refs.remote.iter())
+                .chain(frame.refs.tags.iter())
+                .find(|r| {
+                    r.name.trim_start_matches("refs/heads/")
+                        == name.as_str()
+                        || r.name.trim_start_matches("refs/remotes/")
+                            == name.as_str()
+                        || r.name.trim_start_matches("refs/tags/")
+                            == name.as_str()
+                })?
+                .sha
+                .clone();
+            let parent_map: std::collections::HashMap<&str, &Vec<String>> = frame
+                .commits
+                .iter()
+                .map(|c| (c.sha.as_str(), &c.parents))
+                .collect();
+            let mut set = std::collections::HashSet::new();
+            let mut stack = vec![tip];
+            while let Some(sha) = stack.pop() {
+                if !set.insert(sha.clone()) {
+                    continue;
+                }
+                if let Some(parents) = parent_map.get(sha.as_str()) {
+                    for p in parents.iter() {
+                        if !set.contains(p) {
+                            stack.push(p.clone());
+                        }
+                    }
+                }
+            }
+            Some(set)
+        });
+
     let visible: Vec<usize> = (0..frame.commits.len())
         .filter(|&i| {
             let c = &frame.commits[i];
@@ -116,8 +162,8 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                     return false;
                 }
             }
-            if let Some(b) = &branch_filter {
-                if !c.refs_decoration.contains(b) {
+            if let Some(set) = &reachable {
+                if !set.contains(&c.sha) {
                     return false;
                 }
             }
