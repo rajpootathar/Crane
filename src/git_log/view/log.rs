@@ -397,17 +397,25 @@ fn paint_lane(
     let dot_y = rect.center().y;
 
     // Passthrough lanes: a vertical line spanning the full row in the
-    // lane's branch-stable color. Extend each segment 1 px past the
-    // row boundaries on both ends so adjacent rows' segments overlap
-    // — without this, anti-aliasing between successive line_segment
-    // calls leaves a 1 px sliver that reads as a dashed line.
+    // lane's branch-stable color. We extend each segment 1 px past the
+    // row's top/bottom so adjacent rows' segments overlap — without
+    // this, anti-aliasing between successive line_segment calls
+    // leaves a 1 px sliver that reads as a dashed line. The bottom
+    // extension is only safe when there IS a next row to bridge to;
+    // on the last loaded row it spills into empty space below the
+    // log, so we clamp the bottom to rect.bottom() exactly.
+    let bottom_y = if next_lane_row.is_some() {
+        rect.bottom() + 1.0
+    } else {
+        rect.bottom()
+    };
     for &(pt_lane, pt_color) in &lane_row.passthrough_lanes {
         let pt_x = rect.left() + GRAPH_PAD_LEFT + (pt_lane as f32) * COL_W + COL_W * 0.5;
         let pt_color = PALETTE[(pt_color as usize) % PALETTE.len()];
         ui.painter().line_segment(
             [
                 egui::pos2(pt_x, rect.top() - 1.0),
-                egui::pos2(pt_x, rect.bottom() + 1.0),
+                egui::pos2(pt_x, bottom_y),
             ],
             egui::Stroke::new(1.5, pt_color),
         );
