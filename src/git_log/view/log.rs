@@ -127,12 +127,9 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                 .chain(frame.refs.remote.iter())
                 .chain(frame.refs.tags.iter())
                 .find(|r| {
-                    r.name.trim_start_matches("refs/heads/")
-                        == name.as_str()
-                        || r.name.trim_start_matches("refs/remotes/")
-                            == name.as_str()
-                        || r.name.trim_start_matches("refs/tags/")
-                            == name.as_str()
+                    r.name.trim_start_matches("refs/heads/") == name.as_str()
+                        || r.name.trim_start_matches("refs/remotes/") == name.as_str()
+                        || r.name.trim_start_matches("refs/tags/") == name.as_str()
                 })?
                 .sha
                 .clone();
@@ -181,7 +178,26 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
         })
         .collect();
 
-    let max_lane = frame.lanes.max_lane.max(1) as f32;
+    // When a filter is active, recompute lanes from ONLY the visible
+    // commits so the graph reflects what's on screen — otherwise
+    // lanes for filtered-out commits would persist as passthroughs
+    // and "octopus lines" from other branches would still draw.
+    let filter_active = !needle.is_empty()
+        || branch_filter.is_some()
+        || user_filter.is_some();
+    let local_lanes: Option<crate::git_log::graph::LaneFrame> = if filter_active {
+        let visible_commits: Vec<crate::git_log::data::CommitRecord> = visible
+            .iter()
+            .map(|&i| frame.commits[i].clone())
+            .collect();
+        Some(crate::git_log::graph::layout(&visible_commits))
+    } else {
+        None
+    };
+    let lanes_ref: &crate::git_log::graph::LaneFrame =
+        local_lanes.as_ref().unwrap_or(&frame.lanes);
+
+    let max_lane = lanes_ref.max_lane.max(1) as f32;
     let graph_width = GRAPH_PAD_LEFT + (max_lane + 1.0) * COL_W;
     let total = visible.len();
     let meta_w = state.col_log_meta_width.clamp(120.0, 360.0);
@@ -247,12 +263,15 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
         .show_rows(ui, ROW_H, total, |ui, range| {
             for vi in range {
                 // `vi` indexes into the filtered `visible` slice; map
-                // back to the canonical commit index so we read the
-                // correct CommitRecord and matching LaneRow.
+                // back to the canonical commit index for CommitRecord
+                // lookup. Lane data comes from `lanes_ref` which is
+                // either the canonical frame.lanes (no filter) or a
+                // freshly-laid-out frame from just the visible
+                // commits — in both cases `vi` is the right index.
                 let i = visible[vi];
                 let c = &frame.commits[i];
-                let lane = frame.lanes.rows.get(i);
-                let next_lane = frame.lanes.rows.get(i + 1);
+                let lane = lanes_ref.rows.get(vi);
+                let next_lane = lanes_ref.rows.get(vi + 1);
 
                 let row_resp = ui.allocate_response(
                     egui::vec2(ui.available_width(), ROW_H),
@@ -447,89 +466,3 @@ fn paint_lane(
     ui.painter().circle_filled(egui::pos2(dot_x, dot_y), DOT_R, color);
 }
 
-/// Parse the `%D` decoration string and paint colored ref pills
-/// inline before the subject. Returns the new x coordinate where the
-/// caller should resume drawing (after the pills + a small gap).
-///
-/// Decoration format from `git log --pretty=format:...%D`:
-///     `HEAD -> main, origin/main, tag: v1.0`
-/// Empty string when the commit has no refs.
-fn paint_ref_pills(ui: &egui::Ui, decoration: &str, start: egui::Pos2) -> f32 {
-    let painter = ui.painter();
-    let font = egui::FontId::proportional(10.5);
-    let mut x = start.x;
-    let pad_x = 5.0;
-    let pad_y = 2.0;
-    let pill_h = 16.0;
-    let gap = 4.0;
-    let pill_y = start.y - 1.0;
-
-    let raw = decoration.trim().trim_start_matches('(').trim_end_matches(')');
-    for token in raw.split(',') {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let (label, kind) = if let Some(rest) = token.strip_prefix("HEAD -> ") {
-            (rest.to_string(), PillKind::Head)
-        } else if token == "HEAD" {
-            ("HEAD".to_string(), PillKind::Head)
-        } else if let Some(rest) = token.strip_prefix("tag: ") {
-            (rest.to_string(), PillKind::Tag)
-        } else if token.starts_with("refs/") {
-            (token.to_string(), PillKind::Branch)
-        } else if token.contains('/') {
-            (token.to_string(), PillKind::Remote)
-        } else {
-            (token.to_string(), PillKind::Branch)
-        };
-
-        let (bg, fg) = pill_colors(kind);
-        let galley = painter.layout_no_wrap(label, font.clone(), fg);
-        let pill_w = galley.size().x + pad_x * 2.0;
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(x, pill_y),
-            egui::vec2(pill_w, pill_h),
-        );
-        painter.rect_filled(rect, 4.0, bg);
-        painter.galley(
-            egui::pos2(rect.min.x + pad_x, rect.min.y + pad_y),
-            galley,
-            fg,
-        );
-        x += pill_w + gap;
-    }
-    if x > start.x {
-        x += 4.0;
-    }
-    x
-}
-
-#[derive(Clone, Copy)]
-enum PillKind {
-    Head,
-    Branch,
-    Remote,
-    Tag,
-}
-
-fn pill_colors(kind: PillKind) -> (Color32, Color32) {
-    match kind {
-        PillKind::Head => (
-            Color32::from_rgb(76, 119, 210),
-            Color32::from_rgb(245, 247, 252),
-        ),
-        PillKind::Branch => (
-            Color32::from_rgb(78, 92, 130),
-            Color32::from_rgb(220, 226, 240),
-        ),
-        PillKind::Remote => (
-            Color32::from_rgb(72, 78, 95),
-            Color32::from_rgb(180, 190, 210),
-        ),
-        PillKind::Tag => (
-            Color32::from_rgb(100, 142, 84),
-            Color32::from_rgb(232, 240, 220),
-        ),
-    }
-}
