@@ -17,6 +17,7 @@ mod mac {
     pub const ID_CHECK_UPDATES: &str = "crane.check_updates";
     pub const ID_OPEN_FILE: &str = "crane.open_file";
     pub const ID_OPEN_FOLDER: &str = "crane.open_folder";
+    pub const ID_QUIT: &str = "crane.quit";
 
     // muda::Menu wraps an Rc internally and isn't Sync — can't live in
     // a static. We Box::leak after init (menu must outlive the app
@@ -67,7 +68,21 @@ mod mac {
             &PredefinedMenuItem::hide_others(None),
             &PredefinedMenuItem::show_all(None),
             &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::quit(None),
+            // Custom Quit item instead of `PredefinedMenuItem::quit` —
+            // the predefined one calls AppKit's `terminate:` directly
+            // and bypasses eframe's viewport-close path entirely, so
+            // the in-app confirm modal would never get a chance to
+            // show. Routing Cmd+Q through our event drain lets us
+            // pop the confirm and only actually close on user OK.
+            &MenuItem::with_id(
+                MenuId::new(ID_QUIT),
+                "Quit Crane",
+                true,
+                Some(muda::accelerator::Accelerator::new(
+                    Some(muda::accelerator::Modifiers::SUPER),
+                    muda::accelerator::Code::KeyQ,
+                )),
+            ),
         ]);
 
         // No Edit submenu. muda's PredefinedMenuItem::copy/paste/cut
@@ -171,3 +186,6 @@ pub const ID_OPEN_FILE: &str = "crane.open_file";
 
 #[cfg(not(target_os = "macos"))]
 pub const ID_OPEN_FOLDER: &str = "crane.open_folder";
+
+#[cfg(not(target_os = "macos"))]
+pub const ID_QUIT: &str = "crane.quit";

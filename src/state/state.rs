@@ -479,6 +479,15 @@ pub struct App {
     /// membership; collapsed groups hide all their Sub-projects in
     /// the Left Panel tree walk.
     pub group_collapsed: std::collections::HashSet<PathBuf>,
+    /// Quit-confirmation modal. Set by the close-request interceptor
+    /// when the user hits Cmd+Q / clicks the window close button.
+    /// Cleared on Cancel; on confirm, `confirmed_quit` is set so the
+    /// next close request bypasses this guard.
+    pub pending_quit_modal: bool,
+    /// One-shot escape hatch: once the user confirmed the quit modal,
+    /// the next OS-level close request is allowed through without
+    /// re-prompting. Reset on Cancel.
+    pub confirmed_quit: bool,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -534,6 +543,8 @@ impl App {
             tab_switcher: None,
             group_tints: std::collections::HashMap::new(),
             group_collapsed: std::collections::HashSet::new(),
+            pending_quit_modal: false,
+            confirmed_quit: false,
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,

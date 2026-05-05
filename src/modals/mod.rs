@@ -1,5 +1,6 @@
 pub mod confirm_close_tab;
 pub mod confirm_delete_file;
+pub mod confirm_quit;
 pub mod confirm_remove_worktree;
 pub mod empty_state;
 pub mod help;
@@ -13,6 +14,7 @@ pub mod update_toast;
 
 pub use confirm_close_tab::render as render_confirm_close_tab;
 pub use confirm_delete_file::render as render_confirm_delete_file;
+pub use confirm_quit::render as render_confirm_quit;
 pub use confirm_remove_worktree::render as render_confirm_remove_worktree;
 pub use empty_state::render as render_empty_state;
 pub use help::render as render_help_modal;

@@ -26,6 +26,7 @@ pub fn handle(
         || app.pending_remove_worktree.is_some()
         || app.pending_close_tab.is_some()
         || app.pending_delete_file.is_some()
+        || app.pending_quit_modal
         || !app.missing_project_modals.is_empty()
         || pending_close.is_some();
     if modal_open {
@@ -53,6 +54,13 @@ pub fn handle(
             }
             if esc && app.pending_delete_file.is_some() {
                 app.pending_delete_file = None;
+            }
+            if app.pending_quit_modal {
+                // Cmd+W or Esc on the quit confirm cancels the
+                // intent so a chord stutter doesn't fall through
+                // and quit anyway.
+                app.pending_quit_modal = false;
+                app.confirmed_quit = false;
             }
             if esc && !app.missing_project_modals.is_empty() {
                 app.missing_project_modals.clear();

@@ -349,11 +349,32 @@ impl eframe::App for CraneApp {
                         self.app.add_project_from_path(path, &ctx);
                     }
                 }
+                platform_menu::ID_QUIT => {
+                    // Cmd+Q from the native menu — surface the
+                    // confirm modal instead of the OS-level
+                    // `terminate:` that the predefined Quit item
+                    // would have called.
+                    self.app.pending_quit_modal = true;
+                }
                 _ => {}
             }
         }
         self.app.ensure_initial(&ctx);
         self.app.sync_tab_mru();
+        // Close-request guard: Cmd+Q / window-close button asks the
+        // user before tearing down running terminals + open editors.
+        // The OS / eframe surfaces the request via the viewport's
+        // `close_requested` flag; we cancel the close and pop a
+        // modal. On confirm we set `confirmed_quit` and re-issue
+        // Close so the next pass actually exits.
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && !self.app.confirmed_quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.app.pending_quit_modal = true;
+        }
+        if self.app.pending_quit_modal {
+            crate::modals::render_confirm_quit(&ctx, &mut self.app);
+        }
         // Tab switcher (Cmd+~ / Cmd+Shift+~) runs before the generic
         // shortcut handler — the overlay owns the key while it's open
         // so no other Cmd-chord fires during cycling.
