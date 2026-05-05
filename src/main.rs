@@ -542,7 +542,55 @@ impl eframe::App for CraneApp {
             center_rect.max,
         );
         let font_size = self.app.font_size;
-        let inset = canvas_rect.shrink(6.0);
+        let full_inset = canvas_rect.shrink(6.0);
+        // When the active Tab has the bottom-docked Git Log Pane
+        // open, carve the bottom slice off `full_inset` for it (plus
+        // a thin splitter row) and pass the remaining top to
+        // render_layout. The whole Pane sits OUTSIDE the Layout tree
+        // by design — non-draggable, can't dock around it.
+        const GIT_LOG_SPLITTER_H: f32 = 4.0;
+        const GIT_LOG_MIN_H: f32 = 120.0;
+        let git_log_visible = self
+            .app
+            .active_tab_ref()
+            .map(|t| t.git_log_visible)
+            .unwrap_or(false);
+        let git_log_h = if git_log_visible {
+            self.app
+                .active_tab_ref()
+                .and_then(|t| t.git_log_state.as_ref().map(|s| s.height))
+                .unwrap_or(320.0)
+                .clamp(GIT_LOG_MIN_H, full_inset.height() * 0.7)
+        } else {
+            0.0
+        };
+        let inset = if git_log_visible {
+            egui::Rect::from_min_max(
+                full_inset.min,
+                egui::pos2(
+                    full_inset.max.x,
+                    full_inset.max.y - git_log_h - GIT_LOG_SPLITTER_H,
+                ),
+            )
+        } else {
+            full_inset
+        };
+        let git_log_splitter_rect = if git_log_visible {
+            egui::Rect::from_min_max(
+                egui::pos2(full_inset.min.x, full_inset.max.y - git_log_h - GIT_LOG_SPLITTER_H),
+                egui::pos2(full_inset.max.x, full_inset.max.y - git_log_h),
+            )
+        } else {
+            egui::Rect::NOTHING
+        };
+        let git_log_body_rect = if git_log_visible {
+            egui::Rect::from_min_max(
+                egui::pos2(full_inset.min.x, full_inset.max.y - git_log_h),
+                full_inset.max,
+            )
+        } else {
+            egui::Rect::NOTHING
+        };
         // Snapshot diagnostics for every open file in the active layout — this
         // avoids borrowing `self.app.lsp` while `self.app.active_layout()`
         // holds a mutable borrow.
@@ -710,6 +758,54 @@ impl eframe::App for CraneApp {
             }
         } else {
             render_empty_state(&mut center_ui, &mut self.app, &ctx, inset);
+        }
+
+        // Bottom-docked Git Log Pane: rendered AFTER the Layout so the
+        // splitter handle sits on top, and only when the active Tab
+        // has it open. Splitter drag adjusts `state.height`; the ×
+        // button (inside view::render) flips git_log_visible off.
+        if git_log_visible {
+            // Splitter
+            let splitter_resp = center_ui.interact(
+                git_log_splitter_rect,
+                egui::Id::new("git_log_splitter"),
+                egui::Sense::drag(),
+            );
+            if splitter_resp.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            }
+            if splitter_resp.dragged() {
+                let dy = splitter_resp.drag_delta().y;
+                if let Some(state) = self
+                    .app
+                    .active_tab_mut()
+                    .and_then(|t| t.git_log_state.as_mut())
+                {
+                    state.height = (state.height - dy)
+                        .clamp(GIT_LOG_MIN_H, full_inset.height() * 0.7);
+                }
+            }
+            center_ui
+                .painter()
+                .rect_filled(git_log_splitter_rect, 0.0, egui::Color32::from_rgb(36, 40, 52));
+
+            // Body
+            if let Some(state) = self
+                .app
+                .active_tab_mut()
+                .and_then(|t| t.git_log_state.as_mut())
+            {
+                let mut body_ui = center_ui.new_child(
+                    egui::UiBuilder::new().max_rect(git_log_body_rect),
+                );
+                body_ui.set_clip_rect(git_log_body_rect);
+                let close = git_log::view::render(&mut body_ui, git_log_body_rect, state);
+                if close {
+                    if let Some(tab) = self.app.active_tab_mut() {
+                        tab.git_log_visible = false;
+                    }
+                }
+            }
         }
 
         render_missing_project_modal(&ctx, &mut self.app);

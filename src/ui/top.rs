@@ -60,6 +60,10 @@ pub fn render(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
         if icon_button(ui, right_label, 16.0, "Toggle Right Panel (Cmd+/)").clicked() {
             app.show_right = !app.show_right;
         }
+        // Bottom-docked Git Log Pane toggle. Mirrors Cmd+9.
+        if icon_button(ui, icons::GIT_BRANCH, 16.0, "Toggle Git Log (Cmd+9)").clicked() {
+            app.toggle_git_log(ctx);
+        }
         // Settings / Help live in the status bar bottom-right now;
         // top bar stays focused on layout chrome.
         ui.separator();

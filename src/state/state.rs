@@ -1426,6 +1426,41 @@ impl App {
         project.workspaces.iter_mut().find(|w| w.id == wid)
     }
 
+    pub fn active_tab_ref(&self) -> Option<&Tab> {
+        let (pid, wid, tid) = self.active?;
+        let project = self.projects.iter().find(|p| p.id == pid)?;
+        let workspace = project.workspaces.iter().find(|w| w.id == wid)?;
+        workspace.tabs.iter().find(|t| t.id == tid)
+    }
+
+    pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
+        let (pid, wid, tid) = self.active?;
+        let project = self.projects.iter_mut().find(|p| p.id == pid)?;
+        let workspace = project.workspaces.iter_mut().find(|w| w.id == wid)?;
+        workspace.tabs.iter_mut().find(|t| t.id == tid)
+    }
+
+    /// Toggle the bottom-docked Git Log Pane on the active Tab. Lazy-
+    /// inits `git_log_state` on first show, kicks an initial reload,
+    /// and is a no-op when there's no active Tab.
+    pub fn toggle_git_log(&mut self, ctx: &egui::Context) {
+        let Some((pid, wid, tid)) = self.active else { return };
+        let Some(project) = self.projects.iter_mut().find(|p| p.id == pid) else { return };
+        let Some(workspace) = project.workspaces.iter_mut().find(|w| w.id == wid) else {
+            return;
+        };
+        let repo = workspace.path.clone();
+        let Some(tab) = workspace.tabs.iter_mut().find(|t| t.id == tid) else { return };
+
+        tab.git_log_visible = !tab.git_log_visible;
+        if tab.git_log_visible {
+            let state = tab
+                .git_log_state
+                .get_or_insert_with(crate::git_log::GitLogState::new);
+            state.reload(repo, ctx);
+        }
+    }
+
     pub fn set_active(&mut self, pid: ProjectId, wid: WorkspaceId, tid: TabId) {
         self.active = Some((pid, wid, tid));
         self.last_workspace = Some((pid, wid));

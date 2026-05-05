@@ -238,6 +238,23 @@ pub fn handle(
             app.add_project_from_path(path, ctx);
         }
     }
+
+    // Cmd+9: toggle the Git Log bottom-docked Pane on the active Tab.
+    // Matches IntelliJ's Git tool-window binding so users coming from
+    // there have muscle memory.
+    let toggle_log = ctx.input_mut(|i| {
+        let pressed = (i.modifiers.command || i.modifiers.mac_cmd)
+            && i.key_pressed(egui::Key::Num9)
+            && !i.modifiers.shift;
+        if pressed {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num9);
+            i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::Num9);
+        }
+        pressed
+    });
+    if toggle_log {
+        app.toggle_git_log(ctx);
+    }
 }
 
 fn terminal_is_running(app: &App, id: PaneId) -> bool {
