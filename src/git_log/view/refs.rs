@@ -2,13 +2,20 @@ use egui::{Color32, Sense};
 use egui_phosphor::regular as icons;
 
 use crate::git_log::refs::{RefEntry, RefSet, WorktreeEntry};
-use crate::ui::util::muted;
+use crate::git_log::state::FilterState;
+use crate::ui::util::{accent, muted};
 
 const HEADER_COLOR: Color32 = Color32::from_rgb(140, 146, 162);
 
 /// Render the Local / Remote / Tags / Worktrees groups inside the
-/// left column. `refs` is None while the first load is in flight.
-pub fn render(ui: &mut egui::Ui, refs: Option<&RefSet>, head: Option<&str>) {
+/// left column. Clicking a branch/tag/remote sets the branch
+/// filter; clicking the same active filter clears it.
+pub fn render(
+    ui: &mut egui::Ui,
+    refs: Option<&RefSet>,
+    head: Option<&str>,
+    filter: &mut FilterState,
+) {
     egui::ScrollArea::vertical()
         .id_salt("git_log_refs")
         .auto_shrink([false, false])
@@ -19,16 +26,23 @@ pub fn render(ui: &mut egui::Ui, refs: Option<&RefSet>, head: Option<&str>) {
                 return;
             };
 
-            ref_section(ui, "LOCAL", &refs.local, head, &|n| {
+            ref_section(ui, "LOCAL", &refs.local, head, filter, &|n| {
                 n.trim_start_matches("refs/heads/").to_string()
             });
-            ref_section(ui, "REMOTE", &refs.remote, head, &|n| {
+            ref_section(ui, "REMOTE", &refs.remote, head, filter, &|n| {
                 n.trim_start_matches("refs/remotes/").to_string()
             });
-            ref_section(ui, "TAGS", &refs.tags, head, &|n| {
+            ref_section(ui, "TAGS", &refs.tags, head, filter, &|n| {
                 n.trim_start_matches("refs/tags/").to_string()
             });
             wt_section(ui, "WORKTREES", &refs.worktrees);
+
+            if filter.branch.is_some() {
+                ui.add_space(8.0);
+                if ui.small_button(format!("{}  Clear filter", icons::X)).clicked() {
+                    filter.branch = None;
+                }
+            }
         });
 }
 
@@ -37,6 +51,7 @@ fn ref_section(
     title: &str,
     entries: &[RefEntry],
     head: Option<&str>,
+    filter: &mut FilterState,
     strip: &dyn Fn(&str) -> String,
 ) {
     if entries.is_empty() {
@@ -52,6 +67,7 @@ fn ref_section(
     for e in entries {
         let display = strip(&e.name);
         let is_head = head.is_some_and(|h| h == e.sha);
+        let is_active_filter = filter.branch.as_deref() == Some(display.as_str());
         let prefix = if is_head {
             format!("{}  ", icons::ASTERISK)
         } else {
@@ -61,9 +77,15 @@ fn ref_section(
         if is_head {
             text = text.strong();
         }
+        if is_active_filter {
+            text = text.color(accent());
+        }
         let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            filter.branch = if is_active_filter { None } else { Some(display) };
         }
     }
 }
