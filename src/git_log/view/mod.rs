@@ -101,26 +101,36 @@ pub fn render(
         egui::epaint::StrokeKind::Inside,
     );
 
+    // Clone the refs snapshot (small) so the left column's
+    // refs::render can hold an &mut on state.filter without
+    // conflicting with the immut borrow on state.frame.
+    let refs_snapshot = state.frame.as_ref().map(|f| f.refs.clone());
+    let head_snapshot = state
+        .frame
+        .as_ref()
+        .and_then(|f| f.refs.head.clone());
+    let col_refs_w = state.col_refs_width;
+    let col_details_w = state.col_details_width;
+
     let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
     body_ui.set_clip_rect(body);
     body_ui.horizontal(|ui| {
         ui.add_space(8.0);
-        let refs_data = state.frame.as_ref().map(|f| &f.refs);
-        let head = state
-            .frame
-            .as_ref()
-            .and_then(|f| f.refs.head.as_deref());
         ui.allocate_ui_with_layout(
-            egui::vec2(state.col_refs_width, body.height()),
+            egui::vec2(col_refs_w, body.height()),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                refs::render(ui, refs_data, head);
+                refs::render(
+                    ui,
+                    refs_snapshot.as_ref(),
+                    head_snapshot.as_deref(),
+                    &mut state.filter,
+                );
             },
         );
         ui.separator();
 
-        let mid_w = (body.width() - state.col_refs_width - state.col_details_width - 24.0)
-            .max(160.0);
+        let mid_w = (body.width() - col_refs_w - col_details_w - 24.0).max(160.0);
         ui.allocate_ui_with_layout(
             egui::vec2(mid_w, body.height()),
             egui::Layout::top_down(egui::Align::LEFT),
@@ -131,7 +141,7 @@ pub fn render(
 
         ui.separator();
         ui.allocate_ui_with_layout(
-            egui::vec2(state.col_details_width, body.height()),
+            egui::vec2(col_details_w, body.height()),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 let cb = details::render(ui, state, repo);

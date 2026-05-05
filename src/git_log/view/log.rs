@@ -139,7 +139,11 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
         .id_salt("git_log_commits")
         .auto_shrink([false, false])
         .show_rows(ui, ROW_H, total, |ui, range| {
-            for i in range {
+            for vi in range {
+                // `vi` indexes into the filtered `visible` slice; map
+                // back to the canonical commit index so we read the
+                // correct CommitRecord and matching LaneRow.
+                let i = visible[vi];
                 let c = &frame.commits[i];
                 let lane = frame.lanes.rows.get(i);
                 let next_lane = frame.lanes.rows.get(i + 1);
