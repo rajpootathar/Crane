@@ -12,6 +12,14 @@ pub struct LaneRow {
     /// past it (closing branches). Used by the painter to draw lane
     /// caps.
     pub terminating_lanes: Vec<u8>,
+    /// Lanes that pass STRAIGHT THROUGH this row — active before and
+    /// active after, but neither this commit's `own_lane` nor any of
+    /// its `parent_lanes`. Each pair is `(lane_index, color_slot)` so
+    /// the painter can draw a vertical segment in the lane's
+    /// branch-stable color. Without this, a branch tip whose parent
+    /// is many rows below disappears between rows belonging to
+    /// other branches.
+    pub passthrough_lanes: Vec<(u8, u8)>,
     /// Color slot in the 8-color palette. Approximates "color per
     /// branch" — see ColorSeeder for details.
     pub color: u8,
@@ -139,6 +147,30 @@ pub fn layout(commits: &[CommitRecord]) -> LaneFrame {
             })
             .collect();
 
+        // Passthrough lanes: alive before AND after this row, and not
+        // this commit's own lane / parent lanes. The painter draws a
+        // straight vertical segment for each so a branch waiting for
+        // its parent stays visible across intermediate rows.
+        let passthrough_lanes: Vec<(u8, u8)> = lanes_before
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let alive_after =
+                    i < active_lanes.len() && active_lanes[i].is_some();
+                let alive_before = l.is_some();
+                if !(alive_before && alive_after) {
+                    return None;
+                }
+                let lane_u8 = i as u8;
+                if lane_u8 == own_lane as u8
+                    || parent_lanes.contains(&lane_u8)
+                {
+                    return None;
+                }
+                Some((lane_u8, seeder.current(i)))
+            })
+            .collect();
+
         let color = seeder.current(own_lane);
 
         rows.push(LaneRow {
@@ -146,6 +178,7 @@ pub fn layout(commits: &[CommitRecord]) -> LaneFrame {
             own_lane: own_lane as u8,
             parent_lanes,
             terminating_lanes,
+            passthrough_lanes,
             color,
             visible_lanes_after: active_lanes.len() as u8,
         });
@@ -240,6 +273,32 @@ mod tests {
         let c1 = s.current(0);
         let c2 = s.current(0);
         assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn passthrough_lane_drawn_when_branch_tip_waits_for_parent() {
+        // c1 is on a side branch; its parent is `root` which doesn't
+        // appear until two rows later. Between c1 and root, the
+        // intermediate `mid` commit (on the main lane) should leave
+        // c1's lane as a passthrough so the painter keeps drawing it.
+        //
+        //     c1
+        //     | (passthrough through `mid`)
+        //     mid (on lane 0)
+        //     |
+        //     root
+        let commits = vec![
+            cr("c1", &["root"]),
+            cr("mid", &["root"]),
+            cr("root", &[]),
+        ];
+        let frame = layout(&commits);
+        let mid = frame.rows.iter().find(|r| r.sha == "mid").unwrap();
+        // c1's lane should be visible passing through `mid`.
+        assert!(
+            !mid.passthrough_lanes.is_empty(),
+            "expected `mid` row to have a passthrough lane for c1's branch"
+        );
     }
 
     #[test]

@@ -349,6 +349,22 @@ fn paint_lane(
     let dot_x = rect.left() + GRAPH_PAD_LEFT + (lane_row.own_lane as f32) * COL_W + COL_W * 0.5;
     let dot_y = rect.center().y;
 
+    // Passthrough lanes: a vertical line spanning the full row in the
+    // lane's branch-stable color. Without this, a branch tip whose
+    // parent is many rows below disappears across intermediate rows
+    // belonging to other branches.
+    for &(pt_lane, pt_color) in &lane_row.passthrough_lanes {
+        let pt_x = rect.left() + GRAPH_PAD_LEFT + (pt_lane as f32) * COL_W + COL_W * 0.5;
+        let pt_color = PALETTE[(pt_color as usize) % PALETTE.len()];
+        ui.painter().line_segment(
+            [
+                egui::pos2(pt_x, rect.top()),
+                egui::pos2(pt_x, rect.bottom()),
+            ],
+            egui::Stroke::new(1.5, pt_color),
+        );
+    }
+
     if let Some(next) = next_lane_row {
         let next_dot_y = dot_y + ROW_H;
         for &p_lane in &lane_row.parent_lanes {
