@@ -105,6 +105,42 @@ pub fn render(
                 request_close = true;
             }
             ui.add_space(4.0);
+            // Refs / Details collapse toggles. Lives in the header
+            // strip so the splitter stays a clean drag handle.
+            let refs_label = if state.col_refs_collapsed {
+                icons::SIDEBAR
+            } else {
+                icons::SIDEBAR_SIMPLE
+            };
+            if ui
+                .button(refs_label)
+                .on_hover_text(if state.col_refs_collapsed {
+                    "Show refs panel"
+                } else {
+                    "Hide refs panel"
+                })
+                .clicked()
+            {
+                state.col_refs_collapsed = !state.col_refs_collapsed;
+            }
+            ui.add_space(2.0);
+            let details_label = if state.col_details_collapsed {
+                icons::SIDEBAR
+            } else {
+                icons::SIDEBAR_SIMPLE
+            };
+            if ui
+                .button(details_label)
+                .on_hover_text(if state.col_details_collapsed {
+                    "Show details panel"
+                } else {
+                    "Hide details panel"
+                })
+                .clicked()
+            {
+                state.col_details_collapsed = !state.col_details_collapsed;
+            }
+            ui.add_space(4.0);
             if ui
                 .button(icons::ARROW_COUNTER_CLOCKWISE)
                 .on_hover_text("Refresh")
@@ -147,7 +183,6 @@ pub fn render(
         .and_then(|f| f.refs.head.clone());
 
     const SPLIT_W: f32 = 8.0;
-    const TOGGLE_H: f32 = 20.0;
     const MIN_COL_W: f32 = 140.0;
     const MIN_LOG_W: f32 = 240.0;
 
@@ -188,48 +223,11 @@ pub fn render(
         Pos2::new(split2_rect.min.x, body_bottom),
     );
 
-    // ---------- Splitter 1: refs ↔ log ----------
+    // ---------- Splitter 1: refs ↔ log (drag handle only) ----------
     ui.painter().rect_filled(split1_rect, 0.0, pane_divider());
-    // Toggle button — wider hit area (24 px) than the visible splitter
-    // strip so it's reliably clickable. Centered on the splitter
-    // strip's x axis, anchored 4 px down from the body top.
-    let toggle1_w = 24.0;
-    let toggle1_rect = Rect::from_min_size(
-        Pos2::new(
-            split1_rect.center().x - toggle1_w * 0.5,
-            split1_rect.min.y + 4.0,
-        ),
-        egui::vec2(toggle1_w, TOGGLE_H),
-    );
-    let toggle1_label = if state.col_refs_collapsed {
-        icons::CARET_RIGHT
-    } else {
-        icons::CARET_LEFT
-    };
-    let toggle1_resp = ui.put(
-        toggle1_rect,
-        egui::Button::new(
-            egui::RichText::new(toggle1_label)
-                .size(11.0)
-                .color(muted()),
-        )
-        .min_size(egui::vec2(toggle1_w, TOGGLE_H))
-        .frame(false),
-    );
-    if toggle1_resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if toggle1_resp.clicked() {
-        state.col_refs_collapsed = !state.col_refs_collapsed;
-    }
-    // Drag handle below the toggle (only when expanded).
     if !state.col_refs_collapsed {
-        let drag1_rect = Rect::from_min_max(
-            Pos2::new(split1_rect.min.x, toggle1_rect.max.y + 4.0),
-            split1_rect.max,
-        );
         let drag_resp = ui.interact(
-            drag1_rect,
+            split1_rect,
             egui::Id::new("git_log_split1_drag"),
             egui::Sense::drag(),
         );
@@ -243,44 +241,11 @@ pub fn render(
         }
     }
 
-    // ---------- Splitter 2: log ↔ details ----------
+    // ---------- Splitter 2: log ↔ details (drag handle only) ----------
     ui.painter().rect_filled(split2_rect, 0.0, pane_divider());
-    let toggle2_w = 24.0;
-    let toggle2_rect = Rect::from_min_size(
-        Pos2::new(
-            split2_rect.center().x - toggle2_w * 0.5,
-            split2_rect.min.y + 4.0,
-        ),
-        egui::vec2(toggle2_w, TOGGLE_H),
-    );
-    let toggle2_label = if state.col_details_collapsed {
-        icons::CARET_LEFT
-    } else {
-        icons::CARET_RIGHT
-    };
-    let toggle2_resp = ui.put(
-        toggle2_rect,
-        egui::Button::new(
-            egui::RichText::new(toggle2_label)
-                .size(11.0)
-                .color(muted()),
-        )
-        .min_size(egui::vec2(toggle2_w, TOGGLE_H))
-        .frame(false),
-    );
-    if toggle2_resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if toggle2_resp.clicked() {
-        state.col_details_collapsed = !state.col_details_collapsed;
-    }
     if !state.col_details_collapsed {
-        let drag2_rect = Rect::from_min_max(
-            Pos2::new(split2_rect.min.x, toggle2_rect.max.y + 4.0),
-            split2_rect.max,
-        );
         let drag_resp = ui.interact(
-            drag2_rect,
+            split2_rect,
             egui::Id::new("git_log_split2_drag"),
             egui::Sense::drag(),
         );
