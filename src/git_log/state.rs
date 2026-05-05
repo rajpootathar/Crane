@@ -84,6 +84,16 @@ pub struct GitLogState {
     /// column — drag handle on the right edge of the metadata band
     /// resizes this. Subject takes the remaining space.
     pub col_log_meta_width: f32,
+    /// Number of commits visible after filters were applied last
+    /// frame. The header strip reads this to render "N of M commits"
+    /// when any filter is active.
+    pub last_visible_count: usize,
+    /// Set when the user picks a branch in the refs panel — the log
+    /// painter scrolls the corresponding tip into view next frame.
+    pub pending_scroll_to_selected: bool,
+    /// Set by the Cmd+F shortcut handler to request keyboard focus
+    /// on the filter TextEdit on the next frame.
+    pub pending_focus_filter: bool,
 }
 
 impl GitLogState {
@@ -108,6 +118,9 @@ impl GitLogState {
             col_refs_collapsed: false,
             col_details_collapsed: false,
             col_log_meta_width: 220.0,
+            last_visible_count: 0,
+            pending_scroll_to_selected: false,
+            pending_focus_filter: false,
         }
     }
 

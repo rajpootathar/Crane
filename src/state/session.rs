@@ -510,6 +510,9 @@ impl STab {
                 col_refs_collapsed: s.col_refs_collapsed,
                 col_details_collapsed: s.col_details_collapsed,
                 col_log_meta_width: s.col_log_meta_width,
+                last_visible_count: 0,
+                pending_scroll_to_selected: false,
+                pending_focus_filter: false,
             }),
         }
     }

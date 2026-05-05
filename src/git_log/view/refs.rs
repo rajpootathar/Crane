@@ -9,12 +9,15 @@ const HEADER_COLOR: Color32 = Color32::from_rgb(140, 146, 162);
 
 /// Render the Local / Remote / Tags / Worktrees groups inside the
 /// left column. Clicking a branch/tag/remote sets the branch
-/// filter; clicking the same active filter clears it.
+/// filter AND writes that ref's tip sha to `selected_sha_out` so
+/// the caller can scroll the log to it; clicking the same active
+/// filter clears it.
 pub fn render(
     ui: &mut egui::Ui,
     refs: Option<&RefSet>,
     head: Option<&str>,
     filter: &mut FilterState,
+    selected_sha_out: &mut Option<String>,
 ) {
     egui::ScrollArea::vertical()
         .id_salt("git_log_refs")
@@ -26,13 +29,13 @@ pub fn render(
                 return;
             };
 
-            ref_section(ui, "LOCAL", &refs.local, head, filter, &|n| {
+            ref_section(ui, "LOCAL", &refs.local, head, filter, selected_sha_out, &|n| {
                 n.trim_start_matches("refs/heads/").to_string()
             });
-            ref_section(ui, "REMOTE", &refs.remote, head, filter, &|n| {
+            ref_section(ui, "REMOTE", &refs.remote, head, filter, selected_sha_out, &|n| {
                 n.trim_start_matches("refs/remotes/").to_string()
             });
-            ref_section(ui, "TAGS", &refs.tags, head, filter, &|n| {
+            ref_section(ui, "TAGS", &refs.tags, head, filter, selected_sha_out, &|n| {
                 n.trim_start_matches("refs/tags/").to_string()
             });
             wt_section(ui, "WORKTREES", &refs.worktrees);
@@ -52,6 +55,7 @@ fn ref_section(
     entries: &[RefEntry],
     head: Option<&str>,
     filter: &mut FilterState,
+    selected_sha_out: &mut Option<String>,
     strip: &dyn Fn(&str) -> String,
 ) {
     if entries.is_empty() {
@@ -85,7 +89,12 @@ fn ref_section(
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         if resp.clicked() {
-            filter.branch = if is_active_filter { None } else { Some(display) };
+            if is_active_filter {
+                filter.branch = None;
+            } else {
+                filter.branch = Some(display);
+                *selected_sha_out = Some(e.sha.clone());
+            }
         }
     }
 }

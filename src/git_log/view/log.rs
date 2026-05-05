@@ -46,12 +46,17 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
     // Filter bar — single row above the commit list.
     ui.horizontal(|ui| {
         ui.add_space(4.0);
+        let filter_id = egui::Id::new("git_log_filter_text");
         let resp = ui.add(
             egui::TextEdit::singleline(&mut state.filter.text)
                 .hint_text("filter subject / hash / author")
+                .id(filter_id)
                 .desired_width(220.0),
         );
-        let _ = resp;
+        if state.pending_focus_filter {
+            resp.request_focus();
+            state.pending_focus_filter = false;
+        }
 
         // Branch facet (built from local refs).
         let local_branches: Vec<String> = state
@@ -180,6 +185,22 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
     let graph_width = GRAPH_PAD_LEFT + (max_lane + 1.0) * COL_W;
     let total = visible.len();
     let meta_w = state.col_log_meta_width.clamp(120.0, 360.0);
+    state.last_visible_count = total;
+
+    // Auto-scroll target: when a fresh selection lands (e.g. user
+    // clicked a branch in the refs panel which set selected_commit
+    // and pending_scroll_to_selected), find the visible-row index
+    // and ask the ScrollArea to scroll it into view.
+    let scroll_to_visible_idx: Option<usize> = if state.pending_scroll_to_selected {
+        state.pending_scroll_to_selected = false;
+        state.selected_commit.as_ref().and_then(|sha| {
+            visible
+                .iter()
+                .position(|&i| frame.commits[i].sha == *sha)
+        })
+    } else {
+        None
+    };
 
     let mut clicked_sha: Option<String> = None;
     let mut picked_op: Option<GitLogOp> = None;
@@ -214,9 +235,15 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
         }
     }
 
-    egui::ScrollArea::vertical()
+    let mut scroll_area = egui::ScrollArea::vertical()
         .id_salt("git_log_commits")
-        .auto_shrink([false, false])
+        .auto_shrink([false, false]);
+    if let Some(idx) = scroll_to_visible_idx {
+        // Centre the target row in the viewport.
+        let target_y = idx as f32 * ROW_H;
+        scroll_area = scroll_area.vertical_scroll_offset(target_y);
+    }
+    scroll_area
         .show_rows(ui, ROW_H, total, |ui, range| {
             for vi in range {
                 // `vi` indexes into the filtered `visible` slice; map
@@ -250,9 +277,22 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                     paint_lane(ui, &row_resp.rect, lane_row, next_lane);
                 }
 
-                // Subject + metadata.
-                let text_x = row_resp.rect.left() + graph_width + 4.0;
+                // Subject + ref pills + metadata.
+                let mut text_x = row_resp.rect.left() + graph_width + 4.0;
                 let text_y = row_resp.rect.top() + 4.0;
+
+                // Inline ref pills parsed from `refs_decoration`. Each
+                // pill has a tinted bg + label (HEAD / branch / tag /
+                // remote) so the user can see refs without scanning the
+                // refs panel.
+                if !c.refs_decoration.is_empty() {
+                    text_x = paint_ref_pills(
+                        ui,
+                        &c.refs_decoration,
+                        egui::pos2(text_x, text_y),
+                    );
+                }
+
                 ui.painter().text(
                     egui::pos2(text_x, text_y),
                     egui::Align2::LEFT_TOP,
@@ -272,6 +312,20 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                         egui::FontId::proportional(11.5),
                         muted(),
                     );
+                }
+
+                // Tooltip with full hash + ISO date + author email-safe
+                // subject on hover. Triggers via Response so egui
+                // handles delay + position automatically.
+                if row_resp.hovered() {
+                    let tooltip = format!(
+                        "{}\n{}\n{} · {}",
+                        c.subject,
+                        c.sha,
+                        c.author,
+                        c.date,
+                    );
+                    row_resp.clone().on_hover_text(tooltip);
                 }
 
                 if row_resp.clicked() {
@@ -350,16 +404,17 @@ fn paint_lane(
     let dot_y = rect.center().y;
 
     // Passthrough lanes: a vertical line spanning the full row in the
-    // lane's branch-stable color. Without this, a branch tip whose
-    // parent is many rows below disappears across intermediate rows
-    // belonging to other branches.
+    // lane's branch-stable color. Extend each segment 1 px past the
+    // row boundaries on both ends so adjacent rows' segments overlap
+    // — without this, anti-aliasing between successive line_segment
+    // calls leaves a 1 px sliver that reads as a dashed line.
     for &(pt_lane, pt_color) in &lane_row.passthrough_lanes {
         let pt_x = rect.left() + GRAPH_PAD_LEFT + (pt_lane as f32) * COL_W + COL_W * 0.5;
         let pt_color = PALETTE[(pt_color as usize) % PALETTE.len()];
         ui.painter().line_segment(
             [
-                egui::pos2(pt_x, rect.top()),
-                egui::pos2(pt_x, rect.bottom()),
+                egui::pos2(pt_x, rect.top() - 1.0),
+                egui::pos2(pt_x, rect.bottom() + 1.0),
             ],
             egui::Stroke::new(1.5, pt_color),
         );
@@ -416,4 +471,91 @@ fn paint_lane(
     // Dot for this commit — drawn LAST so it sits on top of incoming
     // lines from the row above.
     ui.painter().circle_filled(egui::pos2(dot_x, dot_y), DOT_R, color);
+}
+
+/// Parse the `%D` decoration string and paint colored ref pills
+/// inline before the subject. Returns the new x coordinate where the
+/// caller should resume drawing (after the pills + a small gap).
+///
+/// Decoration format from `git log --pretty=format:...%D`:
+///     `HEAD -> main, origin/main, tag: v1.0`
+/// Empty string when the commit has no refs.
+fn paint_ref_pills(ui: &egui::Ui, decoration: &str, start: egui::Pos2) -> f32 {
+    let painter = ui.painter();
+    let font = egui::FontId::proportional(10.5);
+    let mut x = start.x;
+    let pad_x = 5.0;
+    let pad_y = 2.0;
+    let pill_h = 16.0;
+    let gap = 4.0;
+    let pill_y = start.y - 1.0;
+
+    let raw = decoration.trim().trim_start_matches('(').trim_end_matches(')');
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (label, kind) = if let Some(rest) = token.strip_prefix("HEAD -> ") {
+            (rest.to_string(), PillKind::Head)
+        } else if token == "HEAD" {
+            ("HEAD".to_string(), PillKind::Head)
+        } else if let Some(rest) = token.strip_prefix("tag: ") {
+            (rest.to_string(), PillKind::Tag)
+        } else if token.starts_with("refs/") {
+            (token.to_string(), PillKind::Branch)
+        } else if token.contains('/') {
+            (token.to_string(), PillKind::Remote)
+        } else {
+            (token.to_string(), PillKind::Branch)
+        };
+
+        let (bg, fg) = pill_colors(kind);
+        let galley = painter.layout_no_wrap(label, font.clone(), fg);
+        let pill_w = galley.size().x + pad_x * 2.0;
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(x, pill_y),
+            egui::vec2(pill_w, pill_h),
+        );
+        painter.rect_filled(rect, 4.0, bg);
+        painter.galley(
+            egui::pos2(rect.min.x + pad_x, rect.min.y + pad_y),
+            galley,
+            fg,
+        );
+        x += pill_w + gap;
+    }
+    if x > start.x {
+        x += 4.0;
+    }
+    x
+}
+
+#[derive(Clone, Copy)]
+enum PillKind {
+    Head,
+    Branch,
+    Remote,
+    Tag,
+}
+
+fn pill_colors(kind: PillKind) -> (Color32, Color32) {
+    match kind {
+        PillKind::Head => (
+            Color32::from_rgb(76, 119, 210),
+            Color32::from_rgb(245, 247, 252),
+        ),
+        PillKind::Branch => (
+            Color32::from_rgb(78, 92, 130),
+            Color32::from_rgb(220, 226, 240),
+        ),
+        PillKind::Remote => (
+            Color32::from_rgb(72, 78, 95),
+            Color32::from_rgb(180, 190, 210),
+        ),
+        PillKind::Tag => (
+            Color32::from_rgb(100, 142, 84),
+            Color32::from_rgb(232, 240, 220),
+        ),
+    }
 }

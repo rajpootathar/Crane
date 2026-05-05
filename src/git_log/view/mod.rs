@@ -78,10 +78,20 @@ pub fn render(
                     .color(muted()),
             );
         } else if let Some(frame) = state.frame.as_ref() {
+            // Show "filtered_n of total commits" when any filter is
+            // active so the user can see how many rows the current
+            // filter set narrowed the log to.
+            let filter_active = !state.filter.text.is_empty()
+                || state.filter.branch.is_some()
+                || state.filter.user.is_some();
+            let total = frame.commits.len();
+            let label = if filter_active {
+                format!("{} of {} commits", state.last_visible_count, total)
+            } else {
+                format!("{} commits", total)
+            };
             ui.label(
-                egui::RichText::new(format!("{} commits", frame.commits.len()))
-                    .small()
-                    .color(muted()),
+                egui::RichText::new(label).small().color(muted()),
             );
         }
 
@@ -288,12 +298,19 @@ pub fn render(
     if !state.col_refs_collapsed {
         let mut col_ui = ui.new_child(egui::UiBuilder::new().max_rect(refs_rect));
         col_ui.set_clip_rect(refs_rect);
+        let mut select_sha: Option<String> = None;
         refs::render(
             &mut col_ui,
             refs_snapshot.as_ref(),
             head_snapshot.as_deref(),
             &mut state.filter,
+            &mut select_sha,
         );
+        if let Some(sha) = select_sha {
+            state.selected_commit = Some(sha);
+            state.selected_file = None;
+            state.pending_scroll_to_selected = true;
+        }
     }
 
     // ---------- Log column ----------
