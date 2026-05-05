@@ -180,45 +180,44 @@ pub fn render(
 
     // ---------- Splitter 1: refs ↔ log ----------
     ui.painter().rect_filled(split1_rect, 0.0, pane_divider());
-    let toggle1_rect = Rect::from_min_max(
-        Pos2::new(split1_rect.min.x, split1_rect.min.y + 4.0),
-        Pos2::new(split1_rect.max.x, split1_rect.min.y + 4.0 + TOGGLE_H),
+    // Toggle button — wider hit area (24 px) than the visible splitter
+    // strip so it's reliably clickable. Centered on the splitter
+    // strip's x axis, anchored 4 px down from the body top.
+    let toggle1_w = 24.0;
+    let toggle1_rect = Rect::from_min_size(
+        Pos2::new(
+            split1_rect.center().x - toggle1_w * 0.5,
+            split1_rect.min.y + 4.0,
+        ),
+        egui::vec2(toggle1_w, TOGGLE_H),
     );
-    let drag1_rect = Rect::from_min_max(
-        Pos2::new(split1_rect.min.x, toggle1_rect.max.y),
-        split1_rect.max,
+    let toggle1_label = if state.col_refs_collapsed {
+        icons::CARET_RIGHT
+    } else {
+        icons::CARET_LEFT
+    };
+    let toggle1_resp = ui.put(
+        toggle1_rect,
+        egui::Button::new(
+            egui::RichText::new(toggle1_label)
+                .size(11.0)
+                .color(muted()),
+        )
+        .min_size(egui::vec2(toggle1_w, TOGGLE_H))
+        .frame(false),
     );
-    // Toggle button (always present — collapse or expand depending
-    // on state).
-    {
-        let toggle_resp = ui.interact(
-            toggle1_rect,
-            egui::Id::new("git_log_split1_toggle"),
-            egui::Sense::click(),
-        );
-        let hover = toggle_resp.hovered();
-        if hover {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            ui.painter().rect_filled(toggle1_rect, 3.0, pane_surface());
-        }
-        let icon = if state.col_refs_collapsed {
-            icons::CARET_RIGHT
-        } else {
-            icons::CARET_LEFT
-        };
-        ui.painter().text(
-            toggle1_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            icon,
-            egui::FontId::proportional(11.0),
-            muted(),
-        );
-        if toggle_resp.clicked() {
-            state.col_refs_collapsed = !state.col_refs_collapsed;
-        }
+    if toggle1_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    // Drag handle (only when expanded).
+    if toggle1_resp.clicked() {
+        state.col_refs_collapsed = !state.col_refs_collapsed;
+    }
+    // Drag handle below the toggle (only when expanded).
     if !state.col_refs_collapsed {
+        let drag1_rect = Rect::from_min_max(
+            Pos2::new(split1_rect.min.x, toggle1_rect.max.y + 4.0),
+            split1_rect.max,
+        );
         let drag_resp = ui.interact(
             drag1_rect,
             egui::Id::new("git_log_split1_drag"),
@@ -236,42 +235,40 @@ pub fn render(
 
     // ---------- Splitter 2: log ↔ details ----------
     ui.painter().rect_filled(split2_rect, 0.0, pane_divider());
-    let toggle2_rect = Rect::from_min_max(
-        Pos2::new(split2_rect.min.x, split2_rect.min.y + 4.0),
-        Pos2::new(split2_rect.max.x, split2_rect.min.y + 4.0 + TOGGLE_H),
+    let toggle2_w = 24.0;
+    let toggle2_rect = Rect::from_min_size(
+        Pos2::new(
+            split2_rect.center().x - toggle2_w * 0.5,
+            split2_rect.min.y + 4.0,
+        ),
+        egui::vec2(toggle2_w, TOGGLE_H),
     );
-    let drag2_rect = Rect::from_min_max(
-        Pos2::new(split2_rect.min.x, toggle2_rect.max.y),
-        split2_rect.max,
+    let toggle2_label = if state.col_details_collapsed {
+        icons::CARET_LEFT
+    } else {
+        icons::CARET_RIGHT
+    };
+    let toggle2_resp = ui.put(
+        toggle2_rect,
+        egui::Button::new(
+            egui::RichText::new(toggle2_label)
+                .size(11.0)
+                .color(muted()),
+        )
+        .min_size(egui::vec2(toggle2_w, TOGGLE_H))
+        .frame(false),
     );
-    {
-        let toggle_resp = ui.interact(
-            toggle2_rect,
-            egui::Id::new("git_log_split2_toggle"),
-            egui::Sense::click(),
-        );
-        let hover = toggle_resp.hovered();
-        if hover {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            ui.painter().rect_filled(toggle2_rect, 3.0, pane_surface());
-        }
-        let icon = if state.col_details_collapsed {
-            icons::CARET_LEFT
-        } else {
-            icons::CARET_RIGHT
-        };
-        ui.painter().text(
-            toggle2_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            icon,
-            egui::FontId::proportional(11.0),
-            muted(),
-        );
-        if toggle_resp.clicked() {
-            state.col_details_collapsed = !state.col_details_collapsed;
-        }
+    if toggle2_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if toggle2_resp.clicked() {
+        state.col_details_collapsed = !state.col_details_collapsed;
     }
     if !state.col_details_collapsed {
+        let drag2_rect = Rect::from_min_max(
+            Pos2::new(split2_rect.min.x, toggle2_rect.max.y + 4.0),
+            split2_rect.max,
+        );
         let drag_resp = ui.interact(
             drag2_rect,
             egui::Id::new("git_log_split2_drag"),
