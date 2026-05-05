@@ -1174,6 +1174,16 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
     let mut reorder_root_group: Option<(u64, usize)> = None;
     let mut reorder_in_block: Option<(u64, u64, usize)> = None;
     if let Some(release_pos) = release_pos {
+        // Peek before take. `take_payload::<TreeDrag>` clears egui's
+        // drag state regardless of whether a TreeDrag-typed payload
+        // is actually present, which steals the payload from
+        // `pane_view`'s pane drag-drop (which carries a `DragPayload`,
+        // not `TreeDrag`). Calling `payload::<TreeDrag>` first only
+        // succeeds when the in-flight drag is a project-tree drag —
+        // so non-tree drags fall through unmodified.
+        if egui::DragAndDrop::payload::<TreeDrag>(ctx).is_none() {
+            return;
+        }
         if let Some(payload) = egui::DragAndDrop::take_payload::<TreeDrag>(ctx) {
             let candidates: Vec<&DropZone> = drop_zones
                 .iter()
