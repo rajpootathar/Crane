@@ -314,20 +314,6 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                     );
                 }
 
-                // Tooltip with full hash + ISO date + author email-safe
-                // subject on hover. Triggers via Response so egui
-                // handles delay + position automatically.
-                if row_resp.hovered() {
-                    let tooltip = format!(
-                        "{}\n{}\n{} · {}",
-                        c.subject,
-                        c.sha,
-                        c.author,
-                        c.date,
-                    );
-                    row_resp.clone().on_hover_text(tooltip);
-                }
-
                 if row_resp.clicked() {
                     clicked_sha = Some(c.sha.clone());
                 }
