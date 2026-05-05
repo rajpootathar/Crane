@@ -6,7 +6,21 @@ use egui::{Color32, Pos2, Rect, Stroke};
 use egui_phosphor::regular as icons;
 
 use crate::git_log::state::GitLogState;
+use crate::theme;
 use crate::ui::util::muted;
+
+fn pane_bg() -> Color32 {
+    theme::current().bg.to_color32()
+}
+fn pane_border() -> Color32 {
+    theme::current().border.to_color32()
+}
+fn pane_divider() -> Color32 {
+    theme::current().divider.to_color32()
+}
+fn pane_surface() -> Color32 {
+    theme::current().surface.to_color32()
+}
 
 const HEADER_H: f32 = 28.0;
 
@@ -42,8 +56,7 @@ pub fn render(
     state.poll_worker();
     state.maybe_reload(repo.to_path_buf(), ui.ctx());
 
-    ui.painter()
-        .rect_filled(region, 0.0, Color32::from_rgb(20, 22, 28));
+    ui.painter().rect_filled(region, 0.0, pane_bg());
 
     // Header strip
     let header = Rect::from_min_max(
@@ -103,10 +116,9 @@ pub fn render(
         });
     });
 
-    // Body region — three columns separated by draggable splitters
-    // with 6px hit areas. Each side column is collapsible to a thin
-    // strip carrying just an expand chevron so the user can quickly
-    // get more horizontal room for the log without losing the column.
+    // Body region — three columns. Each side column is fully
+    // collapsible (zero width); when collapsed the splitter strip
+    // hosts the expand chevron so the column can disappear cleanly.
     let body = Rect::from_min_max(
         Pos2::new(region.min.x, region.min.y + HEADER_H),
         region.max,
@@ -114,7 +126,7 @@ pub fn render(
     ui.painter().rect_stroke(
         body,
         0.0,
-        Stroke::new(1.0, Color32::from_rgb(36, 40, 52)),
+        Stroke::new(1.0, pane_border()),
         egui::epaint::StrokeKind::Inside,
     );
 
@@ -124,8 +136,8 @@ pub fn render(
         .as_ref()
         .and_then(|f| f.refs.head.clone());
 
-    const SPLIT_W: f32 = 6.0;
-    const COLLAPSED_W: f32 = 22.0;
+    const SPLIT_W: f32 = 8.0;
+    const TOGGLE_H: f32 = 20.0;
     const MIN_COL_W: f32 = 140.0;
     const MIN_LOG_W: f32 = 240.0;
 
@@ -135,12 +147,12 @@ pub fn render(
     let body_bottom = body.max.y;
 
     let refs_w = if state.col_refs_collapsed {
-        COLLAPSED_W
+        0.0
     } else {
         state.col_refs_width
     };
     let details_w = if state.col_details_collapsed {
-        COLLAPSED_W
+        0.0
     } else {
         state.col_details_width
     };
@@ -166,134 +178,141 @@ pub fn render(
         Pos2::new(split2_rect.min.x, body_bottom),
     );
 
-    // Splitter 1: refs ↔ log. Drag adjusts col_refs_width when not
-    // collapsed; collapsing/expanding handled by the chevron in the
-    // column's own toolbar (drawn below).
+    // ---------- Splitter 1: refs ↔ log ----------
+    ui.painter().rect_filled(split1_rect, 0.0, pane_divider());
+    let toggle1_rect = Rect::from_min_max(
+        Pos2::new(split1_rect.min.x, split1_rect.min.y + 4.0),
+        Pos2::new(split1_rect.max.x, split1_rect.min.y + 4.0 + TOGGLE_H),
+    );
+    let drag1_rect = Rect::from_min_max(
+        Pos2::new(split1_rect.min.x, toggle1_rect.max.y),
+        split1_rect.max,
+    );
+    // Toggle button (always present — collapse or expand depending
+    // on state).
+    {
+        let toggle_resp = ui.interact(
+            toggle1_rect,
+            egui::Id::new("git_log_split1_toggle"),
+            egui::Sense::click(),
+        );
+        let hover = toggle_resp.hovered();
+        if hover {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.painter().rect_filled(toggle1_rect, 3.0, pane_surface());
+        }
+        let icon = if state.col_refs_collapsed {
+            icons::CARET_RIGHT
+        } else {
+            icons::CARET_LEFT
+        };
+        ui.painter().text(
+            toggle1_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icon,
+            egui::FontId::proportional(11.0),
+            muted(),
+        );
+        if toggle_resp.clicked() {
+            state.col_refs_collapsed = !state.col_refs_collapsed;
+        }
+    }
+    // Drag handle (only when expanded).
     if !state.col_refs_collapsed {
-        let resp1 = ui.interact(
-            split1_rect,
-            egui::Id::new("git_log_split1"),
+        let drag_resp = ui.interact(
+            drag1_rect,
+            egui::Id::new("git_log_split1_drag"),
             egui::Sense::drag(),
         );
-        if resp1.hovered() || resp1.dragged() {
+        if drag_resp.hovered() || drag_resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
-        if resp1.dragged() {
+        if drag_resp.dragged() {
             let max_refs = (body.width() - details_w - MIN_LOG_W - SPLIT_W * 2.0).max(MIN_COL_W);
             state.col_refs_width =
-                (state.col_refs_width + resp1.drag_delta().x).clamp(MIN_COL_W, max_refs);
+                (state.col_refs_width + drag_resp.drag_delta().x).clamp(MIN_COL_W, max_refs);
         }
     }
-    ui.painter()
-        .rect_filled(split1_rect, 0.0, Color32::from_rgb(36, 40, 52));
 
-    // Splitter 2: log ↔ details. Same shape, mirrored.
+    // ---------- Splitter 2: log ↔ details ----------
+    ui.painter().rect_filled(split2_rect, 0.0, pane_divider());
+    let toggle2_rect = Rect::from_min_max(
+        Pos2::new(split2_rect.min.x, split2_rect.min.y + 4.0),
+        Pos2::new(split2_rect.max.x, split2_rect.min.y + 4.0 + TOGGLE_H),
+    );
+    let drag2_rect = Rect::from_min_max(
+        Pos2::new(split2_rect.min.x, toggle2_rect.max.y),
+        split2_rect.max,
+    );
+    {
+        let toggle_resp = ui.interact(
+            toggle2_rect,
+            egui::Id::new("git_log_split2_toggle"),
+            egui::Sense::click(),
+        );
+        let hover = toggle_resp.hovered();
+        if hover {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.painter().rect_filled(toggle2_rect, 3.0, pane_surface());
+        }
+        let icon = if state.col_details_collapsed {
+            icons::CARET_LEFT
+        } else {
+            icons::CARET_RIGHT
+        };
+        ui.painter().text(
+            toggle2_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icon,
+            egui::FontId::proportional(11.0),
+            muted(),
+        );
+        if toggle_resp.clicked() {
+            state.col_details_collapsed = !state.col_details_collapsed;
+        }
+    }
     if !state.col_details_collapsed {
-        let resp2 = ui.interact(
-            split2_rect,
-            egui::Id::new("git_log_split2"),
+        let drag_resp = ui.interact(
+            drag2_rect,
+            egui::Id::new("git_log_split2_drag"),
             egui::Sense::drag(),
         );
-        if resp2.hovered() || resp2.dragged() {
+        if drag_resp.hovered() || drag_resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
-        if resp2.dragged() {
+        if drag_resp.dragged() {
             let max_details = (body.width() - refs_w - MIN_LOG_W - SPLIT_W * 2.0).max(MIN_COL_W);
             state.col_details_width =
-                (state.col_details_width - resp2.drag_delta().x).clamp(MIN_COL_W, max_details);
+                (state.col_details_width - drag_resp.drag_delta().x).clamp(MIN_COL_W, max_details);
         }
     }
-    ui.painter()
-        .rect_filled(split2_rect, 0.0, Color32::from_rgb(36, 40, 52));
 
-    // Refs column.
-    {
+    // ---------- Refs column (only when expanded) ----------
+    if !state.col_refs_collapsed {
         let mut col_ui = ui.new_child(egui::UiBuilder::new().max_rect(refs_rect));
         col_ui.set_clip_rect(refs_rect);
-        if state.col_refs_collapsed {
-            // Vertical strip: just the expand chevron.
-            col_ui.vertical_centered(|ui| {
-                ui.add_space(6.0);
-                if ui
-                    .button(icons::CARET_RIGHT)
-                    .on_hover_text("Expand refs panel")
-                    .clicked()
-                {
-                    state.col_refs_collapsed = false;
-                }
-            });
-        } else {
-            col_ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("REFS")
-                        .small()
-                        .color(muted())
-                        .strong(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(2.0);
-                    if ui
-                        .small_button(icons::CARET_LEFT)
-                        .on_hover_text("Collapse")
-                        .clicked()
-                    {
-                        state.col_refs_collapsed = true;
-                    }
-                });
-            });
-            refs::render(
-                &mut col_ui,
-                refs_snapshot.as_ref(),
-                head_snapshot.as_deref(),
-                &mut state.filter,
-            );
-        }
+        refs::render(
+            &mut col_ui,
+            refs_snapshot.as_ref(),
+            head_snapshot.as_deref(),
+            &mut state.filter,
+        );
     }
 
-    // Log column.
+    // ---------- Log column ----------
     {
         let mut col_ui = ui.new_child(egui::UiBuilder::new().max_rect(log_rect));
         col_ui.set_clip_rect(log_rect);
         log::render(&mut col_ui, state);
     }
 
-    // Details column.
-    {
+    // ---------- Details column (only when expanded) ----------
+    if !state.col_details_collapsed {
         let mut col_ui = ui.new_child(egui::UiBuilder::new().max_rect(details_rect));
         col_ui.set_clip_rect(details_rect);
-        if state.col_details_collapsed {
-            col_ui.vertical_centered(|ui| {
-                ui.add_space(6.0);
-                if ui
-                    .button(icons::CARET_LEFT)
-                    .on_hover_text("Expand details panel")
-                    .clicked()
-                {
-                    state.col_details_collapsed = false;
-                }
-            });
-        } else {
-            col_ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                if ui
-                    .small_button(icons::CARET_RIGHT)
-                    .on_hover_text("Collapse")
-                    .clicked()
-                {
-                    state.col_details_collapsed = true;
-                }
-                ui.label(
-                    egui::RichText::new("DETAILS")
-                        .small()
-                        .color(muted())
-                        .strong(),
-                );
-            });
-            let cb = details::render(&mut col_ui, state, repo);
-            if let Some(req) = cb.open_diff {
-                effect.open_diff = Some(req);
-            }
+        let cb = details::render(&mut col_ui, state, repo);
+        if let Some(req) = cb.open_diff {
+            effect.open_diff = Some(req);
         }
     }
 
@@ -313,17 +332,13 @@ pub fn render(
         ui.painter().rect_filled(
             prompt_rect.expand(3.0),
             6.0,
-            Color32::from_rgba_unmultiplied(0, 0, 0, 100),
+            Color32::from_black_alpha(120),
         );
-        ui.painter().rect_filled(
-            prompt_rect,
-            6.0,
-            Color32::from_rgb(28, 32, 42),
-        );
+        ui.painter().rect_filled(prompt_rect, 6.0, pane_surface());
         ui.painter().rect_stroke(
             prompt_rect,
             6.0,
-            Stroke::new(1.0, Color32::from_rgb(80, 92, 130)),
+            Stroke::new(1.0, theme::current().border_strong.to_color32()),
             egui::epaint::StrokeKind::Inside,
         );
         let mut prompt_ui = ui.new_child(

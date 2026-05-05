@@ -187,10 +187,11 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                 );
 
                 let is_selected = state.selected_commit.as_deref() == Some(c.sha.as_str());
+                let theme_now = crate::theme::current();
                 let bg = if is_selected {
-                    Color32::from_rgb(48, 56, 78)
+                    theme_now.surface_hi.to_color32()
                 } else if row_resp.hovered() {
-                    Color32::from_rgb(34, 38, 48)
+                    theme_now.surface_alt.to_color32()
                 } else {
                     Color32::TRANSPARENT
                 };
@@ -211,7 +212,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                     egui::Align2::LEFT_TOP,
                     &c.subject,
                     egui::FontId::proportional(12.5),
-                    Color32::from_rgb(220, 225, 232),
+                    crate::theme::current().text.to_color32(),
                 );
 
                 let date_short = c.date.split('T').next().unwrap_or("");
