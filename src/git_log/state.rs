@@ -6,6 +6,16 @@ use crate::git_log::data::{self, CommitRecord, Sha};
 use crate::git_log::graph::{self, LaneFrame};
 use crate::git_log::refs::{self, RefSet};
 
+/// Filter state applied at render time over the cached GraphFrame —
+/// none of these touch the underlying git query, so toggling them is
+/// always cheap.
+#[derive(Default, Clone)]
+pub struct FilterState {
+    pub text: String,
+    pub branch: Option<String>,
+    pub user: Option<String>,
+}
+
 /// Snapshot produced by the worker thread on each refresh — commits
 /// + refs + lane geometry, all in one consistent generation. UI
 /// thread renders the cached frame; worker swaps in a new one when a
@@ -29,6 +39,7 @@ pub struct GitLogState {
     pub frame: Option<GraphFrame>,
     pub generation: u64,
     pub worker_rx: Option<mpsc::Receiver<GraphFrame>>,
+    pub filter: FilterState,
 }
 
 impl GitLogState {
@@ -44,6 +55,7 @@ impl GitLogState {
             frame: None,
             generation: 0,
             worker_rx: None,
+            filter: FilterState::default(),
         }
     }
 

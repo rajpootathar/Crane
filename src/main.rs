@@ -790,19 +790,57 @@ impl eframe::App for CraneApp {
                 .rect_filled(git_log_splitter_rect, 0.0, egui::Color32::from_rgb(36, 40, 52));
 
             // Body
-            if let Some(state) = self
+            let repo_path = self
                 .app
-                .active_tab_mut()
-                .and_then(|t| t.git_log_state.as_mut())
-            {
+                .active_workspace_path()
+                .map(|p| p.to_path_buf());
+            let effect = if let (Some(repo), Some(state)) = (
+                repo_path.as_ref(),
+                self.app
+                    .active_tab_mut()
+                    .and_then(|t| t.git_log_state.as_mut()),
+            ) {
                 let mut body_ui = center_ui.new_child(
                     egui::UiBuilder::new().max_rect(git_log_body_rect),
                 );
                 body_ui.set_clip_rect(git_log_body_rect);
-                let close = git_log::view::render(&mut body_ui, git_log_body_rect, state);
-                if close {
-                    if let Some(tab) = self.app.active_tab_mut() {
-                        tab.git_log_visible = false;
+                git_log::view::render(&mut body_ui, git_log_body_rect, state, repo)
+            } else {
+                git_log::view::ViewEffect::default()
+            };
+            if effect.close {
+                if let Some(tab) = self.app.active_tab_mut() {
+                    tab.git_log_visible = false;
+                }
+            }
+            if let Some((sha, file)) = effect.open_diff {
+                if let Some(repo) = repo_path.as_ref() {
+                    let parent_ref = format!("{sha}^");
+                    let left_text = String::from_utf8_lossy(
+                        &git::show_at(repo, &parent_ref, &file),
+                    )
+                    .to_string();
+                    let right_text = String::from_utf8_lossy(
+                        &git::show_at(repo, &sha, &file),
+                    )
+                    .to_string();
+                    let path_str = file.to_string_lossy().to_string();
+                    let title = format!(
+                        "{}  ·  {}",
+                        file.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path_str.clone()),
+                        sha.chars().take(7).collect::<String>()
+                    );
+                    if let Some(layout) = self.app.active_layout() {
+                        layout.open_diff_in_files_pane(
+                            path_str.clone(),
+                            path_str,
+                            left_text,
+                            right_text,
+                            title,
+                            Some(repo.to_string_lossy().to_string()),
+                        );
                     }
                 }
             }

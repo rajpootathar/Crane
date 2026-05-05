@@ -1,0 +1,269 @@
+use egui::{Color32, Sense};
+
+use crate::git_log::state::GitLogState;
+use crate::ui::util::muted;
+
+const ROW_H: f32 = 22.0;
+const COL_W: f32 = 14.0;
+const DOT_R: f32 = 4.0;
+const GRAPH_PAD_LEFT: f32 = 8.0;
+
+/// 8-color palette keyed by the lane allocation epoch. Hand-picked
+/// to be legible on both light and dark themes.
+const PALETTE: [Color32; 8] = [
+    Color32::from_rgb(102, 187, 106), // green
+    Color32::from_rgb(66, 165, 245),  // blue
+    Color32::from_rgb(255, 152, 0),   // orange
+    Color32::from_rgb(171, 71, 188),  // purple
+    Color32::from_rgb(236, 64, 122),  // pink
+    Color32::from_rgb(38, 166, 154),  // teal
+    Color32::from_rgb(239, 83, 80),   // red
+    Color32::from_rgb(255, 202, 40),  // yellow
+];
+
+pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
+    let Some(frame) = state.frame.as_ref() else {
+        ui.add_space(8.0);
+        if state.is_loading() {
+            ui.label(egui::RichText::new("loading…").small().color(muted()));
+        } else {
+            ui.label(
+                egui::RichText::new("no commits to display")
+                    .small()
+                    .color(muted()),
+            );
+        }
+        return;
+    };
+
+    if frame.commits.is_empty() {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("No commits yet").color(muted()));
+        return;
+    }
+
+    // Filter bar — single row above the commit list.
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut state.filter.text)
+                .hint_text("filter subject / hash / author")
+                .desired_width(220.0),
+        );
+        let _ = resp;
+
+        // Branch facet (built from local refs).
+        let local_branches: Vec<String> = state
+            .frame
+            .as_ref()
+            .map(|f| {
+                f.refs
+                    .local
+                    .iter()
+                    .map(|r| r.name.trim_start_matches("refs/heads/").to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let branch_label = state
+            .filter
+            .branch
+            .clone()
+            .unwrap_or_else(|| "branch".to_string());
+        egui::ComboBox::from_id_salt("git_log_branch_filter")
+            .selected_text(branch_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.filter.branch, None, "all branches");
+                for b in &local_branches {
+                    ui.selectable_value(&mut state.filter.branch, Some(b.clone()), b);
+                }
+            });
+
+        // User facet (unique authors).
+        let mut authors: Vec<String> = state
+            .frame
+            .as_ref()
+            .map(|f| f.commits.iter().map(|c| c.author.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        authors.sort();
+        authors.dedup();
+        let user_label = state
+            .filter
+            .user
+            .clone()
+            .unwrap_or_else(|| "user".to_string());
+        egui::ComboBox::from_id_salt("git_log_user_filter")
+            .selected_text(user_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.filter.user, None, "all users");
+                for u in &authors {
+                    ui.selectable_value(&mut state.filter.user, Some(u.clone()), u);
+                }
+            });
+    });
+    ui.separator();
+
+    // Apply filters.
+    let needle = state.filter.text.to_lowercase();
+    let branch_filter = state.filter.branch.clone();
+    let user_filter = state.filter.user.clone();
+    let visible: Vec<usize> = (0..frame.commits.len())
+        .filter(|&i| {
+            let c = &frame.commits[i];
+            if !needle.is_empty() {
+                let hay = format!("{} {} {}", c.subject, c.sha, c.author).to_lowercase();
+                if !hay.contains(&needle) {
+                    return false;
+                }
+            }
+            if let Some(b) = &branch_filter {
+                if !c.refs_decoration.contains(b) {
+                    return false;
+                }
+            }
+            if let Some(u) = &user_filter {
+                if &c.author != u {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    let max_lane = frame.lanes.max_lane.max(1) as f32;
+    let graph_width = GRAPH_PAD_LEFT + (max_lane + 1.0) * COL_W;
+    let total = visible.len();
+
+    let mut clicked_sha: Option<String> = None;
+
+    egui::ScrollArea::vertical()
+        .id_salt("git_log_commits")
+        .auto_shrink([false, false])
+        .show_rows(ui, ROW_H, total, |ui, range| {
+            for i in range {
+                let c = &frame.commits[i];
+                let lane = frame.lanes.rows.get(i);
+                let next_lane = frame.lanes.rows.get(i + 1);
+
+                let row_resp = ui.allocate_response(
+                    egui::vec2(ui.available_width(), ROW_H),
+                    Sense::click(),
+                );
+
+                let is_selected = state.selected_commit.as_deref() == Some(c.sha.as_str());
+                let bg = if is_selected {
+                    Color32::from_rgb(48, 56, 78)
+                } else if row_resp.hovered() {
+                    Color32::from_rgb(34, 38, 48)
+                } else {
+                    Color32::TRANSPARENT
+                };
+                if bg != Color32::TRANSPARENT {
+                    ui.painter().rect_filled(row_resp.rect, 0.0, bg);
+                }
+
+                // Graph painter (dots + parent connections).
+                if let Some(lane_row) = lane {
+                    paint_lane(ui, &row_resp.rect, lane_row, next_lane);
+                }
+
+                // Subject + metadata.
+                let text_x = row_resp.rect.left() + graph_width + 4.0;
+                let text_y = row_resp.rect.top() + 4.0;
+                ui.painter().text(
+                    egui::pos2(text_x, text_y),
+                    egui::Align2::LEFT_TOP,
+                    &c.subject,
+                    egui::FontId::proportional(12.5),
+                    Color32::from_rgb(220, 225, 232),
+                );
+
+                let date_short = c.date.split('T').next().unwrap_or("");
+                let meta = format!("{}  {}", c.author, date_short);
+                let meta_x = row_resp.rect.right() - 220.0;
+                if meta_x > text_x + 80.0 {
+                    ui.painter().text(
+                        egui::pos2(meta_x, text_y),
+                        egui::Align2::LEFT_TOP,
+                        &meta,
+                        egui::FontId::proportional(11.5),
+                        muted(),
+                    );
+                }
+
+                if row_resp.clicked() {
+                    clicked_sha = Some(c.sha.clone());
+                }
+            }
+        });
+
+    if let Some(sha) = clicked_sha {
+        state.selected_commit = Some(sha);
+        state.selected_file = None;
+    }
+}
+
+/// Paint the dot for `lane_row` and connecting lines down to its
+/// parents at `next_lane_row`'s level. Uses a quadratic Bezier for
+/// off-axis parents to give branches a smooth curve.
+fn paint_lane(
+    ui: &egui::Ui,
+    rect: &egui::Rect,
+    lane_row: &crate::git_log::graph::LaneRow,
+    next_lane_row: Option<&crate::git_log::graph::LaneRow>,
+) {
+    let color = PALETTE[(lane_row.color as usize) % PALETTE.len()];
+    let dot_x = rect.left() + GRAPH_PAD_LEFT + (lane_row.own_lane as f32) * COL_W + COL_W * 0.5;
+    let dot_y = rect.center().y;
+
+    if let Some(next) = next_lane_row {
+        let next_dot_y = dot_y + ROW_H;
+        for &p_lane in &lane_row.parent_lanes {
+            // Use the next row's color where the parent will continue.
+            let next_color = if (next.own_lane == p_lane)
+                || next.parent_lanes.iter().any(|&l| l == p_lane)
+            {
+                PALETTE[(next.color as usize) % PALETTE.len()]
+            } else {
+                color
+            };
+            let p_x = rect.left() + GRAPH_PAD_LEFT + (p_lane as f32) * COL_W + COL_W * 0.5;
+            if p_lane == lane_row.own_lane {
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(dot_x, dot_y),
+                        egui::pos2(p_x, next_dot_y),
+                    ],
+                    egui::Stroke::new(1.5, next_color),
+                );
+            } else {
+                let mid_y = dot_y + ROW_H * 0.5;
+                let cp = egui::pos2(p_x, mid_y);
+                let bezier = egui::epaint::QuadraticBezierShape {
+                    points: [
+                        egui::pos2(dot_x, dot_y),
+                        cp,
+                        egui::pos2(p_x, next_dot_y),
+                    ],
+                    closed: false,
+                    fill: Color32::TRANSPARENT,
+                    stroke: egui::Stroke::new(1.5, next_color).into(),
+                };
+                ui.painter().add(bezier);
+            }
+        }
+    }
+
+    // Lane caps for branches that terminate at this row.
+    for &term in &lane_row.terminating_lanes {
+        let t_x = rect.left() + GRAPH_PAD_LEFT + (term as f32) * COL_W + COL_W * 0.5;
+        ui.painter().circle_stroke(
+            egui::pos2(t_x, rect.top() + 2.0),
+            DOT_R - 1.0,
+            egui::Stroke::new(1.0, muted()),
+        );
+    }
+
+    // Dot for this commit — drawn LAST so it sits on top of incoming
+    // lines from the row above.
+    ui.painter().circle_filled(egui::pos2(dot_x, dot_y), DOT_R, color);
+}

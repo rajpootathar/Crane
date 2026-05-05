@@ -1,3 +1,7 @@
+mod details;
+mod log;
+mod refs;
+
 use egui::{Color32, Pos2, Rect, Stroke};
 use egui_phosphor::regular as icons;
 
@@ -6,11 +10,29 @@ use crate::ui::util::muted;
 
 const HEADER_H: f32 = 28.0;
 
+/// Effects bubbled up from the bottom-region render so the caller
+/// (in main's render path) can apply them with `&mut App`.
+#[derive(Default)]
+pub struct ViewEffect {
+    /// User clicked the close (×) button — caller should flip
+    /// `tab.git_log_visible = false`.
+    pub close: bool,
+    /// User clicked a file in the details column — caller should open
+    /// a Diff Pane in the active Layout for `(commit_sha, file_path)`.
+    pub open_diff: Option<(String, std::path::PathBuf)>,
+}
+
 /// Render the Git Log bottom region inside `region`. Mutates `state`
-/// (worker poll, header chrome). Returns `true` if the user clicked
-/// the close (×) button — caller should flip `tab.git_log_visible`
-/// to false.
-pub fn render(ui: &mut egui::Ui, region: Rect, state: &mut GitLogState) -> bool {
+/// (worker poll, header chrome, selection). `repo` is the active
+/// workspace's repo path — used by the details column to fetch the
+/// list of changed files for the selected commit.
+pub fn render(
+    ui: &mut egui::Ui,
+    region: Rect,
+    state: &mut GitLogState,
+    repo: &std::path::Path,
+) -> ViewEffect {
+    let mut effect = ViewEffect::default();
     let mut request_close = false;
     state.poll_worker();
 
@@ -59,10 +81,10 @@ pub fn render(ui: &mut egui::Ui, region: Rect, state: &mut GitLogState) -> bool 
                 .on_hover_text("Refresh")
                 .clicked()
             {
-                // Drop cached frame; the next maybe_reload tick will
-                // see no in-flight worker and kick a fresh load.
-                state.frame = None;
+                // Drop the in-flight worker (if any) so reload starts
+                // fresh, then kick a new load against the active repo.
                 state.worker_rx = None;
+                state.reload(repo.to_path_buf(), ui.ctx());
             }
         });
     });
@@ -83,11 +105,16 @@ pub fn render(ui: &mut egui::Ui, region: Rect, state: &mut GitLogState) -> bool 
     body_ui.set_clip_rect(body);
     body_ui.horizontal(|ui| {
         ui.add_space(8.0);
+        let refs_data = state.frame.as_ref().map(|f| &f.refs);
+        let head = state
+            .frame
+            .as_ref()
+            .and_then(|f| f.refs.head.as_deref());
         ui.allocate_ui_with_layout(
             egui::vec2(state.col_refs_width, body.height()),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                ui.label(egui::RichText::new("Refs").color(muted()).small());
+                refs::render(ui, refs_data, head);
             },
         );
         ui.separator();
@@ -98,13 +125,7 @@ pub fn render(ui: &mut egui::Ui, region: Rect, state: &mut GitLogState) -> bool 
             egui::vec2(mid_w, body.height()),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                if let Some(frame) = state.frame.as_ref() {
-                    ui.label(format!("{} commits loaded", frame.commits.len()));
-                } else if state.is_loading() {
-                    ui.label("loading…");
-                } else {
-                    ui.label(egui::RichText::new("no data").color(muted()).small());
-                }
+                log::render(ui, state);
             },
         );
 
@@ -113,10 +134,14 @@ pub fn render(ui: &mut egui::Ui, region: Rect, state: &mut GitLogState) -> bool 
             egui::vec2(state.col_details_width, body.height()),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                ui.label(egui::RichText::new("Details").color(muted()).small());
+                let cb = details::render(ui, state, repo);
+                if let Some(req) = cb.open_diff {
+                    effect.open_diff = Some(req);
+                }
             },
         );
     });
 
-    request_close
+    effect.close = request_close;
+    effect
 }
