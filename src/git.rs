@@ -975,6 +975,27 @@ pub fn commit_files(repo: &Path, sha: &str) -> Vec<(char, PathBuf)> {
     result
 }
 
+/// `git checkout <sha>` — detached-HEAD onto a commit.
+pub fn checkout_commit(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["checkout", sha])
+}
+
+/// `git branch <name> <sha>` — create a new branch at `sha` without
+/// switching to it.
+pub fn branch_from(repo: &Path, name: &str, sha: &str) -> Result<(), String> {
+    run(repo, &["branch", name, sha])
+}
+
+/// `git cherry-pick <sha>` — apply the commit on top of HEAD.
+pub fn cherry_pick(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["cherry-pick", sha])
+}
+
+/// `git revert --no-edit <sha>` — create a revert commit on HEAD.
+pub fn revert(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["revert", "--no-edit", sha])
+}
+
 /// `git show <ref>:<path>` — content of `path` at the given ref.
 /// Empty bytes on missing (e.g. for newly-added files queried at
 /// the parent commit).

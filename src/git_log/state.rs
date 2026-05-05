@@ -19,6 +19,19 @@ pub struct FilterState {
     pub user: Option<String>,
 }
 
+/// Operation requested from the commit-row right-click menu. Bubbled
+/// up via `ViewEffect` and applied by main's render path against the
+/// active workspace's repo.
+#[derive(Clone, Debug)]
+pub enum GitLogOp {
+    Checkout(Sha),
+    BranchFrom(Sha),
+    WorktreeFrom(Sha),
+    CherryPick(Sha),
+    Revert(Sha),
+    CopyHash(Sha),
+}
+
 /// Snapshot produced by the worker thread on each refresh — commits
 /// + refs + lane geometry, all in one consistent generation. UI
 /// thread renders the cached frame; worker swaps in a new one when a
@@ -54,6 +67,13 @@ pub struct GitLogState {
     /// detect Workspace switches so the watcher gets re-created on a
     /// fresh repo.
     pub watched_repo: Option<PathBuf>,
+    /// One-shot op picked from the right-click context menu — drained
+    /// by the caller after `view::render` returns and applied against
+    /// the active workspace's repo.
+    pub pending_op: Option<GitLogOp>,
+    /// User-typed branch name when GitLogOp::BranchFrom is in flight.
+    /// `Some((sha, name))` while the inline prompt is open.
+    pub pending_branch_prompt: Option<(Sha, String)>,
 }
 
 impl GitLogState {
@@ -73,6 +93,8 @@ impl GitLogState {
             watcher: None,
             fetch_in_flight: Arc::new(AtomicBool::new(false)),
             watched_repo: None,
+            pending_op: None,
+            pending_branch_prompt: None,
         }
     }
 

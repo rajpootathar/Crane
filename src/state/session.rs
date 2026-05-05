@@ -495,6 +495,8 @@ impl STab {
                     std::sync::atomic::AtomicBool::new(false),
                 ),
                 watched_repo: None,
+                pending_op: None,
+                pending_branch_prompt: None,
             }),
         }
     }

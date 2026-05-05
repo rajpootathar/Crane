@@ -20,6 +20,11 @@ pub struct ViewEffect {
     /// User clicked a file in the details column — caller should open
     /// a Diff Pane in the active Layout for `(commit_sha, file_path)`.
     pub open_diff: Option<(String, std::path::PathBuf)>,
+    /// User picked an item from the commit-row right-click menu.
+    pub op: Option<crate::git_log::state::GitLogOp>,
+    /// User confirmed the inline branch-from-commit prompt with a
+    /// non-empty name. `(sha, branch_name)`.
+    pub branch_from: Option<(String, String)>,
 }
 
 /// Render the Git Log bottom region inside `region`. Mutates `state`
@@ -162,5 +167,71 @@ pub fn render(
     });
 
     effect.close = request_close;
+    if let Some(op) = state.pending_op.take() {
+        effect.op = Some(op);
+    }
+
+    // Inline branch-from-commit prompt. Floats above the body region.
+    if let Some((sha, name)) = state.pending_branch_prompt.as_ref().cloned() {
+        let prompt_w = 320.0;
+        let prompt_h = 90.0;
+        let prompt_rect = Rect::from_center_size(
+            region.center(),
+            egui::vec2(prompt_w, prompt_h),
+        );
+        ui.painter().rect_filled(
+            prompt_rect.expand(3.0),
+            6.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 100),
+        );
+        ui.painter().rect_filled(
+            prompt_rect,
+            6.0,
+            Color32::from_rgb(28, 32, 42),
+        );
+        ui.painter().rect_stroke(
+            prompt_rect,
+            6.0,
+            Stroke::new(1.0, Color32::from_rgb(80, 92, 130)),
+            egui::epaint::StrokeKind::Inside,
+        );
+        let mut prompt_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(prompt_rect.shrink2(egui::vec2(12.0, 10.0))),
+        );
+        prompt_ui.set_clip_rect(prompt_rect);
+        prompt_ui.label(
+            egui::RichText::new(format!(
+                "Create branch from {}",
+                sha.chars().take(7).collect::<String>()
+            ))
+            .strong(),
+        );
+        prompt_ui.add_space(6.0);
+        let mut buf = name;
+        let resp = prompt_ui.add(
+            egui::TextEdit::singleline(&mut buf)
+                .hint_text("new branch name")
+                .desired_width(prompt_w - 24.0),
+        );
+        resp.request_focus();
+        let enter = resp.lost_focus()
+            && prompt_ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let esc = prompt_ui.input(|i| i.key_pressed(egui::Key::Escape));
+        prompt_ui.add_space(6.0);
+        prompt_ui.horizontal(|ui| {
+            let create = ui.button("Create").clicked() || enter;
+            let cancel = ui.button("Cancel").clicked() || esc;
+            if create && !buf.trim().is_empty() {
+                effect.branch_from = Some((sha.clone(), buf.trim().to_string()));
+                state.pending_branch_prompt = None;
+            } else if cancel {
+                state.pending_branch_prompt = None;
+            } else {
+                state.pending_branch_prompt = Some((sha.clone(), buf));
+            }
+        });
+    }
+
     effect
 }

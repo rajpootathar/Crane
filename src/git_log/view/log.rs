@@ -1,6 +1,7 @@
 use egui::{Color32, Sense};
+use egui_phosphor::regular as icons;
 
-use crate::git_log::state::GitLogState;
+use crate::git_log::state::{GitLogOp, GitLogState};
 use crate::ui::util::muted;
 
 const ROW_H: f32 = 22.0;
@@ -134,6 +135,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
     let total = visible.len();
 
     let mut clicked_sha: Option<String> = None;
+    let mut picked_op: Option<GitLogOp> = None;
 
     egui::ScrollArea::vertical()
         .id_salt("git_log_commits")
@@ -197,12 +199,62 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                 if row_resp.clicked() {
                     clicked_sha = Some(c.sha.clone());
                 }
+
+                let row_sha = c.sha.clone();
+                row_resp.context_menu(|ui| {
+                    if ui
+                        .button(format!("{}  Checkout this commit", icons::ARROW_RIGHT))
+                        .clicked()
+                    {
+                        picked_op = Some(GitLogOp::Checkout(row_sha.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("{}  Create branch from here…", icons::GIT_BRANCH))
+                        .clicked()
+                    {
+                        picked_op = Some(GitLogOp::BranchFrom(row_sha.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("{}  Create worktree from here…", icons::FOLDER_PLUS))
+                        .clicked()
+                    {
+                        picked_op = Some(GitLogOp::WorktreeFrom(row_sha.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("{}  Cherry-pick onto current", icons::GIT_DIFF))
+                        .clicked()
+                    {
+                        picked_op = Some(GitLogOp::CherryPick(row_sha.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(format!("{}  Revert", icons::ARROW_COUNTER_CLOCKWISE))
+                        .clicked()
+                    {
+                        picked_op = Some(GitLogOp::Revert(row_sha.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .button(format!("{}  Copy hash", icons::COPY))
+                        .clicked()
+                    {
+                        picked_op = Some(GitLogOp::CopyHash(row_sha.clone()));
+                        ui.close();
+                    }
+                });
             }
         });
 
     if let Some(sha) = clicked_sha {
         state.selected_commit = Some(sha);
         state.selected_file = None;
+    }
+    if let Some(op) = picked_op {
+        state.pending_op = Some(op);
     }
 }
 

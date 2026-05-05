@@ -844,6 +844,80 @@ impl eframe::App for CraneApp {
                     }
                 }
             }
+            if let Some((sha, name)) = effect.branch_from {
+                if let Some(repo) = repo_path.as_ref() {
+                    if let Err(e) = git::branch_from(repo, &name, &sha) {
+                        self.app.git_error = Some(e);
+                    }
+                    if let Some(state) = self
+                        .app
+                        .active_tab_mut()
+                        .and_then(|t| t.git_log_state.as_mut())
+                    {
+                        state.frame = None;
+                    }
+                }
+            }
+            if let Some(op) = effect.op {
+                if let Some(repo) = repo_path.as_ref() {
+                    use git_log::state::GitLogOp;
+                    match op {
+                        GitLogOp::Checkout(sha) => {
+                            if let Err(e) = git::checkout_commit(repo, &sha) {
+                                self.app.git_error = Some(e);
+                            }
+                        }
+                        GitLogOp::CherryPick(sha) => {
+                            if let Err(e) = git::cherry_pick(repo, &sha) {
+                                self.app.git_error = Some(e);
+                            }
+                        }
+                        GitLogOp::Revert(sha) => {
+                            if let Err(e) = git::revert(repo, &sha) {
+                                self.app.git_error = Some(e);
+                            }
+                        }
+                        GitLogOp::CopyHash(sha) => {
+                            ctx.copy_text(sha);
+                        }
+                        GitLogOp::BranchFrom(sha) => {
+                            // Park the prompt on state — view::mod.rs
+                            // surfaces an inline TextEdit when this is
+                            // Some.
+                            if let Some(state) = self
+                                .app
+                                .active_tab_mut()
+                                .and_then(|t| t.git_log_state.as_mut())
+                            {
+                                state.pending_branch_prompt = Some((sha, String::new()));
+                            }
+                        }
+                        GitLogOp::WorktreeFrom(sha) => {
+                            // Reuse the existing new-workspace modal.
+                            // It defaults to creating a new branch off
+                            // HEAD; when a sha is parked here the modal
+                            // pre-fills the base ref.
+                            if let Some((pid, _, _)) = self.app.active {
+                                self.app.open_new_workspace_modal(pid);
+                                if let Some(modal) = self.app.new_workspace_modal.as_mut() {
+                                    modal.branch = sha;
+                                    modal.create_new_branch = true;
+                                }
+                            }
+                        }
+                    }
+                    // Most ops change refs/HEAD; the watcher will pick
+                    // it up. Drop the cached frame so the next
+                    // `maybe_reload` tick fires fresh.
+                    if let Some(state) = self
+                        .app
+                        .active_tab_mut()
+                        .and_then(|t| t.git_log_state.as_mut())
+                    {
+                        state.frame = None;
+                    }
+                }
+            }
         }
 
         render_missing_project_modal(&ctx, &mut self.app);
