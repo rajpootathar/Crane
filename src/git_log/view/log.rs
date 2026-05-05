@@ -133,6 +133,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
     let max_lane = frame.lanes.max_lane.max(1) as f32;
     let graph_width = GRAPH_PAD_LEFT + (max_lane + 1.0) * COL_W;
     let total = visible.len();
+    let meta_w = state.col_log_meta_width.clamp(120.0, 360.0);
 
     let mut clicked_sha: Option<String> = None;
     let mut picked_op: Option<GitLogOp> = None;
@@ -215,7 +216,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
 
                 let date_short = c.date.split('T').next().unwrap_or("");
                 let meta = format!("{}  {}", c.author, date_short);
-                let meta_x = row_resp.rect.right() - 220.0;
+                let meta_x = row_resp.rect.right() - meta_w;
                 if meta_x > text_x + 80.0 {
                     ui.painter().text(
                         egui::pos2(meta_x, text_y),

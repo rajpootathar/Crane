@@ -134,11 +134,18 @@ pub struct SGitLogState {
     pub selected_commit: Option<String>,
     #[serde(default)]
     pub selected_file: Option<String>,
+    #[serde(default)]
+    pub col_refs_collapsed: bool,
+    #[serde(default)]
+    pub col_details_collapsed: bool,
+    #[serde(default = "default_git_log_meta_w")]
+    pub col_log_meta_width: f32,
 }
 
 fn default_git_log_height() -> f32 { 320.0 }
 fn default_git_log_col_refs() -> f32 { 220.0 }
 fn default_git_log_col_details() -> f32 { 360.0 }
+fn default_git_log_meta_w() -> f32 { 220.0 }
 
 #[derive(Serialize, Deserialize)]
 pub enum SNode {
@@ -459,6 +466,9 @@ impl STab {
                 maximized: s.maximized,
                 selected_commit: s.selected_commit.clone(),
                 selected_file: s.selected_file.as_ref().map(|p| p.to_string_lossy().to_string()),
+                col_refs_collapsed: s.col_refs_collapsed,
+                col_details_collapsed: s.col_details_collapsed,
+                col_log_meta_width: s.col_log_meta_width,
             }),
         }
     }
@@ -497,6 +507,9 @@ impl STab {
                 watched_repo: None,
                 pending_op: None,
                 pending_branch_prompt: None,
+                col_refs_collapsed: s.col_refs_collapsed,
+                col_details_collapsed: s.col_details_collapsed,
+                col_log_meta_width: s.col_log_meta_width,
             }),
         }
     }

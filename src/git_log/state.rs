@@ -74,6 +74,16 @@ pub struct GitLogState {
     /// User-typed branch name when GitLogOp::BranchFrom is in flight.
     /// `Some((sha, name))` while the inline prompt is open.
     pub pending_branch_prompt: Option<(Sha, String)>,
+    /// Refs (left) column collapsed flag. The chevron button in its
+    /// header bar toggles this. When collapsed the column shrinks to
+    /// a thin strip showing only the expand handle.
+    pub col_refs_collapsed: bool,
+    /// Details (right) column collapsed flag.
+    pub col_details_collapsed: bool,
+    /// Log row author/date metadata column width inside the middle
+    /// column — drag handle on the right edge of the metadata band
+    /// resizes this. Subject takes the remaining space.
+    pub col_log_meta_width: f32,
 }
 
 impl GitLogState {
@@ -95,6 +105,9 @@ impl GitLogState {
             watched_repo: None,
             pending_op: None,
             pending_branch_prompt: None,
+            col_refs_collapsed: false,
+            col_details_collapsed: false,
+            col_log_meta_width: 220.0,
         }
     }
 
