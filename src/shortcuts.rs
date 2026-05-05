@@ -238,6 +238,57 @@ pub fn handle(
             app.add_project_from_path(path, ctx);
         }
     }
+
+    // Cmd+9: toggle the Git Log bottom-docked Pane on the active Tab.
+    // Matches IntelliJ's Git tool-window binding so users coming from
+    // there have muscle memory.
+    let toggle_log = ctx.input_mut(|i| {
+        let pressed = (i.modifiers.command || i.modifiers.mac_cmd)
+            && i.key_pressed(egui::Key::Num9)
+            && !i.modifiers.shift;
+        if pressed {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num9);
+            i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::Num9);
+        }
+        pressed
+    });
+    if toggle_log {
+        app.toggle_git_log(ctx);
+    }
+
+    // Cmd+F: when the Git Log pane has focus, focus its filter
+    // TextEdit. Otherwise fall through to the Files Pane's existing
+    // find-in-file handler. Both context reads (memory + git_log
+    // focus flag) are taken BEFORE input_mut so we never nest
+    // egui's global RwLock — that pattern deadlocks at startup.
+    let already_focused = ctx.memory(|m| m.focused().is_some());
+    let git_log_has_focus = app
+        .active_tab_ref()
+        .and_then(|t| t.git_log_state.as_ref().map(|s| s.has_focus))
+        .unwrap_or(false);
+    if git_log_has_focus {
+        let pressed = ctx.input_mut(|i| {
+            let p = (i.modifiers.command || i.modifiers.mac_cmd)
+                && i.key_pressed(egui::Key::F)
+                && !i.modifiers.shift
+                && !i.modifiers.alt;
+            if p && !already_focused {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::F);
+                i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::F);
+                true
+            } else {
+                false
+            }
+        });
+        if pressed {
+            if let Some(state) = app
+                .active_tab_mut()
+                .and_then(|t| t.git_log_state.as_mut())
+            {
+                state.pending_focus_filter = true;
+            }
+        }
+    }
 }
 
 fn terminal_is_running(app: &App, id: PaneId) -> bool {

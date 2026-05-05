@@ -114,7 +114,38 @@ pub struct STab {
     pub panes: Vec<SPane>,
     #[serde(default)]
     pub tint: Option<[u8; 3]>,
+    #[serde(default)]
+    pub git_log_visible: bool,
+    #[serde(default)]
+    pub git_log_state: Option<SGitLogState>,
 }
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct SGitLogState {
+    #[serde(default = "default_git_log_height")]
+    pub height: f32,
+    #[serde(default = "default_git_log_col_refs")]
+    pub col_refs_width: f32,
+    #[serde(default = "default_git_log_col_details")]
+    pub col_details_width: f32,
+    #[serde(default)]
+    pub maximized: bool,
+    #[serde(default)]
+    pub selected_commit: Option<String>,
+    #[serde(default)]
+    pub selected_file: Option<String>,
+    #[serde(default)]
+    pub col_refs_collapsed: bool,
+    #[serde(default)]
+    pub col_details_collapsed: bool,
+    #[serde(default = "default_git_log_meta_w")]
+    pub col_log_meta_width: f32,
+}
+
+fn default_git_log_height() -> f32 { 320.0 }
+fn default_git_log_col_refs() -> f32 { 220.0 }
+fn default_git_log_col_details() -> f32 { 360.0 }
+fn default_git_log_meta_w() -> f32 { 220.0 }
 
 #[derive(Serialize, Deserialize)]
 pub enum SNode {
@@ -427,6 +458,18 @@ impl STab {
             next_pane_id: t.layout.next_pane_id(),
             panes,
             tint: t.tint,
+            git_log_visible: t.git_log_visible,
+            git_log_state: t.git_log_state.as_ref().map(|s| SGitLogState {
+                height: s.height,
+                col_refs_width: s.col_refs_width,
+                col_details_width: s.col_details_width,
+                maximized: s.maximized,
+                selected_commit: s.selected_commit.clone(),
+                selected_file: s.selected_file.as_ref().map(|p| p.to_string_lossy().to_string()),
+                col_refs_collapsed: s.col_refs_collapsed,
+                col_details_collapsed: s.col_details_collapsed,
+                col_log_meta_width: s.col_log_meta_width,
+            }),
         }
     }
 
@@ -444,6 +487,34 @@ impl STab {
             name: self.name,
             layout,
             tint: self.tint,
+            git_log_visible: self.git_log_visible,
+            git_log_state: self.git_log_state.map(|s| crate::git_log::GitLogState {
+                height: s.height,
+                col_refs_width: s.col_refs_width,
+                col_details_width: s.col_details_width,
+                maximized: s.maximized,
+                selected_commit: s.selected_commit,
+                selected_file: s.selected_file.map(std::path::PathBuf::from),
+                last_poll: std::time::Instant::now(),
+                frame: None,
+                generation: 0,
+                worker_rx: None,
+                filter: crate::git_log::state::FilterState::default(),
+                watcher: None,
+                fetch_in_flight: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
+                watched_repo: None,
+                pending_op: None,
+                pending_branch_prompt: None,
+                col_refs_collapsed: s.col_refs_collapsed,
+                col_details_collapsed: s.col_details_collapsed,
+                col_log_meta_width: s.col_log_meta_width,
+                last_visible_count: 0,
+                pending_scroll_to_selected: false,
+                pending_focus_filter: false,
+                has_focus: false,
+            }),
         }
     }
 }

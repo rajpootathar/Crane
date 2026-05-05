@@ -947,3 +947,67 @@ fn run(repo: &Path, args: &[&str]) -> Result<(), String> {
         Err(String::from_utf8_lossy(&out.stderr).to_string())
     }
 }
+
+/// `git show --name-status --format= <sha>` — returns a list of
+/// (status_char, path) for files changed by the commit. Status is
+/// one of A/M/D/R/C. Empty Vec on any error.
+pub fn commit_files(repo: &Path, sha: &str) -> Vec<(char, PathBuf)> {
+    let out = match Command::new("git")
+        .args(["show", "--name-status", "--format=", sha])
+        .current_dir(repo)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut result = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let Some(status) = parts.next() else { continue };
+        let Some(path) = parts.next() else { continue };
+        let ch = status.chars().next().unwrap_or('?');
+        result.push((ch, PathBuf::from(path)));
+    }
+    result
+}
+
+/// `git checkout <sha>` — detached-HEAD onto a commit.
+pub fn checkout_commit(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["checkout", sha])
+}
+
+/// `git branch <name> <sha>` — create a new branch at `sha` without
+/// switching to it.
+pub fn branch_from(repo: &Path, name: &str, sha: &str) -> Result<(), String> {
+    run(repo, &["branch", name, sha])
+}
+
+/// `git cherry-pick <sha>` — apply the commit on top of HEAD.
+pub fn cherry_pick(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["cherry-pick", sha])
+}
+
+/// `git revert --no-edit <sha>` — create a revert commit on HEAD.
+pub fn revert(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["revert", "--no-edit", sha])
+}
+
+/// `git show <ref>:<path>` — content of `path` at the given ref.
+/// Empty bytes on missing (e.g. for newly-added files queried at
+/// the parent commit).
+pub fn show_at(repo: &Path, reference: &str, path: &Path) -> Vec<u8> {
+    let arg = format!("{reference}:{}", path.display());
+    let out = match Command::new("git")
+        .args(["show", &arg])
+        .current_dir(repo)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    out.stdout
+}

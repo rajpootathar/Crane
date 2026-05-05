@@ -4,6 +4,7 @@ mod format;
 #[cfg(target_os = "macos")]
 mod mac_keys;
 mod git;
+mod git_log;
 mod lsp;
 mod modals;
 mod platform_menu;
@@ -541,7 +542,55 @@ impl eframe::App for CraneApp {
             center_rect.max,
         );
         let font_size = self.app.font_size;
-        let inset = canvas_rect.shrink(6.0);
+        let full_inset = canvas_rect.shrink(6.0);
+        // When the active Tab has the bottom-docked Git Log Pane
+        // open, carve the bottom slice off `full_inset` for it (plus
+        // a thin splitter row) and pass the remaining top to
+        // render_layout. The whole Pane sits OUTSIDE the Layout tree
+        // by design — non-draggable, can't dock around it.
+        const GIT_LOG_SPLITTER_H: f32 = 4.0;
+        const GIT_LOG_MIN_H: f32 = 120.0;
+        let git_log_visible = self
+            .app
+            .active_tab_ref()
+            .map(|t| t.git_log_visible)
+            .unwrap_or(false);
+        let git_log_h = if git_log_visible {
+            self.app
+                .active_tab_ref()
+                .and_then(|t| t.git_log_state.as_ref().map(|s| s.height))
+                .unwrap_or(320.0)
+                .clamp(GIT_LOG_MIN_H, full_inset.height() * 0.7)
+        } else {
+            0.0
+        };
+        let inset = if git_log_visible {
+            egui::Rect::from_min_max(
+                full_inset.min,
+                egui::pos2(
+                    full_inset.max.x,
+                    full_inset.max.y - git_log_h - GIT_LOG_SPLITTER_H,
+                ),
+            )
+        } else {
+            full_inset
+        };
+        let git_log_splitter_rect = if git_log_visible {
+            egui::Rect::from_min_max(
+                egui::pos2(full_inset.min.x, full_inset.max.y - git_log_h - GIT_LOG_SPLITTER_H),
+                egui::pos2(full_inset.max.x, full_inset.max.y - git_log_h),
+            )
+        } else {
+            egui::Rect::NOTHING
+        };
+        let git_log_body_rect = if git_log_visible {
+            egui::Rect::from_min_max(
+                egui::pos2(full_inset.min.x, full_inset.max.y - git_log_h),
+                full_inset.max,
+            )
+        } else {
+            egui::Rect::NOTHING
+        };
         // Snapshot diagnostics for every open file in the active layout — this
         // avoids borrowing `self.app.lsp` while `self.app.active_layout()`
         // holds a mutable borrow.
@@ -709,6 +758,166 @@ impl eframe::App for CraneApp {
             }
         } else {
             render_empty_state(&mut center_ui, &mut self.app, &ctx, inset);
+        }
+
+        // Bottom-docked Git Log Pane: rendered AFTER the Layout so the
+        // splitter handle sits on top, and only when the active Tab
+        // has it open. Splitter drag adjusts `state.height`; the ×
+        // button (inside view::render) flips git_log_visible off.
+        if git_log_visible {
+            // Splitter
+            let splitter_resp = center_ui.interact(
+                git_log_splitter_rect,
+                egui::Id::new("git_log_splitter"),
+                egui::Sense::drag(),
+            );
+            if splitter_resp.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            }
+            if splitter_resp.dragged() {
+                let dy = splitter_resp.drag_delta().y;
+                if let Some(state) = self
+                    .app
+                    .active_tab_mut()
+                    .and_then(|t| t.git_log_state.as_mut())
+                {
+                    state.height = (state.height - dy)
+                        .clamp(GIT_LOG_MIN_H, full_inset.height() * 0.7);
+                }
+            }
+            center_ui
+                .painter()
+                .rect_filled(git_log_splitter_rect, 0.0, egui::Color32::from_rgb(36, 40, 52));
+
+            // Body
+            let repo_path = self
+                .app
+                .active_workspace_path()
+                .map(|p| p.to_path_buf());
+            let effect = if let (Some(repo), Some(state)) = (
+                repo_path.as_ref(),
+                self.app
+                    .active_tab_mut()
+                    .and_then(|t| t.git_log_state.as_mut()),
+            ) {
+                let mut body_ui = center_ui.new_child(
+                    egui::UiBuilder::new().max_rect(git_log_body_rect),
+                );
+                body_ui.set_clip_rect(git_log_body_rect);
+                git_log::view::render(&mut body_ui, git_log_body_rect, state, repo)
+            } else {
+                git_log::view::ViewEffect::default()
+            };
+            if effect.close {
+                if let Some(tab) = self.app.active_tab_mut() {
+                    tab.git_log_visible = false;
+                }
+            }
+            if let Some((sha, file)) = effect.open_diff {
+                if let Some(repo) = repo_path.as_ref() {
+                    let parent_ref = format!("{sha}^");
+                    let left_text = String::from_utf8_lossy(
+                        &git::show_at(repo, &parent_ref, &file),
+                    )
+                    .to_string();
+                    let right_text = String::from_utf8_lossy(
+                        &git::show_at(repo, &sha, &file),
+                    )
+                    .to_string();
+                    let path_str = file.to_string_lossy().to_string();
+                    let title = format!(
+                        "{}  ·  {}",
+                        file.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path_str.clone()),
+                        sha.chars().take(7).collect::<String>()
+                    );
+                    if let Some(layout) = self.app.active_layout() {
+                        layout.open_diff_in_files_pane(
+                            path_str.clone(),
+                            path_str,
+                            left_text,
+                            right_text,
+                            title,
+                            Some(repo.to_string_lossy().to_string()),
+                        );
+                    }
+                }
+            }
+            if let Some((sha, name)) = effect.branch_from {
+                if let Some(repo) = repo_path.as_ref() {
+                    if let Err(e) = git::branch_from(repo, &name, &sha) {
+                        self.app.git_error = Some(e);
+                    }
+                    if let Some(state) = self
+                        .app
+                        .active_tab_mut()
+                        .and_then(|t| t.git_log_state.as_mut())
+                    {
+                        state.frame = None;
+                    }
+                }
+            }
+            if let Some(op) = effect.op {
+                if let Some(repo) = repo_path.as_ref() {
+                    use git_log::state::GitLogOp;
+                    match op {
+                        GitLogOp::Checkout(sha) => {
+                            if let Err(e) = git::checkout_commit(repo, &sha) {
+                                self.app.git_error = Some(e);
+                            }
+                        }
+                        GitLogOp::CherryPick(sha) => {
+                            if let Err(e) = git::cherry_pick(repo, &sha) {
+                                self.app.git_error = Some(e);
+                            }
+                        }
+                        GitLogOp::Revert(sha) => {
+                            if let Err(e) = git::revert(repo, &sha) {
+                                self.app.git_error = Some(e);
+                            }
+                        }
+                        GitLogOp::CopyHash(sha) => {
+                            ctx.copy_text(sha);
+                        }
+                        GitLogOp::BranchFrom(sha) => {
+                            // Park the prompt on state — view::mod.rs
+                            // surfaces an inline TextEdit when this is
+                            // Some.
+                            if let Some(state) = self
+                                .app
+                                .active_tab_mut()
+                                .and_then(|t| t.git_log_state.as_mut())
+                            {
+                                state.pending_branch_prompt = Some((sha, String::new()));
+                            }
+                        }
+                        GitLogOp::WorktreeFrom(sha) => {
+                            // Reuse the existing new-workspace modal.
+                            // It defaults to creating a new branch off
+                            // HEAD; when a sha is parked here the modal
+                            // pre-fills the base ref.
+                            if let Some((pid, _, _)) = self.app.active {
+                                self.app.open_new_workspace_modal(pid);
+                                if let Some(modal) = self.app.new_workspace_modal.as_mut() {
+                                    modal.branch = sha;
+                                    modal.create_new_branch = true;
+                                }
+                            }
+                        }
+                    }
+                    // Most ops change refs/HEAD; the watcher will pick
+                    // it up. Drop the cached frame so the next
+                    // `maybe_reload` tick fires fresh.
+                    if let Some(state) = self
+                        .app
+                        .active_tab_mut()
+                        .and_then(|t| t.git_log_state.as_mut())
+                    {
+                        state.frame = None;
+                    }
+                }
+            }
         }
 
         render_missing_project_modal(&ctx, &mut self.app);

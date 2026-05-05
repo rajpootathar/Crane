@@ -7,7 +7,7 @@ members = ["crates/*"]
 
 [package]
 name = "crane"
-version = "0.4.38"
+version = "0.4.39"
 edition = "2024"
 description = "Native GPU-rendered terminal + IDE environment"
 authors = ["rajpootathar"]
@@ -86,6 +86,13 @@ uuid = { version = "1", features = ["v4"] }
 # Windows. Deliberately picked over a hand-rolled `mv ~/.Trash/`
 # shell-out so files keep their "Put Back" affordance in Finder.
 trash = "5"
+# Filesystem watcher for the Git Log Pane. Watches `.git/HEAD`,
+# `.git/refs/`, and `.git/packed-refs` so the log auto-refreshes when
+# the user commits / fetches / switches branches outside Crane.
+# `notify` 8.x is the latest stable line; under the hood it uses
+# FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on
+# Windows. Cross-platform with no extra config.
+notify = "8"
 # PDF viewer (Files Pane file tab). Binds to libpdfium.dylib at
 # runtime — we vendor the dylib via `make vendor-pdfium` so the bundle
 # step has full control over arch + signing. Default features cover
