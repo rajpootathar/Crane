@@ -1683,8 +1683,13 @@ fn render_scoped(
 
         // Current line highlight: subtle background on the line with the
         // primary cursor. Painted over the code area (not gutter).
+        // Y origin matches the line-number paint loop below
+        // (`gutter_rect.min.y + (n - 0.5) * row_h - v_offset`); the
+        // earlier formula folded `gutter_w + code_pad` (horizontal
+        // measurements) into the Y term, which shifted the highlight
+        // down by ~two rows from the actual cursor line.
         let cur_line_num = char_idx_to_line_col(&tab.content, tab.last_cursor_idx).0;
-        let code_hl_y = avail.min.y + gutter_w + code_pad + (cur_line_num as f32 + 0.5) * row_h - v_offset;
+        let code_hl_y = gutter_rect.min.y + (cur_line_num as f32 + 0.5) * row_h - v_offset;
         let code_area_left = code_left + code_pad;
         let code_area_right = avail.min.x + avail.width();
         if code_hl_y >= avail.min.y - row_h && code_hl_y <= avail.max.y + row_h {
