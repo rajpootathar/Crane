@@ -336,7 +336,7 @@ impl Session {
                     tabs,
                     git_status: None,
                     last_status_refresh: None,
-                    git_rx: None,
+                    git_job: None,
                     tint: sw.tint,
                 });
             }

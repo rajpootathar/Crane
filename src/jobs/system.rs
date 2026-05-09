@@ -223,10 +223,17 @@ impl JobSystem {
     /// Construct with a repaint callback (typically `ctx.request_repaint()`).
     /// Pass `None` in tests.
     pub fn new(repaint: Option<Arc<dyn Fn() + Send + Sync>>) -> Arc<Self> {
+        // Crane is an interactive desktop app, not a throughput
+        // service — the goal is minimum resident overhead, not max
+        // parallelism. CPU jobs (highlight, diff, parse) cap at 4 even
+        // on a 16-core machine because user-visible jobs are short and
+        // we'd rather leave cores free for the rest of the system.
+        // I/O is fixed at 2 — git shell-out + file reads parallelise
+        // fine at that width and any more is RAM with no payoff.
         let cpu_size = thread::available_parallelism()
-            .map(|n| n.get().clamp(2, 8))
-            .unwrap_or(4);
-        Self::with_sizes(cpu_size, 4, repaint)
+            .map(|n| n.get().clamp(1, 4))
+            .unwrap_or(2);
+        Self::with_sizes(cpu_size, 2, repaint)
     }
 
     pub fn with_sizes(

@@ -1,8 +1,10 @@
 use crate::git::{self, GitStatus};
+use crate::jobs::{JobHandle, JobKey, JobOutput, JobSystem, Pool, Priority, Scope};
 use crate::state::layout::Layout;
 use crate::update::check::UpdateCheck;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn shellexpand_home(s: &str) -> String {
@@ -43,7 +45,11 @@ pub struct Workspace {
     pub expanded: bool,
     pub git_status: Option<GitStatus>,
     pub last_status_refresh: Option<Instant>,
-    pub git_rx: Option<std::sync::mpsc::Receiver<Option<GitStatus>>>,
+    /// In-flight git status job. Replaced (and the previous one
+    /// cancelled) on every refresh tick that's due. Hot-path render
+    /// reads `git_status` directly — this field is only touched by
+    /// `refresh_active_git_status`.
+    pub git_job: Option<JobHandle<Option<GitStatus>>>,
     /// Optional per-Workspace accent tint applied to the branch icon
     /// and label in the Left Panel. Lets users colour-code branches
     /// the same way [`Project::tint`] colour-codes projects. `None`
@@ -518,6 +524,10 @@ pub struct App {
     /// from a terminal pane). Throttled to 3 s. `None` = never
     /// probed yet.
     pub last_worktree_prune: Option<Instant>,
+    /// Background work pool — git status today, future diff /
+    /// highlight / parse migrations. Lazy-initialized on first use so
+    /// a session that never opens a workspace pays no thread cost.
+    pub jobs: Option<Arc<JobSystem>>,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -577,6 +587,7 @@ impl App {
             confirmed_quit: false,
             last_loose_git_probe: None,
             last_worktree_prune: None,
+            jobs: None,
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,
@@ -764,7 +775,7 @@ impl App {
                 expanded: true,
                 git_status: None,
                 last_status_refresh: None,
-                git_rx: None,
+                git_job: None,
                 tint: None,
             });
         }
@@ -940,7 +951,7 @@ impl App {
                     expanded: true,
                     git_status: None,
                     last_status_refresh: None,
-                    git_rx: None,
+                    git_job: None,
                     tint: None,
                 };
                 if let Some(project) = self.projects.iter_mut().find(|p| p.id == pid) {
@@ -1795,6 +1806,17 @@ impl App {
         let active_interval = Duration::from_millis(1000);
         let inactive_interval = Duration::from_millis(5000);
 
+        // Lazy-init: a session with no projects pays zero thread cost.
+        // After FileWatcher migration this whole interval-poll block
+        // becomes a fallback; for now it drives status updates.
+        let jobs = self.jobs.get_or_insert_with(|| {
+            let ctx = ctx.clone();
+            let repaint: Arc<dyn Fn() + Send + Sync> =
+                Arc::new(move || ctx.request_repaint());
+            JobSystem::new(Some(repaint))
+        });
+        let jobs = Arc::clone(jobs);
+
         for project in self.projects.iter_mut() {
             // Skip polls on projects whose root folder is gone. Spares
             // us a pile of spurious "fatal: not a git repository"
@@ -1804,8 +1826,18 @@ impl App {
                 continue;
             }
             for wt in project.workspaces.iter_mut() {
-                if let Some(rx) = wt.git_rx.as_ref()
-                    && let Ok(status) = rx.try_recv() {
+                if let Some(handle) = wt.git_job.as_ref()
+                    && let Some(out) = handle.try_recv()
+                {
+                    // Drop the handle either way — Done means we got
+                    // the answer; Cancelled means a newer job
+                    // superseded this one and the next tick will pick
+                    // up the new handle.
+                    let status_opt = match out {
+                        JobOutput::Done(s) => Some(s),
+                        JobOutput::Cancelled => None,
+                    };
+                    if let Some(status) = status_opt {
                         // Pull the branch name forward from the
                         // freshly-polled git status: branches renamed
                         // outside Crane (e.g. `git branch -m`) now show
@@ -1820,10 +1852,11 @@ impl App {
                         }
                         wt.git_status = status;
                         wt.last_status_refresh = Some(now);
-                        wt.git_rx = None;
                     }
+                    wt.git_job = None;
+                }
 
-                if wt.git_rx.is_some() {
+                if wt.git_job.is_some() {
                     continue;
                 }
                 let interval = if Some(wt.id) == active_wid {
@@ -1839,15 +1872,19 @@ impl App {
                     continue;
                 }
 
-                let (tx, rx) = std::sync::mpsc::channel();
+                let priority = if Some(wt.id) == active_wid {
+                    Priority::Foreground
+                } else {
+                    Priority::Visible
+                };
                 let path = wt.path.clone();
-                let ctx = ctx.clone();
-                std::thread::spawn(move || {
-                    let status = git::status(&path);
-                    let _ = tx.send(status);
-                    ctx.request_repaint();
-                });
-                wt.git_rx = Some(rx);
+                let handle = jobs.submit(
+                    JobKey::new(Scope::Workspace(wt.id), "git_status"),
+                    priority,
+                    Pool::Io,
+                    move |_tok| git::status(&path),
+                );
+                wt.git_job = Some(handle);
             }
         }
     }
@@ -1952,7 +1989,7 @@ impl App {
                     expanded: true,
                     git_status: None,
                     last_status_refresh: None,
-                    git_rx: None,
+                    git_job: None,
                     tint: None,
                 });
                 self.active = Some((modal.project_id, wt_id, tab_id));
