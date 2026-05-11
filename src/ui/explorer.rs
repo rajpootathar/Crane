@@ -638,8 +638,21 @@ fn collect_paths(node: &DirNode, out: &mut Vec<String>) {
 fn build_tree(changes: &[&FileChange]) -> DirNode {
     let mut root = DirNode::default();
     for c in changes {
-        let parts: Vec<&str> = c.path.split('/').collect();
+        // git status --porcelain reports untracked directories with a
+        // trailing slash (e.g. "some/empty_dir/"). Splitting on '/'
+        // leaves an empty final segment, which renders as a
+        // checkbox + "?" row with no label under the parent — the
+        // ghost child the user saw. Treat the directory itself as
+        // the leaf entry.
+        let cleaned = c.path.trim_end_matches('/');
+        if cleaned.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = cleaned.split('/').collect();
         let (file, dirs) = parts.split_last().unwrap_or((&"", &[]));
+        if file.is_empty() {
+            continue;
+        }
         let mut node = &mut root;
         for d in dirs {
             node = node.dirs.entry((*d).to_string()).or_default();
