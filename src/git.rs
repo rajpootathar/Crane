@@ -249,7 +249,14 @@ pub fn unstage_hunk(repo: &Path, patch: &str) -> Result<(), String> {
 /// the index already contains the new lines, so the hunk is staged.
 pub fn is_hunk_staged(repo: &Path, patch: &str) -> bool {
     let mut child = match Command::new("git")
-        .args(["apply", "--reverse", "--cached", "--check", "-"])
+        .args([
+            "apply",
+            "--reverse",
+            "--cached",
+            "--check",
+            "--unidiff-zero",
+            "-",
+        ])
         .current_dir(repo)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -270,10 +277,14 @@ pub fn is_hunk_staged(repo: &Path, patch: &str) -> bool {
 }
 
 fn apply_hunk(repo: &Path, patch: &str, reverse: bool) -> Result<(), String> {
+    // --unidiff-zero is required for the unified=0 patches that
+    // file_diff_raw generates: git apply's default safety check
+    // rejects context-less patches with "patch does not apply" even
+    // when the line numbers are correct.
     let args = if reverse {
-        vec!["apply", "--reverse", "--cached", "-"]
+        vec!["apply", "--reverse", "--cached", "--unidiff-zero", "-"]
     } else {
-        vec!["apply", "--cached", "-"]
+        vec!["apply", "--cached", "--unidiff-zero", "-"]
     };
     let mut child = Command::new("git")
         .args(&args)
