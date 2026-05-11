@@ -53,7 +53,7 @@ pub fn render(
 ) -> ViewEffect {
     let mut effect = ViewEffect::default();
     let mut request_close = false;
-    state.poll_worker();
+    state.poll_worker(Some(repo.to_path_buf()), ui.ctx());
     state.maybe_reload(repo.to_path_buf(), ui.ctx());
 
     // Focus tracking: clicking anywhere inside the body marks the
@@ -162,7 +162,14 @@ pub fn render(
                 .on_hover_text("Refresh")
                 .clicked()
             {
-                state.worker_rx = None;
+                // Force a reload: cancel any in-flight job (via key
+                // dedup on the next submit) and clear the handle so
+                // we don't early-return at the worker_job.is_some()
+                // check inside reload().
+                if let Some(handle) = state.worker_job.as_ref() {
+                    handle.cancel_token().cancel();
+                }
+                state.worker_job = None;
                 state.reload(repo.to_path_buf(), ui.ctx());
             }
             ui.add_space(4.0);

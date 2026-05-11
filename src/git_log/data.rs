@@ -64,7 +64,21 @@ pub fn load_commits(repo: &Path, max_count: usize) -> Vec<CommitRecord> {
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+        Ok(o) => {
+            log::warn!(
+                "git_log: git log exited non-zero in {}: {}",
+                repo.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            log::warn!(
+                "git_log: git log could not spawn in {}: {e}",
+                repo.display()
+            );
+            return Vec::new();
+        }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     parse_log_output(&stdout)

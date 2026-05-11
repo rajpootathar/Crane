@@ -56,21 +56,59 @@ impl Watcher {
             false
         }
     }
+
+    /// How long since the watcher last fired a debounced event.
+    /// `state` uses this to gate its 30 s poll fallback: when the
+    /// watcher is healthy and active, the poll never re-shells git.
+    pub fn last_event_elapsed(&self) -> Duration {
+        self.last_event.elapsed()
+    }
 }
 
-/// Run `git fetch --all --prune --tags` against `repo` on a worker
-/// thread. `flag` is a shared in-flight bit the UI uses to render a
-/// spinner; cleared when the child exits regardless of success. The
-/// caller's `notify::Watcher` will pick up the resulting `.git/refs/`
-/// writes and trigger a fresh reload.
-pub fn fetch_all_async(repo: PathBuf, flag: Arc<AtomicBool>, ctx: egui::Context) {
+/// Run `git fetch --all --prune --tags` against `repo` via JobSystem
+/// (I/O pool, Background priority — user kicked it but doesn't need
+/// the answer back instantly). `flag` is a shared in-flight bit the
+/// UI uses to render a spinner; cleared when the child exits
+/// regardless of success. The caller's `notify::Watcher` will pick
+/// up the resulting `.git/refs/` writes and trigger a fresh reload.
+pub fn fetch_all_async(repo: PathBuf, flag: Arc<AtomicBool>) {
     flag.store(true, Ordering::Relaxed);
-    std::thread::spawn(move || {
-        let _ = std::process::Command::new("git")
-            .args(["fetch", "--all", "--prune", "--tags"])
-            .current_dir(&repo)
-            .status();
+    let Some(jobs) = crate::jobs::global() else {
+        // No JobSystem yet — fall back to a one-shot thread so the
+        // user's button click isn't silently dropped during early
+        // startup. Won't happen in normal flow because the JobSystem
+        // installs on first render before any pane can be open.
         flag.store(false, Ordering::Relaxed);
-        ctx.request_repaint();
-    });
+        return;
+    };
+    let flag_for_job = Arc::clone(&flag);
+    let repo_for_job = repo.clone();
+    let _handle = jobs.submit::<(), _>(
+        crate::jobs::JobKey::new(crate::jobs::Scope::Global, "git_log_fetch_all"),
+        crate::jobs::Priority::Background,
+        crate::jobs::Pool::Io,
+        move |_tok| {
+            let result = std::process::Command::new("git")
+                .args(["fetch", "--all", "--prune", "--tags"])
+                .current_dir(&repo_for_job)
+                .output();
+            match result {
+                Ok(o) if !o.status.success() => {
+                    log::warn!(
+                        "git_log: git fetch --all failed ({}): {}",
+                        o.status,
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                }
+                Err(e) => {
+                    log::warn!("git_log: git fetch --all could not spawn: {e}");
+                }
+                _ => {}
+            }
+            flag_for_job.store(false, Ordering::Relaxed);
+        },
+    );
+    // Drop the JobHandle — fire-and-forget; the spinner flag carries
+    // completion state, and the user's watcher picks up the new refs.
+    drop(_handle);
 }

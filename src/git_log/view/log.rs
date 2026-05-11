@@ -186,12 +186,38 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
         || branch_filter.is_some()
         || user_filter.is_some();
     let local_lanes: Option<crate::git_log::graph::LaneFrame> = if filter_active {
-        let visible_commits: Vec<crate::git_log::data::CommitRecord> = visible
-            .iter()
-            .map(|&i| frame.commits[i].clone())
-            .collect();
-        Some(crate::git_log::graph::layout(&visible_commits))
+        // Cache by (filter signature, frame generation). When the
+        // user types or scrolls, the same filter + same source frame
+        // yields the same lanes — without this cache, every frame
+        // clones the visible CommitRecords and re-runs graph::layout.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&needle, &mut hasher);
+        std::hash::Hash::hash(&branch_filter, &mut hasher);
+        std::hash::Hash::hash(&user_filter, &mut hasher);
+        let filter_sig = std::hash::Hasher::finish(&hasher);
+        let frame_gen = frame.generation;
+        let cache_hit = state
+            .filter_lane_cache
+            .as_ref()
+            .is_some_and(|(sig, g, _)| *sig == filter_sig && *g == frame_gen);
+        if !cache_hit {
+            let visible_commits: Vec<crate::git_log::data::CommitRecord> = visible
+                .iter()
+                .map(|&i| frame.commits[i].clone())
+                .collect();
+            let lanes = crate::git_log::graph::layout(&visible_commits);
+            state.filter_lane_cache = Some((filter_sig, frame_gen, lanes));
+        }
+        // Cheap clone of LaneFrame (it's small — Vec<usize> + lane
+        // metadata, not commit data). Keeps the cache intact for
+        // the next frame.
+        state
+            .filter_lane_cache
+            .as_ref()
+            .map(|(_, _, l)| l.clone())
     } else {
+        // No filter: drop the cache to free its memory.
+        state.filter_lane_cache = None;
         None
     };
     let lanes_ref: &crate::git_log::graph::LaneFrame =

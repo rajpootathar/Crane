@@ -506,7 +506,8 @@ impl STab {
                 last_poll: std::time::Instant::now(),
                 frame: None,
                 generation: 0,
-                worker_rx: None,
+                worker_job: None,
+                reload_pending: false,
                 filter: crate::git_log::state::FilterState::default(),
                 watcher: None,
                 fetch_in_flight: std::sync::Arc::new(
@@ -522,6 +523,7 @@ impl STab {
                 pending_scroll_to_selected: false,
                 pending_focus_filter: false,
                 has_focus: false,
+                filter_lane_cache: None,
             }),
         }
     }

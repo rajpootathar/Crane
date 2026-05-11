@@ -99,12 +99,6 @@ notify = "8"
 # pdfium_latest + thread_safe + image (image::DynamicImage round-trip
 # into egui::ColorImage).
 pdfium-render = "0.9"
-# Cross-platform filesystem watcher: FSEvents on macOS, inotify on
-# Linux, ReadDirectoryChangesW on Windows. One shared
-# RecommendedWatcher instance services every Project; events feed a
-# single debouncer thread which emits coalesced ChangeEvents to the
-# App. Replaces interval-based git status polling.
-notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -83,7 +83,21 @@ pub fn load_refs(repo: &Path) -> RefSet {
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return RefSet::default(),
+        Ok(o) => {
+            log::warn!(
+                "git_log: for-each-ref exited non-zero in {}: {}",
+                repo.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return RefSet::default();
+        }
+        Err(e) => {
+            log::warn!(
+                "git_log: for-each-ref could not spawn in {}: {e}",
+                repo.display()
+            );
+            return RefSet::default();
+        }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut set = parse_for_each_ref(&stdout);
