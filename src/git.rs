@@ -358,15 +358,19 @@ pub fn parse_hunks(diff: &str) -> Vec<(usize, String)> {
                 i += 1;
             }
             let hunk_content: String = lines[start..i].join("\n");
+            // `prefix` is a byte slice taken up to (but not including)
+            // the first `@@` line — it ALREADY ends with the trailing
+            // newline of the last header line. Adding another `\n`
+            // between prefix and hunk_content inserts a blank line
+            // between the header and the hunk, which git apply
+            // rejects as "patch with only garbage at line 5".
             let mut patch = if prefix.is_empty() {
                 hunk_content
             } else {
-                format!("{}\n{}", prefix, hunk_content)
+                format!("{}{}", prefix, hunk_content)
             };
-            // git apply rejects patches without a trailing newline.
-            // Without this, stage_hunk silently fails on the last
-            // hunk of a file (the one whose final line is the patch
-            // terminator).
+            // git apply also wants a trailing newline; without it the
+            // last hunk of a file silently fails to apply.
             if !patch.ends_with('\n') {
                 patch.push('\n');
             }
@@ -1018,3 +1022,56 @@ pub fn show_at(repo: &Path, reference: &str, path: &Path) -> Vec<u8> {
     };
     out.stdout
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hunks_produces_well_formed_patch() {
+        let diff = concat!(
+            "diff --git a/foo.rs b/foo.rs\n",
+            "index 0000001..0000002 100644\n",
+            "--- a/foo.rs\n",
+            "+++ b/foo.rs\n",
+            "@@ -1,3 +1,4 @@\n",
+            " line1\n",
+            "+added\n",
+            " line2\n",
+            " line3\n",
+        );
+        let hunks = parse_hunks(diff);
+        assert_eq!(hunks.len(), 1);
+        let patch = &hunks[0].1;
+        // Header must be immediately followed by the @@ line — no
+        // blank line in between. The earlier bug inserted "\n\n" at
+        // the boundary, causing `git apply` to reject the patch with
+        // "patch with only garbage at line 5".
+        assert!(
+            !patch.contains("\n\n@@"),
+            "patch has a blank line before the @@ hunk header:\n{patch}"
+        );
+        assert!(patch.starts_with("diff --git"));
+        assert!(patch.ends_with('\n'));
+    }
+
+    #[test]
+    fn parse_hunks_appends_trailing_newline_when_missing() {
+        let diff = concat!(
+            "diff --git a/foo.rs b/foo.rs\n",
+            "index 0000001..0000002 100644\n",
+            "--- a/foo.rs\n",
+            "+++ b/foo.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new",
+        );
+        let hunks = parse_hunks(diff);
+        assert_eq!(hunks.len(), 1);
+        assert!(
+            hunks[0].1.ends_with('\n'),
+            "patch must end with a newline for git apply to accept it"
+        );
+    }
+}
+
