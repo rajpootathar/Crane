@@ -376,7 +376,11 @@ pub fn render_diff_body(
     let gutter_old_w = char_w * ldigits as f32 + 10.0;
     let gutter_new_w = char_w * rdigits as f32 + 10.0;
     let sign_w = char_w * 2.0 + 8.0;
-    let stage_btn_w = 20.0;
+    // Stage-hunk control gutter. Wider than before so it's an
+    // actual click target instead of a 20-px sliver, and uses a
+    // checkbox glyph (matches Right Panel Changes "stage" affordance)
+    // instead of a tiny plus icon.
+    let stage_btn_w = 28.0;
 
     let scroll_out = scroll.show_rows(&mut body_ui, row_h, rows.len(), |ui, row_range| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -397,25 +401,31 @@ pub fn render_diff_body(
                         ui.cursor().min,
                         egui::vec2(stage_btn_w, row_h),
                     );
-                    let btn_id = egui::Id::new(("stage_hunk", tab.left_path.clone(), tab.right_path.clone(), hi));
+                    let btn_id = egui::Id::new((
+                        "stage_hunk",
+                        tab.left_path.clone(),
+                        tab.right_path.clone(),
+                        hi,
+                    ));
                     let btn_resp = ui.interact(btn_rect, btn_id, egui::Sense::click());
                     let btn_hovered = btn_resp.hovered();
                     let btn_clicked = btn_resp.clicked();
                     if btn_hovered {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    btn_resp.on_hover_text("Stage hunk");
-                    if btn_clicked {
-                        if let Some(repo) = &tab.repo_path {
-                            let repo_path = std::path::Path::new(repo);
-                            match crate::git::stage_hunk(repo_path, patch) {
-                                Ok(()) => {
-                                    tab.pending_hunk_stage = true;
-                                    ui.ctx().data_mut(|d| d.insert_temp(refresh_id, true));
-                                }
-                                Err(e) => {
-                                    tab.error = Some(format!("Stage hunk failed: {e}"));
-                                }
+                    btn_resp.on_hover_text("Stage this hunk");
+                    if btn_clicked
+                        && let Some(repo) = &tab.repo_path
+                    {
+                        let repo_path = std::path::Path::new(repo);
+                        match crate::git::stage_hunk(repo_path, patch) {
+                            Ok(()) => {
+                                tab.pending_hunk_stage = true;
+                                ui.ctx().data_mut(|d| d.insert_temp(refresh_id, true));
+                            }
+                            Err(e) => {
+                                log::warn!("stage_hunk failed: {e}");
+                                tab.error = Some(format!("Stage hunk failed: {e}"));
                             }
                         }
                     }
@@ -451,17 +461,41 @@ pub fn render_diff_body(
                 );
                 painter.rect_filled(bg_rect, 0.0, bg);
             }
-            // Paint stage button on top of row background
+            // Paint stage button on top of row background. Checkbox
+            // metaphor matches the Right Panel Changes tab (empty
+            // square = "click to stage"). Always visible (not just on
+            // hover) so users find the affordance; hover bumps the
+            // background + brightens the icon for feedback.
             if let Some((btn_rect, hovered)) = &stage_btn_paint {
-                if *hovered {
-                    painter.rect_filled(*btn_rect, 2.0, theme::current().row_hover.to_color32());
-                }
+                // Pill background slightly inset so it doesn't bleed
+                // into the row's signed-line tint.
+                let inset = 3.0;
+                let pill = egui::Rect::from_min_max(
+                    egui::pos2(btn_rect.left() + inset, btn_rect.top() + inset),
+                    egui::pos2(btn_rect.right() - inset, btn_rect.bottom() - inset),
+                );
+                let (fill, fg) = if *hovered {
+                    (ADD_BG, ADD_FG)
+                } else {
+                    (
+                        theme::current().surface_alt.to_color32(),
+                        theme::current().text_muted.to_color32(),
+                    )
+                };
+                painter.rect_filled(pill, 4.0, fill);
+                painter.rect_stroke(
+                    pill,
+                    4.0,
+                    egui::Stroke::new(1.0, ADD_FG),
+                    egui::StrokeKind::Inside,
+                );
+                let glyph = if *hovered { icons::CHECK_SQUARE } else { icons::SQUARE };
                 painter.text(
-                    btn_rect.center(),
+                    pill.center(),
                     egui::Align2::CENTER_CENTER,
-                    icons::PLUS_CIRCLE,
-                    FontId::new(11.0, FontFamily::Proportional),
-                    ADD_FG,
+                    glyph,
+                    FontId::new(14.0, FontFamily::Proportional),
+                    fg,
                 );
             }
             let gx = rect.min.x + stage_btn_w;
