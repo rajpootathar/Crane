@@ -243,6 +243,32 @@ pub fn unstage_hunk(repo: &Path, patch: &str) -> Result<(), String> {
     apply_hunk(repo, patch, true)
 }
 
+/// Probe whether the hunk represented by `patch` (a HEAD→working-tree
+/// hunk) is already present in the index. We test by asking git
+/// whether the patch can be reverse-applied to the index: if it can,
+/// the index already contains the new lines, so the hunk is staged.
+pub fn is_hunk_staged(repo: &Path, patch: &str) -> bool {
+    let mut child = match Command::new("git")
+        .args(["apply", "--reverse", "--cached", "--check", "-"])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(patch.as_bytes());
+    }
+    child
+        .wait_with_output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn apply_hunk(repo: &Path, patch: &str, reverse: bool) -> Result<(), String> {
     let args = if reverse {
         vec!["apply", "--reverse", "--cached", "-"]
@@ -284,11 +310,12 @@ pub fn staged_content(repo: &Path, rel_path: &str) -> Option<String> {
     }
 }
 
-/// Get the unified diff between HEAD and the working tree for a file.
-/// Returns the raw diff text including hunk headers and context lines.
+/// Get the unified diff between HEAD and the working tree for a file
+/// — includes both staged and unstaged changes. Returns the raw diff
+/// text including hunk headers and context lines.
 pub fn file_diff_raw(repo: &Path, rel_path: &str) -> Option<String> {
     let out = Command::new("git")
-        .args(["diff", "--", rel_path])
+        .args(["diff", "HEAD", "--", rel_path])
         .current_dir(repo)
         .output()
         .ok()?;

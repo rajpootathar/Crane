@@ -131,11 +131,6 @@ pub struct DiffTabData {
     /// Set to true by the diff view when a hunk is staged. The main loop
     /// reads this flag and triggers a diff content refresh.
     pub pending_hunk_stage: bool,
-    /// When false: left = staged, right = working tree (unstaged changes,
-    /// hunk button stages). When true: left = HEAD, right = staged
-    /// (staged changes, hunk button unstages). Toggled from the diff
-    /// header.
-    pub show_staged: bool,
     /// Horizontal scroll offsets for side-by-side mode (left/right halves).
     pub sbs_h_scroll_left: f32,
     pub sbs_h_scroll_right: f32,
@@ -197,39 +192,6 @@ impl DiffTabData {
         }
     }
 
-    /// Switch between viewing unstaged changes (staged ↔ working tree)
-    /// and staged changes (HEAD ↔ staged). Rewrites `left_path`,
-    /// `left_text`, and `right_text` from git so the diff view's hunk
-    /// button can drive either `stage_hunk` or `unstage_hunk`.
-    pub fn set_show_staged(&mut self, show_staged: bool) {
-        if self.show_staged == show_staged {
-            return;
-        }
-        let root: PathBuf = match self.repo_path.as_deref() {
-            Some(r) => PathBuf::from(r),
-            None => return,
-        };
-        let rel = self
-            .left_path
-            .strip_prefix("staged:")
-            .or_else(|| self.left_path.strip_prefix("HEAD:"))
-            .unwrap_or(&self.left_path)
-            .to_string();
-        self.show_staged = show_staged;
-        if show_staged {
-            self.left_path = format!("HEAD:{}", rel);
-            self.left_text = crate::git::head_content(&root, &rel);
-            self.right_text = crate::git::staged_content(&root, &rel)
-                .unwrap_or_default();
-        } else {
-            self.left_path = format!("staged:{}", rel);
-            self.left_text = crate::git::staged_content(&root, &rel)
-                .unwrap_or_else(|| crate::git::head_content(&root, &rel));
-            let abs = root.join(&rel);
-            self.right_text = std::fs::read_to_string(&abs).unwrap_or_default();
-        }
-        self.invalidate();
-    }
 }
 
 pub enum TabKind {
@@ -385,7 +347,6 @@ impl FilesPane {
             diff_mode: DiffMode::Unified,
             repo_path,
             pending_hunk_stage: false,
-            show_staged: false,
             sbs_h_scroll_left: 0.0,
             sbs_h_scroll_right: 0.0,
             computed: None,

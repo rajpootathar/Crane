@@ -40,6 +40,10 @@ pub struct DiffComputed {
     pub tags: Vec<ChangeTag>,
     pub hunk_starts: Vec<usize>,
     pub hunk_patches: Vec<Option<String>>,
+    /// Per-hunk: true if the hunk is already in the index (action is
+    /// "unstage"), false otherwise (action is "stage"). Probed once
+    /// per compute via `git apply --reverse --cached --check`.
+    pub hunk_staged: Vec<bool>,
     pub row_to_hunk: Vec<Option<usize>>,
     pub ldigits: usize,
     pub rdigits: usize,
@@ -56,6 +60,7 @@ impl DiffComputed {
             tags: Vec::new(),
             hunk_starts: Vec::new(),
             hunk_patches: Vec::new(),
+            hunk_staged: Vec::new(),
             row_to_hunk: Vec::new(),
             ldigits: 0,
             rdigits: 0,
@@ -140,6 +145,25 @@ fn compute_diff(
         vec![None; hunk_starts.len()]
     };
 
+    if cancel.is_cancelled() {
+        return DiffComputed::empty();
+    }
+
+    // Probe each hunk for staged state. Done on the I/O pool with the
+    // diff compute so the UI never blocks on N git invocations.
+    let hunk_staged: Vec<bool> = if let Some(repo) = repo_path.as_ref() {
+        let repo_p = std::path::Path::new(repo);
+        hunk_patches
+            .iter()
+            .map(|p| match p {
+                Some(patch) => crate::git::is_hunk_staged(repo_p, patch),
+                None => false,
+            })
+            .collect()
+    } else {
+        vec![false; hunk_patches.len()]
+    };
+
     let mut row_to_hunk: Vec<Option<usize>> = vec![None; total_rows];
     for (hi, &start) in hunk_starts.iter().enumerate() {
         let end = hunk_starts.get(hi + 1).copied().unwrap_or(total_rows);
@@ -155,6 +179,7 @@ fn compute_diff(
         tags,
         hunk_starts,
         hunk_patches,
+        hunk_staged,
         row_to_hunk,
         ldigits,
         rdigits,
@@ -314,32 +339,6 @@ pub fn render_diff_body(
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            // Unstaged ⇄ Staged toggle. When show_staged=true the diff
-            // is HEAD ↔ index and the hunk button unstages. Otherwise
-            // it's index ↔ working-tree and the button stages.
-            let mut toggle_to: Option<bool> = None;
-            let staged_btn = ui.add(
-                egui::Button::selectable(
-                    tab.show_staged,
-                    RichText::new("Staged").size(11.0).monospace(),
-                ),
-            );
-            if staged_btn.clicked() && !tab.show_staged {
-                toggle_to = Some(true);
-            }
-            let unstaged_btn = ui.add(
-                egui::Button::selectable(
-                    !tab.show_staged,
-                    RichText::new("Unstaged").size(11.0).monospace(),
-                ),
-            );
-            if unstaged_btn.clicked() && tab.show_staged {
-                toggle_to = Some(false);
-            }
-            if let Some(s) = toggle_to {
-                tab.set_show_staged(s);
-            }
-            ui.add_space(8.0);
             let nav_enabled = !hunk_starts.is_empty();
             let down = ui.add_enabled(
                 nav_enabled,
@@ -451,9 +450,10 @@ pub fn render_diff_body(
             // Stage button at hunk start -- register interaction early,
             // paint after row background so the button isn't covered.
             let is_hunk_start = hunk_starts.contains(&i);
-            let mut stage_btn_paint: Option<(egui::Rect, bool)> = None;
+            let mut stage_btn_paint: Option<(egui::Rect, bool, bool)> = None;
             if is_hunk_start && let Some(hi) = row_to_hunk[i] {
                 if let Some(patch) = &hunk_patches[hi] {
+                    let is_unstage = computed.hunk_staged.get(hi).copied().unwrap_or(false);
                     let btn_rect = egui::Rect::from_min_size(
                         ui.cursor().min,
                         egui::vec2(stage_btn_w, row_h),
@@ -470,7 +470,6 @@ pub fn render_diff_body(
                     if btn_hovered {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    let is_unstage = tab.show_staged;
                     let hover = if is_unstage { "Unstage this hunk" } else { "Stage this hunk" };
                     btn_resp.on_hover_text(hover);
                     if btn_clicked
@@ -494,7 +493,7 @@ pub fn render_diff_body(
                             }
                         }
                     }
-                    stage_btn_paint = Some((btn_rect, btn_hovered));
+                    stage_btn_paint = Some((btn_rect, btn_hovered, is_unstage));
                 }
             }
             let mut hl = HighlightLines::new(syntax, st_theme);
@@ -531,8 +530,8 @@ pub fn render_diff_body(
             // background — no nested box-around-a-box (the earlier
             // pill + square-checkbox combination read as two
             // overlapping boxes).
-            if let Some((btn_rect, hovered)) = &stage_btn_paint {
-                let is_unstage = tab.show_staged;
+            if let Some((btn_rect, hovered, is_unstage)) = &stage_btn_paint {
+                let is_unstage = *is_unstage;
                 let accent_bg = if is_unstage { DEL_BG } else { ADD_BG };
                 let accent_fg = if is_unstage { DEL_FG } else { ADD_FG };
                 if *hovered {

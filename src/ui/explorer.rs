@@ -585,13 +585,11 @@ fn force_status_refresh(app: &mut App) {
 fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
     let full = repo.join(rel_path);
     let right_text = std::fs::read_to_string(&full).unwrap_or_default();
-    // Use staged content as left side when the file has staged changes,
-    // otherwise use HEAD content. This makes the diff show only
-    // *unstaged* changes, and per-hunk staging removes hunks from view.
-    let (left_text, left_label) = match git::staged_content(repo, rel_path) {
-        Some(text) => (text, format!("staged:{rel_path}")),
-        None => (git::head_content(repo, rel_path), format!("HEAD:{rel_path}")),
-    };
+    // Always diff HEAD ↔ working tree. Each hunk renders its own
+    // stage / unstage action depending on whether it's already in the
+    // index (probed per-hunk via `git apply --reverse --cached --check`).
+    let left_text = git::head_content(repo, rel_path);
+    let left_label = format!("HEAD:{rel_path}");
     let title = format!(
         "diff: {}",
         std::path::Path::new(rel_path)
