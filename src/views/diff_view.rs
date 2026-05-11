@@ -530,28 +530,27 @@ pub fn render_diff_body(
             // background — no nested box-around-a-box (the earlier
             // pill + square-checkbox combination read as two
             // overlapping boxes).
+            // Same green check-circle glyph for both states — the
+            // colour communicates "checked" (staged, click unstages)
+            // vs "unchecked" (unstaged, click stages), the way a real
+            // checkbox does. Hover paints a subtle disc behind it.
             if let Some((btn_rect, hovered, is_unstage)) = &stage_btn_paint {
-                let is_unstage = *is_unstage;
-                let accent_bg = if is_unstage { DEL_BG } else { ADD_BG };
-                let accent_fg = if is_unstage { DEL_FG } else { ADD_FG };
+                let is_staged = *is_unstage;
                 if *hovered {
                     let center = btn_rect.center();
-                    painter.circle_filled(center, btn_rect.height() * 0.42, accent_bg);
+                    painter.circle_filled(center, btn_rect.height() * 0.42, ADD_BG);
                 }
-                let glyph_color = if *hovered {
-                    accent_fg
+                let glyph_color = if is_staged {
+                    ADD_FG
+                } else if *hovered {
+                    ADD_FG
                 } else {
                     theme::current().text_muted.to_color32()
-                };
-                let glyph = if is_unstage {
-                    icons::ARROW_COUNTER_CLOCKWISE
-                } else {
-                    icons::CHECK_CIRCLE
                 };
                 painter.text(
                     btn_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    glyph,
+                    icons::CHECK_CIRCLE,
                     FontId::new(16.0, FontFamily::Proportional),
                     glyph_color,
                 );
