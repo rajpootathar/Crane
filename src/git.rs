@@ -358,11 +358,18 @@ pub fn parse_hunks(diff: &str) -> Vec<(usize, String)> {
                 i += 1;
             }
             let hunk_content: String = lines[start..i].join("\n");
-            let patch = if prefix.is_empty() {
+            let mut patch = if prefix.is_empty() {
                 hunk_content
             } else {
                 format!("{}\n{}", prefix, hunk_content)
             };
+            // git apply rejects patches without a trailing newline.
+            // Without this, stage_hunk silently fails on the last
+            // hunk of a file (the one whose final line is the patch
+            // terminator).
+            if !patch.ends_with('\n') {
+                patch.push('\n');
+            }
             hunks.push((hunk_idx, patch));
             hunk_idx += 1;
         } else {

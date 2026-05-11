@@ -353,6 +353,32 @@ pub fn render_diff_body(
     ui.add_space(4.0);
     ui.separator();
 
+    // Surface stage_hunk failures so they don't fail silently.
+    // Previously tab.error was set but never rendered — a failed
+    // git apply looked indistinguishable from "click did nothing."
+    if let Some(err) = tab.error.clone() {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("{}  {}", icons::WARNING, err))
+                    .size(11.0)
+                    .color(DEL_FG)
+                    .monospace(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                if ui
+                    .small_button(icons::X)
+                    .on_hover_text("Dismiss")
+                    .clicked()
+                {
+                    tab.error = None;
+                }
+            });
+        });
+        ui.add_space(2.0);
+    }
+
     // -- Scroll body --
     let row_h = (font_size * 1.25).ceil();
     let total_body_h = total_rows as f32 * row_h;
@@ -461,41 +487,27 @@ pub fn render_diff_body(
                 );
                 painter.rect_filled(bg_rect, 0.0, bg);
             }
-            // Paint stage button on top of row background. Checkbox
-            // metaphor matches the Right Panel Changes tab (empty
-            // square = "click to stage"). Always visible (not just on
-            // hover) so users find the affordance; hover bumps the
-            // background + brightens the icon for feedback.
+            // Stage-hunk affordance. A single circle-check glyph in
+            // the addition-accent color. Hover paints a subtle round
+            // background — no nested box-around-a-box (the earlier
+            // pill + square-checkbox combination read as two
+            // overlapping boxes).
             if let Some((btn_rect, hovered)) = &stage_btn_paint {
-                // Pill background slightly inset so it doesn't bleed
-                // into the row's signed-line tint.
-                let inset = 3.0;
-                let pill = egui::Rect::from_min_max(
-                    egui::pos2(btn_rect.left() + inset, btn_rect.top() + inset),
-                    egui::pos2(btn_rect.right() - inset, btn_rect.bottom() - inset),
-                );
-                let (fill, fg) = if *hovered {
-                    (ADD_BG, ADD_FG)
+                if *hovered {
+                    let center = btn_rect.center();
+                    painter.circle_filled(center, btn_rect.height() * 0.42, ADD_BG);
+                }
+                let glyph_color = if *hovered {
+                    ADD_FG
                 } else {
-                    (
-                        theme::current().surface_alt.to_color32(),
-                        theme::current().text_muted.to_color32(),
-                    )
+                    theme::current().text_muted.to_color32()
                 };
-                painter.rect_filled(pill, 4.0, fill);
-                painter.rect_stroke(
-                    pill,
-                    4.0,
-                    egui::Stroke::new(1.0, ADD_FG),
-                    egui::StrokeKind::Inside,
-                );
-                let glyph = if *hovered { icons::CHECK_SQUARE } else { icons::SQUARE };
                 painter.text(
-                    pill.center(),
+                    btn_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    glyph,
-                    FontId::new(14.0, FontFamily::Proportional),
-                    fg,
+                    icons::CHECK_CIRCLE,
+                    FontId::new(16.0, FontFamily::Proportional),
+                    glyph_color,
                 );
             }
             let gx = rect.min.x + stage_btn_w;
