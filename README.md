@@ -32,12 +32,44 @@ Grab the latest build for your platform from the [Releases](https://github.com/r
 
 ## Features
 
-- **Split panes** — horizontal / vertical splits with draggable dividers.
-- **Pane types** — Terminal, Files (editable, tabbed, syntax-highlighted via syntect), Markdown, Diff, Browser (placeholder — native webview pending).
-- **Left Panel** — Projects → Workspaces (git worktrees) → Tabs tree with diff-stat badges.
-- **Right Panel** — Git Changes (stage / unstage / commit / push / pull) + Files browser.
-- **Session restore** — projects, workspaces, tabs, layouts, open files, panel state all persist to `~/.crane/session.json` and restore on launch.
-- **Git worktree management** — create a new workspace by picking a branch + location; removal cleans up.
+### Workspaces & projects
+- **Project → Workspace → Tab → Layout → Pane** hierarchy. Each Workspace is a git worktree (`git worktree add`) so branches are real filesystem checkouts, not virtual switches.
+- **Drag-drop reorder** for projects, workspaces, and tabs in the Left Panel.
+- **Loose-files projects** — folders that aren't a git repo surface their contents as a flat tree; nested `.git` roots auto-promote to sub-projects under a group header.
+- **Session restore** — projects, workspaces, tabs, layout splits, open files, panel widths, fonts, themes, ANSI/SGR terminal state all persist to `~/.crane/session.json` and reload exactly as left.
+- **Workspace lifecycle** — Cmd+Q confirmation, ghost-worktree pruning when the dir disappears outside Crane.
+
+### Panes
+- **Split panes** with draggable dividers; horizontal / vertical splits via `Cmd+D` / `Cmd+Shift+D`. Focus border highlights the active pane.
+- **Pane types:**
+  - **Terminal** — in-house VT parser (`crates/crane_term`) on top of `portable-pty`. Owns its own grid, scrollback, `?2026` synchronized-output replay, resize-aware reflow, wrap-aware copy, reverse-wraparound for `\b` / `CSI D`.
+  - **Files** — editable tabbed editor with `syntect` highlighting (line-incremental cache so typing in a large file stays smooth), find/replace, read-only mode for files outside any workspace, native trash on delete, undo stack for file ops.
+  - **Diff** — unified diff with hunk-level stage button, per-hunk jump nav, minimap scrollbar, syntax highlighting on both sides. Computation cached via `JobSystem` — re-rendering a 5k-line diff is a single `Arc::clone`.
+  - **Markdown** — `pulldown-cmark` render with composite paragraphs (no inter-segment gaps), accent-tinted headings, code-fence styling.
+  - **Browser** — `wry`-backed embedded webview (macOS / Linux / Windows).
+  - **PDF** — `pdfium-render` viewer with text selection, page navigation, "Open Externally" handoff.
+
+### Git
+- **Right Panel Changes** — staged / unstaged split, stage/unstage by file or hunk, commit (Cmd+Enter), push, pull, fetch.
+- **Git Log Pane** (`Cmd+9`) — DAG graph with lane-based layout, ref pills (HEAD / local branch / remote / tag), filter by subject/hash/author + by branch + by user, right-click menu (checkout / branch from / worktree from / cherry-pick / revert / copy hash), auto-refresh on `.git/refs/` changes via filesystem watcher.
+- **Branch picker** — click the branch chip in the status bar to switch / pick branches across all repos in the active workspace.
+- **External edits land instantly** — any file touched outside Crane (other editor, build script, sub-agent in a terminal pane) reflects in the Changes tab within ~50 ms.
+
+### Performance & architecture
+- **No async runtime** — plain `std::thread` + `parking_lot` + `mpsc`. No Tokio.
+- **JobSystem** (`src/jobs/`) — bounded worker pools (4 CPU + 2 I/O), keyed jobs with dedup-on-supersede (newer submit cancels older), cooperative cancellation tokens, `OnceLock` global accessor for render-side use. Idle Crane runs zero git subprocesses; only real changes wake the system.
+- **FileWatcher** (`src/file_watcher.rs`) — one `notify` watcher + one debouncer thread for the whole app, 50 ms event coalescing, prefix routing to ProjectId, filters `.git/objects/`, `.git/logs/`, editor temp files. macOS FSEvents, Linux inotify, Windows ReadDirectoryChangesW.
+- **DirCache** (`src/dir_cache.rs`) — mtime-keyed `read_dir` cache; the Files Pane tree reads from `Arc<Vec<DirEntryCached>>` on hit (zero allocation, zero `read_dir`).
+- **Cached diff renders** — `TextDiff::from_lines` + `git diff` subprocess run on the I/O pool; `Arc<DiffComputed>` cached on the tab and invalidated explicitly on content change.
+- **Cached PTY repaint** — terminal reader thread gates `request_repaint()` on a dirty-epoch + cursor-position change.
+- **Panic-safe workers** — a job that panics doesn't take down the worker; the registry entry is released, the consumer sees `Disconnected`, the pool keeps running.
+- **Lazy init** — sessions that never open a project pay zero thread cost.
+
+### Fonts, themes, accessibility
+- **System font fallback chain** — CJK / Arabic / Hebrew / Devanagari registered at startup so non-Latin scripts render correctly.
+- **Live theme switcher** — `crane.yaml`-driven palettes with built-in dark / light themes; reloads on save.
+- **Font size** — `Cmd+=` / `Cmd+-` / `Cmd+0`. Per-pane scaling.
+- **Confirm-before-quit** — Cmd+Q prompts; prevents accidental dismissal.
 
 ## Keyboard shortcuts
 
@@ -49,10 +81,16 @@ Grab the latest build for your platform from the [Releases](https://github.com/r
 | `Cmd+W` | Close focused Pane |
 | `Cmd+Shift+W` | Close active Tab |
 | `Cmd+[` / `Cmd+]` | Focus prev / next Pane |
+| `Cmd+\`` / `Cmd+~` | Tab switcher (forward / backward) |
 | `Cmd+B` / `Cmd+/` | Toggle Left / Right Panel |
+| `Cmd+9` | Toggle Git Log Pane on active Tab |
+| `Cmd+O` / `Cmd+Shift+O` | Open file / open folder as project |
+| `Cmd+F` | Find in active editor — or focus the Git Log filter when that pane has focus |
+| `Cmd+H` | Toggle find-and-replace in active editor |
 | `Cmd+=` / `Cmd+-` / `Cmd+0` | Font size up / down / reset |
 | `Cmd+S` | Save the active file in Files Pane |
-| `Cmd+Enter` | Submit commit (when the message field is focused) |
+| `Cmd+Enter` | Submit commit (when the commit message field is focused) |
+| `Cmd+Q` | Quit (with confirmation modal) |
 
 ---
 
@@ -126,26 +164,29 @@ git push origin v0.1.0
 
 ## Architecture
 
-Single binary. Pure Rust. No Electron, no web runtime, no FFI.
+Single binary. Pure Rust. No Electron, no web runtime, no FFI, no async runtime.
 
 ```
 src/
-├── main.rs          eframe entry + shortcuts + top-level composition
-├── state.rs         App · Project · Workspace · Tab
-├── layout.rs        Layout tree (Node::Leaf / Node::Split) · Pane · PaneContent
-├── terminal/
-│   ├── term.rs      PTY spawn + crane_term::Term wiring + reader thread + input writer
-│   └── view.rs      Grid renderer via egui::Painter; key → escape sequence
-├── (crates/crane_term) In-house VT parser glue + grid + scrollback + reflow
-├── pane_view.rs     Renders Layout tree · headers · borders · splitters · focus
-├── ui_left.rs       Left Panel (project tree)
-├── ui_right.rs      Right Panel (Changes · Files)
-├── ui_top.rs        Main Panel top bar (breadcrumb, action buttons, panel toggles)
-├── ui_util.rs       Shared widget primitives + tree row + design tokens
+├── main.rs          eframe entry + shortcuts + on_exit shutdown
+├── state/
+│   ├── state.rs     App · Project · Workspace · Tab
+│   ├── layout.rs    Layout tree (Node::Leaf / Node::Split) · Pane · PaneContent
+│   └── session.rs   Session save/restore (~/.crane/session.json)
+├── terminal/        PTY spawn + crane_term::Term wiring + reader thread + grid renderer
+├── (crates/crane_term)   In-house VT parser + grid + scrollback + reflow
+├── jobs/            Bounded worker pools · keyed dedup · cooperative cancel · OnceLock global
+├── file_watcher.rs  One notify watcher + debouncer · prefix routing to ProjectId
+├── dir_cache.rs     Mtime-keyed read_dir cache · Arc-on-hit
+├── git_log/         DAG graph layout · refs parser · auto-refresh · filter
 ├── git.rs           Shell-out git: status · stage · unstage · commit · push · pull · worktree
-├── session.rs       Session save/restore (~/.crane/session.json)
-└── views/           Pane-content renderers: files · markdown · diff · browser
+├── browser/         wry webview host
+├── lsp/             LSP client (per-language stdio multiplexer)
+├── ui/              Left Panel · Right Panel · top bar · pane renderer · explorer
+└── views/           Pane-content renderers: file_view · markdown_view · diff_view · pdf_view · browser_view
 ```
+
+The three background primitives (`jobs/`, `file_watcher.rs`, `dir_cache.rs`) keep the render thread idle: zero git subprocesses at rest, zero per-frame `read_dir`, zero per-frame diff recompute. See [`docs/specs/2026-05-09-job-system-and-file-watcher.md`](docs/specs/2026-05-09-job-system-and-file-watcher.md) for the design.
 
 See [CLAUDE.md](CLAUDE.md) for project conventions + the canonical naming glossary (Left Panel / Main Panel / Right Panel; Project → Workspace → Tab → Layout → Pane).
 
@@ -166,7 +207,13 @@ See [CLAUDE.md](CLAUDE.md) for project conventions + the canonical naming glossa
 make test            # or: cargo test --bin crane
 ```
 
-Covers the pure Layout tree operations (`split_at`, `remove_node`, `first_leaf`, `collect_leaves`, `contains`, `set_ratio`).
+Covers:
+- Pure Layout tree operations (`split_at`, `remove_node`, `first_leaf`, `collect_leaves`, `contains`, `set_ratio`).
+- JobSystem invariants: submit/result, key dedup supersedes, scope cancel, Drop cancels in-flight, repaint hook fires, priority ordering under single-worker contention, panic recovery + registry cleanup.
+- FileWatcher: filter list, prefix-route to ProjectId, end-to-end create+modify via tempdir, unwatch silences events.
+- DirCache: Arc reuse on cache hit, mtime invalidation, sort order (dirs first then alpha).
+- crane_term: VT parser, ?2026 sync replay, scrollback, reflow on resize (38 tests).
+- Update checker version comparison, theme TOML round-trip.
 
 ---
 
