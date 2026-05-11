@@ -108,17 +108,43 @@ pub fn layout(commits: &[CommitRecord]) -> LaneFrame {
             }
         };
 
-        // 2. First parent claims the same lane (linear continuation).
+        // 2. First parent claims the same lane (linear continuation),
+        //    UNLESS that parent is already pending in another lane —
+        //    then we terminate our lane and merge into the existing
+        //    one. Without this, two branches that share a parent
+        //    leave a dangling lane that draws passthrough forever
+        //    because position() finds the first match when the parent
+        //    is finally processed.
         let mut parent_lanes: Vec<u8> = Vec::new();
         if let Some(p0) = c.parents.first() {
-            active_lanes[own_lane] = Some(p0.clone());
-            parent_lanes.push(own_lane as u8);
+            let already_tracked = active_lanes
+                .iter()
+                .enumerate()
+                .find(|(i, l)| *i != own_lane && l.as_ref() == Some(p0))
+                .map(|(i, _)| i);
+            if let Some(other) = already_tracked {
+                active_lanes[own_lane] = None;
+                parent_lanes.push(other as u8);
+            } else {
+                active_lanes[own_lane] = Some(p0.clone());
+                parent_lanes.push(own_lane as u8);
+            }
         } else {
             active_lanes[own_lane] = None; // root commit
         }
 
-        // 3. Subsequent parents → branch off into new lanes (leftmost free).
+        // 3. Subsequent parents → branch off into new lanes, OR merge
+        //    into an existing lane if that parent is already pending.
         for p in c.parents.iter().skip(1) {
+            let already_tracked = active_lanes
+                .iter()
+                .enumerate()
+                .find(|(_, l)| l.as_ref() == Some(p))
+                .map(|(i, _)| i);
+            if let Some(other) = already_tracked {
+                parent_lanes.push(other as u8);
+                continue;
+            }
             let slot = active_lanes.iter().position(Option::is_none).unwrap_or(active_lanes.len());
             if slot == active_lanes.len() {
                 active_lanes.push(None);
@@ -148,9 +174,19 @@ pub fn layout(commits: &[CommitRecord]) -> LaneFrame {
             .collect();
 
         // Passthrough lanes: alive before AND after this row, and not
-        // this commit's own lane / parent lanes. The painter draws a
-        // straight vertical segment for each so a branch waiting for
-        // its parent stays visible across intermediate rows.
+        // this commit's own lane. The painter draws a vertical
+        // segment spanning the full row height; this carries the lane
+        // visually across intermediate commits.
+        //
+        // Note we do NOT exclude `parent_lanes`. The parent-lane
+        // bezier only covers the bottom half of this row (from this
+        // commit's dot center down to the next row's center). The TOP
+        // half of a lane that was alive coming in still needs the
+        // vertical segment — otherwise "merge into existing lane"
+        // commits leave a 1-row gap above the curve, and the user
+        // sees the branch lane disconnect on the bottom side of the
+        // merge. The bezier's lower half and the passthrough segment
+        // overlap cleanly in the bottom-left corner of the row.
         let passthrough_lanes: Vec<(u8, u8)> = lanes_before
             .iter()
             .enumerate()
@@ -162,9 +198,7 @@ pub fn layout(commits: &[CommitRecord]) -> LaneFrame {
                     return None;
                 }
                 let lane_u8 = i as u8;
-                if lane_u8 == own_lane as u8
-                    || parent_lanes.contains(&lane_u8)
-                {
+                if lane_u8 == own_lane as u8 {
                     return None;
                 }
                 Some((lane_u8, seeder.current(i)))
@@ -298,6 +332,84 @@ mod tests {
         assert!(
             !mid.passthrough_lanes.is_empty(),
             "expected `mid` row to have a passthrough lane for c1's branch"
+        );
+    }
+
+    #[test]
+    fn merged_branches_do_not_leave_dangling_lane() {
+        // Reported bug: when two branches converge on the same parent
+        // commit, only one lane should remain after processing — the
+        // other should terminate at the merge-into-existing-lane row.
+        // Previously the lane stayed alive forever and drew passthrough
+        // all the way to the oldest visible commit.
+        //
+        //     m       (merge of c2, b1)
+        //     |\
+        //     c2 b1
+        //     | /
+        //     c1      ← both branches share this parent
+        //     |
+        //     root
+        let commits = vec![
+            cr("m",  &["c2", "b1"]),
+            cr("c2", &["c1"]),
+            cr("b1", &["c1"]),
+            cr("c1", &["root"]),
+            cr("root", &[]),
+        ];
+        let frame = layout(&commits);
+
+        // After processing c1 (the convergence point), only ONE lane
+        // should still be active waiting for `root`. The painter
+        // reads `visible_lanes_after` to know how wide to draw.
+        let c1_row = frame.rows.iter().find(|r| r.sha == "c1").unwrap();
+        assert_eq!(
+            c1_row.visible_lanes_after, 1,
+            "after the convergence point, only one lane should remain (got {})",
+            c1_row.visible_lanes_after
+        );
+
+        // At `root`, there should be NO passthrough lanes — the only
+        // lane is root's own.
+        let root_row = frame.rows.iter().find(|r| r.sha == "root").unwrap();
+        assert!(
+            root_row.passthrough_lanes.is_empty(),
+            "root row should have no passthroughs; got {:?}",
+            root_row.passthrough_lanes
+        );
+    }
+
+    #[test]
+    fn fork_commit_at_branch_origin_terminates_branch_lane() {
+        // Variant: a single side branch (no merge yet) reaches its
+        // origin — the commit on the side branch whose parent is on
+        // the mainline. After that commit, the side lane must
+        // terminate, not draw passthrough past the branch origin.
+        //
+        //     main2
+        //     |  side  ← branch tip
+        //     | /
+        //     main1   ← branch origin (side's parent)
+        //     |
+        //     root
+        let commits = vec![
+            cr("main2", &["main1"]),
+            cr("side",  &["main1"]),
+            cr("main1", &["root"]),
+            cr("root",  &[]),
+        ];
+        let frame = layout(&commits);
+
+        // At main1, side's lane must have merged in — no passthrough.
+        let main1_row = frame.rows.iter().find(|r| r.sha == "main1").unwrap();
+        assert!(
+            main1_row.passthrough_lanes.is_empty(),
+            "main1 row should not have side's lane as a passthrough; got {:?}",
+            main1_row.passthrough_lanes
+        );
+        assert_eq!(
+            main1_row.visible_lanes_after, 1,
+            "only mainline lane should survive past the branch origin"
         );
     }
 

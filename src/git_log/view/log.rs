@@ -9,6 +9,66 @@ const COL_W: f32 = 14.0;
 const DOT_R: f32 = 4.0;
 const GRAPH_PAD_LEFT: f32 = 8.0;
 
+/// Categorised ref names parsed out of git log's `(HEAD -> main,
+/// origin/main, tag: v1.0)` decoration string. Each becomes a small
+/// rounded pill rendered to the left of the commit subject so the
+/// user can see at a glance what's at this commit.
+#[derive(Clone)]
+struct RefPill {
+    label: String,
+    bg: Color32,
+    fg: Color32,
+}
+
+/// Parse refs_decoration into pills. Decoration string format (from
+/// `git log --pretty=...%d`):
+///   ` (HEAD -> main, origin/main, tag: v1.0)`
+/// Always wrapped in `(...)` and prefixed with a space when non-empty.
+fn parse_ref_pills(decoration: &str) -> Vec<RefPill> {
+    let body = decoration.trim().trim_start_matches('(').trim_end_matches(')');
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for raw in body.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (label, bg, fg) = if let Some(rest) = raw.strip_prefix("HEAD -> ") {
+            (
+                format!("HEAD → {rest}"),
+                Color32::from_rgb(102, 187, 106),
+                Color32::BLACK,
+            )
+        } else if raw == "HEAD" {
+            ("HEAD".to_string(), Color32::from_rgb(102, 187, 106), Color32::BLACK)
+        } else if let Some(t) = raw.strip_prefix("tag: ") {
+            (
+                t.to_string(),
+                Color32::from_rgb(255, 202, 40),
+                Color32::BLACK,
+            )
+        } else if raw.contains('/') {
+            // Remote-tracking branch (origin/main etc.).
+            (
+                raw.to_string(),
+                Color32::from_rgb(66, 165, 245),
+                Color32::WHITE,
+            )
+        } else {
+            // Local branch.
+            (
+                raw.to_string(),
+                Color32::from_rgb(171, 71, 188),
+                Color32::WHITE,
+            )
+        };
+        out.push(RefPill { label, bg, fg });
+    }
+    out
+}
+
 /// 8-color palette keyed by the lane allocation epoch. Hand-picked
 /// to be legible on both light and dark themes.
 const PALETTE: [Color32; 8] = [
@@ -322,9 +382,36 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                     paint_lane(ui, &row_resp.rect, lane_row, next_lane);
                 }
 
-                // Subject + metadata.
-                let text_x = row_resp.rect.left() + graph_width + 4.0;
+                // Ref pills (HEAD / branches / tags) painted to the
+                // left of the subject. Width is estimated from char
+                // count (no fonts RwLock entry on the hot path — we
+                // don't call layout_no_wrap inside show_rows, only
+                // the top-level Painter::text path that's already in
+                // use for the subject below).
+                let mut text_x = row_resp.rect.left() + graph_width + 4.0;
                 let text_y = row_resp.rect.top() + 4.0;
+                let pills = parse_ref_pills(&c.refs_decoration);
+                let pill_font = egui::FontId::proportional(10.5);
+                let pill_h = ROW_H - 8.0;
+                for pill in &pills {
+                    // Approx width: char count × monospace-ish factor.
+                    // Slightly generous so the pill doesn't visually
+                    // clip the label even with proportional chars.
+                    let est_w = pill.label.chars().count() as f32 * 6.2 + 10.0;
+                    let pill_rect = egui::Rect::from_min_size(
+                        egui::pos2(text_x, row_resp.rect.top() + 4.0),
+                        egui::vec2(est_w, pill_h),
+                    );
+                    ui.painter().rect_filled(pill_rect, 4.0, pill.bg);
+                    ui.painter().text(
+                        egui::pos2(pill_rect.center().x, pill_rect.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        &pill.label,
+                        pill_font.clone(),
+                        pill.fg,
+                    );
+                    text_x += est_w + 4.0;
+                }
 
                 ui.painter().text(
                     egui::pos2(text_x, text_y),
