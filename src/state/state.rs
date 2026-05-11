@@ -1195,6 +1195,7 @@ impl App {
                             }
                             dt.right_text = new_text.to_string();
                             dt.reload_left_text();
+                            dt.invalidate();
                         }
                     }
                 }
@@ -1229,6 +1230,7 @@ impl App {
                                 std::fs::read_to_string(&read_path)
                                     .unwrap_or_default();
                             dt.reload_left_text();
+                            dt.invalidate();
                         }
                     }
                 }

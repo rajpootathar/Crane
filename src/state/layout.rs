@@ -135,16 +135,30 @@ pub struct DiffTabData {
     pub sbs_h_scroll_left: f32,
     pub sbs_h_scroll_right: f32,
     /// Cached diff computation. Pure function of (left_text, right_text,
-    /// repo_path, right_path) — when any of those change, the cache is
-    /// invalidated and a new job is submitted to JobSystem. Render reads
-    /// from this directly with zero allocation on the cache-hit path.
+    /// repo_path, right_path) — when any of those change, callers MUST
+    /// invoke `invalidate()` to bump `inputs_version`. Render reads
+    /// `computed` directly with zero allocation on the cache-hit path
+    /// and compares u64 versions instead of hashing the full text
+    /// every frame.
     pub computed: Option<std::sync::Arc<crate::views::diff_view::DiffComputed>>,
     pub compute_job: Option<crate::jobs::JobHandle<crate::views::diff_view::DiffComputed>>,
-    pub computed_fingerprint: u64,
-    pub job_fingerprint: u64,
+    /// Bumped by `invalidate()` whenever inputs change. Initial
+    /// construction starts at 1 so the first render sees a fresh
+    /// version (vs `computed_for_version: 0`).
+    pub inputs_version: u64,
+    pub computed_for_version: u64,
+    pub job_for_version: u64,
 }
 
 impl DiffTabData {
+    /// Bump the inputs version, invalidating the cached compute. Every
+    /// mutator of left_text / right_text / left_path / right_path /
+    /// repo_path MUST call this so the next render kicks a fresh job.
+    /// Missing a call means the diff renders stale data.
+    pub fn invalidate(&mut self) {
+        self.inputs_version = self.inputs_version.wrapping_add(1);
+    }
+
     /// Reload the left-side content from git (staged or HEAD) using
     /// `right_path` to resolve the repo root. Shared by both
     /// save-triggered and hunk-stage diff refreshes.
@@ -159,6 +173,7 @@ impl DiffTabData {
         {
             self.left_text = crate::git::staged_content(&root, &rel)
                 .unwrap_or_else(|| crate::git::head_content(&root, &rel));
+            self.invalidate();
         } else if let Some((root, rel)) = self
             .left_path
             .strip_prefix("HEAD:")
@@ -167,6 +182,7 @@ impl DiffTabData {
             })
         {
             self.left_text = crate::git::head_content(&root, &rel);
+            self.invalidate();
         }
     }
 }
@@ -309,6 +325,7 @@ impl FilesPane {
             t.error = None;
             t.image_texture = None;
             t.repo_path = repo_path;
+            t.invalidate();
             self.active = idx;
             return;
         }
@@ -327,8 +344,11 @@ impl FilesPane {
             sbs_h_scroll_right: 0.0,
             computed: None,
             compute_job: None,
-            computed_fingerprint: 0,
-            job_fingerprint: 0,
+            // Start at 1 so the first render sees an unmatched version
+            // (computed_for_version stays at 0 until a job lands).
+            inputs_version: 1,
+            computed_for_version: 0,
+            job_for_version: 0,
         }));
         self.active = self.tabs.len() - 1;
     }

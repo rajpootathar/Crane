@@ -12,6 +12,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SynStyle, Theme as SynTheme};
+// DefaultHasher is still used in tab_key (stable per-tab key from
+// left_path + right_path). Per-frame input fingerprint hashing was
+// removed — DiffTabData::inputs_version replaces it.
 
 const ADD_BG: Color32 = Color32::from_rgb(25, 55, 35);
 const DEL_BG: Color32 = Color32::from_rgb(60, 28, 32);
@@ -60,16 +63,6 @@ impl DiffComputed {
             right_lines_count: 0,
         }
     }
-}
-
-fn compute_fingerprint(tab: &DiffTabData) -> u64 {
-    let mut h = DefaultHasher::new();
-    tab.left_text.hash(&mut h);
-    tab.right_text.hash(&mut h);
-    tab.repo_path.hash(&mut h);
-    tab.right_path.hash(&mut h);
-    tab.left_path.hash(&mut h);
-    h.finish()
 }
 
 /// The expensive bit. Pulled out of the render path so JobSystem can
@@ -190,18 +183,18 @@ pub fn render_diff_body(
     let (ss, st_theme) = resolve_theme();
     let char_w = measure_char_w(ui, &font);
 
-    // Cache lookup. Pure-fn fingerprint over inputs; cache hit → zero
-    // allocation, zero subprocess. Cache miss → submit to JobSystem
-    // (I/O pool, dedup'd by tab path so a rapid reload supersedes the
-    // previous job).
-    let fingerprint = compute_fingerprint(tab);
+    // Cache check via explicit version counter — no per-frame hashing
+    // of left_text + right_text. Mutators of those fields MUST call
+    // DiffTabData::invalidate() to bump inputs_version. Cache hit →
+    // one u64 compare + Arc::clone, zero hashing, zero allocation.
+    let current_version = tab.inputs_version;
 
     if let Some(handle) = tab.compute_job.as_ref() {
         if let Some(out) = handle.try_recv() {
             match out {
                 JobOutput::Done(d) => {
                     tab.computed = Some(Arc::new(d));
-                    tab.computed_fingerprint = tab.job_fingerprint;
+                    tab.computed_for_version = tab.job_for_version;
                 }
                 JobOutput::Cancelled => {}
             }
@@ -209,21 +202,14 @@ pub fn render_diff_body(
         }
     }
 
-    let cached_ok = tab
-        .computed
-        .as_ref()
-        .map(|_| tab.computed_fingerprint == fingerprint)
-        .unwrap_or(false);
-    let job_ok = tab.compute_job.is_some() && tab.job_fingerprint == fingerprint;
+    let cached_ok = tab.computed.is_some() && tab.computed_for_version == current_version;
+    let job_ok = tab.compute_job.is_some() && tab.job_for_version == current_version;
 
     if !cached_ok && !job_ok && let Some(jobs) = crate::jobs::global() {
         // Stable key per diff tab — hash of (left_path, right_path)
         // identifies the tab uniquely without changing on every edit.
-        // The previous design used the input fingerprint as the key,
-        // which meant every edit created a new JobKey and dedup never
-        // fired — older in-flight jobs ran to completion and burned
-        // I/O-pool time on results no one would read.
-        // Stale results are now filtered via `job_fingerprint` instead.
+        // Earlier in-flight jobs are superseded via key dedup; their
+        // cancel tokens flip and their results are dropped.
         let mut hasher = DefaultHasher::new();
         tab.left_path.hash(&mut hasher);
         tab.right_path.hash(&mut hasher);
@@ -239,7 +225,7 @@ pub fn render_diff_body(
             move |tok| compute_diff(left_text, right_text, repo_path, right_path, tok),
         );
         tab.compute_job = Some(handle);
-        tab.job_fingerprint = fingerprint;
+        tab.job_for_version = current_version;
     }
 
     // No cached result yet — show a placeholder header and bail.
