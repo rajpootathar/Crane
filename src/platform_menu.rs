@@ -120,8 +120,13 @@ mod mac {
                     muda::accelerator::Code::KeyO,
                 )),
             ),
-            &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::close_window(None),
+            // No `PredefinedMenuItem::close_window` here. AppKit binds
+            // it to Cmd+W and intercepts the key off the main menu
+            // before it reaches winit/egui, so our Cmd+W="close focused
+            // pane" shortcut never fires — instead NSWindow's
+            // performClose: triggers the viewport close request and the
+            // quit-confirm modal pops up. Cmd+W is reserved for the
+            // pane-level close shortcut handled in shortcuts::handle.
         ]);
 
         let window = Submenu::new("Window", true);

@@ -29,6 +29,13 @@ pub struct Row {
     pub old_ln: String,
     pub new_ln: String,
     pub content: String,
+    /// 1-based new line number, or None for deletion rows. Used to
+    /// match similar's row-level hunks against git diff's line-range
+    /// hunks — without this we'd zip by index and misalign when git
+    /// merges adjacent changes by context that similar keeps split
+    /// (or vice versa).
+    pub new_lno: Option<usize>,
+    pub old_lno: Option<usize>,
 }
 
 /// Pure result of diffing left_text vs right_text + parsing git's
@@ -40,7 +47,16 @@ pub struct DiffComputed {
     pub tags: Vec<ChangeTag>,
     pub hunk_starts: Vec<usize>,
     pub hunk_patches: Vec<Option<String>>,
+    /// Per-hunk: true if the hunk is already in the index (action is
+    /// "unstage"), false otherwise (action is "stage"). Probed once
+    /// per compute via `git apply --reverse --cached --check`.
+    pub hunk_staged: Vec<bool>,
     pub row_to_hunk: Vec<Option<usize>>,
+    /// True for rows that belong to a git hunk shared with an earlier
+    /// visual hunk (downstream rows of a multi-visual-hunk group). The
+    /// stage-button gutter renders a vertical connector through these
+    /// rows so the user can see the changes ship together.
+    pub row_in_shared_group: Vec<bool>,
     pub ldigits: usize,
     pub rdigits: usize,
     pub left_lines_count: usize,
@@ -56,7 +72,9 @@ impl DiffComputed {
             tags: Vec::new(),
             hunk_starts: Vec::new(),
             hunk_patches: Vec::new(),
+            hunk_staged: Vec::new(),
             row_to_hunk: Vec::new(),
+            row_in_shared_group: Vec::new(),
             ldigits: 0,
             rdigits: 0,
             left_lines_count: 0,
@@ -90,17 +108,21 @@ fn compute_diff(
 
     let rows: Vec<Row> = diff
         .iter_all_changes()
-        .map(|c| Row {
-            tag: c.tag(),
-            old_ln: c
-                .old_index()
-                .map(|i| format!("{:>w$}", i + 1, w = ldigits))
-                .unwrap_or_else(|| " ".repeat(ldigits)),
-            new_ln: c
-                .new_index()
-                .map(|i| format!("{:>w$}", i + 1, w = rdigits))
-                .unwrap_or_else(|| " ".repeat(rdigits)),
-            content: c.value().trim_end_matches('\n').to_string(),
+        .map(|c| {
+            let old_lno = c.old_index().map(|i| i + 1);
+            let new_lno = c.new_index().map(|i| i + 1);
+            Row {
+                tag: c.tag(),
+                old_ln: old_lno
+                    .map(|n| format!("{:>w$}", n, w = ldigits))
+                    .unwrap_or_else(|| " ".repeat(ldigits)),
+                new_ln: new_lno
+                    .map(|n| format!("{:>w$}", n, w = rdigits))
+                    .unwrap_or_else(|| " ".repeat(rdigits)),
+                content: c.value().trim_end_matches('\n').to_string(),
+                new_lno,
+                old_lno,
+            }
         })
         .collect();
 
@@ -124,20 +146,94 @@ fn compute_diff(
     // Per-hunk patches via `git diff` (subprocess) + parse_hunks. The
     // shelling-out is what made render-frame stalls visible; running
     // it here on the I/O pool keeps the UI thread out of waitpid.
+    //
+    // Match by line number, not index: git groups adjacent changes by
+    // context-line proximity, similar groups by contiguity of changed
+    // rows. The two algorithms produce different hunk counts when
+    // changes sit within `--unified=3` of each other (git merges
+    // them, similar shows them separately), so zipping by index
+    // misaligns patches — earlier hunks would unstage the wrong patch
+    // and the last hunk would get None and render no icon at all.
     let hunk_patches: Vec<Option<String>> = if let Some(repo) = repo_path.as_ref() {
         let repo_p = std::path::Path::new(repo);
         if let Some(raw) = crate::git::file_diff_raw(repo_p, &right_path) {
-            let parsed = crate::git::parse_hunks(&raw);
+            let parsed = crate::git::parse_hunks_detailed(&raw);
+            // Dedupe by git-hunk identity. similar splits adjacent
+            // changes that git considers one hunk (3-line context);
+            // without dedup, two visual hunks resolve to the same
+            // patch and clicking either stages both — confusing, and
+            // it makes the second appear staged after a refresh even
+            // though the user only checked the first.
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
             hunk_starts
                 .iter()
-                .enumerate()
-                .map(|(hi, _)| parsed.get(hi).map(|(_, patch)| patch.clone()))
+                .map(|&start_row| {
+                    // Probe the hunk's first row plus a few following
+                    // for a usable line number. A pure-deletion hunk's
+                    // first row has no new_lno; fall back to old_lno.
+                    let mut new_target: Option<usize> = None;
+                    let mut old_target: Option<usize> = None;
+                    for r in &rows[start_row..(start_row + 5).min(rows.len())] {
+                        if new_target.is_none() {
+                            new_target = r.new_lno;
+                        }
+                        if old_target.is_none() {
+                            old_target = r.old_lno;
+                        }
+                        if new_target.is_some() && old_target.is_some() {
+                            break;
+                        }
+                    }
+                    let matched = parsed
+                        .iter()
+                        .enumerate()
+                        .find(|(_, h)| {
+                            if let Some(n) = new_target {
+                                let lo = h.new_start;
+                                let hi = h.new_start + h.new_count;
+                                if n >= lo && n < hi {
+                                    return true;
+                                }
+                            }
+                            if let Some(o) = old_target {
+                                let lo = h.old_start;
+                                let hi = h.old_start + h.old_count;
+                                if o >= lo && o < hi {
+                                    return true;
+                                }
+                            }
+                            false
+                        });
+                    match matched {
+                        Some((idx, h)) if seen.insert(idx) => Some(h.patch.clone()),
+                        _ => None,
+                    }
+                })
                 .collect()
         } else {
             vec![None; hunk_starts.len()]
         }
     } else {
         vec![None; hunk_starts.len()]
+    };
+
+    if cancel.is_cancelled() {
+        return DiffComputed::empty();
+    }
+
+    // Probe each hunk for staged state. Done on the I/O pool with the
+    // diff compute so the UI never blocks on N git invocations.
+    let hunk_staged: Vec<bool> = if let Some(repo) = repo_path.as_ref() {
+        let repo_p = std::path::Path::new(repo);
+        hunk_patches
+            .iter()
+            .map(|p| match p {
+                Some(patch) => crate::git::is_hunk_staged(repo_p, patch),
+                None => false,
+            })
+            .collect()
+    } else {
+        vec![false; hunk_patches.len()]
     };
 
     let mut row_to_hunk: Vec<Option<usize>> = vec![None; total_rows];
@@ -150,12 +246,60 @@ fn compute_diff(
         }
     }
 
+    // Mark rows that share a git hunk with an earlier visual hunk —
+    // i.e. downstream rows of a multi-visual-hunk group. The render
+    // layer draws a vertical connector through them so it's obvious
+    // the changes are bound to one stage action.
+    //
+    // Each visual hunk's "change run" is the contiguous block of
+    // non-Equal rows starting at hunk_starts[hi]. Don't extend the
+    // connector into the Equal rows that follow — that's the bug
+    // that ran the line through tens of unrelated rows.
+    let hunk_change_end = |start: usize| -> usize {
+        let mut end = start;
+        while end < tags.len() && !matches!(tags[end], ChangeTag::Equal) {
+            end += 1;
+        }
+        end
+    };
+    let mut row_in_shared_group: Vec<bool> = vec![false; total_rows];
+    {
+        let mut hi = 0;
+        while hi < hunk_starts.len() {
+            if hunk_patches.get(hi).and_then(|p| p.as_ref()).is_none() {
+                hi += 1;
+                continue;
+            }
+            let mut j = hi + 1;
+            while j < hunk_starts.len()
+                && hunk_patches.get(j).and_then(|p| p.as_ref()).is_none()
+            {
+                j += 1;
+            }
+            if j > hi + 1 {
+                let anchor_row = hunk_starts[hi];
+                // End at the last change-row of the LAST shared visual
+                // hunk — not the start of the next independent group.
+                let last_shared = j - 1;
+                let group_change_end = hunk_change_end(hunk_starts[last_shared]);
+                for r in (anchor_row + 1)..group_change_end {
+                    if r < row_in_shared_group.len() {
+                        row_in_shared_group[r] = true;
+                    }
+                }
+            }
+            hi = j;
+        }
+    }
+
     DiffComputed {
         rows,
         tags,
         hunk_starts,
         hunk_patches,
+        hunk_staged,
         row_to_hunk,
+        row_in_shared_group,
         ldigits,
         rdigits,
         left_lines_count,
@@ -228,8 +372,12 @@ pub fn render_diff_body(
         tab.job_for_version = current_version;
     }
 
-    // No cached result yet — show a placeholder header and bail.
-    let computed = match tab.computed.as_ref().filter(|_| cached_ok) {
+    // Render with the freshest cache we have. If the inputs version
+    // moved but a previous Arc<DiffComputed> still exists, keep showing
+    // it while the new job runs — prevents the "flash to spinner" the
+    // user sees after every hunk stage. Only fall back to the spinner
+    // on the very first compute (no cached value at all).
+    let computed = match tab.computed.as_ref() {
         Some(c) => Arc::clone(c),
         None => {
             ui.add_space(8.0);
@@ -245,6 +393,7 @@ pub fn render_diff_body(
             return;
         }
     };
+    let _ = cached_ok;
 
     let rows = &computed.rows;
     let tags = &computed.tags;
@@ -353,6 +502,32 @@ pub fn render_diff_body(
     ui.add_space(4.0);
     ui.separator();
 
+    // Surface stage_hunk failures so they don't fail silently.
+    // Previously tab.error was set but never rendered — a failed
+    // git apply looked indistinguishable from "click did nothing."
+    if let Some(err) = tab.error.clone() {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("{}  {}", icons::WARNING, err))
+                    .size(11.0)
+                    .color(DEL_FG)
+                    .monospace(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                if ui
+                    .small_button(icons::X)
+                    .on_hover_text("Dismiss")
+                    .clicked()
+                {
+                    tab.error = None;
+                }
+            });
+        });
+        ui.add_space(2.0);
+    }
+
     // -- Scroll body --
     let row_h = (font_size * 1.25).ceil();
     let total_body_h = total_rows as f32 * row_h;
@@ -376,7 +551,11 @@ pub fn render_diff_body(
     let gutter_old_w = char_w * ldigits as f32 + 10.0;
     let gutter_new_w = char_w * rdigits as f32 + 10.0;
     let sign_w = char_w * 2.0 + 8.0;
-    let stage_btn_w = 20.0;
+    // Stage-hunk control gutter. Wider than before so it's an
+    // actual click target instead of a 20-px sliver, and uses a
+    // checkbox glyph (matches Right Panel Changes "stage" affordance)
+    // instead of a tiny plus icon.
+    let stage_btn_w = 28.0;
 
     let scroll_out = scroll.show_rows(&mut body_ui, row_h, rows.len(), |ui, row_range| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -390,36 +569,50 @@ pub fn render_diff_body(
             // Stage button at hunk start -- register interaction early,
             // paint after row background so the button isn't covered.
             let is_hunk_start = hunk_starts.contains(&i);
-            let mut stage_btn_paint: Option<(egui::Rect, bool)> = None;
+            let mut stage_btn_paint: Option<(egui::Rect, bool, bool)> = None;
             if is_hunk_start && let Some(hi) = row_to_hunk[i] {
                 if let Some(patch) = &hunk_patches[hi] {
+                    let is_unstage = computed.hunk_staged.get(hi).copied().unwrap_or(false);
                     let btn_rect = egui::Rect::from_min_size(
                         ui.cursor().min,
                         egui::vec2(stage_btn_w, row_h),
                     );
-                    let btn_id = egui::Id::new(("stage_hunk", tab.left_path.clone(), tab.right_path.clone(), hi));
+                    let btn_id = egui::Id::new((
+                        "stage_hunk",
+                        tab.left_path.clone(),
+                        tab.right_path.clone(),
+                        hi,
+                    ));
                     let btn_resp = ui.interact(btn_rect, btn_id, egui::Sense::click());
                     let btn_hovered = btn_resp.hovered();
                     let btn_clicked = btn_resp.clicked();
                     if btn_hovered {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    btn_resp.on_hover_text("Stage hunk");
-                    if btn_clicked {
-                        if let Some(repo) = &tab.repo_path {
-                            let repo_path = std::path::Path::new(repo);
-                            match crate::git::stage_hunk(repo_path, patch) {
-                                Ok(()) => {
-                                    tab.pending_hunk_stage = true;
-                                    ui.ctx().data_mut(|d| d.insert_temp(refresh_id, true));
-                                }
-                                Err(e) => {
-                                    tab.error = Some(format!("Stage hunk failed: {e}"));
-                                }
+                    let hover = if is_unstage { "Unstage this hunk" } else { "Stage this hunk" };
+                    btn_resp.on_hover_text(hover);
+                    if btn_clicked
+                        && let Some(repo) = &tab.repo_path
+                    {
+                        let repo_path = std::path::Path::new(repo);
+                        let res = if is_unstage {
+                            crate::git::unstage_hunk(repo_path, patch)
+                        } else {
+                            crate::git::stage_hunk(repo_path, patch)
+                        };
+                        match res {
+                            Ok(()) => {
+                                tab.pending_hunk_stage = true;
+                                ui.ctx().data_mut(|d| d.insert_temp(refresh_id, true));
+                            }
+                            Err(e) => {
+                                let verb = if is_unstage { "Unstage" } else { "Stage" };
+                                log::warn!("{} hunk failed: {e}", verb.to_lowercase());
+                                tab.error = Some(format!("{verb} hunk failed: {e}"));
                             }
                         }
                     }
-                    stage_btn_paint = Some((btn_rect, btn_hovered));
+                    stage_btn_paint = Some((btn_rect, btn_hovered, is_unstage));
                 }
             }
             let mut hl = HighlightLines::new(syntax, st_theme);
@@ -451,17 +644,73 @@ pub fn render_diff_body(
                 );
                 painter.rect_filled(bg_rect, 0.0, bg);
             }
-            // Paint stage button on top of row background
-            if let Some((btn_rect, hovered)) = &stage_btn_paint {
-                if *hovered {
-                    painter.rect_filled(*btn_rect, 2.0, theme::current().row_hover.to_color32());
+            // Stage-hunk affordance. A single circle-check glyph in
+            // the addition-accent color. Hover paints a subtle round
+            // background — no nested box-around-a-box (the earlier
+            // pill + square-checkbox combination read as two
+            // overlapping boxes).
+            // Connector line for downstream rows of a multi-visual-hunk
+            // git group. Renders a thin vertical accent through the
+            // stage-button gutter so the user can trace which rows the
+            // anchor's check button covers — without it, a single icon
+            // anchoring two visually separate hunks looks accidental.
+            let in_group = computed
+                .row_in_shared_group
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+            let next_in_group = computed
+                .row_in_shared_group
+                .get(i + 1)
+                .copied()
+                .unwrap_or(false);
+            if in_group || (stage_btn_paint.is_some() && next_in_group) {
+                let cx = rect.min.x + stage_btn_w * 0.5;
+                let connector_color = Color32::from_rgba_unmultiplied(
+                    ADD_FG.r(), ADD_FG.g(), ADD_FG.b(), 90,
+                );
+                let top_y = if in_group { rect.min.y } else { rect.center().y };
+                painter.line_segment(
+                    [
+                        Pos2::new(cx, top_y),
+                        Pos2::new(cx, rect.max.y),
+                    ],
+                    egui::Stroke::new(1.5, connector_color),
+                );
+            }
+            // Three visually distinct states so the user can tell at
+            // a glance whether a hunk is staged:
+            //   - unstaged, idle:  empty CIRCLE,         muted gray
+            //   - unstaged, hover: CHECK_CIRCLE preview, green + disc
+            //   - staged,   idle:  CHECK_CIRCLE,         bright green
+            //   - staged,   hover: CHECK_CIRCLE bolder,  green + disc
+            // Same icon family, different glyph for the empty state so
+            // "click changes the state" reads visually, not just via
+            // a colour shift.
+            if let Some((btn_rect, hovered, is_staged)) = &stage_btn_paint {
+                let is_staged = *is_staged;
+                let hovered = *hovered;
+                if hovered {
+                    let center = btn_rect.center();
+                    painter.circle_filled(center, btn_rect.height() * 0.42, ADD_BG);
                 }
+                let glyph = if is_staged || hovered {
+                    icons::CHECK_CIRCLE
+                } else {
+                    icons::CIRCLE
+                };
+                let glyph_color = if is_staged || hovered {
+                    ADD_FG
+                } else {
+                    theme::current().text_muted.to_color32()
+                };
+                let glyph_size = if is_staged && hovered { 18.0 } else { 16.0 };
                 painter.text(
                     btn_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    icons::PLUS_CIRCLE,
-                    FontId::new(11.0, FontFamily::Proportional),
-                    ADD_FG,
+                    glyph,
+                    FontId::new(glyph_size, FontFamily::Proportional),
+                    glyph_color,
                 );
             }
             let gx = rect.min.x + stage_btn_w;

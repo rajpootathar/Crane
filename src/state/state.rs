@@ -1239,6 +1239,9 @@ impl App {
                                 continue;
                             }
                             dt.pending_hunk_stage = false;
+                            // Diff is always HEAD ↔ working tree; reload
+                            // right from disk and left from git so the
+                            // per-hunk staged flags get re-probed.
                             let read_path = dt.repo_path.as_ref()
                                 .map(|repo| std::path::Path::new(repo).join(&dt.right_path))
                                 .unwrap_or_else(|| std::path::PathBuf::from(&dt.right_path));
