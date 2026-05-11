@@ -159,29 +159,35 @@ impl DiffTabData {
         self.inputs_version = self.inputs_version.wrapping_add(1);
     }
 
-    /// Reload the left-side content from git (staged or HEAD) using
-    /// `right_path` to resolve the repo root. Shared by both
-    /// save-triggered and hunk-stage diff refreshes.
+    /// Reload the left-side content from git (staged or HEAD).
+    /// Shared by save-triggered and hunk-stage diff refreshes.
+    ///
+    /// Resolves the repo root from `self.repo_path` (an absolute
+    /// path captured when the diff was opened), NOT from
+    /// `right_path` — `right_path` is the repo-relative form (e.g.
+    /// `src/foo.rs`), so canonicalising it against CWD silently
+    /// fails when Crane wasn't launched from the repo. The previous
+    /// implementation hit that path and reload became a no-op,
+    /// breaking the post-hunk-stage diff refresh.
     pub fn reload_left_text(&mut self) {
-        let right = std::path::Path::new(&self.right_path);
-        if let Some((root, rel)) = self
-            .left_path
-            .strip_prefix("staged:")
-            .and_then(|rel| {
-                crate::git::find_git_root(right).map(|root| (root, rel.to_string()))
-            })
-        {
-            self.left_text = crate::git::staged_content(&root, &rel)
-                .unwrap_or_else(|| crate::git::head_content(&root, &rel));
+        let root: PathBuf = match self.repo_path.as_deref() {
+            Some(r) => PathBuf::from(r),
+            None => {
+                // Fall back to deriving from right_path, but try the
+                // joined repo + right_path before giving up.
+                let right = std::path::Path::new(&self.right_path);
+                match crate::git::find_git_root(right) {
+                    Some(r) => r,
+                    None => return,
+                }
+            }
+        };
+        if let Some(rel) = self.left_path.strip_prefix("staged:") {
+            self.left_text = crate::git::staged_content(&root, rel)
+                .unwrap_or_else(|| crate::git::head_content(&root, rel));
             self.invalidate();
-        } else if let Some((root, rel)) = self
-            .left_path
-            .strip_prefix("HEAD:")
-            .and_then(|rel| {
-                crate::git::find_git_root(right).map(|root| (root, rel.to_string()))
-            })
-        {
-            self.left_text = crate::git::head_content(&root, &rel);
+        } else if let Some(rel) = self.left_path.strip_prefix("HEAD:") {
+            self.left_text = crate::git::head_content(&root, rel);
             self.invalidate();
         }
     }
