@@ -152,6 +152,13 @@ fn compute_diff(
         let repo_p = std::path::Path::new(repo);
         if let Some(raw) = crate::git::file_diff_raw(repo_p, &right_path) {
             let parsed = crate::git::parse_hunks_detailed(&raw);
+            // Dedupe by git-hunk identity. similar splits adjacent
+            // changes that git considers one hunk (3-line context);
+            // without dedup, two visual hunks resolve to the same
+            // patch and clicking either stages both — confusing, and
+            // it makes the second appear staged after a refresh even
+            // though the user only checked the first.
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
             hunk_starts
                 .iter()
                 .map(|&start_row| {
@@ -171,9 +178,10 @@ fn compute_diff(
                             break;
                         }
                     }
-                    parsed
+                    let matched = parsed
                         .iter()
-                        .find(|h| {
+                        .enumerate()
+                        .find(|(_, h)| {
                             if let Some(n) = new_target {
                                 let lo = h.new_start;
                                 let hi = h.new_start + h.new_count;
@@ -189,8 +197,11 @@ fn compute_diff(
                                 }
                             }
                             false
-                        })
-                        .map(|h| h.patch.clone())
+                        });
+                    match matched {
+                        Some((idx, h)) if seen.insert(idx) => Some(h.patch.clone()),
+                        _ => None,
+                    }
                 })
                 .collect()
         } else {
