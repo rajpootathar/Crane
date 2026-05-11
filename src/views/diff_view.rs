@@ -250,6 +250,18 @@ fn compute_diff(
     // i.e. downstream rows of a multi-visual-hunk group. The render
     // layer draws a vertical connector through them so it's obvious
     // the changes are bound to one stage action.
+    //
+    // Each visual hunk's "change run" is the contiguous block of
+    // non-Equal rows starting at hunk_starts[hi]. Don't extend the
+    // connector into the Equal rows that follow — that's the bug
+    // that ran the line through tens of unrelated rows.
+    let hunk_change_end = |start: usize| -> usize {
+        let mut end = start;
+        while end < tags.len() && !matches!(tags[end], ChangeTag::Equal) {
+            end += 1;
+        }
+        end
+    };
     let mut row_in_shared_group: Vec<bool> = vec![false; total_rows];
     {
         let mut hi = 0;
@@ -266,8 +278,11 @@ fn compute_diff(
             }
             if j > hi + 1 {
                 let anchor_row = hunk_starts[hi];
-                let group_end = hunk_starts.get(j).copied().unwrap_or(total_rows);
-                for r in (anchor_row + 1)..group_end {
+                // End at the last change-row of the LAST shared visual
+                // hunk — not the start of the next independent group.
+                let last_shared = j - 1;
+                let group_change_end = hunk_change_end(hunk_starts[last_shared]);
+                for r in (anchor_row + 1)..group_change_end {
                     if r < row_in_shared_group.len() {
                         row_in_shared_group[r] = true;
                     }
