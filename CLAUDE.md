@@ -202,6 +202,6 @@ User-facing persistence: `~/.crane/` (planned for config, sessions, themes). Not
 
 - Multi-user / team collaboration
 - Plugin/extension system
-- Custom GPU-rendered text editor (Files Pane uses egui RichText + syntect; no editing)
+- Custom GPU-rendered text editor backend (Files Pane uses `egui::TextEdit::multiline` + syntect — full editing, find/replace, goto-line, undo, cut/copy/paste; no Vim mode, no LSP-driven autocomplete)
 - Agent orchestration
 - Windows + Linux polish (macOS-first, but cross-platform deps are selected)
