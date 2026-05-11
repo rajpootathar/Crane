@@ -52,6 +52,11 @@ pub struct DiffComputed {
     /// per compute via `git apply --reverse --cached --check`.
     pub hunk_staged: Vec<bool>,
     pub row_to_hunk: Vec<Option<usize>>,
+    /// True for rows that belong to a git hunk shared with an earlier
+    /// visual hunk (downstream rows of a multi-visual-hunk group). The
+    /// stage-button gutter renders a vertical connector through these
+    /// rows so the user can see the changes ship together.
+    pub row_in_shared_group: Vec<bool>,
     pub ldigits: usize,
     pub rdigits: usize,
     pub left_lines_count: usize,
@@ -69,6 +74,7 @@ impl DiffComputed {
             hunk_patches: Vec::new(),
             hunk_staged: Vec::new(),
             row_to_hunk: Vec::new(),
+            row_in_shared_group: Vec::new(),
             ldigits: 0,
             rdigits: 0,
             left_lines_count: 0,
@@ -240,6 +246,37 @@ fn compute_diff(
         }
     }
 
+    // Mark rows that share a git hunk with an earlier visual hunk —
+    // i.e. downstream rows of a multi-visual-hunk group. The render
+    // layer draws a vertical connector through them so it's obvious
+    // the changes are bound to one stage action.
+    let mut row_in_shared_group: Vec<bool> = vec![false; total_rows];
+    {
+        let mut hi = 0;
+        while hi < hunk_starts.len() {
+            if hunk_patches.get(hi).and_then(|p| p.as_ref()).is_none() {
+                hi += 1;
+                continue;
+            }
+            let mut j = hi + 1;
+            while j < hunk_starts.len()
+                && hunk_patches.get(j).and_then(|p| p.as_ref()).is_none()
+            {
+                j += 1;
+            }
+            if j > hi + 1 {
+                let anchor_row = hunk_starts[hi];
+                let group_end = hunk_starts.get(j).copied().unwrap_or(total_rows);
+                for r in (anchor_row + 1)..group_end {
+                    if r < row_in_shared_group.len() {
+                        row_in_shared_group[r] = true;
+                    }
+                }
+            }
+            hi = j;
+        }
+    }
+
     DiffComputed {
         rows,
         tags,
@@ -247,6 +284,7 @@ fn compute_diff(
         hunk_patches,
         hunk_staged,
         row_to_hunk,
+        row_in_shared_group,
         ldigits,
         rdigits,
         left_lines_count,
@@ -596,6 +634,35 @@ pub fn render_diff_body(
             // background — no nested box-around-a-box (the earlier
             // pill + square-checkbox combination read as two
             // overlapping boxes).
+            // Connector line for downstream rows of a multi-visual-hunk
+            // git group. Renders a thin vertical accent through the
+            // stage-button gutter so the user can trace which rows the
+            // anchor's check button covers — without it, a single icon
+            // anchoring two visually separate hunks looks accidental.
+            let in_group = computed
+                .row_in_shared_group
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+            let next_in_group = computed
+                .row_in_shared_group
+                .get(i + 1)
+                .copied()
+                .unwrap_or(false);
+            if in_group || (stage_btn_paint.is_some() && next_in_group) {
+                let cx = rect.min.x + stage_btn_w * 0.5;
+                let connector_color = Color32::from_rgba_unmultiplied(
+                    ADD_FG.r(), ADD_FG.g(), ADD_FG.b(), 90,
+                );
+                let top_y = if in_group { rect.min.y } else { rect.center().y };
+                painter.line_segment(
+                    [
+                        Pos2::new(cx, top_y),
+                        Pos2::new(cx, rect.max.y),
+                    ],
+                    egui::Stroke::new(1.5, connector_color),
+                );
+            }
             // Three visually distinct states so the user can tell at
             // a glance whether a hunk is staged:
             //   - unstaged, idle:  empty CIRCLE,         muted gray
