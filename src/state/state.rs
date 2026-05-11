@@ -1239,12 +1239,23 @@ impl App {
                                 continue;
                             }
                             dt.pending_hunk_stage = false;
-                            let read_path = dt.repo_path.as_ref()
-                                .map(|repo| std::path::Path::new(repo).join(&dt.right_path))
-                                .unwrap_or_else(|| std::path::PathBuf::from(&dt.right_path));
-                            dt.right_text =
-                                std::fs::read_to_string(&read_path)
-                                    .unwrap_or_default();
+                            // In show_staged mode, right side mirrors
+                            // the index; otherwise it mirrors the
+                            // working tree on disk.
+                            if dt.show_staged {
+                                if let Some(repo) = dt.repo_path.as_ref() {
+                                    let repo_p = std::path::Path::new(repo);
+                                    dt.right_text = crate::git::staged_content(repo_p, &dt.right_path)
+                                        .unwrap_or_default();
+                                }
+                            } else {
+                                let read_path = dt.repo_path.as_ref()
+                                    .map(|repo| std::path::Path::new(repo).join(&dt.right_path))
+                                    .unwrap_or_else(|| std::path::PathBuf::from(&dt.right_path));
+                                dt.right_text =
+                                    std::fs::read_to_string(&read_path)
+                                        .unwrap_or_default();
+                            }
                             dt.reload_left_text();
                             dt.invalidate();
                         }

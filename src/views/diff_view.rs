@@ -228,8 +228,12 @@ pub fn render_diff_body(
         tab.job_for_version = current_version;
     }
 
-    // No cached result yet — show a placeholder header and bail.
-    let computed = match tab.computed.as_ref().filter(|_| cached_ok) {
+    // Render with the freshest cache we have. If the inputs version
+    // moved but a previous Arc<DiffComputed> still exists, keep showing
+    // it while the new job runs — prevents the "flash to spinner" the
+    // user sees after every hunk stage. Only fall back to the spinner
+    // on the very first compute (no cached value at all).
+    let computed = match tab.computed.as_ref() {
         Some(c) => Arc::clone(c),
         None => {
             ui.add_space(8.0);
@@ -245,6 +249,7 @@ pub fn render_diff_body(
             return;
         }
     };
+    let _ = cached_ok;
 
     let rows = &computed.rows;
     let tags = &computed.tags;
@@ -308,6 +313,32 @@ pub fn render_diff_body(
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
+            // Unstaged ⇄ Staged toggle. When show_staged=true the diff
+            // is HEAD ↔ index and the hunk button unstages. Otherwise
+            // it's index ↔ working-tree and the button stages.
+            let mut toggle_to: Option<bool> = None;
+            let staged_btn = ui.add(
+                egui::Button::selectable(
+                    tab.show_staged,
+                    RichText::new("Staged").size(11.0).monospace(),
+                ),
+            );
+            if staged_btn.clicked() && !tab.show_staged {
+                toggle_to = Some(true);
+            }
+            let unstaged_btn = ui.add(
+                egui::Button::selectable(
+                    !tab.show_staged,
+                    RichText::new("Unstaged").size(11.0).monospace(),
+                ),
+            );
+            if unstaged_btn.clicked() && tab.show_staged {
+                toggle_to = Some(false);
+            }
+            if let Some(s) = toggle_to {
+                tab.set_show_staged(s);
+            }
             ui.add_space(8.0);
             let nav_enabled = !hunk_starts.is_empty();
             let down = ui.add_enabled(
@@ -439,19 +470,27 @@ pub fn render_diff_body(
                     if btn_hovered {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    btn_resp.on_hover_text("Stage this hunk");
+                    let is_unstage = tab.show_staged;
+                    let hover = if is_unstage { "Unstage this hunk" } else { "Stage this hunk" };
+                    btn_resp.on_hover_text(hover);
                     if btn_clicked
                         && let Some(repo) = &tab.repo_path
                     {
                         let repo_path = std::path::Path::new(repo);
-                        match crate::git::stage_hunk(repo_path, patch) {
+                        let res = if is_unstage {
+                            crate::git::unstage_hunk(repo_path, patch)
+                        } else {
+                            crate::git::stage_hunk(repo_path, patch)
+                        };
+                        match res {
                             Ok(()) => {
                                 tab.pending_hunk_stage = true;
                                 ui.ctx().data_mut(|d| d.insert_temp(refresh_id, true));
                             }
                             Err(e) => {
-                                log::warn!("stage_hunk failed: {e}");
-                                tab.error = Some(format!("Stage hunk failed: {e}"));
+                                let verb = if is_unstage { "Unstage" } else { "Stage" };
+                                log::warn!("{} hunk failed: {e}", verb.to_lowercase());
+                                tab.error = Some(format!("{verb} hunk failed: {e}"));
                             }
                         }
                     }
@@ -493,19 +532,27 @@ pub fn render_diff_body(
             // pill + square-checkbox combination read as two
             // overlapping boxes).
             if let Some((btn_rect, hovered)) = &stage_btn_paint {
+                let is_unstage = tab.show_staged;
+                let accent_bg = if is_unstage { DEL_BG } else { ADD_BG };
+                let accent_fg = if is_unstage { DEL_FG } else { ADD_FG };
                 if *hovered {
                     let center = btn_rect.center();
-                    painter.circle_filled(center, btn_rect.height() * 0.42, ADD_BG);
+                    painter.circle_filled(center, btn_rect.height() * 0.42, accent_bg);
                 }
                 let glyph_color = if *hovered {
-                    ADD_FG
+                    accent_fg
                 } else {
                     theme::current().text_muted.to_color32()
+                };
+                let glyph = if is_unstage {
+                    icons::ARROW_COUNTER_CLOCKWISE
+                } else {
+                    icons::CHECK_CIRCLE
                 };
                 painter.text(
                     btn_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    icons::CHECK_CIRCLE,
+                    glyph,
                     FontId::new(16.0, FontFamily::Proportional),
                     glyph_color,
                 );
