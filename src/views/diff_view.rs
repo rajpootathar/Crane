@@ -29,6 +29,13 @@ pub struct Row {
     pub old_ln: String,
     pub new_ln: String,
     pub content: String,
+    /// 1-based new line number, or None for deletion rows. Used to
+    /// match similar's row-level hunks against git diff's line-range
+    /// hunks — without this we'd zip by index and misalign when git
+    /// merges adjacent changes by context that similar keeps split
+    /// (or vice versa).
+    pub new_lno: Option<usize>,
+    pub old_lno: Option<usize>,
 }
 
 /// Pure result of diffing left_text vs right_text + parsing git's
@@ -95,17 +102,21 @@ fn compute_diff(
 
     let rows: Vec<Row> = diff
         .iter_all_changes()
-        .map(|c| Row {
-            tag: c.tag(),
-            old_ln: c
-                .old_index()
-                .map(|i| format!("{:>w$}", i + 1, w = ldigits))
-                .unwrap_or_else(|| " ".repeat(ldigits)),
-            new_ln: c
-                .new_index()
-                .map(|i| format!("{:>w$}", i + 1, w = rdigits))
-                .unwrap_or_else(|| " ".repeat(rdigits)),
-            content: c.value().trim_end_matches('\n').to_string(),
+        .map(|c| {
+            let old_lno = c.old_index().map(|i| i + 1);
+            let new_lno = c.new_index().map(|i| i + 1);
+            Row {
+                tag: c.tag(),
+                old_ln: old_lno
+                    .map(|n| format!("{:>w$}", n, w = ldigits))
+                    .unwrap_or_else(|| " ".repeat(ldigits)),
+                new_ln: new_lno
+                    .map(|n| format!("{:>w$}", n, w = rdigits))
+                    .unwrap_or_else(|| " ".repeat(rdigits)),
+                content: c.value().trim_end_matches('\n').to_string(),
+                new_lno,
+                old_lno,
+            }
         })
         .collect();
 
@@ -129,14 +140,58 @@ fn compute_diff(
     // Per-hunk patches via `git diff` (subprocess) + parse_hunks. The
     // shelling-out is what made render-frame stalls visible; running
     // it here on the I/O pool keeps the UI thread out of waitpid.
+    //
+    // Match by line number, not index: git groups adjacent changes by
+    // context-line proximity, similar groups by contiguity of changed
+    // rows. The two algorithms produce different hunk counts when
+    // changes sit within `--unified=3` of each other (git merges
+    // them, similar shows them separately), so zipping by index
+    // misaligns patches — earlier hunks would unstage the wrong patch
+    // and the last hunk would get None and render no icon at all.
     let hunk_patches: Vec<Option<String>> = if let Some(repo) = repo_path.as_ref() {
         let repo_p = std::path::Path::new(repo);
         if let Some(raw) = crate::git::file_diff_raw(repo_p, &right_path) {
-            let parsed = crate::git::parse_hunks(&raw);
+            let parsed = crate::git::parse_hunks_detailed(&raw);
             hunk_starts
                 .iter()
-                .enumerate()
-                .map(|(hi, _)| parsed.get(hi).map(|(_, patch)| patch.clone()))
+                .map(|&start_row| {
+                    // Probe the hunk's first row plus a few following
+                    // for a usable line number. A pure-deletion hunk's
+                    // first row has no new_lno; fall back to old_lno.
+                    let mut new_target: Option<usize> = None;
+                    let mut old_target: Option<usize> = None;
+                    for r in &rows[start_row..(start_row + 5).min(rows.len())] {
+                        if new_target.is_none() {
+                            new_target = r.new_lno;
+                        }
+                        if old_target.is_none() {
+                            old_target = r.old_lno;
+                        }
+                        if new_target.is_some() && old_target.is_some() {
+                            break;
+                        }
+                    }
+                    parsed
+                        .iter()
+                        .find(|h| {
+                            if let Some(n) = new_target {
+                                let lo = h.new_start;
+                                let hi = h.new_start + h.new_count;
+                                if n >= lo && n < hi {
+                                    return true;
+                                }
+                            }
+                            if let Some(o) = old_target {
+                                let lo = h.old_start;
+                                let hi = h.old_start + h.old_count;
+                                if o >= lo && o < hi {
+                                    return true;
+                                }
+                            }
+                            false
+                        })
+                        .map(|h| h.patch.clone())
+                })
                 .collect()
         } else {
             vec![None; hunk_starts.len()]
@@ -530,28 +585,38 @@ pub fn render_diff_body(
             // background — no nested box-around-a-box (the earlier
             // pill + square-checkbox combination read as two
             // overlapping boxes).
-            // Same green check-circle glyph for both states — the
-            // colour communicates "checked" (staged, click unstages)
-            // vs "unchecked" (unstaged, click stages), the way a real
-            // checkbox does. Hover paints a subtle disc behind it.
-            if let Some((btn_rect, hovered, is_unstage)) = &stage_btn_paint {
-                let is_staged = *is_unstage;
-                if *hovered {
+            // Three visually distinct states so the user can tell at
+            // a glance whether a hunk is staged:
+            //   - unstaged, idle:  empty CIRCLE,         muted gray
+            //   - unstaged, hover: CHECK_CIRCLE preview, green + disc
+            //   - staged,   idle:  CHECK_CIRCLE,         bright green
+            //   - staged,   hover: CHECK_CIRCLE bolder,  green + disc
+            // Same icon family, different glyph for the empty state so
+            // "click changes the state" reads visually, not just via
+            // a colour shift.
+            if let Some((btn_rect, hovered, is_staged)) = &stage_btn_paint {
+                let is_staged = *is_staged;
+                let hovered = *hovered;
+                if hovered {
                     let center = btn_rect.center();
                     painter.circle_filled(center, btn_rect.height() * 0.42, ADD_BG);
                 }
-                let glyph_color = if is_staged {
-                    ADD_FG
-                } else if *hovered {
+                let glyph = if is_staged || hovered {
+                    icons::CHECK_CIRCLE
+                } else {
+                    icons::CIRCLE
+                };
+                let glyph_color = if is_staged || hovered {
                     ADD_FG
                 } else {
                     theme::current().text_muted.to_color32()
                 };
+                let glyph_size = if is_staged && hovered { 18.0 } else { 16.0 };
                 painter.text(
                     btn_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    icons::CHECK_CIRCLE,
-                    FontId::new(16.0, FontFamily::Proportional),
+                    glyph,
+                    FontId::new(glyph_size, FontFamily::Proportional),
                     glyph_color,
                 );
             }

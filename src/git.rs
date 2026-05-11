@@ -341,6 +341,99 @@ pub fn file_diff_staged(repo: &Path, rel_path: &str) -> Option<String> {
     }
 }
 
+/// Parsed unified-diff hunk with line ranges. `new_start`/`new_count`
+/// are taken from the `@@ -old,n +new,m @@` header and used by
+/// callers to match each git hunk against an in-memory diff view's
+/// hunk regions (line-number match, not array index — the two
+/// diffing algorithms group adjacent changes differently).
+pub struct ParsedHunk {
+    pub patch: String,
+    pub old_start: usize,
+    pub old_count: usize,
+    pub new_start: usize,
+    pub new_count: usize,
+}
+
+fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
+    let inner = line.strip_prefix("@@ ")?;
+    let end = inner.find(" @@")?;
+    let ranges = &inner[..end];
+    let mut it = ranges.split(' ');
+    let old = it.next()?.strip_prefix('-')?;
+    let new = it.next()?.strip_prefix('+')?;
+    let parse_range = |s: &str| -> Option<(usize, usize)> {
+        let mut p = s.splitn(2, ',');
+        let start: usize = p.next()?.parse().ok()?;
+        let count: usize = match p.next() {
+            Some(c) => c.parse().ok()?,
+            None => 1,
+        };
+        Some((start, count))
+    };
+    let (os, oc) = parse_range(old)?;
+    let (ns, nc) = parse_range(new)?;
+    Some((os, oc, ns, nc))
+}
+
+/// Parse a unified diff into individual hunks with line ranges.
+pub fn parse_hunks_detailed(diff: &str) -> Vec<ParsedHunk> {
+    let mut out: Vec<ParsedHunk> = Vec::new();
+    let header_end = diff.find('\n').unwrap_or(0);
+    let header = if diff.starts_with("diff --git") {
+        &diff[..header_end]
+    } else {
+        ""
+    };
+    let mut first_hunk = 0;
+    for (i, line) in diff.lines().enumerate() {
+        if line.starts_with("@@") {
+            first_hunk = i;
+            break;
+        }
+    }
+    let prefix: &str = if !header.is_empty() {
+        &diff[..diff
+            .lines()
+            .take(first_hunk)
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            .min(diff.len())]
+    } else {
+        ""
+    };
+    let lines: Vec<&str> = diff.lines().collect();
+    let mut i = first_hunk;
+    while i < lines.len() {
+        if lines[i].starts_with("@@") {
+            let start = i;
+            let ranges = parse_hunk_header(lines[i]).unwrap_or((0, 0, 0, 0));
+            i += 1;
+            while i < lines.len() && !lines[i].starts_with("@@") {
+                i += 1;
+            }
+            let hunk_content: String = lines[start..i].join("\n");
+            let mut patch = if prefix.is_empty() {
+                hunk_content
+            } else {
+                format!("{}{}", prefix, hunk_content)
+            };
+            if !patch.ends_with('\n') {
+                patch.push('\n');
+            }
+            out.push(ParsedHunk {
+                patch,
+                old_start: ranges.0,
+                old_count: ranges.1,
+                new_start: ranges.2,
+                new_count: ranges.3,
+            });
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Parse a unified diff into individual hunk patches. Each patch
 /// includes the `diff --git` header, the hunk header `@@ ... @@`,
 /// and the content lines. Returns (hunk_index, patch_text) pairs.
