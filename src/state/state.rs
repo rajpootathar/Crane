@@ -1,8 +1,11 @@
+use crate::file_watcher::{ChangeEvent, FileWatcher};
 use crate::git::{self, GitStatus};
+use crate::jobs::{JobHandle, JobKey, JobOutput, JobSystem, Pool, Priority, Scope};
 use crate::state::layout::Layout;
 use crate::update::check::UpdateCheck;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn shellexpand_home(s: &str) -> String {
@@ -43,7 +46,11 @@ pub struct Workspace {
     pub expanded: bool,
     pub git_status: Option<GitStatus>,
     pub last_status_refresh: Option<Instant>,
-    pub git_rx: Option<std::sync::mpsc::Receiver<Option<GitStatus>>>,
+    /// In-flight git status job. Replaced (and the previous one
+    /// cancelled) on every refresh tick that's due. Hot-path render
+    /// reads `git_status` directly — this field is only touched by
+    /// `refresh_active_git_status`.
+    pub git_job: Option<JobHandle<Option<GitStatus>>>,
     /// Optional per-Workspace accent tint applied to the branch icon
     /// and label in the Left Panel. Lets users colour-code branches
     /// the same way [`Project::tint`] colour-codes projects. `None`
@@ -337,7 +344,11 @@ pub struct BranchPickerState {
     pub opened_at: Option<Instant>,
     pub error: Option<String>,
     pub loading: bool,
-    pub rx: Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Vec<String>, Vec<String>)>>>,
+    /// In-flight branch-list job. Replaces the previous
+    /// thread-per-open + ad-hoc mpsc::channel pattern; goes through
+    /// the JobSystem I/O pool with key dedup so rapid open/close
+    /// cycles don't queue multiple redundant scans.
+    pub job: Option<crate::jobs::JobHandle<Vec<(PathBuf, Vec<String>, Vec<String>)>>>,
     /// Per-repo branch data loaded when the picker opens:
     /// repo_root → (local branches, remote branches in `remote/branch` form).
     pub repos: Vec<(PathBuf, Vec<String>, Vec<String>)>,
@@ -356,7 +367,7 @@ impl Default for BranchPickerState {
             opened_at: None,
             error: None,
             loading: false,
-            rx: None,
+            job: None,
             repos: Vec::new(),
             filter: None,
         }
@@ -518,6 +529,17 @@ pub struct App {
     /// from a terminal pane). Throttled to 3 s. `None` = never
     /// probed yet.
     pub last_worktree_prune: Option<Instant>,
+    /// Background work pool — git status today, future diff /
+    /// highlight / parse migrations. Lazy-initialized on first use so
+    /// a session that never opens a workspace pays no thread cost.
+    pub jobs: Option<Arc<JobSystem>>,
+    /// Cross-platform filesystem watcher. Lazy-init alongside `jobs`.
+    /// On every refresh tick we drain `fs_events` and force-stale any
+    /// workspaces whose paths were touched, so `git status` reruns
+    /// near-instantly on real change instead of waiting for the next
+    /// interval poll. The interval poll remains as a safety net.
+    pub file_watcher: Option<FileWatcher>,
+    pub fs_events: Option<std::sync::mpsc::Receiver<ChangeEvent>>,
     next_project: ProjectId,
     next_workspace: WorkspaceId,
     next_tab: TabId,
@@ -577,6 +599,9 @@ impl App {
             confirmed_quit: false,
             last_loose_git_probe: None,
             last_worktree_prune: None,
+            jobs: None,
+            file_watcher: None,
+            fs_events: None,
             next_project: 1,
             next_workspace: 1,
             next_tab: 1,
@@ -764,7 +789,7 @@ impl App {
                 expanded: true,
                 git_status: None,
                 last_status_refresh: None,
-                git_rx: None,
+                git_job: None,
                 tint: None,
             });
         }
@@ -789,6 +814,18 @@ impl App {
         {
             self.active = Some((id, wt, tab));
             self.last_workspace = Some((id, wt));
+        }
+        if let Some(fw) = self.file_watcher.as_ref()
+            && let Some(p) = self.projects.iter().find(|p| p.id == id)
+            && !p.missing
+        {
+            if let Err(e) = fw.watch_project(id, p.path.clone()) {
+                log::warn!(
+                    "FileWatcher: watch_project({}) failed: {e}; git status updates \
+                     for this project will rely on the interval poll fallback",
+                    p.path.display()
+                );
+            }
         }
         Some(id)
     }
@@ -940,7 +977,7 @@ impl App {
                     expanded: true,
                     git_status: None,
                     last_status_refresh: None,
-                    git_rx: None,
+                    git_job: None,
                     tint: None,
                 };
                 if let Some(project) = self.projects.iter_mut().find(|p| p.id == pid) {
@@ -1164,6 +1201,7 @@ impl App {
                             }
                             dt.right_text = new_text.to_string();
                             dt.reload_left_text();
+                            dt.invalidate();
                         }
                     }
                 }
@@ -1198,6 +1236,7 @@ impl App {
                                 std::fs::read_to_string(&read_path)
                                     .unwrap_or_default();
                             dt.reload_left_text();
+                            dt.invalidate();
                         }
                     }
                 }
@@ -1787,13 +1826,84 @@ impl App {
     pub fn refresh_active_git_status(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let active_wid = self.active.map(|(_, w, _)| w);
-        // Active workspace polls at 1s for snappy feedback while the
-        // user is interacting. Inactive workspaces poll at 5s so the
-        // Left Panel +N/-N badges update for branches touched by
-        // sub-agents or external git operations without burning a git
-        // subprocess per workspace per second.
+        // With FileWatcher live, real changes invalidate `last_status_refresh`
+        // within ~50 ms — the interval poll below is the safety net for
+        // changes the watcher misses (network drives, OS event drops,
+        // remote ops via git fetch). Active 1 s, inactive 5 s.
         let active_interval = Duration::from_millis(1000);
         let inactive_interval = Duration::from_millis(5000);
+
+        // Lazy-init JobSystem + FileWatcher together. A session with no
+        // projects pays zero thread cost.
+        if self.jobs.is_none() {
+            let ctx_clone = ctx.clone();
+            let repaint: Arc<dyn Fn() + Send + Sync> =
+                Arc::new(move || ctx_clone.request_repaint());
+            let js = JobSystem::new(Some(repaint));
+            crate::jobs::install(Arc::clone(&js));
+            self.jobs = Some(js);
+        }
+        if self.file_watcher.is_none() {
+            match FileWatcher::new() {
+                Ok(fw) => {
+                    self.fs_events = fw.take_receiver();
+                    // Watch every existing project root. Subsequent
+                    // additions go through `add_project_*` which calls
+                    // watch_project directly.
+                    for p in &self.projects {
+                        if !p.missing {
+                            if let Err(e) = fw.watch_project(p.id, p.path.clone()) {
+                                log::warn!(
+                                    "FileWatcher: watch_project({}) failed: {e}; \
+                                     git status updates for this project will rely \
+                                     on the interval poll fallback",
+                                    p.path.display()
+                                );
+                            }
+                        }
+                    }
+                    self.file_watcher = Some(fw);
+                }
+                Err(e) => {
+                    log::warn!("FileWatcher init failed: {e}");
+                }
+            }
+        }
+        let jobs = Arc::clone(self.jobs.as_ref().expect("jobs init"));
+
+        // Drain coalesced filesystem events. For each affected project,
+        // mark workspaces under it as "due now" so the next loop block
+        // picks them up. The watcher does the heavy filtering (.git
+        // internals, editor noise); we only forward the project_id.
+        if let Some(rx) = self.fs_events.as_ref() {
+            let mut touched_projects: HashSet<ProjectId> = HashSet::new();
+            let cache = crate::dir_cache::global();
+            while let Ok(ev) = rx.try_recv() {
+                touched_projects.insert(ev.project);
+                // Invalidate the parent dir of every changed path —
+                // belt-and-braces over the mtime self-invalidation.
+                // Cheap: each parent is one HashMap remove.
+                for p in ev.paths.iter() {
+                    if let Some(parent) = p.parent() {
+                        cache.invalidate(parent);
+                    }
+                }
+            }
+            if !touched_projects.is_empty() {
+                for project in self.projects.iter_mut() {
+                    if !touched_projects.contains(&project.id) {
+                        continue;
+                    }
+                    for wt in project.workspaces.iter_mut() {
+                        // Force the next iteration to consider this
+                        // workspace due. We don't cancel the in-flight
+                        // job because key dedup will supersede it on
+                        // submit; the older Cancelled result is dropped.
+                        wt.last_status_refresh = None;
+                    }
+                }
+            }
+        }
 
         for project in self.projects.iter_mut() {
             // Skip polls on projects whose root folder is gone. Spares
@@ -1804,8 +1914,18 @@ impl App {
                 continue;
             }
             for wt in project.workspaces.iter_mut() {
-                if let Some(rx) = wt.git_rx.as_ref()
-                    && let Ok(status) = rx.try_recv() {
+                if let Some(handle) = wt.git_job.as_ref()
+                    && let Some(out) = handle.try_recv()
+                {
+                    // Drop the handle either way — Done means we got
+                    // the answer; Cancelled means a newer job
+                    // superseded this one and the next tick will pick
+                    // up the new handle.
+                    let status_opt = match out {
+                        JobOutput::Done(s) => Some(s),
+                        JobOutput::Cancelled => None,
+                    };
+                    if let Some(status) = status_opt {
                         // Pull the branch name forward from the
                         // freshly-polled git status: branches renamed
                         // outside Crane (e.g. `git branch -m`) now show
@@ -1820,10 +1940,11 @@ impl App {
                         }
                         wt.git_status = status;
                         wt.last_status_refresh = Some(now);
-                        wt.git_rx = None;
                     }
+                    wt.git_job = None;
+                }
 
-                if wt.git_rx.is_some() {
+                if wt.git_job.is_some() {
                     continue;
                 }
                 let interval = if Some(wt.id) == active_wid {
@@ -1839,15 +1960,19 @@ impl App {
                     continue;
                 }
 
-                let (tx, rx) = std::sync::mpsc::channel();
+                let priority = if Some(wt.id) == active_wid {
+                    Priority::Foreground
+                } else {
+                    Priority::Visible
+                };
                 let path = wt.path.clone();
-                let ctx = ctx.clone();
-                std::thread::spawn(move || {
-                    let status = git::status(&path);
-                    let _ = tx.send(status);
-                    ctx.request_repaint();
-                });
-                wt.git_rx = Some(rx);
+                let handle = jobs.submit(
+                    JobKey::new(Scope::Workspace(wt.id), "git_status"),
+                    priority,
+                    Pool::Io,
+                    move |_tok| git::status(&path),
+                );
+                wt.git_job = Some(handle);
             }
         }
     }
@@ -1952,7 +2077,7 @@ impl App {
                     expanded: true,
                     git_status: None,
                     last_status_refresh: None,
-                    git_rx: None,
+                    git_job: None,
                     tint: None,
                 });
                 self.active = Some((modal.project_id, wt_id, tab_id));
@@ -2177,6 +2302,25 @@ impl App {
             .iter()
             .find(|p| p.id == pid)
             .and_then(|p| p.group_path.clone());
+        if let Some(fw) = self.file_watcher.as_ref() {
+            fw.unwatch_project(pid);
+        }
+        // Cancel every in-flight job under this project. Jobs are
+        // keyed at Workspace and Tab scope (not Project), so the
+        // Scope::Project cancel below is belt-and-braces for any
+        // future Project-scoped submissions; the workspace/tab
+        // loops are the ones that actually do the work today.
+        if let Some(jobs) = self.jobs.as_ref() {
+            jobs.cancel_scope(Scope::Project(pid));
+            if let Some(project) = self.projects.iter().find(|p| p.id == pid) {
+                for wt in &project.workspaces {
+                    jobs.cancel_scope(Scope::Workspace(wt.id));
+                    for tab in &wt.tabs {
+                        jobs.cancel_scope(Scope::Tab(tab.id));
+                    }
+                }
+            }
+        }
         self.projects.retain(|p| p.id != pid);
         if let Some((p, _, _)) = self.active
             && p == pid {

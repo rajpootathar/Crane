@@ -9,6 +9,7 @@ use crate::state::App;
 use crate::theme;
 use egui::RichText;
 use egui_phosphor::regular as icons;
+use std::path::PathBuf;
 
 pub const HEIGHT: f32 = 28.0;
 
@@ -111,55 +112,62 @@ pub fn render(ui: &mut egui::Ui, app: &mut App) {
     );
 }
 
-/// Spawn a worker to discover repos + list their branches off the UI
-/// thread. Results flow back via `App::branch_picker_rx`, which the
-/// picker drains each frame. A monorepo with many submodules means
-/// 1 + 2·N git subprocesses — this used to hitch the UI noticeably.
-pub fn load_branch_picker(app: &mut App, ctx: &egui::Context) {
+/// Discover repos + list their branches off the UI thread via
+/// JobSystem (I/O pool, Foreground priority — the picker is open and
+/// the user is waiting). Key dedup means rapid open/close cycles
+/// supersede in-flight scans rather than stacking new threads.
+pub fn load_branch_picker(app: &mut App, _ctx: &egui::Context) {
     let Some(ws) = app.active_workspace_path().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    let Some(jobs) = crate::jobs::global() else {
         return;
     };
     app.branch_picker.loading = true;
     app.branch_picker.repos.clear();
-    let (tx, rx) = std::sync::mpsc::channel();
-    app.branch_picker.rx = Some(rx);
-    let ctx = ctx.clone();
-    std::thread::spawn(move || {
-        let roots = crate::git::discover_repos(&ws, 5);
-        let data: Vec<_> = roots
-            .into_iter()
-            .map(|r| {
+    let handle = jobs.submit(
+        crate::jobs::JobKey::new(crate::jobs::Scope::Global, "branch_picker"),
+        crate::jobs::Priority::Foreground,
+        crate::jobs::Pool::Io,
+        move |tok| {
+            let roots = crate::git::discover_repos(&ws, 5);
+            let mut data: Vec<(PathBuf, Vec<String>, Vec<String>)> =
+                Vec::with_capacity(roots.len());
+            for r in roots {
+                if tok.is_cancelled() {
+                    break;
+                }
                 let locals = crate::git::list_local_branches(&r);
                 let remotes = crate::git::list_remote_branches(&r);
-                (r, locals, remotes)
-            })
-            .collect();
-        let _ = tx.send(data);
-        ctx.request_repaint();
-    });
+                data.push((r, locals, remotes));
+            }
+            data
+        },
+    );
+    app.branch_picker.job = Some(handle);
 }
 
 /// Drain the worker's result once it finishes. Called once per picker
 /// frame — non-blocking.
 pub fn poll_branch_picker(app: &mut App) {
-    let Some(rx) = app.branch_picker.rx.as_ref() else {
+    let Some(handle) = app.branch_picker.job.as_ref() else {
         return;
     };
-    match rx.try_recv() {
-        Ok(data) => {
+    match handle.try_recv() {
+        Some(crate::jobs::JobOutput::Done(data)) => {
             let active = app.active_repo_root();
             app.branch_picker.repos = data;
             app.branch_picker.filter = active.filter(|a| {
                 app.branch_picker.repos.iter().any(|(r, _, _)| r == a)
             });
             app.branch_picker.loading = false;
-            app.branch_picker.rx = None;
+            app.branch_picker.job = None;
         }
-        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        Some(crate::jobs::JobOutput::Cancelled) => {
             app.branch_picker.loading = false;
-            app.branch_picker.rx = None;
+            app.branch_picker.job = None;
         }
+        None => {}
     }
 }
 

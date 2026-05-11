@@ -1,3 +1,4 @@
+use crate::jobs::{JobKey, JobOutput, Pool, Priority, Scope};
 use crate::state::layout::DiffTabData;
 use crate::theme;
 use crate::views::file_util::is_image_path;
@@ -6,8 +7,14 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, Pos2, Rect, RichText, ScrollArea};
 use egui_phosphor::regular as icons;
 use similar::{ChangeTag, TextDiff};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SynStyle, Theme as SynTheme};
+// DefaultHasher is still used in tab_key (stable per-tab key from
+// left_path + right_path). Per-frame input fingerprint hashing was
+// removed — DiffTabData::inputs_version replaces it.
 
 const ADD_BG: Color32 = Color32::from_rgb(25, 55, 35);
 const DEL_BG: Color32 = Color32::from_rgb(60, 28, 32);
@@ -17,38 +24,69 @@ const DEL_FG: Color32 = Color32::from_rgb(230, 130, 130);
 const MUTED: Color32 = Color32::from_rgb(140, 146, 160);
 const MINIMAP_W: f32 = 10.0;
 
-struct Row {
-    tag: ChangeTag,
-    old_ln: String,
-    new_ln: String,
-    content: String,
+pub struct Row {
+    pub tag: ChangeTag,
+    pub old_ln: String,
+    pub new_ln: String,
+    pub content: String,
 }
 
-pub fn render_diff_body(
-    ui: &mut egui::Ui,
-    tab: &mut DiffTabData,
-    font_size: f32,
-    _tab_index: usize,
-) {
-    let is_image = is_image_path(&tab.right_path);
-    let left_path = tab.left_path.clone();
-    let right_path = tab.right_path.clone();
+/// Pure result of diffing left_text vs right_text + parsing git's
+/// hunk patches. Render reads this with zero allocation; the job
+/// thread builds it. See `compute_diff`.
+#[allow(dead_code)]
+pub struct DiffComputed {
+    pub rows: Vec<Row>,
+    pub tags: Vec<ChangeTag>,
+    pub hunk_starts: Vec<usize>,
+    pub hunk_patches: Vec<Option<String>>,
+    pub row_to_hunk: Vec<Option<usize>>,
+    pub ldigits: usize,
+    pub rdigits: usize,
+    pub left_lines_count: usize,
+    pub right_lines_count: usize,
+}
 
-    if is_image {
-        render_image_block(ui, tab, &left_path, &right_path, _tab_index);
-        return;
+impl DiffComputed {
+    /// Sentinel returned when a job is cancelled mid-compute. Render
+    /// treats this the same as a cache miss.
+    fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            tags: Vec::new(),
+            hunk_starts: Vec::new(),
+            hunk_patches: Vec::new(),
+            row_to_hunk: Vec::new(),
+            ldigits: 0,
+            rdigits: 0,
+            left_lines_count: 0,
+            right_lines_count: 0,
+        }
     }
+}
 
-    let diff = TextDiff::from_lines(&tab.left_text, &tab.right_text);
-    let font = FontId::new(font_size, FontFamily::Monospace);
-    let left_lines_count = tab.left_text.lines().count().max(1);
-    let right_lines_count = tab.right_text.lines().count().max(1);
-
-    let syntax = resolve_syntax(&tab.right_path);
-    let (ss, st_theme) = resolve_theme();
+/// The expensive bit. Pulled out of the render path so JobSystem can
+/// run it on the I/O pool — `git diff` shells out a subprocess (the
+/// real latency culprit) and `TextDiff::from_lines` walks both texts.
+///
+/// Cancel-checks at phase boundaries so a tab closing mid-compute
+/// frees the worker quickly. Cancellation is cooperative — we never
+/// abort mid-syscall, only at safe points.
+fn compute_diff(
+    left_text: String,
+    right_text: String,
+    repo_path: Option<String>,
+    right_path: String,
+    cancel: &crate::jobs::CancelToken,
+) -> DiffComputed {
+    if cancel.is_cancelled() {
+        return DiffComputed::empty();
+    }
+    let diff = TextDiff::from_lines(&left_text, &right_text);
+    let left_lines_count = left_text.lines().count().max(1);
+    let right_lines_count = right_text.lines().count().max(1);
     let ldigits = left_lines_count.to_string().len().max(3);
     let rdigits = right_lines_count.to_string().len().max(3);
-    let char_w = measure_char_w(ui, &font);
 
     let rows: Vec<Row> = diff
         .iter_all_changes()
@@ -69,27 +107,26 @@ pub fn render_diff_body(
     let tags: Vec<ChangeTag> = rows.iter().map(|r| r.tag).collect();
     let total_rows = tags.len().max(1);
 
-    let hunk_starts = {
-        let mut starts = Vec::new();
-        let mut in_hunk = false;
-        for (i, tag) in tags.iter().enumerate() {
-            let changed = !matches!(tag, ChangeTag::Equal);
-            if changed && !in_hunk {
-                starts.push(i);
-            }
-            in_hunk = changed;
+    let mut hunk_starts: Vec<usize> = Vec::new();
+    let mut in_hunk = false;
+    for (i, tag) in tags.iter().enumerate() {
+        let changed = !matches!(tag, ChangeTag::Equal);
+        if changed && !in_hunk {
+            hunk_starts.push(i);
         }
-        starts
-    };
+        in_hunk = changed;
+    }
 
-    // Compute hunk patches for per-hunk staging. Uses `git diff` to
-    // generate proper unified-diff patches that `git apply --cached`
-    // can consume. The hunk indices align with `hunk_starts` because
-    // both `similar` and `git diff` operate on the same file content.
-    let hunk_patches: Vec<Option<String>> = if let Some(repo) = &tab.repo_path {
-        let repo_path = std::path::Path::new(repo);
-        let rel = tab.right_path.as_str();
-        if let Some(raw) = crate::git::file_diff_raw(repo_path, rel) {
+    if cancel.is_cancelled() {
+        return DiffComputed::empty();
+    }
+
+    // Per-hunk patches via `git diff` (subprocess) + parse_hunks. The
+    // shelling-out is what made render-frame stalls visible; running
+    // it here on the I/O pool keeps the UI thread out of waitpid.
+    let hunk_patches: Vec<Option<String>> = if let Some(repo) = repo_path.as_ref() {
+        let repo_p = std::path::Path::new(repo);
+        if let Some(raw) = crate::git::file_diff_raw(repo_p, &right_path) {
             let parsed = crate::git::parse_hunks(&raw);
             hunk_starts
                 .iter()
@@ -102,6 +139,120 @@ pub fn render_diff_body(
     } else {
         vec![None; hunk_starts.len()]
     };
+
+    let mut row_to_hunk: Vec<Option<usize>> = vec![None; total_rows];
+    for (hi, &start) in hunk_starts.iter().enumerate() {
+        let end = hunk_starts.get(hi + 1).copied().unwrap_or(total_rows);
+        for r in start..end {
+            if r < row_to_hunk.len() {
+                row_to_hunk[r] = Some(hi);
+            }
+        }
+    }
+
+    DiffComputed {
+        rows,
+        tags,
+        hunk_starts,
+        hunk_patches,
+        row_to_hunk,
+        ldigits,
+        rdigits,
+        left_lines_count,
+        right_lines_count,
+    }
+}
+
+pub fn render_diff_body(
+    ui: &mut egui::Ui,
+    tab: &mut DiffTabData,
+    font_size: f32,
+    _tab_index: usize,
+) {
+    let is_image = is_image_path(&tab.right_path);
+    let left_path = tab.left_path.clone();
+    let right_path = tab.right_path.clone();
+
+    if is_image {
+        render_image_block(ui, tab, &left_path, &right_path, _tab_index);
+        return;
+    }
+
+    let font = FontId::new(font_size, FontFamily::Monospace);
+    let syntax = resolve_syntax(&tab.right_path);
+    let (ss, st_theme) = resolve_theme();
+    let char_w = measure_char_w(ui, &font);
+
+    // Cache check via explicit version counter — no per-frame hashing
+    // of left_text + right_text. Mutators of those fields MUST call
+    // DiffTabData::invalidate() to bump inputs_version. Cache hit →
+    // one u64 compare + Arc::clone, zero hashing, zero allocation.
+    let current_version = tab.inputs_version;
+
+    if let Some(handle) = tab.compute_job.as_ref() {
+        if let Some(out) = handle.try_recv() {
+            match out {
+                JobOutput::Done(d) => {
+                    tab.computed = Some(Arc::new(d));
+                    tab.computed_for_version = tab.job_for_version;
+                }
+                JobOutput::Cancelled => {}
+            }
+            tab.compute_job = None;
+        }
+    }
+
+    let cached_ok = tab.computed.is_some() && tab.computed_for_version == current_version;
+    let job_ok = tab.compute_job.is_some() && tab.job_for_version == current_version;
+
+    if !cached_ok && !job_ok && let Some(jobs) = crate::jobs::global() {
+        // Stable key per diff tab — hash of (left_path, right_path)
+        // identifies the tab uniquely without changing on every edit.
+        // Earlier in-flight jobs are superseded via key dedup; their
+        // cancel tokens flip and their results are dropped.
+        let mut hasher = DefaultHasher::new();
+        tab.left_path.hash(&mut hasher);
+        tab.right_path.hash(&mut hasher);
+        let tab_key = hasher.finish();
+        let left_text = tab.left_text.clone();
+        let right_text = tab.right_text.clone();
+        let repo_path = tab.repo_path.clone();
+        let right_path = tab.right_path.clone();
+        let handle = jobs.submit(
+            JobKey::new(Scope::Tab(tab_key), "diff_compute"),
+            Priority::Foreground,
+            Pool::Io,
+            move |tok| compute_diff(left_text, right_text, repo_path, right_path, tok),
+        );
+        tab.compute_job = Some(handle);
+        tab.job_for_version = current_version;
+    }
+
+    // No cached result yet — show a placeholder header and bail.
+    let computed = match tab.computed.as_ref().filter(|_| cached_ok) {
+        Some(c) => Arc::clone(c),
+        None => {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Computing diff…")
+                        .size(11.0)
+                        .color(MUTED)
+                        .monospace(),
+                );
+            });
+            return;
+        }
+    };
+
+    let rows = &computed.rows;
+    let tags = &computed.tags;
+    let hunk_starts = &computed.hunk_starts;
+    let hunk_patches = &computed.hunk_patches;
+    let total_rows = tags.len().max(1);
+    let ldigits = computed.ldigits;
+    let rdigits = computed.rdigits;
 
     // Flag: set when a hunk is staged, triggering a full diff refresh
     // next frame. Stored in egui data keyed to the diff tab.
@@ -218,24 +369,9 @@ pub fn render_diff_body(
         scroll = scroll.vertical_scroll_offset(y);
     }
 
-    // Build a lookup: row index -> which hunk it belongs to (for stage buttons)
-    let row_to_hunk: Vec<Option<usize>> = {
-        let mut map = vec![None; total_rows];
-        for (hi, &start) in hunk_starts.iter().enumerate() {
-            if let Some(end) = hunk_starts.get(hi + 1) {
-                for r in start..*end {
-                    if r < map.len() {
-                        map[r] = Some(hi);
-                    }
-                }
-            } else {
-                for r in start..total_rows {
-                    map[r] = Some(hi);
-                }
-            }
-        }
-        map
-    };
+    // row_to_hunk is precomputed in DiffComputed; alias the cached
+    // slice instead of rebuilding it every frame.
+    let row_to_hunk = &computed.row_to_hunk;
 
     let gutter_old_w = char_w * ldigits as f32 + 10.0;
     let gutter_new_w = char_w * rdigits as f32 + 10.0;

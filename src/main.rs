@@ -3,7 +3,10 @@ mod browser;
 mod format;
 #[cfg(target_os = "macos")]
 mod mac_keys;
+mod dir_cache;
+mod file_watcher;
 mod git;
+mod jobs;
 mod lsp;
 mod modals;
 mod platform_menu;
@@ -867,6 +870,21 @@ impl eframe::App for CraneApp {
         }
 
         self.maybe_save();
+    }
+
+    /// Called by eframe just before the window closes. Cancel
+    /// in-flight JobSystem work explicitly and join workers, because
+    /// the global OnceLock<Arc<JobSystem>> in `crate::jobs` holds a
+    /// strong reference for process lifetime — without this hook,
+    /// `JobSystem::Drop` never fires and the process can exit while
+    /// workers are mid-syscall (git status subprocess, file read,
+    /// etc.). We also drop the FileWatcher so its notify backend
+    /// thread exits cleanly.
+    fn on_exit(&mut self) {
+        if let Some(jobs) = self.app.jobs.as_ref() {
+            jobs.shutdown();
+        }
+        self.app.file_watcher = None;
     }
 }
 

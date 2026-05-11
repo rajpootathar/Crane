@@ -1062,26 +1062,16 @@ fn render_fs_dir(
     if let Some(p) = pending_here {
         render_pending_editor_row(ui, depth, p, commit, cancel);
     }
-    let read = match std::fs::read_dir(path) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    let mut entries: Vec<_> = read.filter_map(|e| e.ok()).collect();
-    entries.sort_by_key(|e| {
-        (
-            !e.path().is_dir(),
-            e.file_name().to_string_lossy().to_string(),
-        )
-    });
-    for e in entries {
-        let name = e.file_name().to_string_lossy().to_string();
-        if matches!(
-            name.as_str(),
-            ".git" | "target" | "node_modules" | ".DS_Store"
-        ) {
+    // Listing comes from the directory cache: one stat per dir per
+    // frame instead of read_dir + sort. Cache self-invalidates when
+    // the dir's mtime bumps (file added/removed).
+    let entries = crate::dir_cache::global().entries(path);
+    for e in entries.iter() {
+        let name = e.name.as_str();
+        if matches!(name, ".git" | "target" | "node_modules" | ".DS_Store") {
             continue;
         }
-        let entry_path = e.path();
+        let entry_path = e.path.clone();
         // Loose-files Project hides directories that are already
         // exposed as their own Project (nested git repos under a
         // non-git parent). Without this, every nested repo would
