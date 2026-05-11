@@ -132,70 +132,174 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
         return;
     }
 
-    // Filter bar — single row above the commit list.
+    // Filter bar — refined, theme-aware row with consistent control
+    // heights. Search field gets a magnifying-glass affordance and a
+    // clear (×) button when non-empty. Facet pickers use compact
+    // pill-style toggles with a chevron, sized to their label.
+    let theme = crate::theme::current();
+    let bar_h = 24.0;
+    let radius = egui::CornerRadius::same(4);
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.add_space(4.0);
+        ui.add_space(8.0);
+        ui.spacing_mut().item_spacing.x = 6.0;
+
+        // ---- Search input ----------------------------------------
+        let search_w = 240.0_f32;
+        let (search_rect, _) = ui.allocate_exact_size(
+            egui::vec2(search_w, bar_h),
+            egui::Sense::hover(),
+        );
+        ui.painter()
+            .rect_filled(search_rect, radius, theme.surface_alt.to_color32());
+        ui.painter().rect_stroke(
+            search_rect,
+            radius,
+            egui::Stroke::new(1.0, theme.divider.to_color32()),
+            egui::StrokeKind::Inside,
+        );
+        // Search icon glyph
+        ui.painter().text(
+            egui::pos2(search_rect.left() + 8.0, search_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            icons::MAGNIFYING_GLASS,
+            egui::FontId::proportional(12.0),
+            theme.text_muted.to_color32(),
+        );
+        // TextEdit overlay — borderless, inset to leave room for the
+        // icon left and clear button right.
+        let text_inner = egui::Rect::from_min_max(
+            egui::pos2(search_rect.left() + 26.0, search_rect.top() + 2.0),
+            egui::pos2(search_rect.right() - 22.0, search_rect.bottom() - 2.0),
+        );
         let filter_id = egui::Id::new("git_log_filter_text");
-        let resp = ui.add(
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(text_inner)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let resp = child.add(
             egui::TextEdit::singleline(&mut state.filter.text)
-                .hint_text("filter subject / hash / author")
+                .hint_text("subject / hash / author")
                 .id(filter_id)
-                .desired_width(220.0),
+                .desired_width(text_inner.width())
+                .background_color(Color32::TRANSPARENT),
         );
         if state.pending_focus_filter {
             resp.request_focus();
             state.pending_focus_filter = false;
         }
+        // Clear button when the field is non-empty.
+        if !state.filter.text.is_empty() {
+            let clear_rect = egui::Rect::from_min_max(
+                egui::pos2(search_rect.right() - 20.0, search_rect.top() + 2.0),
+                egui::pos2(search_rect.right() - 4.0, search_rect.bottom() - 2.0),
+            );
+            let clear_resp = ui.interact(
+                clear_rect,
+                egui::Id::new("git_log_filter_clear"),
+                egui::Sense::click(),
+            );
+            if clear_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                ui.painter().rect_filled(
+                    clear_rect,
+                    egui::CornerRadius::same(3),
+                    theme.surface_hi.to_color32(),
+                );
+            }
+            ui.painter().text(
+                clear_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icons::X,
+                egui::FontId::proportional(11.0),
+                theme.text_muted.to_color32(),
+            );
+            if clear_resp.clicked() {
+                state.filter.text.clear();
+            }
+        }
 
-        // Branch facet (built from local refs).
-        let local_branches: Vec<String> = state
-            .frame
-            .as_ref()
-            .map(|f| {
-                f.refs
-                    .local
-                    .iter()
-                    .map(|r| r.name.trim_start_matches("refs/heads/").to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // ---- Branch facet ----------------------------------------
+        let local_branches: Vec<String> = frame
+            .refs
+            .local
+            .iter()
+            .map(|r| r.name.trim_start_matches("refs/heads/").to_string())
+            .collect();
         let branch_label = state
             .filter
             .branch
-            .clone()
-            .unwrap_or_else(|| "branch".to_string());
-        egui::ComboBox::from_id_salt("git_log_branch_filter")
-            .selected_text(branch_label)
-            .show_ui(ui, |ui| {
+            .as_deref()
+            .unwrap_or("branch")
+            .to_string();
+        compact_combo(
+            ui,
+            "git_log_branch_filter",
+            &branch_label,
+            state.filter.branch.is_some(),
+            &theme,
+            |ui| {
                 ui.selectable_value(&mut state.filter.branch, None, "all branches");
+                ui.separator();
                 for b in &local_branches {
                     ui.selectable_value(&mut state.filter.branch, Some(b.clone()), b);
                 }
-            });
+            },
+        );
 
-        // User facet (unique authors).
-        let mut authors: Vec<String> = state
-            .frame
-            .as_ref()
-            .map(|f| f.commits.iter().map(|c| c.author.clone()).collect::<Vec<_>>())
-            .unwrap_or_default();
+        // ---- User facet ------------------------------------------
+        let mut authors: Vec<String> =
+            frame.commits.iter().map(|c| c.author.clone()).collect();
         authors.sort();
         authors.dedup();
         let user_label = state
             .filter
             .user
-            .clone()
-            .unwrap_or_else(|| "user".to_string());
-        egui::ComboBox::from_id_salt("git_log_user_filter")
-            .selected_text(user_label)
-            .show_ui(ui, |ui| {
+            .as_deref()
+            .unwrap_or("user")
+            .to_string();
+        compact_combo(
+            ui,
+            "git_log_user_filter",
+            &user_label,
+            state.filter.user.is_some(),
+            &theme,
+            |ui| {
                 ui.selectable_value(&mut state.filter.user, None, "all users");
+                ui.separator();
                 for u in &authors {
                     ui.selectable_value(&mut state.filter.user, Some(u.clone()), u);
                 }
-            });
+            },
+        );
+
+        // Filter-status indicator pushed to the right edge.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
+            if state.filter.text.is_empty()
+                && state.filter.branch.is_none()
+                && state.filter.user.is_none()
+            {
+                ui.label(
+                    egui::RichText::new(format!("{} commits", frame.commits.len()))
+                        .size(11.0)
+                        .color(theme.text_muted.to_color32()),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} of {}",
+                        state.last_visible_count,
+                        frame.commits.len()
+                    ))
+                    .size(11.0)
+                    .color(theme.text_muted.to_color32()),
+                );
+            }
+        });
     });
-    ui.separator();
+    ui.add_space(2.0);
 
     // Apply filters.
     let needle = state.filter.text.to_lowercase();
@@ -525,6 +629,48 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
     }
 }
 
+/// Compact ComboBox styled to match the filter bar. Wraps the
+/// standard ComboBox in a scoped visuals override so the trigger
+/// reads as a flat pill on the bar's surface (no chunky brown
+/// background, no oversized border). Active state tints the stroke
+/// with the theme accent.
+fn compact_combo<R>(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    label: &str,
+    is_active: bool,
+    theme: &crate::theme::Theme,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    let radius = egui::CornerRadius::same(4);
+    let visuals = ui.visuals_mut();
+    visuals.widgets.inactive.bg_fill = theme.surface_alt.to_color32();
+    visuals.widgets.inactive.weak_bg_fill = theme.surface_alt.to_color32();
+    visuals.widgets.hovered.bg_fill = theme.surface_hi.to_color32();
+    visuals.widgets.hovered.weak_bg_fill = theme.surface_hi.to_color32();
+    visuals.widgets.inactive.corner_radius = radius;
+    visuals.widgets.hovered.corner_radius = radius;
+    visuals.widgets.active.corner_radius = radius;
+    let stroke_col = if is_active {
+        theme.accent.to_color32()
+    } else {
+        theme.divider.to_color32()
+    };
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, stroke_col);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, stroke_col);
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(
+            egui::RichText::new(label)
+                .size(12.0)
+                .color(if is_active {
+                    theme.text.to_color32()
+                } else {
+                    theme.text_muted.to_color32()
+                }),
+        )
+        .show_ui(ui, add_contents);
+}
+
 /// Paint the dot for `lane_row` and connecting lines down to its
 /// parents at `next_lane_row`'s level. Uses a quadratic Bezier for
 /// off-axis parents to give branches a smooth curve.
@@ -566,11 +712,30 @@ fn paint_lane(
     if let Some(next) = next_lane_row {
         let next_dot_y = dot_y + ROW_H;
         for &p_lane in &lane_row.parent_lanes {
-            // Use the next row's color where the parent will continue.
-            let next_color = if (next.own_lane == p_lane)
-                || next.parent_lanes.iter().any(|&l| l == p_lane)
-            {
+            // Color of the line: whatever lane p_lane is on the next
+            // row. Three cases:
+            //   1. next is on lane p_lane (own_lane match) — use
+            //      next's commit color (linear continuation).
+            //   2. lane p_lane is a passthrough on next (it's alive
+            //      through next but next is on a different lane) —
+            //      use the passthrough's per-lane color from the
+            //      layout.
+            //   3. Neither — fall back to this row's color.
+            //
+            // The previous logic adopted next.color whenever next's
+            // parent_lanes contained p_lane, which is wrong for
+            // "merge into existing lane" rows: a red branch
+            // terminating into the blue mainline made the mainline
+            // segment above the terminator render red because next
+            // was the red row whose first parent was lane 0.
+            let next_color = if next.own_lane == p_lane {
                 PALETTE[(next.color as usize) % PALETTE.len()]
+            } else if let Some(&(_, c)) = next
+                .passthrough_lanes
+                .iter()
+                .find(|(l, _)| *l == p_lane)
+            {
+                PALETTE[(c as usize) % PALETTE.len()]
             } else {
                 color
             };
