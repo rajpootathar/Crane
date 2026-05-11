@@ -311,11 +311,15 @@ pub fn staged_content(repo: &Path, rel_path: &str) -> Option<String> {
 }
 
 /// Get the unified diff between HEAD and the working tree for a file
-/// — includes both staged and unstaged changes. Returns the raw diff
-/// text including hunk headers and context lines.
+/// — includes both staged and unstaged changes. Uses `--unified=0` so
+/// every atomic change region becomes its own hunk; without that, git
+/// merges changes within 3 lines of each other into a single hunk and
+/// the diff view can't offer per-region stage actions (jetbrains-style
+/// hunk split). git apply accepts unified=0 patches via line numbers,
+/// so stage / unstage / is-staged probes all keep working.
 pub fn file_diff_raw(repo: &Path, rel_path: &str) -> Option<String> {
     let out = Command::new("git")
-        .args(["diff", "HEAD", "--", rel_path])
+        .args(["diff", "--unified=0", "HEAD", "--", rel_path])
         .current_dir(repo)
         .output()
         .ok()?;
