@@ -24,11 +24,47 @@ struct RefPill {
 /// `git log --pretty=...%d`):
 ///   ` (HEAD -> main, origin/main, tag: v1.0)`
 /// Always wrapped in `(...)` and prefixed with a space when non-empty.
-fn parse_ref_pills(decoration: &str) -> Vec<RefPill> {
+///
+/// Categorisation uses the actual `RefSet` rather than slash-counting
+/// the name — a local branch can legitimately contain slashes
+/// (`feat/drag-drop`), so the previous `contains('/')` heuristic
+/// misclassified those as remote-tracking.
+fn parse_ref_pills(
+    decoration: &str,
+    refs: &crate::git_log::refs::RefSet,
+) -> Vec<RefPill> {
     let body = decoration.trim().trim_start_matches('(').trim_end_matches(')');
     if body.is_empty() {
         return Vec::new();
     }
+
+    // Short-name sets for O(1) categorisation. RefSet stores fully
+    // qualified `refs/heads/foo`; decoration uses the short form.
+    let local_names: std::collections::HashSet<&str> = refs
+        .local
+        .iter()
+        .filter_map(|r| r.name.strip_prefix("refs/heads/"))
+        .collect();
+    let remote_names: std::collections::HashSet<&str> = refs
+        .remote
+        .iter()
+        .filter_map(|r| r.name.strip_prefix("refs/remotes/"))
+        .collect();
+
+    let categorise = |name: &str| -> (Color32, Color32) {
+        if local_names.contains(name) {
+            // Local branch — purple, white text.
+            (Color32::from_rgb(171, 71, 188), Color32::WHITE)
+        } else if remote_names.contains(name) {
+            // Remote-tracking branch — blue, white text.
+            (Color32::from_rgb(66, 165, 245), Color32::WHITE)
+        } else {
+            // Unknown — neutral grey so it stands apart from miscategorised
+            // colour rather than masquerading as the wrong category.
+            (Color32::from_rgb(110, 118, 132), Color32::WHITE)
+        }
+    };
+
     let mut out = Vec::new();
     for raw in body.split(',') {
         let raw = raw.trim();
@@ -42,27 +78,20 @@ fn parse_ref_pills(decoration: &str) -> Vec<RefPill> {
                 Color32::BLACK,
             )
         } else if raw == "HEAD" {
-            ("HEAD".to_string(), Color32::from_rgb(102, 187, 106), Color32::BLACK)
+            (
+                "HEAD".to_string(),
+                Color32::from_rgb(102, 187, 106),
+                Color32::BLACK,
+            )
         } else if let Some(t) = raw.strip_prefix("tag: ") {
             (
                 t.to_string(),
                 Color32::from_rgb(255, 202, 40),
                 Color32::BLACK,
             )
-        } else if raw.contains('/') {
-            // Remote-tracking branch (origin/main etc.).
-            (
-                raw.to_string(),
-                Color32::from_rgb(66, 165, 245),
-                Color32::WHITE,
-            )
         } else {
-            // Local branch.
-            (
-                raw.to_string(),
-                Color32::from_rgb(171, 71, 188),
-                Color32::WHITE,
-            )
+            let (bg, fg) = categorise(raw);
+            (raw.to_string(), bg, fg)
         };
         out.push(RefPill { label, bg, fg });
     }
@@ -390,7 +419,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut GitLogState) {
                 // use for the subject below).
                 let mut text_x = row_resp.rect.left() + graph_width + 4.0;
                 let text_y = row_resp.rect.top() + 4.0;
-                let pills = parse_ref_pills(&c.refs_decoration);
+                let pills = parse_ref_pills(&c.refs_decoration, &frame.refs);
                 let pill_font = egui::FontId::proportional(10.5);
                 let pill_h = ROW_H - 8.0;
                 for pill in &pills {
@@ -555,19 +584,40 @@ fn paint_lane(
                     egui::Stroke::new(1.5, next_color),
                 );
             } else {
+                // The bezier ends at the next dot's center. Anti-
+                // aliasing on the bezier's endpoint plus the filled
+                // dot drawn on top leaves a 1–2 px gap where the curve
+                // visually fails to meet the lane below — the user
+                // sees the branch "not touching" the lane it merges
+                // into. Extend the bezier endpoint ~DOT_R past the
+                // dot center so the curve visibly enters the dot,
+                // then the filled dot covers the overshoot cleanly.
                 let mid_y = dot_y + ROW_H * 0.5;
                 let cp = egui::pos2(p_x, mid_y);
                 let bezier = egui::epaint::QuadraticBezierShape {
                     points: [
                         egui::pos2(dot_x, dot_y),
                         cp,
-                        egui::pos2(p_x, next_dot_y),
+                        egui::pos2(p_x, next_dot_y + DOT_R),
                     ],
                     closed: false,
                     fill: Color32::TRANSPARENT,
                     stroke: egui::Stroke::new(1.5, next_color).into(),
                 };
                 ui.painter().add(bezier);
+
+                // Anchor segment: short vertical line at the merge
+                // lane from the next row's top edge to the dot
+                // center. Guarantees a visible connection even when
+                // the next row renders its dot WITHOUT a passthrough
+                // (which is the "merge into existing lane" case).
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(p_x, next_dot_y - ROW_H * 0.5),
+                        egui::pos2(p_x, next_dot_y),
+                    ],
+                    egui::Stroke::new(1.5, next_color),
+                );
             }
         }
     }
