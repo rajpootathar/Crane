@@ -629,6 +629,18 @@ fn open_file_diff(app: &mut App, repo: &std::path::Path, rel_path: &str) {
     }
 }
 
+/// Resolved drag-drop op for the Files tree. Built once on pointer
+/// release; consumed at the top of `render_files` to actually move
+/// or copy the path. We resolve drop semantics ("drop on a file
+/// row" → "drop into its parent dir") at the row level so the
+/// caller doesn't need to re-derive intent.
+#[derive(Clone, Debug)]
+struct FsDropOp {
+    src: PathBuf,
+    dst_dir: PathBuf,
+    copy: bool,
+}
+
 /// Render a failed git-op pill with an expand toggle. Errors from
 /// `git push` / `pull` are often multi-line (remote rejection
 /// messages, hook output, etc.) — the collapsed view shows the first
@@ -1006,7 +1018,7 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
     let mut toggled: Option<PathBuf> = None;
     let mut new_entry: Option<(PathBuf, NewEntryKind)> = None;
     let mut delete_request: Option<PathBuf> = None;
-    let mut drop_request: Option<(PathBuf, PathBuf)> = None;
+    let mut drop_request: Option<FsDropOp> = None;
     let mut commit_pending = false;
     let mut cancel_pending = false;
     let mut open_diff: Option<String> = None;
@@ -1078,8 +1090,26 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
     if let Some(p) = delete_request {
         app.pending_delete_file = Some(crate::state::PendingDeleteFile { path: p });
     }
-    if let Some((src, dst_dir)) = drop_request {
-        move_path(app, &src, &dst_dir);
+    if let Some(op) = drop_request {
+        if op.copy {
+            copy_into(app, &op.src, &op.dst_dir);
+        } else {
+            move_path(app, &op.src, &op.dst_dir);
+        }
+        // Bust the dir-cache for both endpoints so the next render
+        // re-reads the listing instead of showing stale entries
+        // (old name still in src, new file missing from dst).
+        let cache = crate::dir_cache::global();
+        if let Some(parent) = op.src.parent() {
+            cache.invalidate(parent);
+        }
+        cache.invalidate(&op.dst_dir);
+        // Force the next git-status poll to fire immediately so the
+        // moved/copied row picks up its new colour (modified /
+        // untracked / renamed) within a frame instead of waiting
+        // for the throttled interval.
+        force_status_refresh(app);
+        ui.ctx().request_repaint();
     }
     if let Some(p) = toggled
         && !app.expanded_dirs.remove(&p) {
@@ -1133,6 +1163,55 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
             focused_once: false,
         });
     }
+
+    // In-flight drag chip. Floats next to the cursor showing the
+    // name (and icon) of the item being dragged, plus a "Copy" hint
+    // when Alt is held. Without this overlay there was no signal at
+    // all that a drag was even in progress — users dropped blindly.
+    let drag_src: Option<PathBuf> =
+        egui::DragAndDrop::payload::<PathBuf>(ui.ctx()).map(|p| (*p).clone());
+    if let Some(src) = drag_src {
+        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            let copy_held = ui.ctx().input(|i| i.modifiers.alt);
+            let name = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("(file)")
+                .to_string();
+            let glyph = if src.is_dir() { icons::FOLDER } else { icons::FILE };
+            let label = if copy_held {
+                format!("{glyph}  {name}   +  Copy")
+            } else {
+                format!("{glyph}  {name}")
+            };
+            egui::Area::new(egui::Id::new("crane.fs_drag_chip"))
+                .order(egui::Order::Tooltip)
+                .interactable(false)
+                .fixed_pos(pos + egui::vec2(14.0, 14.0))
+                .show(ui.ctx(), |ui| {
+                    let t = theme::current();
+                    let bg = if copy_held {
+                        t.accent.to_color32()
+                    } else {
+                        ui.visuals().extreme_bg_color
+                    };
+                    let fg = if copy_held {
+                        Color32::WHITE
+                    } else {
+                        t.text.to_color32()
+                    };
+                    egui::Frame::NONE
+                        .fill(bg)
+                        .stroke(egui::Stroke::new(1.0, t.accent.to_color32()))
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .inner_margin(egui::Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(label).color(fg).size(11.5));
+                        });
+                });
+            ui.ctx().request_repaint();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1148,7 +1227,7 @@ fn render_fs_dir(
     toggle_dir: &mut Option<PathBuf>,
     new_entry: &mut Option<(PathBuf, NewEntryKind)>,
     delete_request: &mut Option<PathBuf>,
-    drop_request: &mut Option<(PathBuf, PathBuf)>,
+    drop_request: &mut Option<FsDropOp>,
     selected: Option<&std::path::Path>,
     pending: Option<&mut PendingNewEntry>,
     commit: &mut bool,
@@ -1246,24 +1325,90 @@ fn render_fs_dir(
             *open_file = Some(entry_path.clone());
             *opened_preview = false;
         }
-        // Drag source: any row can be dragged. dnd_set_drag_payload
-        // attaches the path to egui's global drag state; pointer
-        // release on a folder row reads it back as a drop target.
+        // Drag source: any row (file or folder) can be dragged.
+        // Payload is the absolute source path; egui's DragAndDrop
+        // state carries it from this frame until pointer release.
         if row.response.dragged() {
             row.response.dnd_set_drag_payload(entry_path.clone());
         }
-        // Drop target: only directories accept drops. We refuse a
-        // drop when the source is the directory itself (no-op) or a
-        // descendant of itself (would loop the filesystem). The
-        // actual rename is deferred to the caller via `drop_request`.
-        if is_dir {
-            if let Some(payload) = row.response.dnd_release_payload::<PathBuf>() {
-                let src: PathBuf = (*payload).clone();
-                let same = src == entry_path;
-                let into_self_or_descendant = entry_path.starts_with(&src);
-                if !same && !into_self_or_descendant {
-                    *drop_request = Some((src, entry_path.clone()));
-                }
+
+        // Drop target resolution. Drops on a folder row land INSIDE
+        // that folder; drops on a file row land in the file's
+        // PARENT directory — same as Finder/VS Code. Without this,
+        // dragging a file "next to" another file silently refused
+        // the drop because the target wasn't a folder.
+        let target_dir: PathBuf = if is_dir {
+            entry_path.clone()
+        } else {
+            entry_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| workspace_root.to_path_buf())
+        };
+
+        // While a drag is in flight, check whether dropping HERE
+        // would be valid (not into self, not into a descendant of
+        // self, not a same-folder no-op). Paint a highlight on the
+        // row to confirm the drop will land. Without this, users
+        // had no feedback about where the file would go.
+        let ctx = ui.ctx();
+        let in_flight_src: Option<PathBuf> =
+            egui::DragAndDrop::payload::<PathBuf>(ctx).map(|p| (*p).clone());
+        let pointer_over_row = ctx
+            .pointer_interact_pos()
+            .is_some_and(|p| row.rect.contains(p));
+        let copy_held = ctx.input(|i| i.modifiers.alt);
+
+        if let Some(src) = in_flight_src.as_ref() {
+            let same = *src == entry_path;
+            let into_self = target_dir == *src;
+            let into_descendant = target_dir.starts_with(src);
+            let same_parent = src.parent() == Some(target_dir.as_path());
+            let valid_target = !same && !into_self && !into_descendant && !same_parent;
+
+            if valid_target && pointer_over_row {
+                // Source-row highlight: subtle accent overlay so the
+                // user can see exactly which row will receive the
+                // drop. Painted as an inset so it doesn't fight the
+                // existing row borders.
+                let accent = theme::current().accent.to_color32();
+                let highlight = egui::Color32::from_rgba_unmultiplied(
+                    accent.r(),
+                    accent.g(),
+                    accent.b(),
+                    if copy_held { 80 } else { 60 },
+                );
+                ui.painter()
+                    .rect_filled(row.rect.shrink(1.0), 4.0, highlight);
+                ui.painter().rect_stroke(
+                    row.rect.shrink(1.0),
+                    4.0,
+                    egui::Stroke::new(1.0, accent),
+                    egui::epaint::StrokeKind::Inside,
+                );
+                ctx.set_cursor_icon(if copy_held {
+                    egui::CursorIcon::Copy
+                } else {
+                    egui::CursorIcon::Grabbing
+                });
+            }
+        }
+
+        // Drop dispatch. Read the payload back on release for THIS
+        // row — works for both file and folder rows because we
+        // already resolved `target_dir` above.
+        if let Some(payload) = row.response.dnd_release_payload::<PathBuf>() {
+            let src: PathBuf = (*payload).clone();
+            let same = src == entry_path;
+            let into_self = target_dir == src;
+            let into_descendant = target_dir.starts_with(&src);
+            let same_parent = src.parent() == Some(target_dir.as_path());
+            if !same && !into_self && !into_descendant && !same_parent {
+                *drop_request = Some(FsDropOp {
+                    src,
+                    dst_dir: target_dir,
+                    copy: copy_held,
+                });
             }
         }
         let path_owned = entry_path.clone();
@@ -1370,6 +1515,43 @@ fn render_fs_dir(
 /// surface the error instead of silently copying — copy-then-delete
 /// across filesystems would change the move's atomicity guarantees.
 /// Refuses to overwrite an existing entry at the destination.
+/// Alt-drop variant of `move_path`: copy the entry into `dst_dir`
+/// instead of renaming it. Picks the next free `<name> (n)` suffix
+/// if the bare name already exists, matching how Finder de-dupes a
+/// copy-and-paste in the same directory. Failure surfaces via
+/// `git_error` like every other Files-Pane op.
+fn copy_into(app: &mut App, src: &std::path::Path, dst_dir: &std::path::Path) {
+    let Some(name) = src.file_name().and_then(|n| n.to_str()) else { return; };
+    let (stem, ext) = name.rsplit_once('.').map(|(s, e)| (s, Some(e))).unwrap_or((name, None));
+    let mut dst = dst_dir.join(name);
+    let mut n = 2;
+    while dst.exists() {
+        let candidate = match ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        dst = dst_dir.join(candidate);
+        n += 1;
+        if n > 999 {
+            app.git_error = Some(format!(
+                "Copy: too many duplicates of `{name}` in {}",
+                dst_dir.display()
+            ));
+            return;
+        }
+    }
+    let result = if src.is_dir() {
+        copy_dir_recursive(src, &dst)
+    } else {
+        std::fs::copy(src, &dst).map(|_| ())
+    };
+    if let Err(e) = result {
+        app.git_error = Some(format!("Copy: {e}"));
+        return;
+    }
+    app.expanded_dirs.insert(dst_dir.to_path_buf());
+}
+
 fn move_path(app: &mut App, src: &std::path::Path, dst_dir: &std::path::Path) {
     let Some(name) = src.file_name() else { return; };
     let dst = dst_dir.join(name);
