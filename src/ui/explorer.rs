@@ -1140,15 +1140,25 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
     for src in &dropped {
         if let Some(name) = src.file_name() {
             let dst = path.join(name);
-            if src != &dst {
-                if src.is_dir() {
-                    let _ = copy_dir_recursive(src, &dst);
-                } else {
-                    let _ = std::fs::copy(src, &dst);
-                }
-                app.expanded_dirs.insert(path.clone());
-                app.external_drop_handled = true;
+            if src == &dst {
+                continue;
             }
+            if src.is_dir() && dst_inside_src(src, &path) {
+                app.git_error = Some(format!(
+                    "Drop: `{}` is inside `{}` — refusing to copy a folder into itself",
+                    path.display(),
+                    src.display()
+                ));
+                app.external_drop_handled = true;
+                continue;
+            }
+            if src.is_dir() {
+                let _ = copy_dir_recursive(src, &dst);
+            } else {
+                let _ = std::fs::copy(src, &dst);
+            }
+            app.expanded_dirs.insert(path.clone());
+            app.external_drop_handled = true;
         }
     }
     if let Some((parent, kind)) = new_entry {
@@ -1179,34 +1189,53 @@ fn render_files(ui: &mut egui::Ui, app: &mut App) {
                 .unwrap_or("(file)")
                 .to_string();
             let glyph = if src.is_dir() { icons::FOLDER } else { icons::FILE };
-            let label = if copy_held {
-                format!("{glyph}  {name}   +  Copy")
-            } else {
-                format!("{glyph}  {name}")
-            };
+            let label = format!("{glyph}  {name}");
             egui::Area::new(egui::Id::new("crane.fs_drag_chip"))
                 .order(egui::Order::Tooltip)
                 .interactable(false)
                 .fixed_pos(pos + egui::vec2(14.0, 14.0))
                 .show(ui.ctx(), |ui| {
                     let t = theme::current();
-                    let bg = if copy_held {
-                        t.accent.to_color32()
+                    let accent = t.accent.to_color32();
+                    // Pick legible text colour against the accent pill
+                    // by luminance — fixes themes (mint, peach, mango)
+                    // where hard-coded white turns the badge into mush.
+                    let lum = 0.299 * accent.r() as f32
+                        + 0.587 * accent.g() as f32
+                        + 0.114 * accent.b() as f32;
+                    let on_accent = if lum > 150.0 {
+                        Color32::from_gray(20)
                     } else {
-                        ui.visuals().extreme_bg_color
-                    };
-                    let fg = if copy_held {
                         Color32::WHITE
-                    } else {
-                        t.text.to_color32()
                     };
                     egui::Frame::NONE
-                        .fill(bg)
-                        .stroke(egui::Stroke::new(1.0, t.accent.to_color32()))
+                        .fill(ui.visuals().extreme_bg_color)
+                        .stroke(egui::Stroke::new(1.0, accent))
                         .corner_radius(egui::CornerRadius::same(5))
                         .inner_margin(egui::Margin::symmetric(8, 5))
                         .show(ui, |ui| {
-                            ui.label(RichText::new(label).color(fg).size(11.5));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.label(
+                                    RichText::new(&label)
+                                        .color(t.text.to_color32())
+                                        .size(11.5),
+                                );
+                                if copy_held {
+                                    egui::Frame::NONE
+                                        .fill(accent)
+                                        .corner_radius(egui::CornerRadius::same(3))
+                                        .inner_margin(egui::Margin::symmetric(6, 2))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new("COPY")
+                                                    .color(on_accent)
+                                                    .size(10.0)
+                                                    .strong(),
+                                            );
+                                        });
+                                }
+                            });
                         });
                 });
             ui.ctx().request_repaint();
@@ -1522,6 +1551,14 @@ fn render_fs_dir(
 /// `git_error` like every other Files-Pane op.
 fn copy_into(app: &mut App, src: &std::path::Path, dst_dir: &std::path::Path) {
     let Some(name) = src.file_name().and_then(|n| n.to_str()) else { return; };
+    if src.is_dir() && dst_inside_src(src, dst_dir) {
+        app.git_error = Some(format!(
+            "Copy: `{}` is inside `{}` — refusing to copy a folder into itself",
+            dst_dir.display(),
+            src.display()
+        ));
+        return;
+    }
     let (stem, ext) = name.rsplit_once('.').map(|(s, e)| (s, Some(e))).unwrap_or((name, None));
     let mut dst = dst_dir.join(name);
     let mut n = 2;
@@ -1582,7 +1619,30 @@ fn move_path(app: &mut App, src: &std::path::Path, dst_dir: &std::path::Path) {
 }
 
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    copy_dir_recursive_inner(src, dst, 0)
+    // Refuse to copy a directory into its own descendant — without
+    // this, the destination is created inside `src` and the next
+    // `read_dir(src)` re-encounters it, recurses, and balloons by an
+    // order of magnitude per level. Tens to hundreds of GB of writes
+    // have been seen in the wild before the depth cap engages.
+    // Compare canonicalized paths so symlinked aliases are caught
+    // too. If canonicalize fails (e.g. dst doesn't exist yet), fall
+    // back to a textual prefix check on the absolute paths.
+    let src_canon = std::fs::canonicalize(src)?;
+    let dst_abs = match std::fs::canonicalize(dst) {
+        Ok(p) => p,
+        Err(_) => dst
+            .parent()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .map(|p| p.join(dst.file_name().unwrap_or_default()))
+            .unwrap_or_else(|| dst.to_path_buf()),
+    };
+    if dst_abs == src_canon || dst_abs.starts_with(&src_canon) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to copy a directory into itself or a descendant",
+        ));
+    }
+    copy_dir_recursive_inner(&src_canon, dst, 0)
 }
 
 fn copy_dir_recursive_inner(src: &std::path::Path, dst: &std::path::Path, depth: usize) -> std::io::Result<()> {
@@ -1605,6 +1665,17 @@ fn copy_dir_recursive_inner(src: &std::path::Path, dst: &std::path::Path, depth:
         }
     }
     Ok(())
+}
+
+/// Returns true when `dst_dir` is `src` or sits anywhere underneath
+/// it. Used by every copy / move entry point to refuse the operation
+/// before any bytes are written.
+fn dst_inside_src(src: &std::path::Path, dst_dir: &std::path::Path) -> bool {
+    let Ok(src_c) = std::fs::canonicalize(src) else {
+        return false;
+    };
+    let dst_c = std::fs::canonicalize(dst_dir).unwrap_or_else(|_| dst_dir.to_path_buf());
+    dst_c == src_c || dst_c.starts_with(&src_c)
 }
 
 /// Push an op onto the LIFO undo stack, evicting the oldest when
