@@ -340,7 +340,7 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
             Pos2::new(cursor_x + 8.0, rect.center().y),
             egui::Align2::CENTER_CENTER,
             leading,
-            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            egui::FontId::new(13.5, egui::FontFamily::Proportional),
             color,
         );
         cursor_x += 18.0;
@@ -365,7 +365,7 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
         Pos2::new(cursor_x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         cfg.label,
-        egui::FontId::new(12.5, egui::FontFamily::Proportional),
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
         text_color,
     );
 
