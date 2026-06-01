@@ -628,6 +628,13 @@ fn render_tree(ui: &mut egui::Ui, app: &mut App, ctx: &egui::Context) {
                         let badge = wt.git_status.as_ref().and_then(|s| {
                             if s.added > 0 || s.deleted > 0 {
                                 Some((s.added, s.deleted, t.diff_added(), t.diff_deleted()))
+                            } else if !s.changes.is_empty() {
+                                // Dirty but no line stats — e.g. an
+                                // untracked binary or empty file. `(0, 0)`
+                                // tells draw_row to paint a plain dirty
+                                // dot so the branch still shows it has
+                                // uncommitted content.
+                                Some((0, 0, t.diff_added(), t.diff_deleted()))
                             } else {
                                 None
                             }

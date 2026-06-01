@@ -372,7 +372,16 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     // visual hint that the text continues, matches how VS Code /
     // Finder truncate narrow sidebar labels, and avoids the measure-
     // and-shrink loop that an ellipsis pass would need.
-    let badge_reserve: f32 = if cfg.badge.is_some() { 64.0 } else { 0.0 };
+    // A `(0, 0)` badge is the "dirty dot" signal — reserve only a sliver
+    // for the dot; any non-zero badge reserves room for the +N / -M text.
+    let badge_is_dot = matches!(cfg.badge, Some((0, 0, _, _)));
+    let badge_reserve: f32 = if badge_is_dot {
+        16.0
+    } else if cfg.badge.is_some() {
+        64.0
+    } else {
+        0.0
+    };
     let trailing_reserve = (cfg.trailing_count as f32) * 22.0;
     let label_right = rect.max.x - 8.0 - badge_reserve - trailing_reserve;
     let label_clip = Rect::from_min_max(
@@ -390,6 +399,16 @@ pub fn draw_row(ui: &mut Ui, cfg: RowConfig<'_>) -> RowResult {
     if let Some((added, deleted, add_color, del_color)) = cfg.badge {
         let trailing_reserve = (cfg.trailing_count as f32) * 22.0;
         let mut bx = rect.max.x - 10.0 - trailing_reserve;
+        // Dirty dot: changes present but no line stats (untracked binary
+        // / empty file). A small filled circle in the add colour so the
+        // branch still signals it has uncommitted content.
+        if added == 0 && deleted == 0 {
+            painter.circle_filled(
+                Pos2::new(bx - 4.0, rect.center().y),
+                3.0,
+                add_color,
+            );
+        }
         if deleted > 0 {
             let s = format!("-{deleted}");
             let galley = painter.layout_no_wrap(

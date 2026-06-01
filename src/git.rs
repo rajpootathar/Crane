@@ -185,7 +185,15 @@ pub fn status(repo: &Path) -> Option<GitStatus> {
         });
     }
 
-    let (added, deleted) = shortstat(repo).unwrap_or((0, 0));
+    let (mut added, deleted) = shortstat(repo).unwrap_or((0, 0));
+    // `git diff --shortstat HEAD` ignores untracked files, so a brand-new
+    // unstaged file would contribute nothing to the +/- counts and the
+    // Left Panel badge would stay blank even though the Changes panel
+    // lists the file. Fold each untracked text file's line count into
+    // `added` so the workspace row shows a `+N` indicator like any other
+    // addition. (`git add`ed new files already count — they're tracked in
+    // the index and picked up by the diff above.)
+    added += untracked_added_lines(repo, &changes);
     let ahead_behind = ahead_behind(repo);
     Some(GitStatus {
         branch,
@@ -194,6 +202,36 @@ pub fn status(repo: &Path) -> Option<GitStatus> {
         deleted,
         ahead_behind,
     })
+}
+
+/// Sum the line counts of every untracked file in `changes`, so newly
+/// created files contribute to the `added` total the same way `git`
+/// would count them as insertions once added. Binary files (those with
+/// a NUL byte) are skipped — counting "lines" there is meaningless, and
+/// `git` reports them as `Bin` rather than an insertion count.
+fn untracked_added_lines(repo: &Path, changes: &[FileChange]) -> usize {
+    let mut total = 0usize;
+    for c in changes {
+        if c.status != ChangeStatus::Untracked {
+            continue;
+        }
+        let full = repo.join(&c.path);
+        let Ok(bytes) = std::fs::read(&full) else {
+            continue;
+        };
+        if bytes.is_empty() || bytes.contains(&0) {
+            continue;
+        }
+        // git counts each line, including a final line without a trailing
+        // newline. Newlines + 1 unless the file ends in a newline.
+        let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+        total += if bytes.last() == Some(&b'\n') {
+            newlines
+        } else {
+            newlines + 1
+        };
+    }
+    total
 }
 
 fn shortstat(repo: &Path) -> Option<(usize, usize)> {
