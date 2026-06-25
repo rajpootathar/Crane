@@ -4,10 +4,11 @@
 //! are placeholder content; the point is to prove the whole-app layout +
 //! theme render in warpui exactly like the egui version.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::split::SplitRow;
 use warpui::color::ColorU;
 use warpui::elements::{
     ChildView, ConstrainedBox, Container, DispatchEventResult, EventHandler, Expanded, Flex,
@@ -29,6 +30,8 @@ pub struct CraneShellView {
     /// Shared with the terminal view; a sidebar click writes the project
     /// path here and the terminal respawns there.
     requested_cwd: Rc<RefCell<Option<PathBuf>>>,
+    /// Center split ratio (terminal | files), draggable.
+    split_ratio: Rc<Cell<f32>>,
 }
 
 impl CraneShellView {
@@ -50,6 +53,7 @@ impl CraneShellView {
             terminal,
             projects,
             requested_cwd,
+            split_ratio: Rc::new(Cell::new(0.68)),
         }
     }
 
@@ -138,7 +142,7 @@ impl CraneShellView {
             for w in &p.worktrees {
                 col = col.with_child(self.nav_row(&w.name, 12.0, theme::ACCENT, 26.0, &w.path));
                 for t in &w.tabs {
-                    col = col.with_child(self.tree_row(t, 11.0, theme::TEXT_MUTED, 40.0));
+                    col = col.with_child(self.nav_row(t, 11.0, theme::TEXT_MUTED, 40.0, &w.path));
                 }
             }
         }
@@ -191,7 +195,24 @@ impl CraneShellView {
     }
 
     fn center(&self) -> Box<dyn Element> {
-        ChildView::new(&self.terminal).finish()
+        // Draggable split: terminal | files. Drag the strip between them.
+        SplitRow::new(
+            ChildView::new(&self.terminal).finish(),
+            self.files_pane(),
+            self.split_ratio.clone(),
+            theme::BORDER,
+        )
+        .finish()
+    }
+
+    fn files_pane(&self) -> Box<dyn Element> {
+        let content = Flex::column()
+            .with_child(self.header("FILES"))
+            .with_child(self.tree_row("src/", 13.0, theme::TEXT, 12.0))
+            .with_child(self.tree_row("Cargo.toml", 13.0, theme::TEXT_MUTED, 12.0))
+            .with_child(self.tree_row("README.md", 13.0, theme::TEXT_MUTED, 12.0))
+            .finish();
+        self.panel(theme::BG, content)
     }
 }
 

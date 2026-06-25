@@ -14,6 +14,7 @@ pub mod grid_element;
 pub mod input;
 pub mod projects;
 pub mod shell;
+pub mod split;
 pub mod theme;
 pub mod view;
 
