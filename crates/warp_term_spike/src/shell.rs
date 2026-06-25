@@ -34,7 +34,8 @@ pub struct CraneShellView {
     split_ratio: Rc<Cell<f32>>,
     /// Selected (project_idx, worktree_idx, tab_idx) — drives breadcrumb +
     /// row highlight. `tab_idx == usize::MAX` means the worktree row itself.
-    selected: Rc<RefCell<(usize, usize, usize)>>,
+    /// Plain view state: mutated in `handle_action` so warpui re-renders.
+    selected: (usize, usize, usize),
 }
 
 impl CraneShellView {
@@ -69,7 +70,7 @@ impl CraneShellView {
             projects,
             requested_cwd,
             split_ratio: Rc::new(Cell::new(0.68)),
-            selected: Rc::new(RefCell::new((0, 0, usize::MAX))),
+            selected: (0, 0, usize::MAX),
         }
     }
 
@@ -84,7 +85,7 @@ impl CraneShellView {
         path: &str,
         sel: (usize, usize, usize),
     ) -> Box<dyn Element> {
-        let is_sel = *self.selected.borrow() == sel;
+        let is_sel = self.selected == sel;
         let row_h = size + 8.0;
         // 3 layers, bottom -> top:
         //   1. highlight bar (colored only when selected)
@@ -115,13 +116,14 @@ impl CraneShellView {
         if path.is_empty() {
             return row;
         }
-        let cwd = self.requested_cwd.clone();
-        let selected = self.selected.clone();
         let target = PathBuf::from(path);
         EventHandler::new(row)
-            .on_left_mouse_down(move |_ctx, _app, _pos| {
-                *cwd.borrow_mut() = Some(target.clone());
-                *selected.borrow_mut() = sel;
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                // Route through a typed action so warpui re-renders the view.
+                ctx.dispatch_typed_action(CraneShellAction::Select {
+                    sel,
+                    path: target.clone(),
+                });
                 DispatchEventResult::StopPropagation
             })
             .finish()
@@ -183,7 +185,7 @@ impl CraneShellView {
                 12.0,
             ));
         }
-        let sel = *self.selected.borrow();
+        let sel = self.selected;
         for (pi, p) in self.projects.iter().enumerate() {
             let pkey = (pi, usize::MAX, usize::MAX);
             let pcol = if sel == pkey { theme::TEXT_HOVER } else { theme::TEXT };
@@ -220,7 +222,7 @@ impl CraneShellView {
     /// left ~84px is left empty so the traffic-light buttons have room
     /// (this region is the draggable titlebar), the breadcrumb follows.
     fn breadcrumb(&self) -> String {
-        let (pi, wi, ti) = *self.selected.borrow();
+        let (pi, wi, ti) = self.selected;
         let mut parts: Vec<String> = Vec::new();
         if let Some(p) = self.projects.get(pi) {
             parts.push(p.name.clone());
@@ -322,9 +324,23 @@ impl View for CraneShellView {
 }
 
 #[derive(Debug, Clone)]
-pub enum CraneShellAction {}
+pub enum CraneShellAction {
+    Select {
+        sel: (usize, usize, usize),
+        path: PathBuf,
+    },
+}
 
 impl TypedActionView for CraneShellView {
     type Action = CraneShellAction;
-    fn handle_action(&mut self, _action: &Self::Action, _ctx: &mut ViewContext<Self>) {}
+    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
+        match action {
+            CraneShellAction::Select { sel, path } => {
+                self.selected = *sel;
+                *self.requested_cwd.borrow_mut() = Some(path.clone());
+                // Mark the view dirty so warpui re-renders (highlight + crumb).
+                ctx.notify();
+            }
+        }
+    }
 }
