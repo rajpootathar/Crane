@@ -62,6 +62,10 @@ assets = [
 [dependencies]
 eframe = { version = "0.34", features = ["wgpu", "persistence"] }
 egui = "0.34"
+# Warp's MIT-licensed GPU UI framework (vendored under vendor/warp). The
+# egui -> warpui migration builds the new GUI against this while egui still
+# compiles, so both frontends coexist until the swap is complete.
+warpui = { path = "vendor/warp/crates/warpui" }
 # In-house terminal core. Owns VT parsing, grid, scrollback, and
 # the linefeed routing that fixes TUI scrollback duplication
 # (Claude Code splash etc.). Replaces alacritty_terminal entirely.

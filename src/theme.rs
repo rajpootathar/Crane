@@ -25,6 +25,11 @@ impl Rgb {
     pub fn to_color32(self) -> Color32 {
         Color32::from_rgb(self.r, self.g, self.b)
     }
+    /// warpui equivalent of `to_color32`. Used by the warpui frontend during
+    /// the egui -> warpui migration; both coexist until egui is removed.
+    pub fn to_warp(self) -> warpui::color::ColorU {
+        warpui::color::ColorU::new(self.r, self.g, self.b, 255)
+    }
 }
 
 /// A named colour palette covering every surface Crane paints itself.
