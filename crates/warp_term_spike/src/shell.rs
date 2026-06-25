@@ -38,6 +38,8 @@ pub struct CraneShellView {
     /// row highlight. `tab_idx == usize::MAX` means the worktree row itself.
     /// Plain view state: mutated in `handle_action` so warpui re-renders.
     selected: (usize, usize, usize),
+    show_left: bool,
+    show_right: bool,
 }
 
 impl CraneShellView {
@@ -82,6 +84,8 @@ impl CraneShellView {
             requested_cwd,
             split_ratio: Rc::new(Cell::new(0.68)),
             selected: (0, 0, usize::MAX),
+            show_left: true,
+            show_right: true,
         }
     }
 
@@ -91,6 +95,49 @@ impl CraneShellView {
     fn icon(&self, glyph: &str, size: f32, color: ColorU) -> Box<dyn Element> {
         Text::new(glyph.to_string(), self.icon_font, size)
             .with_color(color)
+            .finish()
+    }
+
+    /// A bare icon button — Container records the hit + sizes to content.
+    fn icon_button(&self, glyph: &str, action: CraneShellAction) -> Box<dyn Element> {
+        let content = Container::new(self.icon(glyph, 15.0, theme::TEXT_MUTED))
+            .with_background_color(theme::TOPBAR_BG)
+            .with_uniform_padding(5.0)
+            .finish();
+        EventHandler::new(content)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    /// A labelled pill button (icon + text on a surface pill).
+    fn pill_button(&self, glyph: &str, label: &str, action: CraneShellAction) -> Box<dyn Element> {
+        let inner = Flex::row()
+            .with_child(
+                Container::new(self.icon(glyph, 12.0, theme::TEXT_MUTED))
+                    .with_padding_right(5.0)
+                    .finish(),
+            )
+            .with_child(
+                Text::new(label.to_string(), self.ui_font, 12.0)
+                    .with_color(theme::TEXT_MUTED)
+                    .finish(),
+            )
+            .finish();
+        let content = Container::new(inner)
+            .with_background_color(theme::SURFACE)
+            .with_padding_left(10.0)
+            .with_padding_right(10.0)
+            .with_padding_top(4.0)
+            .with_padding_bottom(4.0)
+            .finish();
+        EventHandler::new(content)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
             .finish()
     }
 
@@ -302,16 +349,33 @@ impl CraneShellView {
         }
     }
 
+    fn spacer(w: f32) -> Box<dyn Element> {
+        ConstrainedBox::new(Rect::new().finish()).with_width(w).finish()
+    }
+
     fn top_bar(&self) -> Box<dyn Element> {
-        let content = Container::new(
+        let crumb = Container::new(
             Text::new(self.breadcrumb(), self.ui_font, 12.0)
                 .with_color(theme::TEXT_MUTED)
                 .finish(),
         )
-        .with_padding_left(84.0)
-        .with_padding_top(8.0)
+        .with_padding_left(6.0)
+        .with_padding_top(9.0)
         .finish();
-        ConstrainedBox::new(self.panel(theme::TOPBAR_BG, content))
+        let row = Flex::row()
+            .with_child(Self::spacer(80.0)) // macOS traffic-light inset
+            .with_child(self.icon_button(icons::SIDEBAR, CraneShellAction::ToggleLeft))
+            .with_child(crumb)
+            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+            .with_child(self.pill_button(icons::TERMINAL_WINDOW, "Terminal", CraneShellAction::Noop))
+            .with_child(Self::spacer(6.0))
+            .with_child(self.pill_button(icons::GLOBE, "Browser", CraneShellAction::Noop))
+            .with_child(Self::spacer(8.0))
+            .with_child(self.icon_button(icons::GIT_BRANCH, CraneShellAction::Noop))
+            .with_child(self.icon_button(icons::SIDEBAR, CraneShellAction::ToggleRight))
+            .with_child(Self::spacer(8.0))
+            .finish();
+        ConstrainedBox::new(self.panel(theme::TOPBAR_BG, row))
             .with_height(theme::TOPBAR_H)
             .finish()
     }
@@ -362,13 +426,15 @@ impl View for CraneShellView {
     }
 
     fn render(&self, _ctx: &AppContext) -> Box<dyn Element> {
-        let body = Flex::row()
-            .with_child(self.left_sidebar())
-            .with_child(self.divider())
-            .with_child(Expanded::new(1.0, self.center()).finish())
-            .with_child(self.divider())
-            .with_child(self.right_sidebar())
-            .finish();
+        let mut body = Flex::row();
+        if self.show_left {
+            body = body.with_child(self.left_sidebar()).with_child(self.divider());
+        }
+        body = body.with_child(Expanded::new(1.0, self.center()).finish());
+        if self.show_right {
+            body = body.with_child(self.divider()).with_child(self.right_sidebar());
+        }
+        let body = body.finish();
 
         let column = Flex::column()
             .with_child(self.top_bar())
@@ -405,6 +471,9 @@ pub enum CraneShellAction {
         sel: (usize, usize, usize),
         path: PathBuf,
     },
+    ToggleLeft,
+    ToggleRight,
+    Noop,
 }
 
 impl TypedActionView for CraneShellView {
@@ -414,9 +483,12 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::Select { sel, path } => {
                 self.selected = *sel;
                 *self.requested_cwd.borrow_mut() = Some(path.clone());
-                // Mark the view dirty so warpui re-renders (highlight + crumb).
-                ctx.notify();
             }
+            CraneShellAction::ToggleLeft => self.show_left = !self.show_left,
+            CraneShellAction::ToggleRight => self.show_right = !self.show_right,
+            CraneShellAction::Noop => {}
         }
+        // Mark the view dirty so warpui re-renders.
+        ctx.notify();
     }
 }
