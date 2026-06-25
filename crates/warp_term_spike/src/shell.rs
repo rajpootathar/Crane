@@ -86,19 +86,31 @@ impl CraneShellView {
     ) -> Box<dyn Element> {
         let is_sel = *self.selected.borrow() == sel;
         let row_h = size + 8.0;
-        // A hit-recording Rect spanning the full row — without this the
-        // EventHandler gets no clicks (Text records no hit geometry). Doubles
-        // as the selection highlight bar.
+        // 3 layers, bottom -> top:
+        //   1. highlight bar (colored only when selected)
+        //   2. the label text
+        //   3. a TRANSPARENT hit-recording Rect on top — this MUST be the
+        //      topmost layer, because the EventHandler hit-tests at the
+        //      child's *max* z-index. (Text records no hit geometry, and a
+        //      hit Rect placed below the text sits under that max-z and is
+        //      never found.) Transparent so the text shows through.
         let mut bg = Rect::new();
         if is_sel {
             bg = bg.with_background_color(theme::ROW_ACTIVE);
         }
-        let hit = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
+        let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
         let label = Container::new(Text::new(text.to_string(), self.ui_font, size).with_color(color).finish())
             .with_padding_left(pad)
             .with_padding_top(4.0)
             .finish();
-        let row = Stack::new().with_child(hit).with_child(label).finish();
+        let hit_layer = ConstrainedBox::new(Rect::new().finish())
+            .with_height(row_h)
+            .finish();
+        let row = Stack::new()
+            .with_child(bg_layer)
+            .with_child(label)
+            .with_child(hit_layer)
+            .finish();
 
         if path.is_empty() {
             return row;
