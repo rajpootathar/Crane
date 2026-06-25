@@ -84,14 +84,29 @@ impl CraneShellView {
         path: &str,
         sel: (usize, usize, usize),
     ) -> Box<dyn Element> {
-        let inner = self.tree_row(text, size, color, pad);
+        let is_sel = *self.selected.borrow() == sel;
+        let row_h = size + 8.0;
+        // A hit-recording Rect spanning the full row — without this the
+        // EventHandler gets no clicks (Text records no hit geometry). Doubles
+        // as the selection highlight bar.
+        let mut bg = Rect::new();
+        if is_sel {
+            bg = bg.with_background_color(theme::ROW_ACTIVE);
+        }
+        let hit = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
+        let label = Container::new(Text::new(text.to_string(), self.ui_font, size).with_color(color).finish())
+            .with_padding_left(pad)
+            .with_padding_top(4.0)
+            .finish();
+        let row = Stack::new().with_child(hit).with_child(label).finish();
+
         if path.is_empty() {
-            return inner;
+            return row;
         }
         let cwd = self.requested_cwd.clone();
         let selected = self.selected.clone();
         let target = PathBuf::from(path);
-        EventHandler::new(inner)
+        EventHandler::new(row)
             .on_left_mouse_down(move |_ctx, _app, _pos| {
                 *cwd.borrow_mut() = Some(target.clone());
                 *selected.borrow_mut() = sel;
