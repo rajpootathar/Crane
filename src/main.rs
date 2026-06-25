@@ -418,7 +418,7 @@ impl eframe::App for CraneApp {
                 ws.close_focused();
             }
         }
-        self.app.refresh_active_git_status(&ctx);
+        self.app.refresh_active_git_status(&crate::state::wake_from_egui(&ctx));
         // If the user just turned off a language in Settings, stop its
         // server process now instead of waiting for app exit. Cheap no-op
         // when every running server is still enabled.

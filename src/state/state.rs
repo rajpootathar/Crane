@@ -1647,7 +1647,7 @@ impl App {
         &self,
         kind: GitOpKind,
         repo: std::path::PathBuf,
-        ctx: egui::Context,
+        wake: crate::state::WakeHandle,
         commit_message: Option<String>,
     ) {
         {
@@ -1678,7 +1678,7 @@ impl App {
                             "Nothing to push (up to date)".into()
                         },
                     };
-                    ctx.request_repaint();
+                    wake();
                     return;
                 }
                 if kind == GitOpKind::Pull && ab.behind == 0 {
@@ -1687,14 +1687,14 @@ impl App {
                         repo: repo.clone(),
                         message: "Already up to date".into(),
                     };
-                    ctx.request_repaint();
+                    wake();
                     return;
                 }
             }
         }
 
         let status = self.git_op_status.clone();
-        let ctx2 = ctx.clone();
+        let wake2 = wake.clone();
         let repo_for_thread = repo.clone();
         std::thread::spawn(move || {
             let result: Result<String, String> = match kind {
@@ -1729,7 +1729,7 @@ impl App {
                 },
             };
             drop(guard);
-            ctx2.request_repaint();
+            wake2();
         });
     }
 
@@ -2247,7 +2247,7 @@ impl App {
         self.last_workspace = Some((pid, wid));
     }
 
-    pub fn refresh_active_git_status(&mut self, ctx: &egui::Context) {
+    pub fn refresh_active_git_status(&mut self, wake: &crate::state::WakeHandle) {
         let now = Instant::now();
         let active_wid = self.active.map(|(_, w, _)| w);
         // With FileWatcher live, real changes invalidate `last_status_refresh`
@@ -2260,10 +2260,7 @@ impl App {
         // Lazy-init JobSystem + FileWatcher together. A session with no
         // projects pays zero thread cost.
         if self.jobs.is_none() {
-            let ctx_clone = ctx.clone();
-            let repaint: Arc<dyn Fn() + Send + Sync> =
-                Arc::new(move || ctx_clone.request_repaint());
-            let js = JobSystem::new(Some(repaint));
+            let js = JobSystem::new(Some(wake.clone()));
             crate::jobs::install(Arc::clone(&js));
             self.jobs = Some(js);
         }

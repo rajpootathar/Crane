@@ -290,7 +290,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                 app.dispatch_git_op(
                     GitOpKind::Fetch,
                     repo_path.clone(),
-                    ui.ctx().clone(),
+                    crate::state::wake_from_egui(ui.ctx()),
                     None,
                 );
             }
@@ -304,7 +304,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                 app.dispatch_git_op(
                     GitOpKind::Pull,
                     repo_path.clone(),
-                    ui.ctx().clone(),
+                    crate::state::wake_from_egui(ui.ctx()),
                     None,
                 );
             }
@@ -318,7 +318,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
                 app.dispatch_git_op(
                     GitOpKind::Push,
                     repo_path.clone(),
-                    ui.ctx().clone(),
+                    crate::state::wake_from_egui(ui.ctx()),
                     None,
                 );
             }
@@ -584,7 +584,7 @@ fn render_changes(ui: &mut egui::Ui, app: &mut App) {
         app.dispatch_git_op(
             GitOpKind::Commit,
             repo_path.clone(),
-            ui.ctx().clone(),
+            crate::state::wake_from_egui(ui.ctx()),
             Some(msg),
         );
         app.commit_message.clear();

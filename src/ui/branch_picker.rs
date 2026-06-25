@@ -389,7 +389,7 @@ pub fn render(ctx: &egui::Context, app: &mut App) {
                     wt.name = branch.clone();
                 }
                 app.branch_picker.error = None;
-                app.refresh_active_git_status(ctx);
+                app.refresh_active_git_status(&crate::state::wake_from_egui(ctx));
                 // Close the picker on success — user sees the status
                 // bar flip to the new branch and knows it worked.
                 app.branch_picker.open = false;
