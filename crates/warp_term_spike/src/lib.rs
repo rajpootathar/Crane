@@ -11,6 +11,7 @@ use warpui::AssetProvider;
 pub mod color;
 pub mod controller;
 pub mod grid_element;
+pub mod icons;
 pub mod input;
 pub mod projects;
 pub mod shell;

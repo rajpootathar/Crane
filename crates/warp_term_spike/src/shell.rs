@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::icons;
 use crate::split::SplitRow;
 use warpui::color::ColorU;
 use warpui::elements::{
@@ -25,6 +26,7 @@ use crate::view::TerminalView;
 
 pub struct CraneShellView {
     ui_font: FamilyId,
+    icon_font: FamilyId,
     terminal: ViewHandle<TerminalView>,
     projects: Vec<crate::projects::ProjectNode>,
     /// Shared with the terminal view; a sidebar click writes the project
@@ -46,6 +48,14 @@ impl CraneShellView {
                 .or_else(|_| cache.load_system_font("Menlo"))
                 .expect("load ui font")
         });
+        let icon_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
+            cache
+                .load_family_from_bytes(
+                    "phosphor",
+                    vec![include_bytes!("../assets/Phosphor.ttf").to_vec()],
+                )
+                .expect("load phosphor")
+        });
         let projects = crate::projects::load_projects();
         // Default the terminal to the first project's first worktree folder.
         let default_cwd = projects
@@ -66,6 +76,7 @@ impl CraneShellView {
         };
         Self {
             ui_font,
+            icon_font,
             terminal,
             projects,
             requested_cwd,
@@ -76,8 +87,18 @@ impl CraneShellView {
 
     /// A clickable project/worktree row — clicking respawns the terminal in
     /// `path` (empty path = non-clickable, e.g. a tab label).
+    /// A phosphor icon glyph rendered as Text in the icon font.
+    fn icon(&self, glyph: &str, size: f32, color: ColorU) -> Box<dyn Element> {
+        Text::new(glyph.to_string(), self.icon_font, size)
+            .with_color(color)
+            .finish()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn nav_row(
         &self,
+        icon_glyph: &str,
+        icon_color: ColorU,
         text: &str,
         size: f32,
         color: ColorU,
@@ -100,7 +121,19 @@ impl CraneShellView {
             bg = bg.with_background_color(theme::ROW_ACTIVE);
         }
         let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
-        let label = Container::new(Text::new(text.to_string(), self.ui_font, size).with_color(color).finish())
+        let label_inner = Flex::row()
+            .with_child(
+                Container::new(self.icon(icon_glyph, size, icon_color))
+                    .with_padding_right(6.0)
+                    .finish(),
+            )
+            .with_child(
+                Text::new(text.to_string(), self.ui_font, size)
+                    .with_color(color)
+                    .finish(),
+            )
+            .finish();
+        let label = Container::new(label_inner)
             .with_padding_left(pad)
             .with_padding_top(4.0)
             .finish();
@@ -189,15 +222,42 @@ impl CraneShellView {
         for (pi, p) in self.projects.iter().enumerate() {
             let pkey = (pi, usize::MAX, usize::MAX);
             let pcol = if sel == pkey { theme::TEXT_HOVER } else { theme::TEXT };
-            col = col.with_child(self.nav_row(&p.name, 13.0, pcol, 12.0, &p.path, pkey));
+            col = col.with_child(self.nav_row(
+                icons::CUBE,
+                project_tint(pi),
+                &p.name,
+                13.0,
+                pcol,
+                12.0,
+                &p.path,
+                pkey,
+            ));
             for (wi, w) in p.worktrees.iter().enumerate() {
                 let wkey = (pi, wi, usize::MAX);
                 let wcol = if sel == wkey { theme::TEXT_HOVER } else { theme::ACCENT };
-                col = col.with_child(self.nav_row(&w.name, 12.0, wcol, 26.0, &w.path, wkey));
+                col = col.with_child(self.nav_row(
+                    icons::GIT_BRANCH,
+                    wcol,
+                    &w.name,
+                    12.0,
+                    wcol,
+                    26.0,
+                    &w.path,
+                    wkey,
+                ));
                 for (ti, t) in w.tabs.iter().enumerate() {
                     let tkey = (pi, wi, ti);
                     let tcol = if sel == tkey { theme::TEXT_HOVER } else { theme::TEXT_MUTED };
-                    col = col.with_child(self.nav_row(t, 11.0, tcol, 40.0, &w.path, tkey));
+                    col = col.with_child(self.nav_row(
+                        icons::TERMINAL_WINDOW,
+                        tcol,
+                        t,
+                        11.0,
+                        tcol,
+                        40.0,
+                        &w.path,
+                        tkey,
+                    ));
                 }
             }
         }
@@ -321,6 +381,22 @@ impl View for CraneShellView {
             .with_child(column)
             .finish()
     }
+}
+
+/// Distinct per-project icon tint (stand-in until session.json tints are read).
+fn project_tint(idx: usize) -> ColorU {
+    const P: [(u8, u8, u8); 8] = [
+        (232, 146, 42),
+        (68, 170, 153),
+        (170, 102, 204),
+        (90, 135, 220),
+        (204, 119, 221),
+        (119, 204, 204),
+        (232, 108, 108),
+        (120, 200, 120),
+    ];
+    let (r, g, b) = P[idx % 8];
+    ColorU::new(r, g, b, 255)
 }
 
 #[derive(Debug, Clone)]
