@@ -3,6 +3,23 @@
 > Generated from a multi-agent inventory of the egui UI + theme system.
 > Constraint: keep model/state/theme/Layout-Pane tree and shortcuts 1:1; rewrite only the rendering layer (egui → warpui), preserving the same panels, layout, and visual design.
 
+---
+
+## STATUS — updated after the 100% line-by-line audit
+
+A full line-by-line audit of the egui Crane (~34,700 lines, 14 subsystems) is complete. The exhaustive per-pane build spec now lives in **`warpui-1to1-spec.md`** (every struct/field, UI element with icon/color/dimension, interaction, state, and warpui approach). The ordered build checklist is in **`warpui-1to1-punchlist.md`**. This plan remains the structural strategy; the two companion docs are the source of truth for *what* to build.
+
+**Aggregate port status: ~5–8% by feature.** Foundations proven (warpui renders + links into crane, terminal pane done, layout/theme tokens, the click → `dispatch_typed_action` → `ctx.notify()` reactive pattern). Almost no IDE *behavior* is ported yet.
+
+**The 3 biggest pieces of work (from the audit):**
+1. **Recursive `Layout`/`Node` pane tree + per-tab layouts** — replace the hardcoded `SplitRow` center; everything (pane headers, focus, split, close, dock-drag, tab switching) hangs off this.
+2. **Real git data layer + the whole Changes/Files right panel** — no git module in the spike yet; right panel is a static mock. Needs ported `git.rs`, recursive FS tree, staging, commit box, diff-on-click, and the 3-column **Git Log dock** (refs | graph | details).
+3. **Mutable in-memory project/session model + drag-drop reordering** — `load_projects()` is a read-only snapshot; left-panel rename/tint/reorder/expand and right-panel refresh need a live mutable model with write-back to `~/.crane/session.json`.
+
+**Single most important next item:** load the `egui_phosphor` TTF as a warpui `FamilyId` + add an icon-glyph and clickable-button helper — nothing reaches visual parity without icons, and ~70% of remaining gaps render at least one phosphor glyph.
+
+**Recommended execution order:** FOUND-1..6 (icons, button primitive, hover, mutable session model, app keyboard handler, full theme model) → Center recursive Node tree + tabs + headers → Left project tree → Right Changes/Files → top/status bars → modals + branch picker + Git Log dock → doc panes → file editor (rope-based, hardest).
+
 I have what I need. The codebase confirms the inventories: `ui()` override at main.rs:324, `persist_window: true`, the two multiline-TextEdit sites (`file_view.rs` is the real editor, `explorer.rs` is the commit box), and the full src tree. The fourth inventory ("doc-panes") is a stub, so I'll treat doc-panes / views from the actual tree rather than the placeholder data. Here is the master plan.
 
 ---
