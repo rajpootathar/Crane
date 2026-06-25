@@ -32,6 +32,9 @@ pub struct CraneShellView {
     requested_cwd: Rc<RefCell<Option<PathBuf>>>,
     /// Center split ratio (terminal | files), draggable.
     split_ratio: Rc<Cell<f32>>,
+    /// Selected (project_idx, worktree_idx, tab_idx) — drives breadcrumb +
+    /// row highlight. `tab_idx == usize::MAX` means the worktree row itself.
+    selected: Rc<RefCell<(usize, usize, usize)>>,
 }
 
 impl CraneShellView {
@@ -42,18 +45,31 @@ impl CraneShellView {
                 .or_else(|_| cache.load_system_font("Menlo"))
                 .expect("load ui font")
         });
-        let requested_cwd: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+        let projects = crate::projects::load_projects();
+        // Default the terminal to the first project's first worktree folder.
+        let default_cwd = projects
+            .first()
+            .map(|p| {
+                p.worktrees
+                    .first()
+                    .map(|w| w.path.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| p.path.clone())
+            })
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let requested_cwd: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(default_cwd));
         let terminal = {
             let rc = requested_cwd.clone();
             ctx.add_view(move |ctx| TerminalView::new_with(ctx, rc))
         };
-        let projects = crate::projects::load_projects();
         Self {
             ui_font,
             terminal,
             projects,
             requested_cwd,
             split_ratio: Rc::new(Cell::new(0.68)),
+            selected: Rc::new(RefCell::new((0, 0, usize::MAX))),
         }
     }
 
@@ -66,16 +82,19 @@ impl CraneShellView {
         color: ColorU,
         pad: f32,
         path: &str,
+        sel: (usize, usize, usize),
     ) -> Box<dyn Element> {
         let inner = self.tree_row(text, size, color, pad);
         if path.is_empty() {
             return inner;
         }
         let cwd = self.requested_cwd.clone();
+        let selected = self.selected.clone();
         let target = PathBuf::from(path);
         EventHandler::new(inner)
             .on_left_mouse_down(move |_ctx, _app, _pos| {
                 *cwd.borrow_mut() = Some(target.clone());
+                *selected.borrow_mut() = sel;
                 DispatchEventResult::StopPropagation
             })
             .finish()
@@ -137,12 +156,19 @@ impl CraneShellView {
                 12.0,
             ));
         }
-        for p in &self.projects {
-            col = col.with_child(self.nav_row(&p.name, 13.0, theme::TEXT, 12.0, &p.path));
-            for w in &p.worktrees {
-                col = col.with_child(self.nav_row(&w.name, 12.0, theme::ACCENT, 26.0, &w.path));
-                for t in &w.tabs {
-                    col = col.with_child(self.nav_row(t, 11.0, theme::TEXT_MUTED, 40.0, &w.path));
+        let sel = *self.selected.borrow();
+        for (pi, p) in self.projects.iter().enumerate() {
+            let pkey = (pi, usize::MAX, usize::MAX);
+            let pcol = if sel == pkey { theme::TEXT_HOVER } else { theme::TEXT };
+            col = col.with_child(self.nav_row(&p.name, 13.0, pcol, 12.0, &p.path, pkey));
+            for (wi, w) in p.worktrees.iter().enumerate() {
+                let wkey = (pi, wi, usize::MAX);
+                let wcol = if sel == wkey { theme::TEXT_HOVER } else { theme::ACCENT };
+                col = col.with_child(self.nav_row(&w.name, 12.0, wcol, 26.0, &w.path, wkey));
+                for (ti, t) in w.tabs.iter().enumerate() {
+                    let tkey = (pi, wi, ti);
+                    let tcol = if sel == tkey { theme::TEXT_HOVER } else { theme::TEXT_MUTED };
+                    col = col.with_child(self.nav_row(t, 11.0, tcol, 40.0, &w.path, tkey));
                 }
             }
         }
@@ -166,9 +192,30 @@ impl CraneShellView {
     /// Unified full-width top bar that doubles as the macOS titlebar: the
     /// left ~84px is left empty so the traffic-light buttons have room
     /// (this region is the draggable titlebar), the breadcrumb follows.
+    fn breadcrumb(&self) -> String {
+        let (pi, wi, ti) = *self.selected.borrow();
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(p) = self.projects.get(pi) {
+            parts.push(p.name.clone());
+            if let Some(w) = p.worktrees.get(wi) {
+                parts.push(w.name.clone());
+                if ti != usize::MAX {
+                    if let Some(t) = w.tabs.get(ti) {
+                        parts.push(t.clone());
+                    }
+                }
+            }
+        }
+        if parts.is_empty() {
+            "Crane".to_string()
+        } else {
+            parts.join("  /  ")
+        }
+    }
+
     fn top_bar(&self) -> Box<dyn Element> {
         let content = Container::new(
-            Text::new("crane  /  main  /  terminal", self.ui_font, 12.0)
+            Text::new(self.breadcrumb(), self.ui_font, 12.0)
                 .with_color(theme::TEXT_MUTED)
                 .finish(),
         )

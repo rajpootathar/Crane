@@ -16,6 +16,7 @@ pub const SURFACE: ColorU = c(40, 45, 60);
 pub const BORDER: ColorU = c(60, 66, 86);
 pub const DIVIDER: ColorU = c(36, 40, 52);
 pub const TEXT: ColorU = c(212, 216, 228);
+pub const TEXT_HOVER: ColorU = c(234, 238, 248);
 pub const TEXT_MUTED: ColorU = c(150, 156, 172);
 pub const TEXT_HEADER: ColorU = c(140, 146, 162);
 pub const ACCENT: ColorU = c(90, 135, 220);
