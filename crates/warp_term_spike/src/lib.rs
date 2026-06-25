@@ -12,6 +12,7 @@ pub mod color;
 pub mod controller;
 pub mod grid_element;
 pub mod input;
+pub mod projects;
 pub mod shell;
 pub mod theme;
 pub mod view;

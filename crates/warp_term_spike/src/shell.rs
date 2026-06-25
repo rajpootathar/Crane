@@ -19,6 +19,7 @@ use crate::view::TerminalView;
 pub struct CraneShellView {
     ui_font: FamilyId,
     terminal: ViewHandle<TerminalView>,
+    projects: Vec<crate::projects::ProjectNode>,
 }
 
 impl CraneShellView {
@@ -30,7 +31,12 @@ impl CraneShellView {
                 .expect("load ui font")
         });
         let terminal = ctx.add_view(TerminalView::new);
-        Self { ui_font, terminal }
+        let projects = crate::projects::load_projects();
+        Self {
+            ui_font,
+            terminal,
+            projects,
+        }
     }
 
     fn panel(&self, bg: warpui::color::ColorU, content: Box<dyn Element>) -> Box<dyn Element> {
@@ -58,6 +64,19 @@ impl CraneShellView {
             .finish()
     }
 
+    /// A project-tree row at a given indent (owns its text — from session.json).
+    fn tree_row(&self, text: &str, size: f32, color: warpui::color::ColorU, pad_left: f32) -> Box<dyn Element> {
+        Container::new(
+            Text::new(text.to_string(), self.ui_font, size)
+                .with_color(color)
+                .finish(),
+        )
+        .with_padding_left(pad_left)
+        .with_padding_top(2.0)
+        .with_padding_bottom(2.0)
+        .finish()
+    }
+
     fn divider(&self) -> Box<dyn Element> {
         ConstrainedBox::new(Rect::new().with_background_color(theme::DIVIDER).finish())
             .with_width(1.0)
@@ -65,13 +84,27 @@ impl CraneShellView {
     }
 
     fn left_sidebar(&self) -> Box<dyn Element> {
-        let content = Flex::column()
-            .with_child(self.header("PROJECTS"))
-            .with_child(self.row("crane", theme::TEXT))
-            .with_child(self.row("superset", theme::TEXT_MUTED))
-            .with_child(self.row("homeopathy_auto", theme::TEXT_MUTED))
-            .finish();
-        ConstrainedBox::new(self.panel(theme::SIDEBAR_BG, content))
+        // Real project tree loaded from ~/.crane/session.json: the user's
+        // actual projects -> worktrees (branches) -> tabs.
+        let mut col = Flex::column().with_child(self.header("PROJECTS"));
+        if self.projects.is_empty() {
+            col = col.with_child(self.tree_row(
+                "(no ~/.crane/session.json)",
+                12.0,
+                theme::TEXT_MUTED,
+                12.0,
+            ));
+        }
+        for p in &self.projects {
+            col = col.with_child(self.tree_row(&p.name, 13.0, theme::TEXT, 12.0));
+            for w in &p.worktrees {
+                col = col.with_child(self.tree_row(&w.name, 12.0, theme::ACCENT, 26.0));
+                for t in &w.tabs {
+                    col = col.with_child(self.tree_row(t, 11.0, theme::TEXT_MUTED, 40.0));
+                }
+            }
+        }
+        ConstrainedBox::new(self.panel(theme::SIDEBAR_BG, col.finish()))
             .with_width(theme::LEFT_W)
             .finish()
     }
