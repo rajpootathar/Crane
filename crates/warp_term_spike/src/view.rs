@@ -30,23 +30,38 @@ pub struct TerminalView {
     /// applied here on the next frame (decouples &mut resize from the
     /// immutable layout/paint borrow).
     desired: Rc<StdCell<Option<(usize, usize)>>>,
+    /// Project cwd requested by a sidebar click; render respawns the
+    /// terminal here when it differs from `current_cwd`.
+    requested_cwd: Rc<RefCell<Option<std::path::PathBuf>>>,
+    current_cwd: RefCell<Option<std::path::PathBuf>>,
+    /// Repaint waker, reused when respawning the controller.
+    wake: Wake,
     _repaint: SpawnedLocalStream,
 }
 
 impl TerminalView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
+        Self::new_with(ctx, Rc::new(RefCell::new(None)))
+    }
+
+    /// Like `new`, but driven by a shared `requested_cwd` the shell sets when
+    /// the user clicks a project — the terminal respawns in that directory.
+    pub fn new_with(
+        ctx: &mut ViewContext<Self>,
+        requested_cwd: Rc<RefCell<Option<std::path::PathBuf>>>,
+    ) -> Self {
         let font_family = warpui::fonts::Cache::handle(ctx)
             .update(ctx, |cache, _| cache.load_system_font("Menlo").expect("load Menlo"));
         ctx.focus_self();
 
         // Reader thread -> async channel -> ctx.notify() repaint. Bounded(1)
-        // so a burst of wakes coalesces into a single pending repaint instead
-        // of growing an unbounded queue under heavy output.
+        // so a burst of wakes coalesces into a single pending repaint.
         let (tx, rx) = async_channel::bounded::<()>(1);
         let wake: Wake = Arc::new(move || {
             let _ = tx.try_send(());
         });
-        let controller = TerminalController::new(80, 24, None, wake).expect("spawn terminal");
+        let controller =
+            TerminalController::new(80, 24, None, wake.clone()).expect("spawn terminal");
         let repaint =
             ctx.spawn_stream_local(rx, |_this, _item, ctx| ctx.notify(), |_this, _ctx| {});
 
@@ -54,6 +69,9 @@ impl TerminalView {
             font_family,
             controller: Rc::new(RefCell::new(controller)),
             desired: Rc::new(StdCell::new(None)),
+            requested_cwd,
+            current_cwd: RefCell::new(None),
+            wake,
             _repaint: repaint,
         }
     }
@@ -69,6 +87,21 @@ impl View for TerminalView {
     }
 
     fn render(&self, _ctx: &AppContext) -> Box<dyn Element> {
+        // Respawn the terminal in a newly-selected project directory.
+        {
+            let req = self.requested_cwd.borrow().clone();
+            if req != *self.current_cwd.borrow() {
+                if let Some(path) = req.as_ref() {
+                    if let Ok(c) =
+                        TerminalController::new(80, 24, Some(path.as_path()), self.wake.clone())
+                    {
+                        *self.controller.borrow_mut() = c;
+                    }
+                }
+                *self.current_cwd.borrow_mut() = req;
+            }
+        }
+
         // Apply a resize requested by the previous frame's layout pass.
         if let Some((c, r)) = self.desired.get() {
             let mut ctrl = self.controller.borrow_mut();

@@ -6,11 +6,13 @@
 
 pub struct WorktreeNode {
     pub name: String,
+    pub path: String,
     pub tabs: Vec<String>,
 }
 
 pub struct ProjectNode {
     pub name: String,
+    pub path: String,
     pub worktrees: Vec<WorktreeNode>,
 }
 
@@ -33,6 +35,11 @@ pub fn load_projects() -> Vec<ProjectNode> {
                 .and_then(|x| x.as_str())
                 .unwrap_or("(unnamed)")
                 .to_string();
+            let path = p
+                .get("path")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             let mut worktrees = Vec::new();
             if let Some(ws) = p.get("workspaces").and_then(|x| x.as_array()) {
                 for w in ws {
@@ -42,6 +49,11 @@ pub fn load_projects() -> Vec<ProjectNode> {
                         .filter(|s| !s.is_empty())
                         .or_else(|| w.get("name").and_then(|x| x.as_str()))
                         .unwrap_or("(branch)")
+                        .to_string();
+                    let wpath = w
+                        .get("path")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
                         .to_string();
                     let mut tabs = Vec::new();
                     if let Some(ts) = w.get("tabs").and_then(|x| x.as_array()) {
@@ -54,10 +66,18 @@ pub fn load_projects() -> Vec<ProjectNode> {
                             );
                         }
                     }
-                    worktrees.push(WorktreeNode { name: wname, tabs });
+                    worktrees.push(WorktreeNode {
+                        name: wname,
+                        path: wpath,
+                        tabs,
+                    });
                 }
             }
-            out.push(ProjectNode { name, worktrees });
+            out.push(ProjectNode {
+                name,
+                path,
+                worktrees,
+            });
         }
     }
     out

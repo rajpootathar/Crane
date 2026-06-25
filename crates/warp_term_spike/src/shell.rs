@@ -4,8 +4,14 @@
 //! are placeholder content; the point is to prove the whole-app layout +
 //! theme render in warpui exactly like the egui version.
 
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
+
+use warpui::color::ColorU;
 use warpui::elements::{
-    ChildView, ConstrainedBox, Container, Expanded, Flex, ParentElement, Rect, Stack, Text,
+    ChildView, ConstrainedBox, Container, DispatchEventResult, EventHandler, Expanded, Flex,
+    ParentElement, Rect, Stack, Text,
 };
 use warpui::fonts::FamilyId;
 use warpui::{
@@ -20,6 +26,9 @@ pub struct CraneShellView {
     ui_font: FamilyId,
     terminal: ViewHandle<TerminalView>,
     projects: Vec<crate::projects::ProjectNode>,
+    /// Shared with the terminal view; a sidebar click writes the project
+    /// path here and the terminal respawns there.
+    requested_cwd: Rc<RefCell<Option<PathBuf>>>,
 }
 
 impl CraneShellView {
@@ -30,13 +39,42 @@ impl CraneShellView {
                 .or_else(|_| cache.load_system_font("Menlo"))
                 .expect("load ui font")
         });
-        let terminal = ctx.add_view(TerminalView::new);
+        let requested_cwd: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+        let terminal = {
+            let rc = requested_cwd.clone();
+            ctx.add_view(move |ctx| TerminalView::new_with(ctx, rc))
+        };
         let projects = crate::projects::load_projects();
         Self {
             ui_font,
             terminal,
             projects,
+            requested_cwd,
         }
+    }
+
+    /// A clickable project/worktree row — clicking respawns the terminal in
+    /// `path` (empty path = non-clickable, e.g. a tab label).
+    fn nav_row(
+        &self,
+        text: &str,
+        size: f32,
+        color: ColorU,
+        pad: f32,
+        path: &str,
+    ) -> Box<dyn Element> {
+        let inner = self.tree_row(text, size, color, pad);
+        if path.is_empty() {
+            return inner;
+        }
+        let cwd = self.requested_cwd.clone();
+        let target = PathBuf::from(path);
+        EventHandler::new(inner)
+            .on_left_mouse_down(move |_ctx, _app, _pos| {
+                *cwd.borrow_mut() = Some(target.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
     }
 
     fn panel(&self, bg: warpui::color::ColorU, content: Box<dyn Element>) -> Box<dyn Element> {
@@ -96,9 +134,9 @@ impl CraneShellView {
             ));
         }
         for p in &self.projects {
-            col = col.with_child(self.tree_row(&p.name, 13.0, theme::TEXT, 12.0));
+            col = col.with_child(self.nav_row(&p.name, 13.0, theme::TEXT, 12.0, &p.path));
             for w in &p.worktrees {
-                col = col.with_child(self.tree_row(&w.name, 12.0, theme::ACCENT, 26.0));
+                col = col.with_child(self.nav_row(&w.name, 12.0, theme::ACCENT, 26.0, &w.path));
                 for t in &w.tabs {
                     col = col.with_child(self.tree_row(t, 11.0, theme::TEXT_MUTED, 40.0));
                 }
