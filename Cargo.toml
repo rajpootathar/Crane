@@ -4,6 +4,10 @@
 # root is implicitly a workspace member alongside whatever matches
 # `crates/*`.
 members = ["crates/*"]
+# `vendor/warp` is the Warp monorepo (its own workspace), pulled in as a
+# submodule so `warpui` can be path-depended on. Keep it out of Crane's
+# workspace so cargo treats warpui as an external path dependency.
+exclude = ["vendor"]
 
 [package]
 name = "crane"
@@ -181,3 +185,19 @@ opt-level = 3
 [profile.release]
 opt-level = 3
 strip = "symbols"
+
+# --- warpui (Warp) integration pins ---------------------------------------
+# Warp's `warpui` (vendored under vendor/warp) builds against a git-pinned
+# `font-kit` fork that requires the servo core-foundation-rs git revision for
+# core-graphics/core-text/core-foundation. Those pins live in Warp's own
+# workspace `[patch]`, which cargo ignores when building from Crane's
+# workspace — so without replicating them here the graph ends up with two
+# incompatible `core_graphics` versions and font-kit fails to compile.
+# Mirrors vendor/warp/Cargo.toml [patch.crates-io].
+[patch.crates-io]
+core-foundation = { git = "https://github.com/servo/core-foundation-rs", rev = "6f844cf1a1a18e25b70fcdf1bcdc458555bd2eff" }
+core-foundation-sys = { git = "https://github.com/servo/core-foundation-rs", rev = "6f844cf1a1a18e25b70fcdf1bcdc458555bd2eff" }
+core-graphics = { git = "https://github.com/servo/core-foundation-rs", rev = "6f844cf1a1a18e25b70fcdf1bcdc458555bd2eff" }
+core-text = { git = "https://github.com/servo/core-foundation-rs", rev = "6f844cf1a1a18e25b70fcdf1bcdc458555bd2eff" }
+objc = { git = "https://github.com/warpdotdev/rust-objc.git", rev = "5b656827fa9f863ef0eb22e444a3fedac009e78a" }
+pathfinder_simd = { git = "https://github.com/warpdotdev/pathfinder.git", rev = "34128a129ca6aee168fbc5060a4f21b4f7e486a9" }

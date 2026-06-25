@@ -1,0 +1,6 @@
+# warpui (vendor/warp) requires MACOSX_DEPLOYMENT_TARGET to be set at build
+# time — its build.rs pins the Metal AIR bytecode target to it. Warp sets this
+# in its own .cargo/config.toml, which cargo does NOT inherit when building
+# from Crane's workspace, so we replicate it here.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "10.14"
