@@ -664,9 +664,28 @@ impl View for CraneShellView {
             .with_child(self.status_bar())
             .finish();
 
-        Stack::new()
+        let root = Stack::new()
             .with_child(Rect::new().with_background_color(theme::BG).finish())
             .with_child(column)
+            .finish();
+
+        // App-level keyboard shortcuts. The terminal pane propagates Cmd combos
+        // up to here (its own on_keydown returns PropagateToParent for cmd).
+        EventHandler::new(root)
+            .on_keydown(|ctx, _app, ks| {
+                if ks.cmd && !ks.ctrl && !ks.alt {
+                    let act = match ks.key.as_str() {
+                        "b" => Some(CraneShellAction::ToggleLeft),
+                        "/" => Some(CraneShellAction::ToggleRight),
+                        _ => None,
+                    };
+                    if let Some(act) = act {
+                        ctx.dispatch_typed_action(act);
+                        return DispatchEventResult::StopPropagation;
+                    }
+                }
+                DispatchEventResult::PropagateToParent
+            })
             .finish()
     }
 }
