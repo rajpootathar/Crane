@@ -41,25 +41,27 @@ pub struct TerminalView {
 
 impl TerminalView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
-        Self::new_with(ctx, Rc::new(RefCell::new(None)))
+        let (tx, rx) = async_channel::bounded::<()>(1);
+        let wake: Wake = Arc::new(move || {
+            let _ = tx.try_send(());
+        });
+        Self::new_with(ctx, Rc::new(RefCell::new(None)), wake, rx)
     }
 
-    /// Like `new`, but driven by a shared `requested_cwd` the shell sets when
-    /// the user clicks a project — the terminal respawns in that directory.
+    /// Like `new`, but driven by a shared `requested_cwd` the shell sets, plus
+    /// a shared `wake`/`rx` so the SHELL can also ping a repaint (e.g. when a
+    /// tab click changes the cwd — the terminal respawns immediately instead of
+    /// waiting for the next PTY byte).
     pub fn new_with(
         ctx: &mut ViewContext<Self>,
         requested_cwd: Rc<RefCell<Option<std::path::PathBuf>>>,
+        wake: Wake,
+        rx: async_channel::Receiver<()>,
     ) -> Self {
         let font_family = warpui::fonts::Cache::handle(ctx)
             .update(ctx, |cache, _| cache.load_system_font("Menlo").expect("load Menlo"));
         ctx.focus_self();
 
-        // Reader thread -> async channel -> ctx.notify() repaint. Bounded(1)
-        // so a burst of wakes coalesces into a single pending repaint.
-        let (tx, rx) = async_channel::bounded::<()>(1);
-        let wake: Wake = Arc::new(move || {
-            let _ = tx.try_send(());
-        });
         // Spawn directly in the initial requested cwd (avoids the
         // spawn-in-$HOME-then-respawn double start).
         let initial = requested_cwd.borrow().clone();

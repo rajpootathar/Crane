@@ -30,6 +30,9 @@ pub struct CraneShellView {
     ui_font: FamilyId,
     icon_font: FamilyId,
     terminal: ViewHandle<TerminalView>,
+    /// Pings the terminal view to repaint (so a tab click respawns it
+    /// immediately, not on the next PTY byte).
+    term_wake: crate::controller::Wake,
     projects: Vec<crate::projects::ProjectNode>,
     /// Shared with the terminal view; a sidebar click writes the project
     /// path here and the terminal respawns there.
@@ -90,14 +93,20 @@ impl CraneShellView {
             None => Vec::new(),
         };
         let requested_cwd: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(default_cwd));
+        let (term_tx, term_rx) = async_channel::bounded::<()>(1);
+        let term_wake: crate::controller::Wake = std::sync::Arc::new(move || {
+            let _ = term_tx.try_send(());
+        });
         let terminal = {
             let rc = requested_cwd.clone();
-            ctx.add_view(move |ctx| TerminalView::new_with(ctx, rc))
+            let wake = term_wake.clone();
+            ctx.add_view(move |ctx| TerminalView::new_with(ctx, rc, wake, term_rx))
         };
         Self {
             ui_font,
             icon_font,
             terminal,
+            term_wake,
             projects,
             requested_cwd,
             split_ratio: Rc::new(Cell::new(0.68)),
@@ -605,24 +614,9 @@ impl CraneShellView {
     }
 
     fn center(&self) -> Box<dyn Element> {
-        // Draggable split: terminal | files. Drag the strip between them.
-        SplitRow::new(
-            ChildView::new(&self.terminal).finish(),
-            self.files_pane(),
-            self.split_ratio.clone(),
-            theme::BORDER,
-        )
-        .finish()
-    }
-
-    fn files_pane(&self) -> Box<dyn Element> {
-        let content = Flex::column()
-            .with_child(self.header("FILES"))
-            .with_child(self.tree_row("src/", 13.0, theme::TEXT, 12.0))
-            .with_child(self.tree_row("Cargo.toml", 13.0, theme::TEXT_MUTED, 12.0))
-            .with_child(self.tree_row("README.md", 13.0, theme::TEXT_MUTED, 12.0))
-            .finish();
-        self.panel(theme::BG, content)
+        // The active Tab's pane(s). For now a single terminal pane; the
+        // recursive Node split tree replaces this next.
+        self.panel(theme::BG, ChildView::new(&self.terminal).finish())
     }
 }
 
@@ -699,6 +693,8 @@ impl TypedActionView for CraneShellView {
                 self.selected = *sel;
                 *self.requested_cwd.borrow_mut() = Some(path.clone());
                 self.refresh_panel();
+                // Ping the terminal so it respawns in the new cwd now.
+                (self.term_wake)();
             }
             CraneShellAction::ToggleLeft => self.show_left = !self.show_left,
             CraneShellAction::ToggleRight => self.show_right = !self.show_right,
