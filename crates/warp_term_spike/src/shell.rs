@@ -1164,7 +1164,7 @@ impl View for CraneShellView {
                 let snapshot: Vec<(PaneId, RectF)> =
                     focus_rects.borrow().iter().map(|(k, v)| (*k, v.get())).collect();
                 for (pid, r) in snapshot {
-                    if r.contains_point(*pos) {
+                    if r.contains_point(pos) {
                         ctx.dispatch_typed_action(CraneShellAction::FocusPane(pid));
                         break;
                     }
