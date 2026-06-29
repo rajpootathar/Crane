@@ -5,7 +5,7 @@
 //! theme render in warpui exactly like the egui version.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -29,14 +29,14 @@ use crate::view::TerminalView;
 pub struct CraneShellView {
     ui_font: FamilyId,
     icon_font: FamilyId,
-    terminal: ViewHandle<TerminalView>,
-    /// Pings the terminal view to repaint (so a tab click respawns it
-    /// immediately, not on the next PTY byte).
-    term_wake: crate::controller::Wake,
+    /// One PERSISTENT terminal per opened tab — created once, kept alive with
+    /// full scrollback, switched (never respawned). History is retained.
+    terminals: HashMap<(usize, usize, usize), ViewHandle<TerminalView>>,
+    /// Which tab's terminal is shown in the center.
+    active_tab: Option<(usize, usize, usize)>,
     projects: Vec<crate::projects::ProjectNode>,
-    /// Shared with the terminal view; a sidebar click writes the project
-    /// path here and the terminal respawns there.
-    requested_cwd: Rc<RefCell<Option<PathBuf>>>,
+    /// Active worktree dir — drives the Files/Changes panel root.
+    active_cwd: Option<PathBuf>,
     /// Center split ratio (terminal | files), draggable.
     split_ratio: Rc<Cell<f32>>,
     /// Selected (project_idx, worktree_idx, tab_idx) — drives breadcrumb +
@@ -92,23 +92,23 @@ impl CraneShellView {
             Some(root) => file_tree::build_rows(root, &HashSet::new()),
             None => Vec::new(),
         };
-        let requested_cwd: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(default_cwd));
-        let (term_tx, term_rx) = async_channel::bounded::<()>(1);
-        let term_wake: crate::controller::Wake = std::sync::Arc::new(move || {
-            let _ = term_tx.try_send(());
-        });
-        let terminal = {
-            let rc = requested_cwd.clone();
-            let wake = term_wake.clone();
-            ctx.add_view(move |ctx| TerminalView::new_with(ctx, rc, wake, term_rx))
-        };
+        let active_cwd = default_cwd.clone();
+        // Open one persistent terminal for the default worktree.
+        let mut terminals: HashMap<(usize, usize, usize), ViewHandle<TerminalView>> =
+            HashMap::new();
+        let mut active_tab = None;
+        if let Some(path) = default_cwd {
+            let key = (0, 0, usize::MAX);
+            terminals.insert(key, Self::spawn_terminal(ctx, path));
+            active_tab = Some(key);
+        }
         Self {
             ui_font,
             icon_font,
-            terminal,
-            term_wake,
+            terminals,
+            active_tab,
             projects,
-            requested_cwd,
+            active_cwd,
             split_ratio: Rc::new(Cell::new(0.68)),
             selected: (0, 0, usize::MAX),
             show_left: true,
@@ -123,11 +123,25 @@ impl CraneShellView {
         }
     }
 
+    /// Spawn a new persistent terminal view rooted at `path`. Each gets its own
+    /// PTY + repaint waker; it is never respawned (history retained).
+    fn spawn_terminal(
+        ctx: &mut ViewContext<Self>,
+        path: PathBuf,
+    ) -> ViewHandle<TerminalView> {
+        let (tx, rx) = async_channel::bounded::<()>(1);
+        let wake: crate::controller::Wake = std::sync::Arc::new(move || {
+            let _ = tx.try_send(());
+        });
+        let cwd = Rc::new(RefCell::new(Some(path)));
+        ctx.add_view(move |ctx| TerminalView::new_with(ctx, cwd, wake, rx))
+    }
+
     /// Rebuild the cached right-panel contents for the active tab. Called from
     /// `handle_action` (never from render) so the FS walk / `git` shell-out
     /// happens once per change, not every repaint.
     fn refresh_panel(&mut self) {
-        let root = self.requested_cwd.borrow().clone();
+        let root = self.active_cwd.clone();
         match root {
             Some(root) if self.files_tab => {
                 self.file_rows = file_tree::build_rows(&root, &self.expanded_dirs);
@@ -614,9 +628,13 @@ impl CraneShellView {
     }
 
     fn center(&self) -> Box<dyn Element> {
-        // The active Tab's pane(s). For now a single terminal pane; the
-        // recursive Node split tree replaces this next.
-        self.panel(theme::BG, ChildView::new(&self.terminal).finish())
+        // Show the active tab's PERSISTENT terminal (history retained); other
+        // tabs' terminals stay alive in `self.terminals`, just not rendered.
+        let body: Box<dyn Element> = match self.active_tab.and_then(|k| self.terminals.get(&k)) {
+            Some(handle) => ChildView::new(handle).finish(),
+            None => Rect::new().with_background_color(theme::BG).finish(),
+        };
+        self.panel(theme::BG, body)
     }
 }
 
@@ -691,10 +709,15 @@ impl TypedActionView for CraneShellView {
         match action {
             CraneShellAction::Select { sel, path } => {
                 self.selected = *sel;
-                *self.requested_cwd.borrow_mut() = Some(path.clone());
+                self.active_cwd = Some(path.clone());
+                // Open this tab's persistent terminal once; thereafter just show
+                // it (its PTY + scrollback have been running the whole time).
+                if !self.terminals.contains_key(sel) {
+                    let handle = Self::spawn_terminal(ctx, path.clone());
+                    self.terminals.insert(*sel, handle);
+                }
+                self.active_tab = Some(*sel);
                 self.refresh_panel();
-                // Ping the terminal so it respawns in the new cwd now.
-                (self.term_wake)();
             }
             CraneShellAction::ToggleLeft => self.show_left = !self.show_left,
             CraneShellAction::ToggleRight => self.show_right = !self.show_right,
