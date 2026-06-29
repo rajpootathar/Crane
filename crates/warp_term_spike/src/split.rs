@@ -147,7 +147,9 @@ impl Element for SplitBox {
         };
         match event.raw_event() {
             Event::MouseMoved { position, .. } => {
-                // Show a resize cursor when hovering the splitter band.
+                // Resize cursor ONLY over the thin splitter band — otherwise
+                // reset, else the resize cursor sticks across the whole pane
+                // (warpui leaves the cursor unchanged when nothing sets it).
                 let a = pos_axis(position);
                 if a >= split_0 - 2.0 && a <= split_0 + SPLIT_W + 2.0 {
                     let cursor = match self.dir {
@@ -157,6 +159,8 @@ impl Element for SplitBox {
                     if let Some(o) = self.origin {
                         ctx.set_cursor(cursor, o.z_index());
                     }
+                } else {
+                    ctx.reset_cursor();
                 }
             }
             Event::LeftMouseDown { position, .. } => {
