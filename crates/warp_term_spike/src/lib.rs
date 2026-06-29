@@ -15,6 +15,7 @@ pub mod git;
 pub mod grid_element;
 pub mod icons;
 pub mod input;
+pub mod layout;
 pub mod projects;
 pub mod shell;
 pub mod split;

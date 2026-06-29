@@ -1,6 +1,6 @@
-//! A horizontal split container with a draggable splitter — the warpui port
-//! of Crane's `pane_view` split geometry (manual rect math + splitter drag).
-//! Lays out two child elements side by side at `ratio`, paints a splitter
+//! A split container with a draggable splitter — the warpui port of Crane's
+//! `pane_view` split geometry. Lays out two child elements at `ratio` along
+//! `dir` (Horizontal = side by side, Vertical = stacked), paints a splitter
 //! strip between them, and adjusts `ratio` when the splitter is dragged.
 
 use std::cell::Cell;
@@ -15,9 +15,12 @@ use warpui::{
     AfterLayoutContext, AppContext, EventContext, LayoutContext, PaintContext, SizeConstraint,
 };
 
+use crate::layout::Dir;
+
 const SPLIT_W: f32 = 5.0;
 
-pub struct SplitRow {
+pub struct SplitBox {
+    dir: Dir,
     first: Box<dyn Element>,
     second: Box<dyn Element>,
     ratio: Rc<Cell<f32>>,
@@ -26,17 +29,20 @@ pub struct SplitRow {
     size: Option<Vector2F>,
     origin: Option<Point>,
     o: Vector2F,
-    first_w: f32,
+    /// Length of the first child along the split axis.
+    first_len: f32,
 }
 
-impl SplitRow {
+impl SplitBox {
     pub fn new(
+        dir: Dir,
         first: Box<dyn Element>,
         second: Box<dyn Element>,
         ratio: Rc<Cell<f32>>,
         splitter_color: ColorU,
     ) -> Self {
         Self {
+            dir,
             first,
             second,
             ratio,
@@ -45,16 +51,24 @@ impl SplitRow {
             size: None,
             origin: None,
             o: vec2f(0.0, 0.0),
-            first_w: 0.0,
+            first_len: 0.0,
         }
     }
 
     fn strict(size: Vector2F) -> SizeConstraint {
         SizeConstraint { min: size, max: size }
     }
+
+    /// The size along the split axis.
+    fn axis(&self, v: Vector2F) -> f32 {
+        match self.dir {
+            Dir::Horizontal => v.x(),
+            Dir::Vertical => v.y(),
+        }
+    }
 }
 
-impl Element for SplitRow {
+impl Element for SplitBox {
     fn layout(
         &mut self,
         constraint: SizeConstraint,
@@ -62,15 +76,17 @@ impl Element for SplitRow {
         app: &AppContext,
     ) -> Vector2F {
         let size = constraint.max;
-        let avail = (size.x() - SPLIT_W).max(0.0);
+        let avail = (self.axis(size) - SPLIT_W).max(0.0);
         let r = self.ratio.get().clamp(0.1, 0.9);
-        let fw = (avail * r).round();
-        let sw = avail - fw;
-        self.first
-            .layout(Self::strict(vec2f(fw, size.y())), ctx, app);
-        self.second
-            .layout(Self::strict(vec2f(sw, size.y())), ctx, app);
-        self.first_w = fw;
+        let fl = (avail * r).round();
+        let sl = avail - fl;
+        let (first_size, second_size) = match self.dir {
+            Dir::Horizontal => (vec2f(fl, size.y()), vec2f(sl, size.y())),
+            Dir::Vertical => (vec2f(size.x(), fl), vec2f(size.x(), sl)),
+        };
+        self.first.layout(Self::strict(first_size), ctx, app);
+        self.second.layout(Self::strict(second_size), ctx, app);
+        self.first_len = fl;
         self.size = Some(size);
         size
     }
@@ -84,17 +100,25 @@ impl Element for SplitRow {
         self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
         self.o = origin;
         let size = self.size.unwrap_or_else(|| vec2f(0.0, 0.0));
-        let fw = self.first_w;
+        let fl = self.first_len;
 
         self.first.paint(origin, ctx, app);
-        let sx = origin.x() + fw;
-        ctx.scene
-            .draw_rect_without_hit_recording(RectF::new(
-                vec2f(sx, origin.y()),
+        let (split_origin, split_size, second_origin) = match self.dir {
+            Dir::Horizontal => (
+                vec2f(origin.x() + fl, origin.y()),
                 vec2f(SPLIT_W, size.y()),
-            ))
+                vec2f(origin.x() + fl + SPLIT_W, origin.y()),
+            ),
+            Dir::Vertical => (
+                vec2f(origin.x(), origin.y() + fl),
+                vec2f(size.x(), SPLIT_W),
+                vec2f(origin.x(), origin.y() + fl + SPLIT_W),
+            ),
+        };
+        ctx.scene
+            .draw_rect_without_hit_recording(RectF::new(split_origin, split_size))
             .with_background(Fill::Solid(self.splitter_color));
-        self.second.paint(vec2f(sx + SPLIT_W, origin.y()), ctx, app);
+        self.second.paint(second_origin, ctx, app);
     }
 
     fn size(&self) -> Option<Vector2F> {
@@ -111,18 +135,24 @@ impl Element for SplitRow {
         ctx: &mut EventContext,
         app: &AppContext,
     ) -> bool {
-        let w = self.size.map(|s| s.x()).unwrap_or(1.0);
-        let split_x0 = self.o.x() + self.first_w;
+        let total = self.axis(self.size.unwrap_or_else(|| vec2f(1.0, 1.0)));
+        let origin_axis = self.axis(self.o);
+        let split_0 = origin_axis + self.first_len;
+        let pos_axis = |p: &Vector2F| match self.dir {
+            Dir::Horizontal => p.x(),
+            Dir::Vertical => p.y(),
+        };
         match event.raw_event() {
             Event::LeftMouseDown { position, .. } => {
-                if position.x() >= split_x0 - 2.0 && position.x() <= split_x0 + SPLIT_W + 2.0 {
+                let a = pos_axis(position);
+                if a >= split_0 - 2.0 && a <= split_0 + SPLIT_W + 2.0 {
                     self.dragging.set(true);
                     return true;
                 }
             }
             Event::LeftMouseDragged { position, .. } => {
                 if self.dragging.get() {
-                    let r = ((position.x() - self.o.x()) / (w - SPLIT_W)).clamp(0.1, 0.9);
+                    let r = ((pos_axis(position) - origin_axis) / (total - SPLIT_W)).clamp(0.1, 0.9);
                     self.ratio.set(r);
                     return true;
                 }

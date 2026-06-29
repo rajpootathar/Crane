@@ -11,7 +11,8 @@ use std::rc::Rc;
 
 use crate::file_tree;
 use crate::icons;
-use crate::split::SplitRow;
+use crate::layout::{Dir, Node, PaneId};
+use crate::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
     ChildView, ConstrainedBox, Container, DispatchEventResult, EventHandler, Expanded, Flex,
@@ -29,10 +30,16 @@ use crate::view::TerminalView;
 pub struct CraneShellView {
     ui_font: FamilyId,
     icon_font: FamilyId,
-    /// One PERSISTENT terminal per opened tab — created once, kept alive with
-    /// full scrollback, switched (never respawned). History is retained.
-    terminals: HashMap<(usize, usize, usize), ViewHandle<TerminalView>>,
-    /// Which tab's terminal is shown in the center.
+    /// All PERSISTENT terminal panes by id — created once, kept alive with full
+    /// scrollback, never respawned. History is retained.
+    panes: HashMap<PaneId, ViewHandle<TerminalView>>,
+    /// Per-tab split tree (the Layout). Each leaf references a pane id.
+    layouts: HashMap<(usize, usize, usize), Node>,
+    /// The focused pane — target for split / close / scroll.
+    focused: Option<PaneId>,
+    /// Monotonic pane id source.
+    next_pane_id: PaneId,
+    /// Which tab's layout is shown in the center.
     active_tab: Option<(usize, usize, usize)>,
     projects: Vec<crate::projects::ProjectNode>,
     /// Active worktree dir — drives the Files/Changes panel root.
@@ -93,19 +100,29 @@ impl CraneShellView {
             None => Vec::new(),
         };
         let active_cwd = default_cwd.clone();
-        // Open one persistent terminal for the default worktree.
-        let mut terminals: HashMap<(usize, usize, usize), ViewHandle<TerminalView>> =
-            HashMap::new();
+        // Open one persistent terminal pane for the default worktree as a
+        // single-leaf layout.
+        let mut panes: HashMap<PaneId, ViewHandle<TerminalView>> = HashMap::new();
+        let mut layouts: HashMap<(usize, usize, usize), Node> = HashMap::new();
         let mut active_tab = None;
+        let mut focused = None;
+        let mut next_pane_id: PaneId = 0;
         if let Some(path) = default_cwd {
             let key = (0, 0, usize::MAX);
-            terminals.insert(key, Self::spawn_terminal(ctx, path));
+            let id = next_pane_id;
+            next_pane_id += 1;
+            panes.insert(id, Self::spawn_terminal(ctx, path));
+            layouts.insert(key, Node::Leaf(id));
             active_tab = Some(key);
+            focused = Some(id);
         }
         Self {
             ui_font,
             icon_font,
-            terminals,
+            panes,
+            layouts,
+            focused,
+            next_pane_id,
             active_tab,
             projects,
             active_cwd,
@@ -628,13 +645,86 @@ impl CraneShellView {
     }
 
     fn center(&self) -> Box<dyn Element> {
-        // Show the active tab's PERSISTENT terminal (history retained); other
-        // tabs' terminals stay alive in `self.terminals`, just not rendered.
-        let body: Box<dyn Element> = match self.active_tab.and_then(|k| self.terminals.get(&k)) {
-            Some(handle) => ChildView::new(handle).finish(),
+        // Render the active tab's split tree. Each leaf is a persistent terminal
+        // pane (history retained); inactive tabs' panes stay alive, unrendered.
+        let body: Box<dyn Element> = match self.active_tab.and_then(|k| self.layouts.get(&k)) {
+            Some(node) => self.render_node(node),
             None => Rect::new().with_background_color(theme::BG).finish(),
         };
         self.panel(theme::BG, body)
+    }
+
+    /// Recursively render a layout `Node` — leaves become terminal `ChildView`s,
+    /// splits become draggable `SplitBox`es.
+    fn render_node(&self, node: &Node) -> Box<dyn Element> {
+        match node {
+            Node::Leaf(id) => match self.panes.get(id) {
+                Some(handle) => ChildView::new(handle).finish(),
+                None => Rect::new().with_background_color(theme::BG).finish(),
+            },
+            Node::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => SplitBox::new(
+                *dir,
+                self.render_node(first),
+                self.render_node(second),
+                ratio.clone(),
+                theme::DIVIDER,
+            )
+            .finish(),
+        }
+    }
+
+    /// Spawn a new persistent terminal pane rooted at `path`; returns its id.
+    fn new_pane(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) -> PaneId {
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
+        let handle = Self::spawn_terminal(ctx, path);
+        self.panes.insert(id, handle);
+        id
+    }
+
+    /// Split the focused pane in `dir` with a new terminal in the same cwd.
+    fn split_focused(&mut self, dir: Dir, ctx: &mut ViewContext<Self>) {
+        let (Some(tab), Some(focused)) = (self.active_tab, self.focused) else {
+            return;
+        };
+        let path = self
+            .active_cwd
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let new_id = self.new_pane(path, ctx);
+        if let Some(node) = self.layouts.get_mut(&tab) {
+            if node.split_leaf(focused, new_id, dir) {
+                self.focused = Some(new_id);
+            } else {
+                // Focused pane not in this tab; drop the orphan view.
+                self.panes.remove(&new_id);
+            }
+        }
+    }
+
+    /// Close the focused pane (and its terminal). Collapses the split tree.
+    fn close_focused(&mut self) {
+        let (Some(tab), Some(focused)) = (self.active_tab, self.focused) else {
+            return;
+        };
+        if let Some(node) = self.layouts.remove(&tab) {
+            match node.close_leaf(focused) {
+                Some(remaining) => {
+                    self.focused = Some(remaining.first_leaf());
+                    self.layouts.insert(tab, remaining);
+                }
+                None => {
+                    self.active_tab = None;
+                    self.focused = None;
+                }
+            }
+        }
+        self.panes.remove(&focused);
     }
 }
 
@@ -677,6 +767,10 @@ impl View for CraneShellView {
                     let act = match ks.key.as_str() {
                         "b" => Some(CraneShellAction::ToggleLeft),
                         "/" => Some(CraneShellAction::ToggleRight),
+                        // Cmd+D split side-by-side, Cmd+Shift+D stacked.
+                        "d" if ks.shift => Some(CraneShellAction::SplitFocused(Dir::Vertical)),
+                        "d" => Some(CraneShellAction::SplitFocused(Dir::Horizontal)),
+                        "w" => Some(CraneShellAction::CloseFocused),
                         _ => None,
                     };
                     if let Some(act) = act {
@@ -719,6 +813,10 @@ pub enum CraneShellAction {
     SelectFile(PathBuf),
     ToggleProject(usize),
     ToggleWorktree(usize, usize),
+    /// Split the focused pane (Horizontal = side by side, Vertical = stacked).
+    SplitFocused(Dir),
+    /// Close the focused pane.
+    CloseFocused,
     Noop,
 }
 
@@ -729,15 +827,21 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::Select { sel, path } => {
                 self.selected = *sel;
                 self.active_cwd = Some(path.clone());
-                // Open this tab's persistent terminal once; thereafter just show
-                // it (its PTY + scrollback have been running the whole time).
-                if !self.terminals.contains_key(sel) {
-                    let handle = Self::spawn_terminal(ctx, path.clone());
-                    self.terminals.insert(*sel, handle);
+                // Open this tab's layout once (single terminal leaf); thereafter
+                // just show it (its PTY + scrollback ran the whole time).
+                if !self.layouts.contains_key(sel) {
+                    let id = self.new_pane(path.clone(), ctx);
+                    self.layouts.insert(*sel, Node::Leaf(id));
+                    self.focused = Some(id);
+                } else if let Some(node) = self.layouts.get(sel) {
+                    // Re-focus this tab's first pane.
+                    self.focused = Some(node.first_leaf());
                 }
                 self.active_tab = Some(*sel);
                 self.refresh_panel();
             }
+            CraneShellAction::SplitFocused(dir) => self.split_focused(*dir, ctx),
+            CraneShellAction::CloseFocused => self.close_focused(),
             CraneShellAction::ToggleLeft => self.show_left = !self.show_left,
             CraneShellAction::ToggleRight => self.show_right = !self.show_right,
             CraneShellAction::SetTab { files } => {
