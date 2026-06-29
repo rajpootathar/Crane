@@ -874,6 +874,19 @@ impl CraneShellView {
         };
         let state = self.drag_states.get(&id).cloned().unwrap_or_default();
 
+        // Leaves of the ACTIVE tab — restrict drop targets to these so a drag
+        // can't hit a stale rect from an inactive tab (which would orphan the
+        // dragged pane). Captured into on_drag.
+        let active_leaves: Vec<PaneId> = self
+            .active_tab
+            .and_then(|t| self.layouts.get(&t))
+            .map(|n| {
+                let mut v = Vec::new();
+                n.leaves(&mut v);
+                v
+            })
+            .unwrap_or_default();
+
         // on_drag: cursor = dragged-rect origin + grab offset → dock zone.
         let drag_state = state.clone();
         let rects = self.pane_rects.clone();
@@ -888,8 +901,12 @@ impl CraneShellView {
                     .cursor_offset_within_element()
                     .unwrap_or_else(|| vec2f(0.0, 0.0));
                 let cursor = rect.origin() + off;
-                let snapshot: Vec<(PaneId, RectF)> =
-                    rects.borrow().iter().map(|(k, v)| (*k, v.get())).collect();
+                let snapshot: Vec<(PaneId, RectF)> = rects
+                    .borrow()
+                    .iter()
+                    .filter(|(k, _)| active_leaves.contains(k))
+                    .map(|(k, v)| (*k, v.get()))
+                    .collect();
                 *preview_drag.borrow_mut() = pane_under(&snapshot, id, cursor);
                 ctx.notify();
             })
