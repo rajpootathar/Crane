@@ -25,6 +25,8 @@ struct OpenFile {
     path: PathBuf,
     name: String,
     lines: Vec<String>,
+    /// Unsaved edits in THIS file (per-file, not per-view).
+    dirty: bool,
 }
 
 fn read_file(path: &PathBuf) -> OpenFile {
@@ -39,6 +41,7 @@ fn read_file(path: &PathBuf) -> OpenFile {
         path: path.clone(),
         name,
         lines,
+        dirty: false,
     }
 }
 
@@ -49,8 +52,6 @@ pub struct FileView {
     /// Edit cursor (line, column) in CHAR units — char-indexed to stay
     /// unicode-safe.
     cursor: (usize, usize),
-    /// True once the buffer diverges from disk (drives the dirty marker).
-    dirty: bool,
     /// Set when this pane was created from pre-built text (git log etc.) — then
     /// it shows that single doc with no tab strip.
     is_doc: bool,
@@ -64,7 +65,6 @@ impl FileView {
             files: vec![read_file(&path)],
             active: 0,
             cursor: (0, 0),
-            dirty: false,
             is_doc: false,
         }
     }
@@ -78,10 +78,10 @@ impl FileView {
                 path: PathBuf::new(),
                 name: title,
                 lines,
+                dirty: false,
             }],
             active: 0,
             cursor: (0, 0),
-            dirty: false,
             is_doc: true,
         }
     }
@@ -105,7 +105,7 @@ impl FileView {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.files.get(self.active).map(|f| f.dirty).unwrap_or(false)
     }
 
     /// Apply an editing keystroke to the active file. Char-indexed so unicode
@@ -204,20 +204,20 @@ impl FileView {
         }
         self.cursor = (l, c);
         if changed {
-            self.dirty = true;
+            self.files[active].dirty = true;
         }
     }
 
     /// Write the active file's buffer back to disk (Cmd+S).
     pub fn save(&mut self) -> bool {
-        let Some(f) = self.files.get(self.active) else {
+        let Some(f) = self.files.get_mut(self.active) else {
             return false;
         };
         if f.path.as_os_str().is_empty() {
             return false; // doc pane (git log / browser)
         }
         if std::fs::write(&f.path, f.lines.join("\n")).is_ok() {
-            self.dirty = false;
+            f.dirty = false;
             true
         } else {
             false
@@ -230,8 +230,8 @@ impl FileView {
             let active = i == self.active;
             let bg = if active { theme::SURFACE } else { theme::TOPBAR_BG };
             let fg = if active { theme::TEXT } else { theme::TEXT_MUTED };
-            // Dirty marker on the active tab when the buffer has unsaved edits.
-            let label = if active && self.dirty {
+            // Per-file dirty marker.
+            let label = if f.dirty {
                 format!("* {}", f.name)
             } else {
                 f.name.clone()
