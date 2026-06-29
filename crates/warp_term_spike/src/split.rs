@@ -11,6 +11,7 @@ use warpui::elements::{Element, Fill, Point};
 use warpui::event::{DispatchedEvent, Event};
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::{vec2f, Vector2F};
+use warpui::platform::Cursor;
 use warpui::{
     AfterLayoutContext, AppContext, EventContext, LayoutContext, PaintContext, SizeConstraint,
 };
@@ -145,6 +146,19 @@ impl Element for SplitBox {
             Dir::Vertical => p.y(),
         };
         match event.raw_event() {
+            Event::MouseMoved { position, .. } => {
+                // Show a resize cursor when hovering the splitter band.
+                let a = pos_axis(position);
+                if a >= split_0 - 2.0 && a <= split_0 + SPLIT_W + 2.0 {
+                    let cursor = match self.dir {
+                        Dir::Horizontal => Cursor::ResizeLeftRight,
+                        Dir::Vertical => Cursor::ResizeUpDown,
+                    };
+                    if let Some(o) = self.origin {
+                        ctx.set_cursor(cursor, o.z_index());
+                    }
+                }
+            }
             Event::LeftMouseDown { position, .. } => {
                 let a = pos_axis(position);
                 if a >= split_0 - 2.0 && a <= split_0 + SPLIT_W + 2.0 {
