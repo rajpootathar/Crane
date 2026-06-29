@@ -191,7 +191,6 @@ impl View for TerminalView {
             self.desired.clone(),
         );
 
-        let controller = self.controller.clone();
         let scroll_ctrl = self.controller.clone();
         let scroll_wake = self.wake.clone();
         EventHandler::new(grid.finish())
@@ -204,36 +203,49 @@ impl View for TerminalView {
                 }
                 DispatchEventResult::StopPropagation
             })
-            .on_keydown(move |ctx, _app, ks: &Keystroke| {
-                if ks.cmd {
-                    // Terminal-local Cmd combos handled here (clipboard +
-                    // controller live in this view); the rest go to the shell.
-                    match ks.key.to_ascii_lowercase().as_str() {
-                        "v" => {
-                            ctx.dispatch_typed_action(TerminalViewAction::Paste);
-                            return DispatchEventResult::StopPropagation;
-                        }
-                        "k" => {
-                            ctx.dispatch_typed_action(TerminalViewAction::Clear);
-                            return DispatchEventResult::StopPropagation;
-                        }
-                        _ => return DispatchEventResult::PropagateToParent,
-                    }
-                }
-                let ctrl = controller.borrow();
-                // Don't forward keys to a dead PTY.
-                if !ctrl.is_alive() {
-                    return DispatchEventResult::PropagateToParent;
-                }
-                let app_cursor = ctrl.term.lock().is_app_cursor();
-                if let Some(bytes) = keystroke_to_pty_bytes(ks, app_cursor) {
-                    ctrl.write_input(&bytes);
-                    DispatchEventResult::StopPropagation
-                } else {
-                    DispatchEventResult::PropagateToParent
-                }
-            })
+            // ALL key handling is routed by the SHELL to the focused pane (the
+            // shell knows which pane is active; warpui per-view focus proved
+            // unreliable across panes). So just bubble keys up.
+            .on_keydown(move |_ctx, _app, _ks: &Keystroke| DispatchEventResult::PropagateToParent)
             .finish()
+    }
+}
+
+impl TerminalView {
+    /// Write a keystroke to THIS terminal's PTY (called by the shell for the
+    /// focused pane).
+    pub fn write_keystroke(&self, ks: &Keystroke) {
+        let ctrl = self.controller.borrow();
+        if !ctrl.is_alive() {
+            return;
+        }
+        let app_cursor = ctrl.term.lock().is_app_cursor();
+        if let Some(bytes) = keystroke_to_pty_bytes(ks, app_cursor) {
+            ctrl.write_input(&bytes);
+        }
+    }
+
+    /// Paste text into THIS terminal (bracketed when the app requested it).
+    pub fn paste_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let ctrl = self.controller.borrow();
+        let bracketed = ctrl.term.lock().is_bracketed_paste();
+        let bytes = if bracketed {
+            let mut b = b"\x1b[200~".to_vec();
+            b.extend_from_slice(text.as_bytes());
+            b.extend_from_slice(b"\x1b[201~");
+            b
+        } else {
+            text.as_bytes().to_vec()
+        };
+        ctrl.write_input(&bytes);
+    }
+
+    /// Clear THIS terminal (Ctrl+L — shell clears + redraws prompt).
+    pub fn clear_screen(&self) {
+        self.controller.borrow().write_input(b"\x0c");
     }
 }
 

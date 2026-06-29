@@ -17,10 +17,9 @@ use crate::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
     ChildView, ConstrainedBox, Container, DispatchEventResult, Draggable, DraggableState,
-    EventHandler, Expanded, Fill, Flex, ParentElement, Rect, Stack, Text,
+    EventHandler, Expanded, Flex, ParentElement, Rect, Stack, Text,
 };
 use warpui::geometry::rect::RectF;
-use warpui::scene::Border;
 use warpui::geometry::vector::vec2f;
 use warpui::fonts::FamilyId;
 use warpui::{
@@ -827,27 +826,11 @@ impl CraneShellView {
             })
             .unwrap_or(true);
         let mut stack = Stack::new().with_child(probed);
-        // Focus indication (only meaningful with >1 pane): dim inactive panes
-        // AND draw a 2px accent border on the active one (canonical Crane spec).
+        // Focus indication: dim INACTIVE panes only (Warp-style, no outline).
         if !single && self.focused != Some(id) && !is_preview {
             stack = stack.with_child(
                 Rect::new()
                     .with_background_color(theme::PANE_DIM)
-                    .finish(),
-            );
-        }
-        if !single && self.focused == Some(id) {
-            stack = stack.with_child(
-                Rect::new()
-                    .with_border(Border {
-                        width: 2.0,
-                        color: Fill::Solid(theme::FOCUS_BORDER),
-                        top: true,
-                        left: true,
-                        bottom: true,
-                        right: true,
-                        dash: None,
-                    })
                     .finish(),
             );
         }
@@ -1185,14 +1168,20 @@ impl View for CraneShellView {
                         "t" if ks.shift => Some(CraneShellAction::NewTab),
                         "t" => Some(CraneShellAction::SplitFocused(Dir::Horizontal)),
                         "w" => Some(CraneShellAction::CloseFocused),
+                        "v" => Some(CraneShellAction::PasteFocused),
+                        "k" => Some(CraneShellAction::ClearFocused),
                         _ => None,
                     };
                     if let Some(act) = act {
                         ctx.dispatch_typed_action(act);
                         return DispatchEventResult::StopPropagation;
                     }
+                    return DispatchEventResult::PropagateToParent;
                 }
-                DispatchEventResult::PropagateToParent
+                // Regular keys: route to the FOCUSED pane's terminal. Shell-driven
+                // input avoids warpui per-view focus being out of sync.
+                ctx.dispatch_typed_action(CraneShellAction::SendKeys(ks.clone()));
+                DispatchEventResult::StopPropagation
             })
             .finish()
     }
@@ -1247,6 +1236,12 @@ pub enum CraneShellAction {
     },
     /// Drag onto the center zone: swap the two panes' positions.
     SwapPanes { a: PaneId, b: PaneId },
+    /// Route a keystroke to the FOCUSED pane's terminal (shell-driven input).
+    SendKeys(warpui::keymap::Keystroke),
+    /// Cmd+V into the focused pane.
+    PasteFocused,
+    /// Cmd+K clear the focused pane.
+    ClearFocused,
     /// Add a new tab to the active workspace.
     NewTab,
     /// Close a tab (project, worktree, tab_id) from the strip.
@@ -1303,6 +1298,22 @@ impl TypedActionView for CraneShellView {
                     if let Some(node) = self.layouts.get_mut(&tab) {
                         node.swap_leaves(*a, *b);
                     }
+                }
+            }
+            CraneShellAction::SendKeys(ks) => {
+                if let Some(h) = self.focused.and_then(|id| self.panes.get(&id)).cloned() {
+                    h.update(ctx, |view, _| view.write_keystroke(ks));
+                }
+            }
+            CraneShellAction::PasteFocused => {
+                let text = ctx.clipboard().read().plain_text;
+                if let Some(h) = self.focused.and_then(|id| self.panes.get(&id)).cloned() {
+                    h.update(ctx, |view, _| view.paste_text(&text));
+                }
+            }
+            CraneShellAction::ClearFocused => {
+                if let Some(h) = self.focused.and_then(|id| self.panes.get(&id)).cloned() {
+                    h.update(ctx, |view, _| view.clear_screen());
                 }
             }
             CraneShellAction::NewTab => {
