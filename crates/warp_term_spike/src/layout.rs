@@ -18,6 +18,10 @@ pub enum Node {
     Split {
         dir: Dir,
         ratio: Rc<Cell<f32>>,
+        /// Drag state — MUST persist here (not in the transient SplitBox, which
+        /// is rebuilt every frame) so a drag survives re-renders between
+        /// mouse-down and mouse-drag.
+        dragging: Rc<Cell<bool>>,
         first: Box<Node>,
         second: Box<Node>,
     },
@@ -34,6 +38,7 @@ impl Node {
                 *self = Node::Split {
                     dir,
                     ratio: Rc::new(Cell::new(0.5)),
+                    dragging: Rc::new(Cell::new(false)),
                     first,
                     second,
                 };
@@ -56,6 +61,7 @@ impl Node {
             Node::Split {
                 dir,
                 ratio,
+                dragging,
                 first,
                 second,
             } => {
@@ -66,6 +72,7 @@ impl Node {
                     (Some(f), Some(s)) => Some(Node::Split {
                         dir,
                         ratio,
+                        dragging,
                         first: Box::new(f),
                         second: Box::new(s),
                     }),

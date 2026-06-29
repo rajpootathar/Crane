@@ -698,6 +698,7 @@ impl CraneShellView {
             Node::Split {
                 dir,
                 ratio,
+                dragging,
                 first,
                 second,
             } => SplitBox::new(
@@ -705,6 +706,7 @@ impl CraneShellView {
                 self.render_node(first),
                 self.render_node(second),
                 ratio.clone(),
+                dragging.clone(),
                 theme::DIVIDER,
             )
             .finish(),

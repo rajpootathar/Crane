@@ -24,7 +24,8 @@ pub struct SplitBox {
     first: Box<dyn Element>,
     second: Box<dyn Element>,
     ratio: Rc<Cell<f32>>,
-    dragging: Cell<bool>,
+    /// Shared with the Node so drag state survives per-frame rebuilds.
+    dragging: Rc<Cell<bool>>,
     splitter_color: ColorU,
     size: Option<Vector2F>,
     origin: Option<Point>,
@@ -39,6 +40,7 @@ impl SplitBox {
         first: Box<dyn Element>,
         second: Box<dyn Element>,
         ratio: Rc<Cell<f32>>,
+        dragging: Rc<Cell<bool>>,
         splitter_color: ColorU,
     ) -> Self {
         Self {
@@ -46,7 +48,7 @@ impl SplitBox {
             first,
             second,
             ratio,
-            dragging: Cell::new(false),
+            dragging,
             splitter_color,
             size: None,
             origin: None,
