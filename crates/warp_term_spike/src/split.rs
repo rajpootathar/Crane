@@ -156,6 +156,9 @@ impl Element for SplitBox {
                 if self.dragging.get() {
                     let r = ((pos_axis(position) - origin_axis) / (total - SPLIT_W)).clamp(0.1, 0.9);
                     self.ratio.set(r);
+                    // Request a repaint so the resize is LIVE — mutating the
+                    // ratio Cell alone doesn't tell warpui to re-render.
+                    ctx.notify();
                     return true;
                 }
             }
