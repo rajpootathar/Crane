@@ -553,8 +553,14 @@ impl CraneShellView {
         }
     }
 
+    /// A fixed-width horizontal gap. MUST bound height too — a width-only
+    /// ConstrainedBox lets the inner Rect fill to infinite height in an
+    /// unbounded-height row (warpui panics in validate_rect).
     fn spacer(w: f32) -> Box<dyn Element> {
-        ConstrainedBox::new(Rect::new().finish()).with_width(w).finish()
+        ConstrainedBox::new(Rect::new().finish())
+            .with_width(w)
+            .with_height(1.0)
+            .finish()
     }
 
     fn top_bar(&self) -> Box<dyn Element> {
