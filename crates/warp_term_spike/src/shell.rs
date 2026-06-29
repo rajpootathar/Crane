@@ -5,9 +5,11 @@
 //! theme render in warpui exactly like the egui version.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::file_tree;
 use crate::icons;
 use crate::split::SplitRow;
 use warpui::color::ColorU;
@@ -40,6 +42,10 @@ pub struct CraneShellView {
     selected: (usize, usize, usize),
     show_left: bool,
     show_right: bool,
+    /// Right panel: true = Files tab, false = Changes tab.
+    files_tab: bool,
+    expanded_dirs: HashSet<PathBuf>,
+    selected_file: Option<PathBuf>,
 }
 
 impl CraneShellView {
@@ -86,6 +92,9 @@ impl CraneShellView {
             selected: (0, 0, usize::MAX),
             show_left: true,
             show_right: true,
+            files_tab: true,
+            expanded_dirs: HashSet::new(),
+            selected_file: None,
         }
     }
 
@@ -313,14 +322,131 @@ impl CraneShellView {
             .finish()
     }
 
-    fn right_sidebar(&self) -> Box<dyn Element> {
-        let content = Flex::column()
-            .with_child(self.header("CHANGES"))
-            .with_child(self.row("M  src/view.rs", theme::TEXT))
-            .with_child(self.row("M  src/shell.rs", theme::TEXT))
-            .with_child(self.row("A  src/theme.rs", theme::ACCENT))
+    fn tab_label(&self, text: &str, active: bool, action: CraneShellAction) -> Box<dyn Element> {
+        let color = if active { theme::TEXT_HOVER } else { theme::TEXT_MUTED };
+        let content = Container::new(
+            Text::new(text.to_string(), self.ui_font, 12.0)
+                .with_color(color)
+                .finish(),
+        )
+        .with_background_color(theme::SIDEBAR_BG)
+        .with_padding_top(2.0)
+        .with_padding_bottom(2.0)
+        .finish();
+        EventHandler::new(content)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    fn file_row(&self, r: &file_tree::FileRow) -> Box<dyn Element> {
+        let is_sel = self.selected_file.as_deref() == Some(r.path.as_path());
+        let row_h = 21.0;
+        let pad = 8.0 + r.depth as f32 * 14.0;
+        let chevron: Box<dyn Element> = if r.is_dir {
+            Container::new(self.icon(
+                if r.expanded {
+                    icons::CARET_DOWN
+                } else {
+                    icons::CARET_RIGHT
+                },
+                10.0,
+                theme::TEXT_MUTED,
+            ))
+            .with_padding_right(4.0)
+            .finish()
+        } else {
+            Self::spacer(13.0)
+        };
+        let glyph = if r.is_dir { icons::FOLDER } else { icons::FILE };
+        let text_color = if r.is_dir { theme::TEXT } else { theme::TEXT_MUTED };
+        let label_inner = Flex::row()
+            .with_child(chevron)
+            .with_child(
+                Container::new(self.icon(glyph, 12.0, theme::TEXT_MUTED))
+                    .with_padding_right(5.0)
+                    .finish(),
+            )
+            .with_child(
+                Text::new(r.name.clone(), self.ui_font, 12.0)
+                    .with_color(text_color)
+                    .finish(),
+            )
             .finish();
-        ConstrainedBox::new(self.panel(theme::SIDEBAR_BG, content))
+        let label = Container::new(label_inner)
+            .with_padding_left(pad)
+            .with_padding_top(3.0)
+            .finish();
+        let mut bg = Rect::new();
+        if is_sel {
+            bg = bg.with_background_color(theme::ROW_ACTIVE);
+        }
+        let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
+        let hit_layer = ConstrainedBox::new(Rect::new().finish())
+            .with_height(row_h)
+            .finish();
+        let row = Stack::new()
+            .with_child(bg_layer)
+            .with_child(label)
+            .with_child(hit_layer)
+            .finish();
+        let action = if r.is_dir {
+            CraneShellAction::ToggleDir(r.path.clone())
+        } else {
+            CraneShellAction::SelectFile(r.path.clone())
+        };
+        EventHandler::new(row)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    fn right_sidebar(&self) -> Box<dyn Element> {
+        let tabs = Flex::row()
+            .with_child(self.tab_label(
+                "Changes",
+                !self.files_tab,
+                CraneShellAction::SetTab { files: false },
+            ))
+            .with_child(Self::spacer(12.0))
+            .with_child(self.tab_label(
+                "Files",
+                self.files_tab,
+                CraneShellAction::SetTab { files: true },
+            ))
+            .finish();
+        let tabs = Container::new(tabs)
+            .with_padding_left(10.0)
+            .with_padding_top(8.0)
+            .with_padding_bottom(6.0)
+            .finish();
+
+        let mut col = Flex::column().with_child(tabs);
+        if self.files_tab {
+            match self.requested_cwd.borrow().clone() {
+                Some(root) => {
+                    for r in file_tree::build_rows(&root, &self.expanded_dirs) {
+                        col = col.with_child(self.file_row(&r));
+                    }
+                }
+                None => {
+                    col = col.with_child(self.tree_row(
+                        "(no folder selected)",
+                        12.0,
+                        theme::TEXT_MUTED,
+                        12.0,
+                    ));
+                }
+            }
+        } else {
+            col = col.with_child(self.tree_row("M  src/shell.rs", 12.0, theme::TEXT, 12.0));
+            col = col.with_child(self.tree_row("A  src/file_tree.rs", 12.0, theme::ACCENT, 12.0));
+        }
+        ConstrainedBox::new(self.panel(theme::SIDEBAR_BG, col.finish()))
             .with_width(theme::RIGHT_W)
             .finish()
     }
@@ -473,6 +599,9 @@ pub enum CraneShellAction {
     },
     ToggleLeft,
     ToggleRight,
+    SetTab { files: bool },
+    ToggleDir(PathBuf),
+    SelectFile(PathBuf),
     Noop,
 }
 
@@ -486,6 +615,13 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::ToggleLeft => self.show_left = !self.show_left,
             CraneShellAction::ToggleRight => self.show_right = !self.show_right,
+            CraneShellAction::SetTab { files } => self.files_tab = *files,
+            CraneShellAction::ToggleDir(p) => {
+                if !self.expanded_dirs.remove(p) {
+                    self.expanded_dirs.insert(p.clone());
+                }
+            }
+            CraneShellAction::SelectFile(p) => self.selected_file = Some(p.clone()),
             CraneShellAction::Noop => {}
         }
         // Mark the view dirty so warpui re-renders.
