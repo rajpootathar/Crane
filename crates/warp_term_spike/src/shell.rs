@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::file_pane::FileView;
 use crate::file_tree;
 use crate::icons;
 use crate::layout::{Dir, Node, PaneId};
@@ -33,9 +34,8 @@ use crate::view::TerminalView;
 pub struct CraneShellView {
     ui_font: FamilyId,
     icon_font: FamilyId,
-    /// All PERSISTENT terminal panes by id — created once, kept alive with full
-    /// scrollback, never respawned. History is retained.
-    panes: HashMap<PaneId, ViewHandle<TerminalView>>,
+    /// All panes by id. Persistent (terminals keep their PTY + scrollback).
+    panes: HashMap<PaneId, PaneContent>,
     /// Per-tab split tree (the Layout). Each leaf references a pane id.
     layouts: HashMap<(usize, usize, usize), Node>,
     /// The focused pane — target for split / close / scroll.
@@ -93,6 +93,13 @@ pub struct TabMeta {
     pub name: String,
 }
 
+/// What a leaf pane holds (warpui port of old Crane's `PaneContent`). More
+/// variants (Browser, GitLog, Markdown) follow.
+pub enum PaneContent {
+    Terminal(ViewHandle<TerminalView>),
+    File(ViewHandle<FileView>),
+}
+
 /// Map a dock edge to (split direction, dragged-goes-first?). Center → None
 /// (handled as a swap, not a split).
 fn edge_dir_before(edge: DockEdge) -> Option<(Dir, bool)> {
@@ -141,7 +148,7 @@ impl CraneShellView {
         let active_cwd = default_cwd.clone();
         // Open the default worktree's first tab as a single-leaf layout, seeding
         // its Tab strip from session.json (or one default tab).
-        let mut panes: HashMap<PaneId, ViewHandle<TerminalView>> = HashMap::new();
+        let mut panes: HashMap<PaneId, PaneContent> = HashMap::new();
         let mut layouts: HashMap<(usize, usize, usize), Node> = HashMap::new();
         let mut worktree_tabs: HashMap<(usize, usize), Vec<TabMeta>> = HashMap::new();
         let mut drag_states: HashMap<PaneId, DraggableState> = HashMap::new();
@@ -170,7 +177,7 @@ impl CraneShellView {
             let key = (0, 0, first_id);
             let pane = next_pane_id;
             next_pane_id += 1;
-            panes.insert(pane, Self::spawn_terminal(ctx, path));
+            panes.insert(pane, PaneContent::Terminal(Self::spawn_terminal(ctx, path)));
             drag_states.insert(pane, DraggableState::default());
             layouts.insert(key, Node::Leaf(pane));
             active_tab = Some(key);
@@ -761,7 +768,8 @@ impl CraneShellView {
     /// shown as a half-pane preview, and applied on drop (edge=split, center=swap).
     fn render_pane(&self, id: PaneId) -> Box<dyn Element> {
         let body: Box<dyn Element> = match self.panes.get(&id) {
-            Some(handle) => ChildView::new(handle).finish(),
+            Some(PaneContent::Terminal(h)) => ChildView::new(h).finish(),
+            Some(PaneContent::File(h)) => ChildView::new(h).finish(),
             None => Rect::new().with_background_color(theme::BG).finish(),
         };
         let state = self.drag_states.get(&id).cloned().unwrap_or_default();
@@ -929,9 +937,40 @@ impl CraneShellView {
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         let handle = Self::spawn_terminal(ctx, path);
-        self.panes.insert(id, handle);
+        self.panes.insert(id, PaneContent::Terminal(handle));
         self.drag_states.insert(id, DraggableState::default());
         id
+    }
+
+    /// Open `path` as a File pane, split beside the focused pane.
+    fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        let Some(tab) = self.active_tab else { return };
+        let target = self
+            .focused
+            .filter(|id| self.panes.contains_key(id))
+            .or_else(|| self.layouts.get(&tab).map(|n| n.first_leaf()));
+        let Some(target) = target else { return };
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
+        let p = path.clone();
+        let handle = ctx.add_view(move |ctx| FileView::new(ctx, p));
+        self.panes.insert(id, PaneContent::File(handle));
+        self.drag_states.insert(id, DraggableState::default());
+        if let Some(node) = self.layouts.get_mut(&tab) {
+            if node.split_leaf(target, id, Dir::Horizontal) {
+                self.focused = Some(id);
+            } else {
+                self.panes.remove(&id);
+            }
+        }
+    }
+
+    /// The terminal view handle for a pane, if it is a terminal.
+    fn terminal_at(&self, id: PaneId) -> Option<ViewHandle<TerminalView>> {
+        match self.panes.get(&id) {
+            Some(PaneContent::Terminal(h)) => Some(h.clone()),
+            _ => None,
+        }
     }
 
     /// Split the focused pane in `dir` with a new terminal in the same cwd.
@@ -1301,18 +1340,18 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::SendKeys(ks) => {
-                if let Some(h) = self.focused.and_then(|id| self.panes.get(&id)).cloned() {
+                if let Some(h) = self.focused.and_then(|id| self.terminal_at(id)) {
                     h.update(ctx, |view, _| view.write_keystroke(ks));
                 }
             }
             CraneShellAction::PasteFocused => {
                 let text = ctx.clipboard().read().plain_text;
-                if let Some(h) = self.focused.and_then(|id| self.panes.get(&id)).cloned() {
+                if let Some(h) = self.focused.and_then(|id| self.terminal_at(id)) {
                     h.update(ctx, |view, _| view.paste_text(&text));
                 }
             }
             CraneShellAction::ClearFocused => {
-                if let Some(h) = self.focused.and_then(|id| self.panes.get(&id)).cloned() {
+                if let Some(h) = self.focused.and_then(|id| self.terminal_at(id)) {
                     h.update(ctx, |view, _| view.clear_screen());
                 }
             }
@@ -1372,7 +1411,10 @@ impl TypedActionView for CraneShellView {
                 }
                 self.refresh_panel();
             }
-            CraneShellAction::SelectFile(p) => self.selected_file = Some(p.clone()),
+            CraneShellAction::SelectFile(p) => {
+                self.selected_file = Some(p.clone());
+                self.open_file(p.clone(), ctx);
+            }
             CraneShellAction::ToggleProject(i) => {
                 if !self.expanded_projects.remove(i) {
                     self.expanded_projects.insert(*i);
@@ -1386,12 +1428,9 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::Noop => {}
         }
-        // Keep KEYBOARD focus in sync with the focused pane, so the pane with
-        // the focus border is the one that actually receives keystrokes.
-        if let Some(id) = self.focused {
-            if let Some(handle) = self.panes.get(&id) {
-                ctx.focus(handle);
-            }
+        // Keep KEYBOARD focus in sync with the focused pane (terminals only).
+        if let Some(handle) = self.focused.and_then(|id| self.terminal_at(id)) {
+            ctx.focus(&handle);
         }
         // Mark the view dirty so warpui re-renders.
         ctx.notify();
