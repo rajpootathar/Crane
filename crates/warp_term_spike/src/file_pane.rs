@@ -46,6 +46,11 @@ pub struct FileView {
     font: FamilyId,
     files: Vec<OpenFile>,
     active: usize,
+    /// Edit cursor (line, column) in CHAR units — char-indexed to stay
+    /// unicode-safe.
+    cursor: (usize, usize),
+    /// True once the buffer diverges from disk (drives the dirty marker).
+    dirty: bool,
     /// Set when this pane was created from pre-built text (git log etc.) — then
     /// it shows that single doc with no tab strip.
     is_doc: bool,
@@ -58,6 +63,8 @@ impl FileView {
             font,
             files: vec![read_file(&path)],
             active: 0,
+            cursor: (0, 0),
+            dirty: false,
             is_doc: false,
         }
     }
@@ -73,6 +80,8 @@ impl FileView {
                 lines,
             }],
             active: 0,
+            cursor: (0, 0),
+            dirty: false,
             is_doc: true,
         }
     }
@@ -91,6 +100,127 @@ impl FileView {
         } else {
             self.files.push(f);
             self.active = self.files.len() - 1;
+        }
+        self.cursor = (0, 0);
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Apply an editing keystroke to the active file. Char-indexed so unicode
+    /// stays correct. Returns false for doc panes (read-only).
+    pub fn edit(&mut self, ks: &warpui::keymap::Keystroke) {
+        if self.is_doc {
+            return;
+        }
+        let active = self.active;
+        let Some(f) = self.files.get_mut(active) else {
+            return;
+        };
+        if f.lines.is_empty() {
+            f.lines.push(String::new());
+        }
+        let (mut l, mut c) = self.cursor;
+        l = l.min(f.lines.len() - 1);
+        c = c.min(f.lines[l].chars().count());
+        let mut changed = false;
+
+        // Helper: rebuild line `li` from a char Vec.
+        match ks.key.as_str() {
+            "backspace" => {
+                if c > 0 {
+                    let mut ch: Vec<char> = f.lines[l].chars().collect();
+                    ch.remove(c - 1);
+                    f.lines[l] = ch.into_iter().collect();
+                    c -= 1;
+                    changed = true;
+                } else if l > 0 {
+                    let cur = f.lines.remove(l);
+                    let prev_len = f.lines[l - 1].chars().count();
+                    f.lines[l - 1].push_str(&cur);
+                    l -= 1;
+                    c = prev_len;
+                    changed = true;
+                }
+            }
+            "enter" | "return" | "numpadenter" => {
+                let ch: Vec<char> = f.lines[l].chars().collect();
+                let left: String = ch[..c].iter().collect();
+                let right: String = ch[c..].iter().collect();
+                f.lines[l] = left;
+                f.lines.insert(l + 1, right);
+                l += 1;
+                c = 0;
+                changed = true;
+            }
+            "tab" => {
+                let mut ch: Vec<char> = f.lines[l].chars().collect();
+                for _ in 0..4 {
+                    ch.insert(c, ' ');
+                }
+                f.lines[l] = ch.into_iter().collect();
+                c += 4;
+                changed = true;
+            }
+            "left" => {
+                if c > 0 {
+                    c -= 1;
+                } else if l > 0 {
+                    l -= 1;
+                    c = f.lines[l].chars().count();
+                }
+            }
+            "right" => {
+                let len = f.lines[l].chars().count();
+                if c < len {
+                    c += 1;
+                } else if l + 1 < f.lines.len() {
+                    l += 1;
+                    c = 0;
+                }
+            }
+            "up" => {
+                if l > 0 {
+                    l -= 1;
+                    c = c.min(f.lines[l].chars().count());
+                }
+            }
+            "down" => {
+                if l + 1 < f.lines.len() {
+                    l += 1;
+                    c = c.min(f.lines[l].chars().count());
+                }
+            }
+            k if k.chars().count() == 1 => {
+                let chr = k.chars().next().unwrap();
+                let mut ch: Vec<char> = f.lines[l].chars().collect();
+                ch.insert(c, chr);
+                f.lines[l] = ch.into_iter().collect();
+                c += 1;
+                changed = true;
+            }
+            _ => {}
+        }
+        self.cursor = (l, c);
+        if changed {
+            self.dirty = true;
+        }
+    }
+
+    /// Write the active file's buffer back to disk (Cmd+S).
+    pub fn save(&mut self) -> bool {
+        let Some(f) = self.files.get(self.active) else {
+            return false;
+        };
+        if f.path.as_os_str().is_empty() {
+            return false; // doc pane (git log / browser)
+        }
+        if std::fs::write(&f.path, f.lines.join("\n")).is_ok() {
+            self.dirty = false;
+            true
+        } else {
+            false
         }
     }
 
@@ -165,9 +295,18 @@ impl View for FileView {
         }
         let mut body = Flex::column();
         if let Some(f) = self.files.get(self.active) {
-            for line in f.lines.iter().take(RENDER_LINES) {
+            for (i, line) in f.lines.iter().take(RENDER_LINES).enumerate() {
+                // Editable panes show a text caret "|" at the cursor column.
+                let display = if !self.is_doc && i == self.cursor.0 {
+                    let mut ch: Vec<char> = line.chars().collect();
+                    let col = self.cursor.1.min(ch.len());
+                    ch.insert(col, '|');
+                    ch.into_iter().collect()
+                } else {
+                    line.clone()
+                };
                 body = body.with_child(
-                    Text::new(line.clone(), self.font, 12.0)
+                    Text::new(display, self.font, 12.0)
                         .with_color(theme::TEXT)
                         .finish(),
                 );

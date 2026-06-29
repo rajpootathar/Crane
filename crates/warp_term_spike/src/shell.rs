@@ -1173,6 +1173,14 @@ impl CraneShellView {
         }
     }
 
+    /// The file view handle for a pane, if it is a File pane.
+    fn file_at(&self, id: PaneId) -> Option<ViewHandle<FileView>> {
+        match self.panes.get(&id) {
+            Some(PaneContent::File(h)) => Some(h.clone()),
+            _ => None,
+        }
+    }
+
     /// Split the focused pane in `dir` with a new terminal in the same cwd.
     fn split_focused(&mut self, dir: Dir, ctx: &mut ViewContext<Self>) {
         let Some(tab) = self.active_tab else { return };
@@ -1410,6 +1418,7 @@ impl View for CraneShellView {
                         "w" => Some(CraneShellAction::CloseFocused),
                         "v" => Some(CraneShellAction::PasteFocused),
                         "k" => Some(CraneShellAction::ClearFocused),
+                        "s" => Some(CraneShellAction::SaveFocusedFile),
                         _ => None,
                     };
                     if let Some(act) = act {
@@ -1482,6 +1491,8 @@ pub enum CraneShellAction {
     PasteFocused,
     /// Cmd+K clear the focused pane.
     ClearFocused,
+    /// Cmd+S save the focused File pane.
+    SaveFocusedFile,
     /// Toggle stage/unstage for a changed file (click in the Changes tab).
     StageToggle { path: String, staged: bool },
     /// Give the commit message box keyboard focus.
@@ -1556,9 +1567,23 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::SendKeys(ks) => {
                 if self.commit_focused {
                     self.edit_commit(ks);
-                } else if let Some(h) = self.active_input_pane().and_then(|id| self.terminal_at(id))
-                {
-                    h.update(ctx, |view, _| view.write_keystroke(ks));
+                } else if let Some(id) = self.active_input_pane() {
+                    if let Some(h) = self.terminal_at(id) {
+                        h.update(ctx, |view, _| view.write_keystroke(ks));
+                    } else if let Some(h) = self.file_at(id) {
+                        // Editable File pane: route keys to its buffer.
+                        h.update(ctx, |view, vctx| {
+                            view.edit(ks);
+                            vctx.notify();
+                        });
+                    }
+                }
+            }
+            CraneShellAction::SaveFocusedFile => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
+                    h.update(ctx, |view, _| {
+                        view.save();
+                    });
                 }
             }
             CraneShellAction::FocusCommit => self.commit_focused = true,
