@@ -1151,6 +1151,20 @@ impl CraneShellView {
         }
     }
 
+    /// The pane that should receive keyboard input: the focused pane IF it
+    /// belongs to the active tab, else the active tab's first pane. Guarantees
+    /// typing goes to the visible tab even if `focused` is stale.
+    fn active_input_pane(&self) -> Option<PaneId> {
+        let tab = self.active_tab?;
+        let node = self.layouts.get(&tab)?;
+        let mut leaves = Vec::new();
+        node.leaves(&mut leaves);
+        match self.focused {
+            Some(f) if leaves.contains(&f) => Some(f),
+            _ => leaves.first().copied(),
+        }
+    }
+
     /// The terminal view handle for a pane, if it is a terminal.
     fn terminal_at(&self, id: PaneId) -> Option<ViewHandle<TerminalView>> {
         match self.panes.get(&id) {
@@ -1230,7 +1244,7 @@ impl CraneShellView {
     /// The Tab strip for the active workspace: a chip per tab (name + close)
     /// plus a `+` to add one. Crane's per-Workspace tab management.
     fn tab_strip(&self) -> Box<dyn Element> {
-        const TAB_H: f32 = 32.0;
+        const TAB_H: f32 = 30.0;
         let mut row = Flex::row();
         if let Some((pi, wi, active_id)) = self.active_tab {
             let path = self
@@ -1278,6 +1292,7 @@ impl CraneShellView {
             .with_padding_left(12.0)
             .with_padding_right(6.0)
             .with_padding_top(8.0)
+            .with_padding_bottom(8.0)
             .finish(),
         )
         .on_left_mouse_down(move |ctx, _app, _pos| {
@@ -1541,7 +1556,8 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::SendKeys(ks) => {
                 if self.commit_focused {
                     self.edit_commit(ks);
-                } else if let Some(h) = self.focused.and_then(|id| self.terminal_at(id)) {
+                } else if let Some(h) = self.active_input_pane().and_then(|id| self.terminal_at(id))
+                {
                     h.update(ctx, |view, _| view.write_keystroke(ks));
                 }
             }
