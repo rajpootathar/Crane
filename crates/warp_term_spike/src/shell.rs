@@ -42,6 +42,8 @@ pub struct CraneShellView {
     focused: Option<PaneId>,
     /// When set, only this pane renders (expand-to-full / maximize).
     maximized: Option<PaneId>,
+    /// The dedicated File pane (files open as TABS inside it), if open.
+    files_pane: Option<PaneId>,
     /// Persistent drag state per pane (survives re-renders; Arc-shared).
     drag_states: HashMap<PaneId, DraggableState>,
     /// Last painted window rect per pane (recorded by RectProbe) — used to
@@ -197,6 +199,7 @@ impl CraneShellView {
             layouts,
             focused,
             maximized: None,
+            files_pane: None,
             drag_states,
             pane_rects: Rc::new(RefCell::new(HashMap::new())),
             drop_preview: Rc::new(RefCell::new(None)),
@@ -1059,14 +1062,14 @@ impl CraneShellView {
         id
     }
 
-    /// Insert `content` as a new pane split beside the focused pane.
-    fn split_with(&mut self, content: PaneContent) {
-        let Some(tab) = self.active_tab else { return };
+    /// Insert `content` as a new pane split beside the focused pane. Returns the
+    /// new pane id (None if there was nowhere to split).
+    fn split_with(&mut self, content: PaneContent) -> Option<PaneId> {
+        let tab = self.active_tab?;
         let target = self
             .focused
             .filter(|id| self.panes.contains_key(id))
-            .or_else(|| self.layouts.get(&tab).map(|n| n.first_leaf()));
-        let Some(target) = target else { return };
+            .or_else(|| self.layouts.get(&tab).map(|n| n.first_leaf()))?;
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         self.panes.insert(id, content);
@@ -1074,16 +1077,28 @@ impl CraneShellView {
         if let Some(node) = self.layouts.get_mut(&tab) {
             if node.split_leaf(target, id, Dir::Horizontal) {
                 self.focused = Some(id);
-            } else {
-                self.panes.remove(&id);
+                return Some(id);
             }
+            self.panes.remove(&id);
         }
+        None
     }
 
-    /// Open `path` as a File pane beside the focused pane.
+    /// Open `path` in the dedicated File pane (as a tab). Creates the pane the
+    /// first time; thereafter adds/switches a tab inside it (old Crane FilesPane).
     fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        // Existing File pane still alive? add a tab to it.
+        if let Some(fp) = self.files_pane {
+            if let Some(PaneContent::File(h)) = self.panes.get(&fp) {
+                let h = h.clone();
+                h.update(ctx, |fv, _| fv.open(path));
+                self.focused = Some(fp);
+                return;
+            }
+            self.files_pane = None; // pane was closed
+        }
         let handle = ctx.add_view(move |ctx| FileView::new(ctx, path));
-        self.split_with(PaneContent::File(handle));
+        self.files_pane = self.split_with(PaneContent::File(handle));
     }
 
     /// Open a Git log pane for the active worktree.
@@ -1093,7 +1108,7 @@ impl CraneShellView {
             .as_deref()
             .map(crate::git::log)
             .unwrap_or_else(|| vec!["<no active workspace>".to_string()]);
-        let handle = ctx.add_view(move |ctx| FileView::from_text(ctx, lines));
+        let handle = ctx.add_view(move |ctx| FileView::from_text(ctx, "Git Log".to_string(), lines));
         self.split_with(PaneContent::File(handle));
     }
 
@@ -1104,7 +1119,8 @@ impl CraneShellView {
             String::new(),
             "(embedded WKWebView pending — old Crane's browser_view)".to_string(),
         ];
-        let handle = ctx.add_view(move |ctx| FileView::from_text(ctx, lines));
+        let handle =
+            ctx.add_view(move |ctx| FileView::from_text(ctx, "Browser".to_string(), lines));
         self.split_with(PaneContent::File(handle));
     }
 
