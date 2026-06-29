@@ -23,6 +23,13 @@ pub const ACCENT: ColorU = c(90, 135, 220);
 pub const ROW_ACTIVE: ColorU = c(48, 56, 80);
 pub const ROW_HOVER: ColorU = c(30, 34, 46);
 pub const FOCUS_BORDER: ColorU = c(100, 140, 220);
+/// Translucent accent for drag drop-zone overlays.
+pub const DROP_ZONE: ColorU = ColorU {
+    r: 100,
+    g: 140,
+    b: 220,
+    a: 120,
+};
 pub const ERROR: ColorU = c(220, 95, 95);
 pub const SUCCESS: ColorU = c(90, 190, 140);
 pub const WARNING: ColorU = c(232, 170, 70);

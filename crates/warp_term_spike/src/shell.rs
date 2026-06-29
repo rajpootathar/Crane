@@ -87,10 +87,32 @@ pub struct TabMeta {
     pub name: String,
 }
 
-/// Drop payload identifying which pane a dragged pane was dropped onto.
+/// Which edge of the target pane a drop landed on → split direction + order.
+#[derive(Debug, Clone, Copy)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Edge {
+    /// (split direction, dragged-goes-first?).
+    fn dir_before(self) -> (Dir, bool) {
+        match self {
+            Edge::Left => (Dir::Horizontal, true),
+            Edge::Right => (Dir::Horizontal, false),
+            Edge::Top => (Dir::Vertical, true),
+            Edge::Bottom => (Dir::Vertical, false),
+        }
+    }
+}
+
+/// Drop payload: which pane + which edge a dragged pane was dropped onto.
 #[derive(Debug)]
 struct PaneDrop {
     id: PaneId,
+    edge: Edge,
 }
 
 impl DropTargetData for PaneDrop {
@@ -761,6 +783,7 @@ impl CraneShellView {
                     ctx.dispatch_typed_action(CraneShellAction::MovePane {
                         dragged: id,
                         target: pd.id,
+                        edge: pd.edge,
                     });
                 }
             })
@@ -770,7 +793,46 @@ impl CraneShellView {
             .with_child(header)
             .with_child(Expanded::new(1.0, body).finish())
             .finish();
-        DropTarget::new(content, PaneDrop { id }).finish()
+        // Only overlay drop zones while a drag is active — otherwise invisible
+        // DropTargets would swallow terminal clicks/scroll.
+        if self.any_dragging() {
+            Stack::new()
+                .with_child(content)
+                .with_child(self.drop_zones(id))
+                .finish()
+        } else {
+            content
+        }
+    }
+
+    /// True while any pane is being dragged (shows the drop-zone overlays).
+    fn any_dragging(&self) -> bool {
+        self.drag_states.values().any(|s| s.is_dragging())
+    }
+
+    /// Four edge drop zones overlaid on a pane during a drag. Each is a
+    /// translucent DropTarget; dropping picks the split direction + order.
+    fn drop_zones(&self, id: PaneId) -> Box<dyn Element> {
+        let zone = |edge: Edge| -> Box<dyn Element> {
+            DropTarget::new(
+                Rect::new()
+                    .with_background_color(theme::DROP_ZONE)
+                    .finish(),
+                PaneDrop { id, edge },
+            )
+            .finish()
+        };
+        // top (1) | middle row [left | center gap | right] (2) | bottom (1)
+        let middle = Flex::row()
+            .with_child(Expanded::new(1.0, zone(Edge::Left)).finish())
+            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+            .with_child(Expanded::new(1.0, zone(Edge::Right)).finish())
+            .finish();
+        Flex::column()
+            .with_child(Expanded::new(1.0, zone(Edge::Top)).finish())
+            .with_child(Expanded::new(2.0, middle).finish())
+            .with_child(Expanded::new(1.0, zone(Edge::Bottom)).finish())
+            .finish()
     }
 
     /// Pane header: title (click to focus) + expand-to-full + close.
@@ -838,19 +900,20 @@ impl CraneShellView {
 
     /// Split the focused pane in `dir` with a new terminal in the same cwd.
     fn split_focused(&mut self, dir: Dir, ctx: &mut ViewContext<Self>) {
-        let (Some(tab), Some(focused)) = (self.active_tab, self.focused) else {
-            return;
-        };
-        let path = self
-            .active_cwd
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/"));
+        let Some(tab) = self.active_tab else { return };
+        // Fall back to the tab's first pane if focus went stale — so Cmd+D/T
+        // always splits SOMETHING rather than silently no-opping.
+        let target = self
+            .focused
+            .filter(|id| self.panes.contains_key(id))
+            .or_else(|| self.layouts.get(&tab).map(|n| n.first_leaf()));
+        let Some(target) = target else { return };
+        let path = self.active_cwd.clone().unwrap_or_else(|| PathBuf::from("/"));
         let new_id = self.new_pane(path, ctx);
         if let Some(node) = self.layouts.get_mut(&tab) {
-            if node.split_leaf(focused, new_id, dir) {
+            if node.split_leaf(target, new_id, dir) {
                 self.focused = Some(new_id);
             } else {
-                // Focused pane not in this tab; drop the orphan view.
                 self.panes.remove(&new_id);
             }
         }
@@ -878,7 +941,7 @@ impl CraneShellView {
 
     /// Drag-rearrange: detach `dragged` from the active tab's tree and re-dock
     /// it beside `target` in `dir`. Pane views stay alive (history retained).
-    fn move_pane(&mut self, dragged: PaneId, target: PaneId, dir: Dir) {
+    fn move_pane(&mut self, dragged: PaneId, target: PaneId, edge: Edge) {
         if dragged == target {
             return;
         }
@@ -886,12 +949,11 @@ impl CraneShellView {
         let Some(node) = self.layouts.remove(&tab) else {
             return;
         };
+        let (dir, before) = edge.dir_before();
         match node.close_leaf(dragged) {
             Some(mut tree) => {
-                // split_leaf re-inserts `dragged` beside `target`. If target
-                // isn't found (shouldn't happen — same tab), the detached tree
-                // still goes back so we never lose panes.
-                tree.split_leaf(target, dragged, dir);
+                // Re-insert `dragged` at the chosen edge of `target`.
+                tree.split_leaf_ordered(target, dragged, dir, before);
                 self.layouts.insert(tab, tree);
                 self.focused = Some(dragged);
             }
@@ -1107,8 +1169,12 @@ pub enum CraneShellAction {
     ToggleMaximize(PaneId),
     /// Split a specific pane (header split buttons).
     SplitPane(PaneId, Dir),
-    /// Drag-rearrange: re-dock `dragged` next to `target` in the layout tree.
-    MovePane { dragged: PaneId, target: PaneId },
+    /// Drag-rearrange: re-dock `dragged` at `edge` of `target`.
+    MovePane {
+        dragged: PaneId,
+        target: PaneId,
+        edge: Edge,
+    },
     /// Add a new tab to the active workspace.
     NewTab,
     /// Close a tab (project, worktree, tab_id) from the strip.
@@ -1157,8 +1223,12 @@ impl TypedActionView for CraneShellView {
                 self.focused = Some(*id);
                 self.split_focused(*dir, ctx);
             }
-            CraneShellAction::MovePane { dragged, target } => {
-                self.move_pane(*dragged, *target, Dir::Horizontal);
+            CraneShellAction::MovePane {
+                dragged,
+                target,
+                edge,
+            } => {
+                self.move_pane(*dragged, *target, *edge);
             }
             CraneShellAction::NewTab => {
                 if let Some((pi, wi, _)) = self.active_tab {

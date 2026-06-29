@@ -52,6 +52,40 @@ impl Node {
         }
     }
 
+    /// Like `split_leaf`, but `before` controls order: true = `new` becomes the
+    /// first (left/top) child, false = second (right/bottom).
+    pub fn split_leaf_ordered(
+        &mut self,
+        target: PaneId,
+        new_pane: PaneId,
+        dir: Dir,
+        before: bool,
+    ) -> bool {
+        match self {
+            Node::Leaf(id) if *id == target => {
+                let existing = *id;
+                let (first, second) = if before {
+                    (new_pane, existing)
+                } else {
+                    (existing, new_pane)
+                };
+                *self = Node::Split {
+                    dir,
+                    ratio: Rc::new(Cell::new(0.5)),
+                    dragging: Rc::new(Cell::new(false)),
+                    first: Box::new(Node::Leaf(first)),
+                    second: Box::new(Node::Leaf(second)),
+                };
+                true
+            }
+            Node::Leaf(_) => false,
+            Node::Split { first, second, .. } => {
+                first.split_leaf_ordered(target, new_pane, dir, before)
+                    || second.split_leaf_ordered(target, new_pane, dir, before)
+            }
+        }
+    }
+
     /// Remove the leaf `target`, collapsing the parent split. Returns the node
     /// to replace `self` with (None if the whole subtree is gone).
     pub fn close_leaf(self, target: PaneId) -> Option<Node> {
