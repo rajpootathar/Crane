@@ -146,6 +146,10 @@ impl TerminalController {
         let mut w = self.writer.lock();
         let _ = w.write_all(data);
         let _ = w.flush();
+        drop(w);
+        // Typing snaps the viewport back to the live screen (like old Crane's
+        // pending_scroll_to_bottom).
+        self.term.lock().scroll_to_bottom();
     }
 
     /// Resize the PTY + grid. NOTE arg order: controller is (cols, rows),
