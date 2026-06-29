@@ -761,18 +761,10 @@ impl CraneShellView {
     /// the dock edge is computed 1:1 from the cursor position (`dock_zone`),
     /// shown as a half-pane preview, and applied on drop (edge=split, center=swap).
     fn render_pane(&self, id: PaneId) -> Box<dyn Element> {
-        let raw_body: Box<dyn Element> = match self.panes.get(&id) {
+        let body: Box<dyn Element> = match self.panes.get(&id) {
             Some(handle) => ChildView::new(handle).finish(),
             None => Rect::new().with_background_color(theme::BG).finish(),
         };
-        // Click the body to focus this pane (propagate so the terminal still
-        // gets the click for future selection).
-        let body = EventHandler::new(raw_body)
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
-                DispatchEventResult::PropagateToParent
-            })
-            .finish();
         let state = self.drag_states.get(&id).cloned().unwrap_or_default();
 
         // on_drag: cursor = dragged-rect origin + grab offset → dock zone.
@@ -1161,9 +1153,24 @@ impl View for CraneShellView {
             .with_child(column)
             .finish();
 
+        // Press-to-focus (old Crane's `pressed_inside`): on any left press, focus
+        // the pane whose rect contains the cursor. Reliable across the terminal's
+        // view boundary because the shell owns the pane rects (via RectProbe).
+        let focus_rects = self.pane_rects.clone();
         // App-level keyboard shortcuts. The terminal pane propagates Cmd combos
         // up to here (its own on_keydown returns PropagateToParent for cmd).
         EventHandler::new(root)
+            .on_left_mouse_down(move |ctx, _app, pos| {
+                let snapshot: Vec<(PaneId, RectF)> =
+                    focus_rects.borrow().iter().map(|(k, v)| (*k, v.get())).collect();
+                for (pid, r) in snapshot {
+                    if r.contains_point(*pos) {
+                        ctx.dispatch_typed_action(CraneShellAction::FocusPane(pid));
+                        break;
+                    }
+                }
+                DispatchEventResult::PropagateToParent
+            })
             .on_keydown(|ctx, _app, ks| {
                 if ks.cmd && !ks.ctrl && !ks.alt {
                     // Shift uppercases the key ("D"), so normalize the case.
