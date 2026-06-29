@@ -44,8 +44,12 @@ pub struct CraneShellView {
     projects: Vec<crate::projects::ProjectNode>,
     /// Active worktree dir — drives the Files/Changes panel root.
     active_cwd: Option<PathBuf>,
-    /// Center split ratio (terminal | files), draggable.
-    split_ratio: Rc<Cell<f32>>,
+    /// Draggable left-panel boundary (fraction of the window width).
+    left_ratio: Rc<Cell<f32>>,
+    left_drag: Rc<Cell<bool>>,
+    /// Draggable right-panel boundary (center | right within the remaining area).
+    right_ratio: Rc<Cell<f32>>,
+    right_drag: Rc<Cell<bool>>,
     /// Selected (project_idx, worktree_idx, tab_idx) — drives breadcrumb +
     /// row highlight. `tab_idx == usize::MAX` means the worktree row itself.
     /// Plain view state: mutated in `handle_action` so warpui re-renders.
@@ -159,7 +163,10 @@ impl CraneShellView {
             active_tab,
             projects,
             active_cwd,
-            split_ratio: Rc::new(Cell::new(0.68)),
+            left_ratio: Rc::new(Cell::new(0.18)),
+            left_drag: Rc::new(Cell::new(false)),
+            right_ratio: Rc::new(Cell::new(0.80)),
+            right_drag: Rc::new(Cell::new(false)),
             selected,
             show_left: true,
             show_right: true,
@@ -441,9 +448,8 @@ impl CraneShellView {
                 }
             }
         }
-        ConstrainedBox::new(self.panel(theme::SIDEBAR_BG, col.finish()))
-            .with_width(theme::LEFT_W)
-            .finish()
+        // No fixed width — the enclosing SplitBox sizes it (draggable).
+        self.panel(theme::SIDEBAR_BG, col.finish())
     }
 
     fn tab_label(&self, text: &str, active: bool, action: CraneShellAction) -> Box<dyn Element> {
@@ -597,9 +603,8 @@ impl CraneShellView {
                 col = col.with_child(self.change_row(ch));
             }
         }
-        ConstrainedBox::new(self.panel(theme::SIDEBAR_BG, col.finish()))
-            .with_width(theme::RIGHT_W)
-            .finish()
+        // No fixed width — the enclosing SplitBox sizes it (draggable).
+        self.panel(theme::SIDEBAR_BG, col.finish())
     }
 
     /// Unified full-width top bar that doubles as the macOS titlebar: the
@@ -835,19 +840,58 @@ impl View for CraneShellView {
     }
 
     fn render(&self, _ctx: &AppContext) -> Box<dyn Element> {
-        let mut body = Flex::row();
-        if self.show_left {
-            body = body.with_child(self.left_sidebar()).with_child(self.divider());
-        }
-        body = body.with_child(Expanded::new(1.0, self.center()).finish());
-        if self.show_right {
-            body = body.with_child(self.divider()).with_child(self.right_sidebar());
-        }
-        let body = body.finish();
+        // The center region: the Tab strip sits ABOVE the panes (mid-pane, like
+        // real Crane — not a full-width top bar).
+        let center_region = Flex::column()
+            .with_child(self.tab_strip())
+            .with_child(Expanded::new(1.0, self.center()).finish())
+            .finish();
+
+        // Resizable left | center | right via nested draggable SplitBoxes.
+        let body: Box<dyn Element> = match (self.show_left, self.show_right) {
+            (true, true) => {
+                let inner = SplitBox::new(
+                    Dir::Horizontal,
+                    center_region,
+                    self.right_sidebar(),
+                    self.right_ratio.clone(),
+                    self.right_drag.clone(),
+                    theme::DIVIDER,
+                )
+                .finish();
+                SplitBox::new(
+                    Dir::Horizontal,
+                    self.left_sidebar(),
+                    inner,
+                    self.left_ratio.clone(),
+                    self.left_drag.clone(),
+                    theme::DIVIDER,
+                )
+                .finish()
+            }
+            (true, false) => SplitBox::new(
+                Dir::Horizontal,
+                self.left_sidebar(),
+                center_region,
+                self.left_ratio.clone(),
+                self.left_drag.clone(),
+                theme::DIVIDER,
+            )
+            .finish(),
+            (false, true) => SplitBox::new(
+                Dir::Horizontal,
+                center_region,
+                self.right_sidebar(),
+                self.right_ratio.clone(),
+                self.right_drag.clone(),
+                theme::DIVIDER,
+            )
+            .finish(),
+            (false, false) => center_region,
+        };
 
         let column = Flex::column()
             .with_child(self.top_bar())
-            .with_child(self.tab_strip())
             .with_child(Expanded::new(1.0, body).finish())
             .with_child(self.status_bar())
             .finish();
