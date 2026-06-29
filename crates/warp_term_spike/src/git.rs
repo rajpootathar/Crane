@@ -11,6 +11,22 @@ pub struct Change {
     pub path: String,
 }
 
+/// Current branch name in `root` (or a short SHA when detached), empty on error.
+pub fn current_branch(root: &Path) -> String {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+    else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// `git log --oneline --graph --decorate -n 300` in `root`, as lines.
 pub fn log(root: &Path) -> Vec<String> {
     let Ok(out) = Command::new("git")

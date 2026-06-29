@@ -56,6 +56,8 @@ pub struct CraneShellView {
     projects: Vec<crate::projects::ProjectNode>,
     /// Active worktree dir — drives the Files/Changes panel root.
     active_cwd: Option<PathBuf>,
+    /// Cached current branch of the active worktree (status bar).
+    branch: String,
     /// Draggable left-panel boundary (fraction of the window width).
     left_ratio: Rc<Cell<f32>>,
     left_drag: Rc<Cell<bool>>,
@@ -199,6 +201,10 @@ impl CraneShellView {
             next_tab_id,
             active_tab,
             projects,
+            branch: active_cwd
+                .as_deref()
+                .map(crate::git::current_branch)
+                .unwrap_or_default(),
             active_cwd,
             left_ratio: Rc::new(Cell::new(0.18)),
             left_drag: Rc::new(Cell::new(false)),
@@ -236,6 +242,10 @@ impl CraneShellView {
     /// happens once per change, not every repaint.
     fn refresh_panel(&mut self) {
         let root = self.active_cwd.clone();
+        self.branch = root
+            .as_deref()
+            .map(crate::git::current_branch)
+            .unwrap_or_default();
         match root {
             Some(root) if self.files_tab => {
                 self.file_rows = file_tree::build_rows(&root, &self.expanded_dirs);
@@ -710,14 +720,28 @@ impl CraneShellView {
     }
 
     fn status_bar(&self) -> Box<dyn Element> {
-        let content = Container::new(
-            Text::new("main  -  ready", self.ui_font, 11.0)
-                .with_color(theme::TEXT_MUTED)
+        let label = if self.branch.is_empty() {
+            "ready".to_string()
+        } else {
+            format!("{}  -  ready", self.branch)
+        };
+        let mut row = Flex::row().with_child(
+            Container::new(self.icon(icons::GIT_BRANCH, 11.0, theme::TEXT_MUTED))
+                .with_padding_left(10.0)
+                .with_padding_right(5.0)
+                .with_padding_top(7.0)
                 .finish(),
-        )
-        .with_padding_left(10.0)
-        .with_padding_top(7.0)
-        .finish();
+        );
+        row = row.with_child(
+            Container::new(
+                Text::new(label, self.ui_font, 11.0)
+                    .with_color(theme::TEXT_MUTED)
+                    .finish(),
+            )
+            .with_padding_top(7.0)
+            .finish(),
+        );
+        let content = row.finish();
         ConstrainedBox::new(self.panel(theme::TOPBAR_BG, content))
             .with_height(theme::STATUS_H)
             .finish()
