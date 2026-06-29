@@ -37,6 +37,8 @@ pub struct CraneShellView {
     layouts: HashMap<(usize, usize, usize), Node>,
     /// The focused pane — target for split / close / scroll.
     focused: Option<PaneId>,
+    /// When set, only this pane renders (expand-to-full / maximize).
+    maximized: Option<PaneId>,
     /// Monotonic pane id source.
     next_pane_id: PaneId,
     /// Which tab's layout is shown in the center.
@@ -157,6 +159,7 @@ impl CraneShellView {
             panes,
             layouts,
             focused,
+            maximized: None,
             next_pane_id,
             worktree_tabs,
             next_tab_id,
@@ -683,8 +686,14 @@ impl CraneShellView {
     }
 
     fn center(&self) -> Box<dyn Element> {
-        // Render the active tab's split tree. Each leaf is a persistent terminal
-        // pane (history retained); inactive tabs' panes stay alive, unrendered.
+        // Expand-to-full: render only the maximized pane.
+        if let Some(id) = self.maximized {
+            if self.panes.contains_key(&id) {
+                return self.panel(theme::BG, self.render_pane(id));
+            }
+        }
+        // Otherwise render the active tab's split tree. Each leaf is a persistent
+        // terminal pane (history retained); inactive tabs' panes stay alive.
         let body: Box<dyn Element> = match self.active_tab.and_then(|k| self.layouts.get(&k)) {
             Some(node) => self.render_node(node),
             None => Rect::new().with_background_color(theme::BG).finish(),
@@ -696,10 +705,7 @@ impl CraneShellView {
     /// splits become draggable `SplitBox`es.
     fn render_node(&self, node: &Node) -> Box<dyn Element> {
         match node {
-            Node::Leaf(id) => match self.panes.get(id) {
-                Some(handle) => ChildView::new(handle).finish(),
-                None => Rect::new().with_background_color(theme::BG).finish(),
-            },
+            Node::Leaf(id) => self.render_pane(*id),
             Node::Split {
                 dir,
                 ratio,
@@ -716,6 +722,71 @@ impl CraneShellView {
             )
             .finish(),
         }
+    }
+
+    /// A leaf pane = a header bar + the terminal body.
+    fn render_pane(&self, id: PaneId) -> Box<dyn Element> {
+        let body: Box<dyn Element> = match self.panes.get(&id) {
+            Some(handle) => ChildView::new(handle).finish(),
+            None => Rect::new().with_background_color(theme::BG).finish(),
+        };
+        Flex::column()
+            .with_child(self.pane_header(id))
+            .with_child(Expanded::new(1.0, body).finish())
+            .finish()
+    }
+
+    /// Pane header: title (click to focus) + expand-to-full + close.
+    fn pane_header(&self, id: PaneId) -> Box<dyn Element> {
+        const H: f32 = 26.0;
+        let focused = self.focused == Some(id);
+        let bg = if focused { theme::SURFACE } else { theme::TOPBAR_BG };
+        let fg = if focused { theme::TEXT } else { theme::TEXT_MUTED };
+
+        // Title — clicking focuses this pane.
+        let title = EventHandler::new(
+            Container::new(
+                Flex::row()
+                    .with_child(
+                        Container::new(self.icon(icons::TERMINAL_WINDOW, 12.0, fg))
+                            .with_padding_right(5.0)
+                            .finish(),
+                    )
+                    .with_child(
+                        Text::new("Terminal".to_string(), self.ui_font, 11.0)
+                            .with_color(fg)
+                            .finish(),
+                    )
+                    .finish(),
+            )
+            .with_padding_left(8.0)
+            .with_padding_top(6.0)
+            .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+
+        // The Expanded title fills the row, pushing these to the right edge.
+        let buttons = Flex::row()
+            .with_child(self.icon_button(icons::ARROWS_OUT, CraneShellAction::ToggleMaximize(id)))
+            .with_child(self.icon_button(icons::X, CraneShellAction::ClosePane(id)))
+            .finish();
+
+        let row = Flex::row()
+            .with_child(Expanded::new(1.0, title).finish())
+            .with_child(buttons)
+            .finish();
+        ConstrainedBox::new(
+            Stack::new()
+                .with_child(Rect::new().with_background_color(bg).finish())
+                .with_child(row)
+                .finish(),
+        )
+        .with_height(H)
+        .finish()
     }
 
     /// Spawn a new persistent terminal pane rooted at `path`; returns its id.
@@ -962,6 +1033,14 @@ pub enum CraneShellAction {
     SplitFocused(Dir),
     /// Close the focused pane.
     CloseFocused,
+    /// Focus a specific pane (click its header).
+    FocusPane(PaneId),
+    /// Close a specific pane (header ✕).
+    ClosePane(PaneId),
+    /// Toggle expand-to-full for a pane (header maximize button).
+    ToggleMaximize(PaneId),
+    /// Split a specific pane (header split buttons).
+    SplitPane(PaneId, Dir),
     /// Add a new tab to the active workspace.
     NewTab,
     /// Close a tab (project, worktree, tab_id) from the strip.
@@ -991,6 +1070,25 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::SplitFocused(dir) => self.split_focused(*dir, ctx),
             CraneShellAction::CloseFocused => self.close_focused(),
+            CraneShellAction::FocusPane(id) => self.focused = Some(*id),
+            CraneShellAction::ClosePane(id) => {
+                self.focused = Some(*id);
+                if self.maximized == Some(*id) {
+                    self.maximized = None;
+                }
+                self.close_focused();
+            }
+            CraneShellAction::ToggleMaximize(id) => {
+                self.maximized = if self.maximized == Some(*id) {
+                    None
+                } else {
+                    Some(*id)
+                };
+            }
+            CraneShellAction::SplitPane(id, dir) => {
+                self.focused = Some(*id);
+                self.split_focused(*dir, ctx);
+            }
             CraneShellAction::NewTab => {
                 if let Some((pi, wi, _)) = self.active_tab {
                     let id = self.next_tab_id;
