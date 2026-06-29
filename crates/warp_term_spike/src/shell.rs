@@ -1590,8 +1590,15 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::CommitStaged => self.commit_now(),
             CraneShellAction::PasteFocused => {
                 let text = ctx.clipboard().read().plain_text;
-                if let Some(h) = self.active_input_pane().and_then(|id| self.terminal_at(id)) {
-                    h.update(ctx, |view, _| view.paste_text(&text));
+                if let Some(id) = self.active_input_pane() {
+                    if let Some(h) = self.terminal_at(id) {
+                        h.update(ctx, |view, _| view.paste_text(&text));
+                    } else if let Some(h) = self.file_at(id) {
+                        h.update(ctx, |view, vctx| {
+                            view.paste_at_cursor(&text);
+                            vctx.notify();
+                        });
+                    }
                 }
             }
             CraneShellAction::ClearFocused => {

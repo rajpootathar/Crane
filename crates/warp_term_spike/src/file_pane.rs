@@ -208,6 +208,40 @@ impl FileView {
         }
     }
 
+    /// Insert clipboard `text` at the cursor (handles multi-line paste).
+    pub fn paste_at_cursor(&mut self, text: &str) {
+        if self.is_doc || text.is_empty() {
+            return;
+        }
+        let active = self.active;
+        if self.files.get(active).is_none() {
+            return;
+        }
+        let (mut l, mut c) = self.cursor;
+        for ch in text.chars() {
+            let f = &mut self.files[active];
+            if l >= f.lines.len() {
+                f.lines.push(String::new());
+            }
+            let mut chars: Vec<char> = f.lines[l].chars().collect();
+            let col = c.min(chars.len());
+            if ch == '\n' {
+                let left: String = chars[..col].iter().collect();
+                let right: String = chars[col..].iter().collect();
+                f.lines[l] = left;
+                f.lines.insert(l + 1, right);
+                l += 1;
+                c = 0;
+            } else {
+                chars.insert(col, ch);
+                f.lines[l] = chars.into_iter().collect();
+                c += 1;
+            }
+        }
+        self.cursor = (l, c);
+        self.files[active].dirty = true;
+    }
+
     /// Write the active file's buffer back to disk (Cmd+S).
     pub fn save(&mut self) -> bool {
         let Some(f) = self.files.get_mut(self.active) else {
