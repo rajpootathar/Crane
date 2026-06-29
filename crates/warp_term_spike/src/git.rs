@@ -9,6 +9,43 @@ pub struct Change {
     /// Porcelain XY status, trimmed (e.g. "M", "A", "D", "??", "R").
     pub status: String,
     pub path: String,
+    /// True if the change is staged (index column X is set).
+    pub staged: bool,
+}
+
+fn run(repo: &Path, args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// `git add -- <path>` (1:1 old Crane).
+pub fn stage(repo: &Path, path: &str) -> Result<(), String> {
+    run(repo, &["add", "--", path])
+}
+
+/// `git restore --staged -- <path>` (1:1 old Crane).
+pub fn unstage(repo: &Path, path: &str) -> Result<(), String> {
+    run(repo, &["restore", "--staged", "--", path])
+}
+
+/// `git commit -m <message>` (1:1 old Crane).
+pub fn commit(repo: &Path, message: &str) -> Result<(), String> {
+    run(repo, &["commit", "-m", message])
+}
+
+/// `git push` non-interactively (1:1 old Crane). Network op — call off-thread.
+pub fn push(repo: &Path) -> Result<(), String> {
+    run(repo, &["push"])
 }
 
 /// Current branch name in `root` (or a short SHA when detached), empty on error.
@@ -76,6 +113,11 @@ pub fn changes(root: &Path) -> Vec<Change> {
                 return None;
             }
             let xy: String = l.chars().take(2).collect();
+            // Index column (X) set and not untracked → staged.
+            let staged = {
+                let x = xy.chars().next().unwrap_or(' ');
+                x != ' ' && x != '?'
+            };
             // Single normalized status letter (most significant).
             let status = if xy.contains('?') {
                 "?"
@@ -103,7 +145,11 @@ pub fn changes(root: &Path) -> Vec<Change> {
                 .unwrap_or(&rest)
                 .trim_matches('"')
                 .to_string();
-            Some(Change { status, path })
+            Some(Change {
+                status,
+                path,
+                staged,
+            })
         })
         .collect()
 }

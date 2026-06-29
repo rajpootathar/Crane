@@ -590,27 +590,50 @@ impl CraneShellView {
             "R" | "C" => theme::ACCENT,
             _ => theme::TEXT_MUTED, // "?" untracked
         };
+        // Leading marker: + = click to stage, − = click to unstage.
+        let (marker, marker_color) = if ch.staged {
+            (icons::MINUS, theme::SUCCESS)
+        } else {
+            (icons::PLUS, theme::TEXT_MUTED)
+        };
         let inner = Flex::row()
+            .with_child(
+                Container::new(self.icon(marker, 11.0, marker_color))
+                    .with_padding_right(4.0)
+                    .finish(),
+            )
             .with_child(
                 ConstrainedBox::new(
                     Text::new(ch.status.clone(), self.ui_font, 11.0)
                         .with_color(color)
                         .finish(),
                 )
-                .with_width(22.0)
+                .with_width(18.0)
                 .finish(),
             )
             .with_child(
                 Text::new(ch.path.clone(), self.ui_font, 12.0)
-                    .with_color(theme::TEXT)
+                    .with_color(if ch.staged { theme::TEXT } else { theme::TEXT_MUTED })
                     .finish(),
             )
             .finish();
-        Container::new(inner)
-            .with_padding_left(12.0)
-            .with_padding_top(3.0)
-            .with_padding_bottom(3.0)
-            .finish()
+        let action = CraneShellAction::StageToggle {
+            path: ch.path.clone(),
+            staged: ch.staged,
+        };
+        EventHandler::new(
+            Container::new(inner)
+                .with_background_color(theme::SIDEBAR_BG)
+                .with_padding_left(10.0)
+                .with_padding_top(3.0)
+                .with_padding_bottom(3.0)
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
     }
 
     fn right_sidebar(&self) -> Box<dyn Element> {
@@ -1331,6 +1354,8 @@ pub enum CraneShellAction {
     PasteFocused,
     /// Cmd+K clear the focused pane.
     ClearFocused,
+    /// Toggle stage/unstage for a changed file (click in the Changes tab).
+    StageToggle { path: String, staged: bool },
     /// Open a Git log pane.
     OpenGitLog,
     /// Open a Browser pane (placeholder).
@@ -1407,6 +1432,16 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::ClearFocused => {
                 if let Some(h) = self.focused.and_then(|id| self.terminal_at(id)) {
                     h.update(ctx, |view, _| view.clear_screen());
+                }
+            }
+            CraneShellAction::StageToggle { path, staged } => {
+                if let Some(root) = self.active_cwd.clone() {
+                    let _ = if *staged {
+                        crate::git::unstage(&root, path)
+                    } else {
+                        crate::git::stage(&root, path)
+                    };
+                    self.refresh_panel();
                 }
             }
             CraneShellAction::OpenGitLog => self.open_gitlog(ctx),
