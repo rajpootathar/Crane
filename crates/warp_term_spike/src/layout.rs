@@ -116,6 +116,23 @@ impl Node {
         }
     }
 
+    /// Swap two panes' positions in the tree (drop on center = swap).
+    pub fn swap_leaves(&mut self, a: PaneId, b: PaneId) {
+        match self {
+            Node::Leaf(id) => {
+                if *id == a {
+                    *id = b;
+                } else if *id == b {
+                    *id = a;
+                }
+            }
+            Node::Split { first, second, .. } => {
+                first.swap_leaves(a, b);
+                second.swap_leaves(a, b);
+            }
+        }
+    }
+
     pub fn first_leaf(&self) -> PaneId {
         match self {
             Node::Leaf(id) => *id,

@@ -4,7 +4,6 @@
 //! are placeholder content; the point is to prove the whole-app layout +
 //! theme render in warpui exactly like the egui version.
 
-use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -13,13 +12,15 @@ use std::rc::Rc;
 use crate::file_tree;
 use crate::icons;
 use crate::layout::{Dir, Node, PaneId};
+use crate::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
 use crate::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
-    AcceptedByDropTarget, ChildView, ConstrainedBox, Container, DispatchEventResult, Draggable,
-    DraggableState, DropTarget, DropTargetData, EventHandler, Expanded, Flex, ParentElement, Rect,
-    Stack, Text,
+    ChildView, ConstrainedBox, Container, DispatchEventResult, Draggable, DraggableState,
+    EventHandler, Expanded, Flex, ParentElement, Rect, Stack, Text,
 };
+use warpui::geometry::rect::RectF;
+use warpui::geometry::vector::vec2f;
 use warpui::fonts::FamilyId;
 use warpui::{
     AppContext, Element, Entity, SingletonEntity as _, TypedActionView, View, ViewContext,
@@ -43,6 +44,11 @@ pub struct CraneShellView {
     maximized: Option<PaneId>,
     /// Persistent drag state per pane (survives re-renders; Arc-shared).
     drag_states: HashMap<PaneId, DraggableState>,
+    /// Last painted window rect per pane (recorded by RectProbe) — used to
+    /// compute the dock zone under the cursor during a drag.
+    pane_rects: Rc<RefCell<HashMap<PaneId, PaneRect>>>,
+    /// Live drop preview during a drag: (target pane, dock edge).
+    drop_preview: Rc<RefCell<Option<(PaneId, DockEdge)>>>,
     /// Monotonic pane id source.
     next_pane_id: PaneId,
     /// Which tab's layout is shown in the center.
@@ -87,37 +93,15 @@ pub struct TabMeta {
     pub name: String,
 }
 
-/// Which edge of the target pane a drop landed on → split direction + order.
-#[derive(Debug, Clone, Copy)]
-pub enum Edge {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-impl Edge {
-    /// (split direction, dragged-goes-first?).
-    fn dir_before(self) -> (Dir, bool) {
-        match self {
-            Edge::Left => (Dir::Horizontal, true),
-            Edge::Right => (Dir::Horizontal, false),
-            Edge::Top => (Dir::Vertical, true),
-            Edge::Bottom => (Dir::Vertical, false),
-        }
-    }
-}
-
-/// Drop payload: which pane + which edge a dragged pane was dropped onto.
-#[derive(Debug)]
-struct PaneDrop {
-    id: PaneId,
-    edge: Edge,
-}
-
-impl DropTargetData for PaneDrop {
-    fn as_any(&self) -> &dyn Any {
-        self
+/// Map a dock edge to (split direction, dragged-goes-first?). Center → None
+/// (handled as a swap, not a split).
+fn edge_dir_before(edge: DockEdge) -> Option<(Dir, bool)> {
+    match edge {
+        DockEdge::Left => Some((Dir::Horizontal, true)),
+        DockEdge::Right => Some((Dir::Horizontal, false)),
+        DockEdge::Top => Some((Dir::Vertical, true)),
+        DockEdge::Bottom => Some((Dir::Vertical, false)),
+        DockEdge::Center => None,
     }
 }
 
@@ -201,6 +185,8 @@ impl CraneShellView {
             focused,
             maximized: None,
             drag_states,
+            pane_rects: Rc::new(RefCell::new(HashMap::new())),
+            drop_preview: Rc::new(RefCell::new(None)),
             next_pane_id,
             worktree_tabs,
             next_tab_id,
@@ -765,74 +751,102 @@ impl CraneShellView {
         }
     }
 
-    /// A leaf pane = a draggable header bar + the terminal body, all wrapped in
-    /// a DropTarget so other panes can be re-docked onto it.
+    /// A leaf pane: header (drag handle) + terminal body, wrapped in a RectProbe
+    /// that records the pane's window rect. Drag the header over another pane:
+    /// the dock edge is computed 1:1 from the cursor position (`dock_zone`),
+    /// shown as a half-pane preview, and applied on drop (edge=split, center=swap).
     fn render_pane(&self, id: PaneId) -> Box<dyn Element> {
         let body: Box<dyn Element> = match self.panes.get(&id) {
             Some(handle) => ChildView::new(handle).finish(),
             None => Rect::new().with_background_color(theme::BG).finish(),
         };
-        // The header is the drag handle: drag it onto another pane to re-dock.
         let state = self.drag_states.get(&id).cloned().unwrap_or_default();
+
+        // on_drag: cursor = dragged-rect origin + grab offset → dock zone.
+        let drag_state = state.clone();
+        let rects = self.pane_rects.clone();
+        let preview_drag = self.drop_preview.clone();
+        let preview_drop = self.drop_preview.clone();
         let header = Draggable::new(state, self.pane_header(id))
             .on_drag_start(move |ctx, _app, _rect| {
                 ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
             })
-            .on_drop(move |ctx, _app, _rect, data| {
-                if let Some(pd) = data.and_then(|d| d.as_any().downcast_ref::<PaneDrop>()) {
-                    ctx.dispatch_typed_action(CraneShellAction::MovePane {
-                        dragged: id,
-                        target: pd.id,
-                        edge: pd.edge,
-                    });
+            .on_drag(move |ctx, _app, rect, _data| {
+                let off = drag_state
+                    .cursor_offset_within_element()
+                    .unwrap_or_else(|| vec2f(0.0, 0.0));
+                let cursor = rect.origin() + off;
+                let snapshot: Vec<(PaneId, RectF)> =
+                    rects.borrow().iter().map(|(k, v)| (*k, v.get())).collect();
+                *preview_drag.borrow_mut() = pane_under(&snapshot, id, cursor);
+                ctx.notify();
+            })
+            .on_drop(move |ctx, _app, _rect, _data| {
+                if let Some((target, edge)) = preview_drop.borrow_mut().take() {
+                    let act = if edge == DockEdge::Center {
+                        CraneShellAction::SwapPanes { a: id, b: target }
+                    } else {
+                        CraneShellAction::DockPane {
+                            src: id,
+                            target,
+                            edge,
+                        }
+                    };
+                    ctx.dispatch_typed_action(act);
                 }
             })
-            .with_accepted_by_drop_target_fn(|_, _| AcceptedByDropTarget::Yes)
             .finish();
+
         let content = Flex::column()
             .with_child(header)
             .with_child(Expanded::new(1.0, body).finish())
             .finish();
-        // Only overlay drop zones while a drag is active — otherwise invisible
-        // DropTargets would swallow terminal clicks/scroll.
-        if self.any_dragging() {
-            Stack::new()
-                .with_child(content)
-                .with_child(self.drop_zones(id))
-                .finish()
-        } else {
-            content
+        let cell = self
+            .pane_rects
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| Rc::new(Cell::new(RectF::new(vec2f(0.0, 0.0), vec2f(0.0, 0.0)))))
+            .clone();
+        let probed = RectProbe::new(content, cell).finish();
+
+        // Live half-pane drop preview when the cursor's dock zone targets us.
+        if let Some((pid, edge)) = *self.drop_preview.borrow() {
+            if pid == id {
+                return Stack::new()
+                    .with_child(probed)
+                    .with_child(self.zone_highlight(edge))
+                    .finish();
+            }
         }
+        probed
     }
 
-    /// True while any pane is being dragged (shows the drop-zone overlays).
-    fn any_dragging(&self) -> bool {
-        self.drag_states.values().any(|s| s.is_dragging())
-    }
-
-    /// Four edge drop zones overlaid on a pane during a drag. Each is a
-    /// translucent DropTarget; dropping picks the split direction + order.
-    fn drop_zones(&self, id: PaneId) -> Box<dyn Element> {
-        let zone = |edge: Edge| -> Box<dyn Element> {
-            DropTarget::new(
-                Rect::new()
-                    .with_background_color(theme::DROP_ZONE)
-                    .finish(),
-                PaneDrop { id, edge },
-            )
-            .finish()
+    /// The half-pane (or full, for Center) highlight overlay for a dock edge —
+    /// matches old Crane's `zone_rect`.
+    fn zone_highlight(&self, edge: DockEdge) -> Box<dyn Element> {
+        let hl = || -> Box<dyn Element> {
+            Rect::new().with_background_color(theme::DROP_ZONE).finish()
         };
-        // top (1) | middle row [left | center gap | right] (2) | bottom (1)
-        let middle = Flex::row()
-            .with_child(Expanded::new(1.0, zone(Edge::Left)).finish())
-            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
-            .with_child(Expanded::new(1.0, zone(Edge::Right)).finish())
-            .finish();
-        Flex::column()
-            .with_child(Expanded::new(1.0, zone(Edge::Top)).finish())
-            .with_child(Expanded::new(2.0, middle).finish())
-            .with_child(Expanded::new(1.0, zone(Edge::Bottom)).finish())
-            .finish()
+        let empty = || -> Box<dyn Element> { Rect::new().finish() };
+        match edge {
+            DockEdge::Center => hl(),
+            DockEdge::Left => Flex::row()
+                .with_child(Expanded::new(1.0, hl()).finish())
+                .with_child(Expanded::new(1.0, empty()).finish())
+                .finish(),
+            DockEdge::Right => Flex::row()
+                .with_child(Expanded::new(1.0, empty()).finish())
+                .with_child(Expanded::new(1.0, hl()).finish())
+                .finish(),
+            DockEdge::Top => Flex::column()
+                .with_child(Expanded::new(1.0, hl()).finish())
+                .with_child(Expanded::new(1.0, empty()).finish())
+                .finish(),
+            DockEdge::Bottom => Flex::column()
+                .with_child(Expanded::new(1.0, empty()).finish())
+                .with_child(Expanded::new(1.0, hl()).finish())
+                .finish(),
+        }
     }
 
     /// Pane header: title (click to focus) + expand-to-full + close.
@@ -941,25 +955,27 @@ impl CraneShellView {
 
     /// Drag-rearrange: detach `dragged` from the active tab's tree and re-dock
     /// it beside `target` in `dir`. Pane views stay alive (history retained).
-    fn move_pane(&mut self, dragged: PaneId, target: PaneId, edge: Edge) {
-        if dragged == target {
+    fn dock_pane(&mut self, src: PaneId, target: PaneId, edge: DockEdge) {
+        if src == target {
             return;
         }
+        let Some((dir, before)) = edge_dir_before(edge) else {
+            return; // Center is a swap, not a dock.
+        };
         let Some(tab) = self.active_tab else { return };
         let Some(node) = self.layouts.remove(&tab) else {
             return;
         };
-        let (dir, before) = edge.dir_before();
-        match node.close_leaf(dragged) {
+        match node.close_leaf(src) {
             Some(mut tree) => {
-                // Re-insert `dragged` at the chosen edge of `target`.
-                tree.split_leaf_ordered(target, dragged, dir, before);
+                // Re-insert `src` at the chosen edge of `target`.
+                tree.split_leaf_ordered(target, src, dir, before);
                 self.layouts.insert(tab, tree);
-                self.focused = Some(dragged);
+                self.focused = Some(src);
             }
             None => {
-                // `dragged` was the whole tree — nothing to re-dock onto.
-                self.layouts.insert(tab, Node::Leaf(dragged));
+                // `src` was the whole tree — nothing to re-dock onto.
+                self.layouts.insert(tab, Node::Leaf(src));
             }
         }
     }
@@ -1169,12 +1185,14 @@ pub enum CraneShellAction {
     ToggleMaximize(PaneId),
     /// Split a specific pane (header split buttons).
     SplitPane(PaneId, Dir),
-    /// Drag-rearrange: re-dock `dragged` at `edge` of `target`.
-    MovePane {
-        dragged: PaneId,
+    /// Drag-rearrange: dock `src` at `edge` of `target` (split).
+    DockPane {
+        src: PaneId,
         target: PaneId,
-        edge: Edge,
+        edge: DockEdge,
     },
+    /// Drag onto the center zone: swap the two panes' positions.
+    SwapPanes { a: PaneId, b: PaneId },
     /// Add a new tab to the active workspace.
     NewTab,
     /// Close a tab (project, worktree, tab_id) from the strip.
@@ -1223,12 +1241,15 @@ impl TypedActionView for CraneShellView {
                 self.focused = Some(*id);
                 self.split_focused(*dir, ctx);
             }
-            CraneShellAction::MovePane {
-                dragged,
-                target,
-                edge,
-            } => {
-                self.move_pane(*dragged, *target, *edge);
+            CraneShellAction::DockPane { src, target, edge } => {
+                self.dock_pane(*src, *target, *edge);
+            }
+            CraneShellAction::SwapPanes { a, b } => {
+                if let Some(tab) = self.active_tab {
+                    if let Some(node) = self.layouts.get_mut(&tab) {
+                        node.swap_leaves(*a, *b);
+                    }
+                }
             }
             CraneShellAction::NewTab => {
                 if let Some((pi, wi, _)) = self.active_tab {

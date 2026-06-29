@@ -17,6 +17,7 @@ pub mod icons;
 pub mod input;
 pub mod layout;
 pub mod projects;
+pub mod rect_probe;
 pub mod shell;
 pub mod split;
 pub mod theme;
