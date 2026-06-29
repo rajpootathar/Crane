@@ -284,7 +284,26 @@ impl FileView {
                 DispatchEventResult::StopPropagation
             })
             .finish();
-            row = row.with_child(chip);
+            // Close button (ASCII "x" — FileView only loads the mono font).
+            let close = EventHandler::new(
+                Container::new(
+                    Text::new("x".to_string(), self.font, 11.0)
+                        .with_color(theme::TEXT_MUTED)
+                        .finish(),
+                )
+                .with_background_color(bg)
+                .with_padding_left(2.0)
+                .with_padding_right(8.0)
+                .with_padding_top(6.0)
+                .with_padding_bottom(6.0)
+                .finish(),
+            )
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(FileViewAction::Close(i));
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            row = row.with_child(Flex::row().with_child(chip).with_child(close).finish());
         }
         ConstrainedBox::new(self.panel(theme::TOPBAR_BG, row.finish()))
             .with_height(28.0)
@@ -306,6 +325,7 @@ impl Entity for FileView {
 #[derive(Debug, Clone)]
 pub enum FileViewAction {
     Switch(usize),
+    Close(usize),
 }
 
 impl TypedActionView for FileView {
@@ -315,6 +335,20 @@ impl TypedActionView for FileView {
             FileViewAction::Switch(i) => {
                 if *i < self.files.len() {
                     self.active = *i;
+                    self.cursor = (0, 0);
+                }
+            }
+            FileViewAction::Close(i) => {
+                // Keep at least one file open (closing the pane itself is the
+                // shell's job — out of scope here).
+                if *i < self.files.len() && self.files.len() > 1 {
+                    self.files.remove(*i);
+                    if self.active >= self.files.len() {
+                        self.active = self.files.len() - 1;
+                    } else if self.active > *i {
+                        self.active -= 1;
+                    }
+                    self.cursor = (0, 0);
                 }
             }
         }
