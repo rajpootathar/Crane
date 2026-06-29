@@ -11,6 +11,33 @@ pub struct Change {
     pub path: String,
 }
 
+/// `git log --oneline --graph --decorate -n 300` in `root`, as lines.
+pub fn log(root: &Path) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "log",
+            "--oneline",
+            "--graph",
+            "--decorate",
+            "--all",
+            "-n",
+            "300",
+        ])
+        .output()
+    else {
+        return vec!["<git not available>".to_string()];
+    };
+    if !out.status.success() {
+        return vec!["<not a git repository>".to_string()];
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
 /// Working-tree changes in `root`, or empty on any error / non-repo.
 pub fn changes(root: &Path) -> Vec<Change> {
     let Ok(out) = Command::new("git")

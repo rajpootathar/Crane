@@ -698,9 +698,9 @@ impl CraneShellView {
                 CraneShellAction::SplitFocused(Dir::Horizontal),
             ))
             .with_child(Self::spacer(6.0))
-            .with_child(self.pill_button(icons::GLOBE, "Browser", CraneShellAction::Noop))
+            .with_child(self.pill_button(icons::GLOBE, "Browser", CraneShellAction::OpenBrowser))
             .with_child(Self::spacer(8.0))
-            .with_child(self.icon_button(icons::GIT_BRANCH, CraneShellAction::Noop))
+            .with_child(self.icon_button(icons::GIT_BRANCH, CraneShellAction::OpenGitLog))
             .with_child(self.icon_button(icons::SIDEBAR, CraneShellAction::ToggleRight))
             .with_child(Self::spacer(8.0))
             .finish();
@@ -942,8 +942,8 @@ impl CraneShellView {
         id
     }
 
-    /// Open `path` as a File pane, split beside the focused pane.
-    fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+    /// Insert `content` as a new pane split beside the focused pane.
+    fn split_with(&mut self, content: PaneContent) {
         let Some(tab) = self.active_tab else { return };
         let target = self
             .focused
@@ -952,9 +952,7 @@ impl CraneShellView {
         let Some(target) = target else { return };
         let id = self.next_pane_id;
         self.next_pane_id += 1;
-        let p = path.clone();
-        let handle = ctx.add_view(move |ctx| FileView::new(ctx, p));
-        self.panes.insert(id, PaneContent::File(handle));
+        self.panes.insert(id, content);
         self.drag_states.insert(id, DraggableState::default());
         if let Some(node) = self.layouts.get_mut(&tab) {
             if node.split_leaf(target, id, Dir::Horizontal) {
@@ -963,6 +961,34 @@ impl CraneShellView {
                 self.panes.remove(&id);
             }
         }
+    }
+
+    /// Open `path` as a File pane beside the focused pane.
+    fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        let handle = ctx.add_view(move |ctx| FileView::new(ctx, path));
+        self.split_with(PaneContent::File(handle));
+    }
+
+    /// Open a Git log pane for the active worktree.
+    fn open_gitlog(&mut self, ctx: &mut ViewContext<Self>) {
+        let lines = self
+            .active_cwd
+            .as_deref()
+            .map(crate::git::log)
+            .unwrap_or_else(|| vec!["<no active workspace>".to_string()]);
+        let handle = ctx.add_view(move |ctx| FileView::from_text(ctx, lines));
+        self.split_with(PaneContent::File(handle));
+    }
+
+    /// Open a placeholder Browser pane (WKWebView embed pending).
+    fn open_browser(&mut self, ctx: &mut ViewContext<Self>) {
+        let lines = vec![
+            "Browser pane".to_string(),
+            String::new(),
+            "(embedded WKWebView pending — old Crane's browser_view)".to_string(),
+        ];
+        let handle = ctx.add_view(move |ctx| FileView::from_text(ctx, lines));
+        self.split_with(PaneContent::File(handle));
     }
 
     /// The terminal view handle for a pane, if it is a terminal.
@@ -1281,6 +1307,10 @@ pub enum CraneShellAction {
     PasteFocused,
     /// Cmd+K clear the focused pane.
     ClearFocused,
+    /// Open a Git log pane.
+    OpenGitLog,
+    /// Open a Browser pane (placeholder).
+    OpenBrowser,
     /// Add a new tab to the active workspace.
     NewTab,
     /// Close a tab (project, worktree, tab_id) from the strip.
@@ -1355,6 +1385,8 @@ impl TypedActionView for CraneShellView {
                     h.update(ctx, |view, _| view.clear_screen());
                 }
             }
+            CraneShellAction::OpenGitLog => self.open_gitlog(ctx),
+            CraneShellAction::OpenBrowser => self.open_browser(ctx),
             CraneShellAction::NewTab => {
                 if let Some((pi, wi, _)) = self.active_tab {
                     let id = self.next_tab_id;

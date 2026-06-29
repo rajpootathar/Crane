@@ -32,6 +32,19 @@ impl FileView {
         let lines: Vec<String> = content.lines().take(MAX_LINES).map(str::to_string).collect();
         Self { font, path, lines }
     }
+
+    /// Build a text pane from pre-computed lines (git log, placeholders, etc.).
+    pub fn from_text(ctx: &mut ViewContext<Self>, lines: Vec<String>) -> Self {
+        let font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
+            cache.load_system_font("Menlo").expect("load Menlo")
+        });
+        let lines = lines.into_iter().take(MAX_LINES).collect();
+        Self {
+            font,
+            path: PathBuf::new(),
+            lines,
+        }
+    }
 }
 
 impl Entity for FileView {
