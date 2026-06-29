@@ -30,6 +30,13 @@ pub const DROP_ZONE: ColorU = ColorU {
     b: 220,
     a: 120,
 };
+/// Translucent black dim over INACTIVE panes (Warp-style focus = no dim).
+pub const PANE_DIM: ColorU = ColorU {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 45,
+};
 pub const ERROR: ColorU = c(220, 95, 95);
 pub const SUCCESS: ColorU = c(90, 190, 140);
 pub const WARNING: ColorU = c(232, 170, 70);

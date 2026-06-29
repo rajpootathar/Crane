@@ -756,10 +756,18 @@ impl CraneShellView {
     /// the dock edge is computed 1:1 from the cursor position (`dock_zone`),
     /// shown as a half-pane preview, and applied on drop (edge=split, center=swap).
     fn render_pane(&self, id: PaneId) -> Box<dyn Element> {
-        let body: Box<dyn Element> = match self.panes.get(&id) {
+        let raw_body: Box<dyn Element> = match self.panes.get(&id) {
             Some(handle) => ChildView::new(handle).finish(),
             None => Rect::new().with_background_color(theme::BG).finish(),
         };
+        // Click the body to focus this pane (propagate so the terminal still
+        // gets the click for future selection).
+        let body = EventHandler::new(raw_body)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
+                DispatchEventResult::PropagateToParent
+            })
+            .finish();
         let state = self.drag_states.get(&id).cloned().unwrap_or_default();
 
         // on_drag: cursor = dragged-rect origin + grab offset → dock zone.
@@ -809,16 +817,34 @@ impl CraneShellView {
             .clone();
         let probed = RectProbe::new(content, cell).finish();
 
-        // Live half-pane drop preview when the cursor's dock zone targets us.
-        if let Some((pid, edge)) = *self.drop_preview.borrow() {
+        let preview = *self.drop_preview.borrow();
+        let is_preview = matches!(preview, Some((pid, _)) if pid == id);
+        // Only one pane in the tab? Never dim (it's the active one).
+        let single = self
+            .active_tab
+            .and_then(|t| self.layouts.get(&t))
+            .map(|n| {
+                let mut leaves = Vec::new();
+                n.leaves(&mut leaves);
+                leaves.len() <= 1
+            })
+            .unwrap_or(true);
+        let mut stack = Stack::new().with_child(probed);
+        // Warp-style focus: dim INACTIVE panes (no border on the active one).
+        if !single && self.focused != Some(id) && !is_preview {
+            stack = stack.with_child(
+                Rect::new()
+                    .with_background_color(theme::PANE_DIM)
+                    .finish(),
+            );
+        }
+        // Drop preview painted last, above everything.
+        if let Some((pid, edge)) = preview {
             if pid == id {
-                return Stack::new()
-                    .with_child(probed)
-                    .with_child(self.zone_highlight(edge))
-                    .finish();
+                stack = stack.with_child(self.zone_highlight(edge));
             }
         }
-        probed
+        stack.finish()
     }
 
     /// The half-pane (or full, for Center) highlight overlay for a dock edge —
