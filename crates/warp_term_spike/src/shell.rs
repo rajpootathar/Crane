@@ -685,7 +685,11 @@ impl CraneShellView {
             .with_child(self.icon_button(icons::SIDEBAR, CraneShellAction::ToggleLeft))
             .with_child(crumb)
             .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
-            .with_child(self.pill_button(icons::TERMINAL_WINDOW, "Terminal", CraneShellAction::Noop))
+            .with_child(self.pill_button(
+                icons::TERMINAL_WINDOW,
+                "Terminal",
+                CraneShellAction::SplitFocused(Dir::Horizontal),
+            ))
             .with_child(Self::spacer(6.0))
             .with_child(self.pill_button(icons::GLOBE, "Browser", CraneShellAction::Noop))
             .with_child(Self::spacer(8.0))
