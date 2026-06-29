@@ -64,6 +64,17 @@ pub struct CraneShellView {
     /// Left tree expand state.
     expanded_projects: HashSet<usize>,
     expanded_worktrees: HashSet<(usize, usize)>,
+    /// Per-workspace (project, worktree) tab list — the Tab strip. Tabs carry a
+    /// STABLE id (not a position) so closing one doesn't reindex the others.
+    worktree_tabs: HashMap<(usize, usize), Vec<TabMeta>>,
+    /// Monotonic tab id source.
+    next_tab_id: usize,
+}
+
+#[derive(Clone)]
+pub struct TabMeta {
+    pub id: usize,
+    pub name: String,
 }
 
 impl CraneShellView {
@@ -100,21 +111,41 @@ impl CraneShellView {
             None => Vec::new(),
         };
         let active_cwd = default_cwd.clone();
-        // Open one persistent terminal pane for the default worktree as a
-        // single-leaf layout.
+        // Open the default worktree's first tab as a single-leaf layout, seeding
+        // its Tab strip from session.json (or one default tab).
         let mut panes: HashMap<PaneId, ViewHandle<TerminalView>> = HashMap::new();
         let mut layouts: HashMap<(usize, usize, usize), Node> = HashMap::new();
+        let mut worktree_tabs: HashMap<(usize, usize), Vec<TabMeta>> = HashMap::new();
         let mut active_tab = None;
         let mut focused = None;
+        let mut selected = (0, 0, usize::MAX);
         let mut next_pane_id: PaneId = 0;
+        let mut next_tab_id: usize = 0;
         if let Some(path) = default_cwd {
-            let key = (0, 0, usize::MAX);
-            let id = next_pane_id;
+            let names: Vec<String> = projects
+                .first()
+                .and_then(|p| p.worktrees.first())
+                .map(|w| w.tabs.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| vec!["Terminal".to_string()]);
+            let metas: Vec<TabMeta> = names
+                .into_iter()
+                .map(|name| {
+                    let id = next_tab_id;
+                    next_tab_id += 1;
+                    TabMeta { id, name }
+                })
+                .collect();
+            let first_id = metas[0].id;
+            worktree_tabs.insert((0, 0), metas);
+            let key = (0, 0, first_id);
+            let pane = next_pane_id;
             next_pane_id += 1;
-            panes.insert(id, Self::spawn_terminal(ctx, path));
-            layouts.insert(key, Node::Leaf(id));
+            panes.insert(pane, Self::spawn_terminal(ctx, path));
+            layouts.insert(key, Node::Leaf(pane));
             active_tab = Some(key);
-            focused = Some(id);
+            focused = Some(pane);
+            selected = key;
         }
         Self {
             ui_font,
@@ -123,11 +154,13 @@ impl CraneShellView {
             layouts,
             focused,
             next_pane_id,
+            worktree_tabs,
+            next_tab_id,
             active_tab,
             projects,
             active_cwd,
             split_ratio: Rc::new(Cell::new(0.68)),
-            selected: (0, 0, usize::MAX),
+            selected,
             show_left: true,
             show_right: true,
             files_tab: true,
@@ -726,6 +759,68 @@ impl CraneShellView {
         }
         self.panes.remove(&focused);
     }
+
+    /// The Tab strip for the active workspace: a chip per tab (name + close)
+    /// plus a `+` to add one. Crane's per-Workspace tab management.
+    fn tab_strip(&self) -> Box<dyn Element> {
+        const TAB_H: f32 = 32.0;
+        let mut row = Flex::row();
+        if let Some((pi, wi, active_id)) = self.active_tab {
+            let path = self
+                .projects
+                .get(pi)
+                .and_then(|p| p.worktrees.get(wi))
+                .map(|w| PathBuf::from(&w.path))
+                .unwrap_or_default();
+            if let Some(tabs) = self.worktree_tabs.get(&(pi, wi)) {
+                for t in tabs {
+                    row =
+                        row.with_child(self.tab_chip(pi, wi, path.clone(), t, t.id == active_id));
+                }
+            }
+        }
+        row = row.with_child(self.icon_button(icons::PLUS, CraneShellAction::NewTab));
+        ConstrainedBox::new(self.panel(theme::TOPBAR_BG, row.finish()))
+            .with_height(TAB_H)
+            .finish()
+    }
+
+    fn tab_chip(
+        &self,
+        pi: usize,
+        wi: usize,
+        path: PathBuf,
+        t: &TabMeta,
+        active: bool,
+    ) -> Box<dyn Element> {
+        let bg = if active { theme::SURFACE } else { theme::TOPBAR_BG };
+        let fg = if active { theme::TEXT } else { theme::TEXT_MUTED };
+        let select = CraneShellAction::Select {
+            sel: (pi, wi, t.id),
+            path,
+        };
+        // Clickable label — a Container with a background records the hit and
+        // sizes to content.
+        let label = EventHandler::new(
+            Container::new(
+                Text::new(t.name.clone(), self.ui_font, 12.0)
+                    .with_color(fg)
+                    .finish(),
+            )
+            .with_background_color(bg)
+            .with_padding_left(12.0)
+            .with_padding_right(6.0)
+            .with_padding_top(8.0)
+            .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(select.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+        let close = self.icon_button(icons::X, CraneShellAction::CloseTab((pi, wi, t.id)));
+        Flex::row().with_child(label).with_child(close).finish()
+    }
 }
 
 impl Entity for CraneShellView {
@@ -750,6 +845,7 @@ impl View for CraneShellView {
 
         let column = Flex::column()
             .with_child(self.top_bar())
+            .with_child(self.tab_strip())
             .with_child(Expanded::new(1.0, body).finish())
             .with_child(self.status_bar())
             .finish();
@@ -764,12 +860,15 @@ impl View for CraneShellView {
         EventHandler::new(root)
             .on_keydown(|ctx, _app, ks| {
                 if ks.cmd && !ks.ctrl && !ks.alt {
-                    let act = match ks.key.as_str() {
+                    // Shift uppercases the key ("D"), so normalize the case.
+                    let key = ks.key.to_ascii_lowercase();
+                    let act = match key.as_str() {
                         "b" => Some(CraneShellAction::ToggleLeft),
                         "/" => Some(CraneShellAction::ToggleRight),
                         // Cmd+D split side-by-side, Cmd+Shift+D stacked.
                         "d" if ks.shift => Some(CraneShellAction::SplitFocused(Dir::Vertical)),
                         "d" => Some(CraneShellAction::SplitFocused(Dir::Horizontal)),
+                        "t" => Some(CraneShellAction::NewTab),
                         "w" => Some(CraneShellAction::CloseFocused),
                         _ => None,
                     };
@@ -817,6 +916,10 @@ pub enum CraneShellAction {
     SplitFocused(Dir),
     /// Close the focused pane.
     CloseFocused,
+    /// Add a new tab to the active workspace.
+    NewTab,
+    /// Close a tab (project, worktree, tab_id) from the strip.
+    CloseTab((usize, usize, usize)),
     Noop,
 }
 
@@ -842,6 +945,50 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::SplitFocused(dir) => self.split_focused(*dir, ctx),
             CraneShellAction::CloseFocused => self.close_focused(),
+            CraneShellAction::NewTab => {
+                if let Some((pi, wi, _)) = self.active_tab {
+                    let id = self.next_tab_id;
+                    self.next_tab_id += 1;
+                    let name = format!("Terminal {}", id + 1);
+                    self.worktree_tabs
+                        .entry((pi, wi))
+                        .or_default()
+                        .push(TabMeta { id, name });
+                    let path = self.active_cwd.clone().unwrap_or_else(|| PathBuf::from("/"));
+                    let pane = self.new_pane(path, ctx);
+                    let key = (pi, wi, id);
+                    self.layouts.insert(key, Node::Leaf(pane));
+                    self.active_tab = Some(key);
+                    self.selected = key;
+                    self.focused = Some(pane);
+                    self.refresh_panel();
+                }
+            }
+            CraneShellAction::CloseTab((pi, wi, tid)) => {
+                // Drop the tab's layout + every pane it owns.
+                if let Some(node) = self.layouts.remove(&(*pi, *wi, *tid)) {
+                    let mut leaves = Vec::new();
+                    node.leaves(&mut leaves);
+                    for l in leaves {
+                        self.panes.remove(&l);
+                    }
+                }
+                if let Some(tabs) = self.worktree_tabs.get_mut(&(*pi, *wi)) {
+                    tabs.retain(|t| t.id != *tid);
+                    // If the closed tab was active, fall back to the first one.
+                    if self.active_tab == Some((*pi, *wi, *tid)) {
+                        if let Some(first) = tabs.first() {
+                            let key = (*pi, *wi, first.id);
+                            self.active_tab = Some(key);
+                            self.selected = key;
+                            self.focused = self.layouts.get(&key).map(|n| n.first_leaf());
+                        } else {
+                            self.active_tab = None;
+                            self.focused = None;
+                        }
+                    }
+                }
+            }
             CraneShellAction::ToggleLeft => self.show_left = !self.show_left,
             CraneShellAction::ToggleRight => self.show_right = !self.show_right,
             CraneShellAction::SetTab { files } => {
