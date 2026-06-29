@@ -27,11 +27,39 @@ pub fn changes(root: &Path) -> Vec<Change> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
-            if l.len() < 4 {
+            // Porcelain v1: "XY <path>" (or "XY <old> -> <new>" for renames).
+            // Index by char count, not bytes, to stay panic-safe on unicode.
+            if l.chars().count() < 4 {
                 return None;
             }
-            let status = l[..2].trim().to_string();
-            let path = l[3..].to_string();
+            let xy: String = l.chars().take(2).collect();
+            // Single normalized status letter (most significant).
+            let status = if xy.contains('?') {
+                "?"
+            } else if xy.contains('A') {
+                "A"
+            } else if xy.contains('D') {
+                "D"
+            } else if xy.contains('R') {
+                "R"
+            } else if xy.contains('C') {
+                "C"
+            } else if xy.contains('M') {
+                "M"
+            } else if xy.contains('U') {
+                "U"
+            } else {
+                xy.trim()
+            }
+            .to_string();
+            let rest: String = l.chars().skip(3).collect();
+            // Renames/copies: "old -> new" — show the new path.
+            let path = rest
+                .rsplit(" -> ")
+                .next()
+                .unwrap_or(&rest)
+                .trim_matches('"')
+                .to_string();
             Some(Change { status, path })
         })
         .collect()

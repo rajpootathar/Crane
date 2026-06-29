@@ -46,6 +46,14 @@ pub struct CraneShellView {
     files_tab: bool,
     expanded_dirs: HashSet<PathBuf>,
     selected_file: Option<PathBuf>,
+    /// Cached right-panel contents — rebuilt in `refresh_panel` on action, NOT
+    /// in render() (which runs every repaint). Avoids shelling out `git` /
+    /// walking the FS every frame.
+    file_rows: Vec<file_tree::FileRow>,
+    changes: Vec<crate::git::Change>,
+    /// Left tree expand state.
+    expanded_projects: HashSet<usize>,
+    expanded_worktrees: HashSet<(usize, usize)>,
 }
 
 impl CraneShellView {
@@ -77,6 +85,10 @@ impl CraneShellView {
             })
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let file_rows = match &default_cwd {
+            Some(root) => file_tree::build_rows(root, &HashSet::new()),
+            None => Vec::new(),
+        };
         let requested_cwd: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(default_cwd));
         let terminal = {
             let rc = requested_cwd.clone();
@@ -95,6 +107,29 @@ impl CraneShellView {
             files_tab: true,
             expanded_dirs: HashSet::new(),
             selected_file: None,
+            file_rows,
+            changes: Vec::new(),
+            expanded_projects: HashSet::from([0]),
+            expanded_worktrees: HashSet::from([(0, 0)]),
+        }
+    }
+
+    /// Rebuild the cached right-panel contents for the active tab. Called from
+    /// `handle_action` (never from render) so the FS walk / `git` shell-out
+    /// happens once per change, not every repaint.
+    fn refresh_panel(&mut self) {
+        let root = self.requested_cwd.borrow().clone();
+        match root {
+            Some(root) if self.files_tab => {
+                self.file_rows = file_tree::build_rows(&root, &self.expanded_dirs);
+            }
+            Some(root) => {
+                self.changes = crate::git::changes(&root);
+            }
+            None => {
+                self.file_rows.clear();
+                self.changes.clear();
+            }
         }
     }
 
@@ -151,33 +186,43 @@ impl CraneShellView {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// A left-tree row. `caret` = Some(expanded) draws a disclosure chevron;
+    /// None = no chevron (tabs/leaves). The TRANSPARENT hit Rect MUST be the
+    /// topmost child (warpui hit-tests at the child's max z-index).
+    #[allow(clippy::too_many_arguments)]
     fn nav_row(
         &self,
+        caret: Option<bool>,
         icon_glyph: &str,
         icon_color: ColorU,
         text: &str,
         size: f32,
         color: ColorU,
         pad: f32,
-        path: &str,
-        sel: (usize, usize, usize),
+        selected: bool,
+        action: CraneShellAction,
     ) -> Box<dyn Element> {
-        let is_sel = self.selected == sel;
         let row_h = size + 8.0;
-        // 3 layers, bottom -> top:
-        //   1. highlight bar (colored only when selected)
-        //   2. the label text
-        //   3. a TRANSPARENT hit-recording Rect on top — this MUST be the
-        //      topmost layer, because the EventHandler hit-tests at the
-        //      child's *max* z-index. (Text records no hit geometry, and a
-        //      hit Rect placed below the text sits under that max-z and is
-        //      never found.) Transparent so the text shows through.
         let mut bg = Rect::new();
-        if is_sel {
+        if selected {
             bg = bg.with_background_color(theme::ROW_ACTIVE);
         }
         let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
-        let label_inner = Flex::row()
+
+        let mut label_inner = Flex::row();
+        if let Some(expanded) = caret {
+            let glyph = if expanded {
+                icons::CARET_DOWN
+            } else {
+                icons::CARET_RIGHT
+            };
+            label_inner = label_inner.with_child(
+                Container::new(self.icon(glyph, 9.0, theme::TEXT_MUTED))
+                    .with_padding_right(3.0)
+                    .finish(),
+            );
+        }
+        label_inner = label_inner
             .with_child(
                 Container::new(self.icon(icon_glyph, size, icon_color))
                     .with_padding_right(6.0)
@@ -187,9 +232,8 @@ impl CraneShellView {
                 Text::new(text.to_string(), self.ui_font, size)
                     .with_color(color)
                     .finish(),
-            )
-            .finish();
-        let label = Container::new(label_inner)
+            );
+        let label = Container::new(label_inner.finish())
             .with_padding_left(pad)
             .with_padding_top(4.0)
             .finish();
@@ -202,17 +246,9 @@ impl CraneShellView {
             .with_child(hit_layer)
             .finish();
 
-        if path.is_empty() {
-            return row;
-        }
-        let target = PathBuf::from(path);
         EventHandler::new(row)
             .on_left_mouse_down(move |ctx, _app, _pos| {
-                // Route through a typed action so warpui re-renders the view.
-                ctx.dispatch_typed_action(CraneShellAction::Select {
-                    sel,
-                    path: target.clone(),
-                });
+                ctx.dispatch_typed_action(action.clone());
                 DispatchEventResult::StopPropagation
             })
             .finish()
@@ -276,43 +312,58 @@ impl CraneShellView {
         }
         let sel = self.selected;
         for (pi, p) in self.projects.iter().enumerate() {
-            let pkey = (pi, usize::MAX, usize::MAX);
-            let pcol = if sel == pkey { theme::TEXT_HOVER } else { theme::TEXT };
+            let p_expanded = self.expanded_projects.contains(&pi);
+            let psel = sel == (pi, usize::MAX, usize::MAX);
+            let pcol = if psel { theme::TEXT_HOVER } else { theme::TEXT };
             col = col.with_child(self.nav_row(
+                Some(p_expanded),
                 icons::CUBE,
                 project_tint(pi),
                 &p.name,
                 13.0,
                 pcol,
-                12.0,
-                &p.path,
-                pkey,
+                10.0,
+                psel,
+                CraneShellAction::ToggleProject(pi),
             ));
+            if !p_expanded {
+                continue;
+            }
             for (wi, w) in p.worktrees.iter().enumerate() {
-                let wkey = (pi, wi, usize::MAX);
-                let wcol = if sel == wkey { theme::TEXT_HOVER } else { theme::ACCENT };
+                let w_expanded = self.expanded_worktrees.contains(&(pi, wi));
+                let wsel = sel == (pi, wi, usize::MAX);
+                let wcol = if wsel { theme::TEXT_HOVER } else { theme::ACCENT };
                 col = col.with_child(self.nav_row(
+                    Some(w_expanded),
                     icons::GIT_BRANCH,
                     wcol,
                     &w.name,
                     12.0,
                     wcol,
-                    26.0,
-                    &w.path,
-                    wkey,
+                    24.0,
+                    wsel,
+                    CraneShellAction::ToggleWorktree(pi, wi),
                 ));
+                if !w_expanded {
+                    continue;
+                }
                 for (ti, t) in w.tabs.iter().enumerate() {
                     let tkey = (pi, wi, ti);
-                    let tcol = if sel == tkey { theme::TEXT_HOVER } else { theme::TEXT_MUTED };
+                    let tsel = sel == tkey;
+                    let tcol = if tsel { theme::TEXT_HOVER } else { theme::TEXT_MUTED };
                     col = col.with_child(self.nav_row(
+                        None,
                         icons::TERMINAL_WINDOW,
                         tcol,
                         t,
                         11.0,
                         tcol,
-                        40.0,
-                        &w.path,
-                        tkey,
+                        42.0,
+                        tsel,
+                        CraneShellAction::Select {
+                            sel: tkey,
+                            path: PathBuf::from(&w.path),
+                        },
                     ));
                 }
             }
@@ -407,11 +458,11 @@ impl CraneShellView {
 
     fn change_row(&self, ch: &crate::git::Change) -> Box<dyn Element> {
         let color = match ch.status.as_str() {
-            "A" | "AM" => theme::SUCCESS,
-            "D" | "AD" => theme::ERROR,
-            "M" | "MM" | "RM" | "UU" => theme::WARNING,
+            "A" => theme::SUCCESS,
+            "D" | "U" => theme::ERROR,
+            "M" => theme::WARNING,
             "R" | "C" => theme::ACCENT,
-            _ => theme::TEXT_MUTED,
+            _ => theme::TEXT_MUTED, // "?" untracked
         };
         let inner = Flex::row()
             .with_child(
@@ -457,42 +508,20 @@ impl CraneShellView {
             .finish();
 
         let mut col = Flex::column().with_child(tabs);
+        // Read CACHED contents (rebuilt in refresh_panel on action, not here).
         if self.files_tab {
-            match self.requested_cwd.borrow().clone() {
-                Some(root) => {
-                    for r in file_tree::build_rows(&root, &self.expanded_dirs) {
-                        col = col.with_child(self.file_row(&r));
-                    }
-                }
-                None => {
-                    col = col.with_child(self.tree_row(
-                        "(no folder selected)",
-                        12.0,
-                        theme::TEXT_MUTED,
-                        12.0,
-                    ));
-                }
+            if self.file_rows.is_empty() {
+                col = col.with_child(self.tree_row("(empty)", 12.0, theme::TEXT_MUTED, 12.0));
+            }
+            for r in &self.file_rows {
+                col = col.with_child(self.file_row(r));
             }
         } else {
-            match self.requested_cwd.borrow().clone() {
-                Some(root) => {
-                    let changes = crate::git::changes(&root);
-                    if changes.is_empty() {
-                        col = col.with_child(self.tree_row(
-                            "No changes",
-                            12.0,
-                            theme::TEXT_MUTED,
-                            12.0,
-                        ));
-                    }
-                    for ch in &changes {
-                        col = col.with_child(self.change_row(ch));
-                    }
-                }
-                None => {
-                    col =
-                        col.with_child(self.tree_row("(no repo)", 12.0, theme::TEXT_MUTED, 12.0));
-                }
+            if self.changes.is_empty() {
+                col = col.with_child(self.tree_row("No changes", 12.0, theme::TEXT_MUTED, 12.0));
+            }
+            for ch in &self.changes {
+                col = col.with_child(self.change_row(ch));
             }
         }
         ConstrainedBox::new(self.panel(theme::SIDEBAR_BG, col.finish()))
@@ -651,6 +680,8 @@ pub enum CraneShellAction {
     SetTab { files: bool },
     ToggleDir(PathBuf),
     SelectFile(PathBuf),
+    ToggleProject(usize),
+    ToggleWorktree(usize, usize),
     Noop,
 }
 
@@ -661,16 +692,32 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::Select { sel, path } => {
                 self.selected = *sel;
                 *self.requested_cwd.borrow_mut() = Some(path.clone());
+                self.refresh_panel();
             }
             CraneShellAction::ToggleLeft => self.show_left = !self.show_left,
             CraneShellAction::ToggleRight => self.show_right = !self.show_right,
-            CraneShellAction::SetTab { files } => self.files_tab = *files,
+            CraneShellAction::SetTab { files } => {
+                self.files_tab = *files;
+                self.refresh_panel();
+            }
             CraneShellAction::ToggleDir(p) => {
                 if !self.expanded_dirs.remove(p) {
                     self.expanded_dirs.insert(p.clone());
                 }
+                self.refresh_panel();
             }
             CraneShellAction::SelectFile(p) => self.selected_file = Some(p.clone()),
+            CraneShellAction::ToggleProject(i) => {
+                if !self.expanded_projects.remove(i) {
+                    self.expanded_projects.insert(*i);
+                }
+            }
+            CraneShellAction::ToggleWorktree(p, w) => {
+                let k = (*p, *w);
+                if !self.expanded_worktrees.remove(&k) {
+                    self.expanded_worktrees.insert(k);
+                }
+            }
             CraneShellAction::Noop => {}
         }
         // Mark the view dirty so warpui re-renders.

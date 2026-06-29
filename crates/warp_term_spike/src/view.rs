@@ -60,8 +60,11 @@ impl TerminalView {
         let wake: Wake = Arc::new(move || {
             let _ = tx.try_send(());
         });
-        let controller =
-            TerminalController::new(80, 24, None, wake.clone()).expect("spawn terminal");
+        // Spawn directly in the initial requested cwd (avoids the
+        // spawn-in-$HOME-then-respawn double start).
+        let initial = requested_cwd.borrow().clone();
+        let controller = TerminalController::new(80, 24, initial.as_deref(), wake.clone())
+            .expect("spawn terminal");
         let repaint =
             ctx.spawn_stream_local(rx, |_this, _item, ctx| ctx.notify(), |_this, _ctx| {});
 
@@ -70,7 +73,7 @@ impl TerminalView {
             controller: Rc::new(RefCell::new(controller)),
             desired: Rc::new(StdCell::new(None)),
             requested_cwd,
-            current_cwd: RefCell::new(None),
+            current_cwd: RefCell::new(initial),
             wake,
             _repaint: repaint,
         }
