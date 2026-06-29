@@ -14,9 +14,15 @@ use warpui::{AppContext, Entity, SingletonEntity as _, TypedActionView, View, Vi
 
 use crate::theme;
 
-const MAX_LINES: usize = 2000;
+/// Render cap (NOT a storage cap — the full file is kept; only a window is
+/// drawn until real scroll/virtualization lands, so a huge file can't blow up
+/// the element tree). Storing the whole file avoids the silent data loss the
+/// 1:1 review flagged.
+const RENDER_LINES: usize = 2000;
 
 struct OpenFile {
+    /// Full path — tabs are keyed by this so same-named files don't collide.
+    path: PathBuf,
     name: String,
     lines: Vec<String>,
 }
@@ -24,12 +30,16 @@ struct OpenFile {
 fn read_file(path: &PathBuf) -> OpenFile {
     let content = std::fs::read_to_string(path)
         .unwrap_or_else(|e| format!("<cannot read {}: {e}>", path.display()));
-    let lines = content.lines().take(MAX_LINES).map(str::to_string).collect();
+    let lines = content.lines().map(str::to_string).collect(); // full content
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    OpenFile { name, lines }
+    OpenFile {
+        path: path.clone(),
+        name,
+        lines,
+    }
 }
 
 pub struct FileView {
@@ -58,8 +68,9 @@ impl FileView {
         Self {
             font,
             files: vec![OpenFile {
+                path: PathBuf::new(),
                 name: title,
-                lines: lines.into_iter().take(MAX_LINES).collect(),
+                lines,
             }],
             active: 0,
             is_doc: true,
@@ -75,7 +86,7 @@ impl FileView {
     /// Open `path` as a new tab (or switch to it if already open).
     pub fn open(&mut self, path: PathBuf) {
         let f = read_file(&path);
-        if let Some(i) = self.files.iter().position(|of| of.name == f.name) {
+        if let Some(i) = self.files.iter().position(|of| of.path == f.path) {
             self.active = i;
         } else {
             self.files.push(f);
@@ -154,7 +165,7 @@ impl View for FileView {
         }
         let mut body = Flex::column();
         if let Some(f) = self.files.get(self.active) {
-            for line in &f.lines {
+            for line in f.lines.iter().take(RENDER_LINES) {
                 body = body.with_child(
                     Text::new(line.clone(), self.font, 12.0)
                         .with_color(theme::TEXT)
