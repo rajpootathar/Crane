@@ -204,10 +204,21 @@ impl View for TerminalView {
                 }
                 DispatchEventResult::StopPropagation
             })
-            .on_keydown(move |_ctx, _app, ks: &Keystroke| {
-                // Let app-level Cmd combos through.
+            .on_keydown(move |ctx, _app, ks: &Keystroke| {
                 if ks.cmd {
-                    return DispatchEventResult::PropagateToParent;
+                    // Terminal-local Cmd combos handled here (clipboard +
+                    // controller live in this view); the rest go to the shell.
+                    match ks.key.to_ascii_lowercase().as_str() {
+                        "v" => {
+                            ctx.dispatch_typed_action(TerminalViewAction::Paste);
+                            return DispatchEventResult::StopPropagation;
+                        }
+                        "k" => {
+                            ctx.dispatch_typed_action(TerminalViewAction::Clear);
+                            return DispatchEventResult::StopPropagation;
+                        }
+                        _ => return DispatchEventResult::PropagateToParent,
+                    }
                 }
                 let ctrl = controller.borrow();
                 // Don't forward keys to a dead PTY.
@@ -227,9 +238,37 @@ impl View for TerminalView {
 }
 
 #[derive(Debug, Clone)]
-pub enum TerminalViewAction {}
+pub enum TerminalViewAction {
+    /// Cmd+V — paste clipboard text (bracketed when the app requested it).
+    Paste,
+    /// Cmd+K — clear the screen (Ctrl+L: shell clears + redraws prompt).
+    Clear,
+}
 
 impl TypedActionView for TerminalView {
     type Action = TerminalViewAction;
-    fn handle_action(&mut self, _action: &Self::Action, _ctx: &mut ViewContext<Self>) {}
+    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
+        match action {
+            TerminalViewAction::Paste => {
+                let text = ctx.clipboard().read().plain_text;
+                if text.is_empty() {
+                    return;
+                }
+                let ctrl = self.controller.borrow();
+                let bracketed = ctrl.term.lock().is_bracketed_paste();
+                let bytes = if bracketed {
+                    let mut b = b"\x1b[200~".to_vec();
+                    b.extend_from_slice(text.as_bytes());
+                    b.extend_from_slice(b"\x1b[201~");
+                    b
+                } else {
+                    text.into_bytes()
+                };
+                ctrl.write_input(&bytes);
+            }
+            TerminalViewAction::Clear => {
+                self.controller.borrow().write_input(b"\x0c");
+            }
+        }
+    }
 }
