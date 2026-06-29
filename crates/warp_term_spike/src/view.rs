@@ -192,7 +192,18 @@ impl View for TerminalView {
         );
 
         let controller = self.controller.clone();
+        let scroll_ctrl = self.controller.clone();
+        let scroll_wake = self.wake.clone();
         EventHandler::new(grid.finish())
+            .on_scroll_wheel(move |_ctx, _app, delta, _mods| {
+                // Scroll up into scrollback (positive display_offset).
+                let lines = (delta.y() / 10.0).round() as i32;
+                if lines != 0 {
+                    scroll_ctrl.borrow().term.lock().scroll_display(lines);
+                    (scroll_wake)();
+                }
+                DispatchEventResult::StopPropagation
+            })
             .on_keydown(move |_ctx, _app, ks: &Keystroke| {
                 // Let app-level Cmd combos through.
                 if ks.cmd {
