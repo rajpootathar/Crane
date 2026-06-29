@@ -1368,6 +1368,13 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::Noop => {}
         }
+        // Keep KEYBOARD focus in sync with the focused pane, so the pane with
+        // the focus border is the one that actually receives keystrokes.
+        if let Some(id) = self.focused {
+            if let Some(handle) = self.panes.get(&id) {
+                ctx.focus(handle);
+            }
+        }
         // Mark the view dirty so warpui re-renders.
         ctx.notify();
     }
