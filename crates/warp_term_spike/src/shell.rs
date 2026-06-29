@@ -4,6 +4,7 @@
 //! are placeholder content; the point is to prove the whole-app layout +
 //! theme render in warpui exactly like the egui version.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -15,8 +16,9 @@ use crate::layout::{Dir, Node, PaneId};
 use crate::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
-    ChildView, ConstrainedBox, Container, DispatchEventResult, EventHandler, Expanded, Flex,
-    ParentElement, Rect, Stack, Text,
+    AcceptedByDropTarget, ChildView, ConstrainedBox, Container, DispatchEventResult, Draggable,
+    DraggableState, DropTarget, DropTargetData, EventHandler, Expanded, Flex, ParentElement, Rect,
+    Stack, Text,
 };
 use warpui::fonts::FamilyId;
 use warpui::{
@@ -39,6 +41,8 @@ pub struct CraneShellView {
     focused: Option<PaneId>,
     /// When set, only this pane renders (expand-to-full / maximize).
     maximized: Option<PaneId>,
+    /// Persistent drag state per pane (survives re-renders; Arc-shared).
+    drag_states: HashMap<PaneId, DraggableState>,
     /// Monotonic pane id source.
     next_pane_id: PaneId,
     /// Which tab's layout is shown in the center.
@@ -83,6 +87,18 @@ pub struct TabMeta {
     pub name: String,
 }
 
+/// Drop payload identifying which pane a dragged pane was dropped onto.
+#[derive(Debug)]
+struct PaneDrop {
+    id: PaneId,
+}
+
+impl DropTargetData for PaneDrop {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 impl CraneShellView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
         let ui_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
@@ -122,6 +138,7 @@ impl CraneShellView {
         let mut panes: HashMap<PaneId, ViewHandle<TerminalView>> = HashMap::new();
         let mut layouts: HashMap<(usize, usize, usize), Node> = HashMap::new();
         let mut worktree_tabs: HashMap<(usize, usize), Vec<TabMeta>> = HashMap::new();
+        let mut drag_states: HashMap<PaneId, DraggableState> = HashMap::new();
         let mut active_tab = None;
         let mut focused = None;
         let mut selected = (0, 0, usize::MAX);
@@ -148,6 +165,7 @@ impl CraneShellView {
             let pane = next_pane_id;
             next_pane_id += 1;
             panes.insert(pane, Self::spawn_terminal(ctx, path));
+            drag_states.insert(pane, DraggableState::default());
             layouts.insert(key, Node::Leaf(pane));
             active_tab = Some(key);
             focused = Some(pane);
@@ -160,6 +178,7 @@ impl CraneShellView {
             layouts,
             focused,
             maximized: None,
+            drag_states,
             next_pane_id,
             worktree_tabs,
             next_tab_id,
@@ -724,16 +743,34 @@ impl CraneShellView {
         }
     }
 
-    /// A leaf pane = a header bar + the terminal body.
+    /// A leaf pane = a draggable header bar + the terminal body, all wrapped in
+    /// a DropTarget so other panes can be re-docked onto it.
     fn render_pane(&self, id: PaneId) -> Box<dyn Element> {
         let body: Box<dyn Element> = match self.panes.get(&id) {
             Some(handle) => ChildView::new(handle).finish(),
             None => Rect::new().with_background_color(theme::BG).finish(),
         };
-        Flex::column()
-            .with_child(self.pane_header(id))
+        // The header is the drag handle: drag it onto another pane to re-dock.
+        let state = self.drag_states.get(&id).cloned().unwrap_or_default();
+        let header = Draggable::new(state, self.pane_header(id))
+            .on_drag_start(move |ctx, _app, _rect| {
+                ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
+            })
+            .on_drop(move |ctx, _app, _rect, data| {
+                if let Some(pd) = data.and_then(|d| d.as_any().downcast_ref::<PaneDrop>()) {
+                    ctx.dispatch_typed_action(CraneShellAction::MovePane {
+                        dragged: id,
+                        target: pd.id,
+                    });
+                }
+            })
+            .with_accepted_by_drop_target_fn(|_, _| AcceptedByDropTarget::Yes)
+            .finish();
+        let content = Flex::column()
+            .with_child(header)
             .with_child(Expanded::new(1.0, body).finish())
-            .finish()
+            .finish();
+        DropTarget::new(content, PaneDrop { id }).finish()
     }
 
     /// Pane header: title (click to focus) + expand-to-full + close.
@@ -795,6 +832,7 @@ impl CraneShellView {
         self.next_pane_id += 1;
         let handle = Self::spawn_terminal(ctx, path);
         self.panes.insert(id, handle);
+        self.drag_states.insert(id, DraggableState::default());
         id
     }
 
@@ -836,6 +874,32 @@ impl CraneShellView {
             }
         }
         self.panes.remove(&focused);
+    }
+
+    /// Drag-rearrange: detach `dragged` from the active tab's tree and re-dock
+    /// it beside `target` in `dir`. Pane views stay alive (history retained).
+    fn move_pane(&mut self, dragged: PaneId, target: PaneId, dir: Dir) {
+        if dragged == target {
+            return;
+        }
+        let Some(tab) = self.active_tab else { return };
+        let Some(node) = self.layouts.remove(&tab) else {
+            return;
+        };
+        match node.close_leaf(dragged) {
+            Some(mut tree) => {
+                // split_leaf re-inserts `dragged` beside `target`. If target
+                // isn't found (shouldn't happen — same tab), the detached tree
+                // still goes back so we never lose panes.
+                tree.split_leaf(target, dragged, dir);
+                self.layouts.insert(tab, tree);
+                self.focused = Some(dragged);
+            }
+            None => {
+                // `dragged` was the whole tree — nothing to re-dock onto.
+                self.layouts.insert(tab, Node::Leaf(dragged));
+            }
+        }
     }
 
     /// The Tab strip for the active workspace: a chip per tab (name + close)
@@ -1041,6 +1105,8 @@ pub enum CraneShellAction {
     ToggleMaximize(PaneId),
     /// Split a specific pane (header split buttons).
     SplitPane(PaneId, Dir),
+    /// Drag-rearrange: re-dock `dragged` next to `target` in the layout tree.
+    MovePane { dragged: PaneId, target: PaneId },
     /// Add a new tab to the active workspace.
     NewTab,
     /// Close a tab (project, worktree, tab_id) from the strip.
@@ -1088,6 +1154,9 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::SplitPane(id, dir) => {
                 self.focused = Some(*id);
                 self.split_focused(*dir, ctx);
+            }
+            CraneShellAction::MovePane { dragged, target } => {
+                self.move_pane(*dragged, *target, Dir::Horizontal);
             }
             CraneShellAction::NewTab => {
                 if let Some((pi, wi, _)) = self.active_tab {
