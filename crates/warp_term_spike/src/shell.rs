@@ -1049,7 +1049,9 @@ impl View for CraneShellView {
                         // Cmd+D split side-by-side, Cmd+Shift+D stacked.
                         "d" if ks.shift => Some(CraneShellAction::SplitFocused(Dir::Vertical)),
                         "d" => Some(CraneShellAction::SplitFocused(Dir::Horizontal)),
-                        "t" => Some(CraneShellAction::NewTab),
+                        // Canonical: Cmd+T splits a pane, Cmd+Shift+T adds a tab.
+                        "t" if ks.shift => Some(CraneShellAction::NewTab),
+                        "t" => Some(CraneShellAction::SplitFocused(Dir::Horizontal)),
                         "w" => Some(CraneShellAction::CloseFocused),
                         _ => None,
                     };
