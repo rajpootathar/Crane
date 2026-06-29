@@ -17,9 +17,10 @@ use crate::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
     ChildView, ConstrainedBox, Container, DispatchEventResult, Draggable, DraggableState,
-    EventHandler, Expanded, Flex, ParentElement, Rect, Stack, Text,
+    EventHandler, Expanded, Fill, Flex, ParentElement, Rect, Stack, Text,
 };
 use warpui::geometry::rect::RectF;
+use warpui::scene::Border;
 use warpui::geometry::vector::vec2f;
 use warpui::fonts::FamilyId;
 use warpui::{
@@ -834,11 +835,27 @@ impl CraneShellView {
             })
             .unwrap_or(true);
         let mut stack = Stack::new().with_child(probed);
-        // Warp-style focus: dim INACTIVE panes (no border on the active one).
+        // Focus indication (only meaningful with >1 pane): dim inactive panes
+        // AND draw a 2px accent border on the active one (canonical Crane spec).
         if !single && self.focused != Some(id) && !is_preview {
             stack = stack.with_child(
                 Rect::new()
                     .with_background_color(theme::PANE_DIM)
+                    .finish(),
+            );
+        }
+        if !single && self.focused == Some(id) {
+            stack = stack.with_child(
+                Rect::new()
+                    .with_border(Border {
+                        width: 2.0,
+                        color: Fill::Solid(theme::FOCUS_BORDER),
+                        top: true,
+                        left: true,
+                        bottom: true,
+                        right: true,
+                        dash: None,
+                    })
                     .finish(),
             );
         }
