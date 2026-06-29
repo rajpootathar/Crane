@@ -21,7 +21,11 @@ pub const TEXT_MUTED: ColorU = c(150, 156, 172);
 pub const TEXT_HEADER: ColorU = c(140, 146, 162);
 pub const ACCENT: ColorU = c(90, 135, 220);
 pub const ROW_ACTIVE: ColorU = c(48, 56, 80);
+pub const ROW_HOVER: ColorU = c(30, 34, 46);
 pub const FOCUS_BORDER: ColorU = c(100, 140, 220);
+pub const ERROR: ColorU = c(220, 95, 95);
+pub const SUCCESS: ColorU = c(90, 190, 140);
+pub const WARNING: ColorU = c(232, 170, 70);
 
 // Panel dimensions (from src/ui/top.rs, src/ui/status.rs, src/state/state.rs).
 pub const TOPBAR_H: f32 = 34.0;

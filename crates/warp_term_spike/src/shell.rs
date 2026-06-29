@@ -405,6 +405,37 @@ impl CraneShellView {
             .finish()
     }
 
+    fn change_row(&self, ch: &crate::git::Change) -> Box<dyn Element> {
+        let color = match ch.status.as_str() {
+            "A" | "AM" => theme::SUCCESS,
+            "D" | "AD" => theme::ERROR,
+            "M" | "MM" | "RM" | "UU" => theme::WARNING,
+            "R" | "C" => theme::ACCENT,
+            _ => theme::TEXT_MUTED,
+        };
+        let inner = Flex::row()
+            .with_child(
+                ConstrainedBox::new(
+                    Text::new(ch.status.clone(), self.ui_font, 11.0)
+                        .with_color(color)
+                        .finish(),
+                )
+                .with_width(22.0)
+                .finish(),
+            )
+            .with_child(
+                Text::new(ch.path.clone(), self.ui_font, 12.0)
+                    .with_color(theme::TEXT)
+                    .finish(),
+            )
+            .finish();
+        Container::new(inner)
+            .with_padding_left(12.0)
+            .with_padding_top(3.0)
+            .with_padding_bottom(3.0)
+            .finish()
+    }
+
     fn right_sidebar(&self) -> Box<dyn Element> {
         let tabs = Flex::row()
             .with_child(self.tab_label(
@@ -443,8 +474,26 @@ impl CraneShellView {
                 }
             }
         } else {
-            col = col.with_child(self.tree_row("M  src/shell.rs", 12.0, theme::TEXT, 12.0));
-            col = col.with_child(self.tree_row("A  src/file_tree.rs", 12.0, theme::ACCENT, 12.0));
+            match self.requested_cwd.borrow().clone() {
+                Some(root) => {
+                    let changes = crate::git::changes(&root);
+                    if changes.is_empty() {
+                        col = col.with_child(self.tree_row(
+                            "No changes",
+                            12.0,
+                            theme::TEXT_MUTED,
+                            12.0,
+                        ));
+                    }
+                    for ch in &changes {
+                        col = col.with_child(self.change_row(ch));
+                    }
+                }
+                None => {
+                    col =
+                        col.with_child(self.tree_row("(no repo)", 12.0, theme::TEXT_MUTED, 12.0));
+                }
+            }
         }
         ConstrainedBox::new(self.panel(theme::SIDEBAR_BG, col.finish()))
             .with_width(theme::RIGHT_W)
