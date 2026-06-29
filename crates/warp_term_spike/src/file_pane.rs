@@ -230,8 +230,14 @@ impl FileView {
             let active = i == self.active;
             let bg = if active { theme::SURFACE } else { theme::TOPBAR_BG };
             let fg = if active { theme::TEXT } else { theme::TEXT_MUTED };
+            // Dirty marker on the active tab when the buffer has unsaved edits.
+            let label = if active && self.dirty {
+                format!("* {}", f.name)
+            } else {
+                f.name.clone()
+            };
             let chip = EventHandler::new(
-                Container::new(Text::new(f.name.clone(), self.font, 11.0).with_color(fg).finish())
+                Container::new(Text::new(label, self.font, 11.0).with_color(fg).finish())
                     .with_background_color(bg)
                     .with_padding_left(10.0)
                     .with_padding_right(10.0)
