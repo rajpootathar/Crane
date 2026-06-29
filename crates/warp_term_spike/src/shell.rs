@@ -58,6 +58,10 @@ pub struct CraneShellView {
     active_cwd: Option<PathBuf>,
     /// Cached current branch of the active worktree (status bar).
     branch: String,
+    /// Commit message buffer + whether the commit box has keyboard focus
+    /// (keys route to it instead of the terminal).
+    commit_msg: String,
+    commit_focused: bool,
     /// Draggable left-panel boundary (fraction of the window width).
     left_ratio: Rc<Cell<f32>>,
     left_drag: Rc<Cell<bool>>,
@@ -205,6 +209,8 @@ impl CraneShellView {
                 .as_deref()
                 .map(crate::git::current_branch)
                 .unwrap_or_default(),
+            commit_msg: String::new(),
+            commit_focused: false,
             active_cwd,
             left_ratio: Rc::new(Cell::new(0.18)),
             left_drag: Rc::new(Cell::new(false)),
@@ -672,9 +678,56 @@ impl CraneShellView {
             for ch in &self.changes {
                 col = col.with_child(self.change_row(ch));
             }
+            col = col.with_child(self.commit_box());
         }
         // No fixed width — the enclosing SplitBox sizes it (draggable).
         self.panel(theme::SIDEBAR_BG, col.finish())
+    }
+
+    /// Commit message field + Commit button at the bottom of the Changes tab.
+    fn commit_box(&self) -> Box<dyn Element> {
+        let staged = self.changes.iter().filter(|c| c.staged).count();
+        let (text, color) = if self.commit_msg.is_empty() {
+            ("Commit message…".to_string(), theme::TEXT_MUTED)
+        } else {
+            // Caret when focused.
+            let caret = if self.commit_focused { "|" } else { "" };
+            (format!("{}{}", self.commit_msg, caret), theme::TEXT)
+        };
+        // Click the field to focus it (keys route here instead of the terminal).
+        let field = EventHandler::new(
+            Container::new(Text::new(text, self.ui_font, 12.0).with_color(color).finish())
+                .with_background_color(if self.commit_focused {
+                    theme::ROW_ACTIVE
+                } else {
+                    theme::SURFACE
+                })
+                .with_padding_left(8.0)
+                .with_padding_right(8.0)
+                .with_padding_top(7.0)
+                .with_padding_bottom(7.0)
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::FocusCommit);
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+
+        let btn_label = format!("Commit ({staged})");
+        let commit_btn = self.pill_button(icons::GIT_BRANCH, &btn_label, CraneShellAction::CommitStaged);
+
+        Container::new(
+            Flex::column()
+                .with_child(field)
+                .with_child(Self::spacer(6.0))
+                .with_child(commit_btn)
+                .finish(),
+        )
+        .with_padding_left(10.0)
+        .with_padding_right(10.0)
+        .with_padding_top(8.0)
+        .finish()
     }
 
     /// Unified full-width top bar that doubles as the macOS titlebar: the
@@ -1038,6 +1091,33 @@ impl CraneShellView {
         self.split_with(PaneContent::File(handle));
     }
 
+    /// Edit the commit message buffer from a keystroke (commit box focused).
+    fn edit_commit(&mut self, ks: &warpui::keymap::Keystroke) {
+        match ks.key.as_str() {
+            "enter" | "return" | "numpadenter" => self.commit_now(),
+            "backspace" => {
+                self.commit_msg.pop();
+            }
+            k if k.chars().count() == 1 => self.commit_msg.push_str(k),
+            _ => {}
+        }
+    }
+
+    /// Commit staged changes with the current message, then clear + refresh.
+    fn commit_now(&mut self) {
+        let msg = self.commit_msg.trim().to_string();
+        if msg.is_empty() {
+            return;
+        }
+        if let Some(root) = self.active_cwd.clone() {
+            if crate::git::commit(&root, &msg).is_ok() {
+                self.commit_msg.clear();
+                self.commit_focused = false;
+                self.refresh_panel();
+            }
+        }
+    }
+
     /// The terminal view handle for a pane, if it is a terminal.
     fn terminal_at(&self, id: PaneId) -> Option<ViewHandle<TerminalView>> {
         match self.panes.get(&id) {
@@ -1356,6 +1436,10 @@ pub enum CraneShellAction {
     ClearFocused,
     /// Toggle stage/unstage for a changed file (click in the Changes tab).
     StageToggle { path: String, staged: bool },
+    /// Give the commit message box keyboard focus.
+    FocusCommit,
+    /// Commit staged changes with the current message.
+    CommitStaged,
     /// Open a Git log pane.
     OpenGitLog,
     /// Open a Browser pane (placeholder).
@@ -1389,7 +1473,10 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::SplitFocused(dir) => self.split_focused(*dir, ctx),
             CraneShellAction::CloseFocused => self.close_focused(),
-            CraneShellAction::FocusPane(id) => self.focused = Some(*id),
+            CraneShellAction::FocusPane(id) => {
+                self.focused = Some(*id);
+                self.commit_focused = false;
+            }
             CraneShellAction::ClosePane(id) => {
                 self.focused = Some(*id);
                 if self.maximized == Some(*id) {
@@ -1419,10 +1506,14 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::SendKeys(ks) => {
-                if let Some(h) = self.focused.and_then(|id| self.terminal_at(id)) {
+                if self.commit_focused {
+                    self.edit_commit(ks);
+                } else if let Some(h) = self.focused.and_then(|id| self.terminal_at(id)) {
                     h.update(ctx, |view, _| view.write_keystroke(ks));
                 }
             }
+            CraneShellAction::FocusCommit => self.commit_focused = true,
+            CraneShellAction::CommitStaged => self.commit_now(),
             CraneShellAction::PasteFocused => {
                 let text = ctx.clipboard().read().plain_text;
                 if let Some(h) = self.focused.and_then(|id| self.terminal_at(id)) {
