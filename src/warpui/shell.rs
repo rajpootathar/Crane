@@ -1290,9 +1290,6 @@ impl CraneShellView {
             }
         }
     }
-
-    /// The Tab strip for the active workspace: a chip per tab (name + close)
-    /// plus a `+` to add one. Crane's per-Workspace tab management.
 }
 
 impl Entity for CraneShellView {
