@@ -56,6 +56,8 @@ pub struct FileView {
     /// file index so switching tabs doesn't cross-contaminate history.
     undo: Vec<(usize, Vec<String>, (usize, usize))>,
     redo: Vec<(usize, Vec<String>, (usize, usize))>,
+    /// First visible line (scroll offset).
+    scroll: usize,
     /// Set when this pane was created from pre-built text (git log etc.) — then
     /// it shows that single doc with no tab strip.
     is_doc: bool,
@@ -71,6 +73,7 @@ impl FileView {
             cursor: (0, 0),
             undo: Vec::new(),
             redo: Vec::new(),
+            scroll: 0,
             is_doc: false,
         }
     }
@@ -90,6 +93,7 @@ impl FileView {
             cursor: (0, 0),
             undo: Vec::new(),
             redo: Vec::new(),
+            scroll: 0,
             is_doc: true,
         }
     }
@@ -409,6 +413,8 @@ impl Entity for FileView {
 pub enum FileViewAction {
     Switch(usize),
     Close(usize),
+    /// Scroll by N lines (positive = down).
+    Scroll(i32),
 }
 
 impl TypedActionView for FileView {
@@ -434,6 +440,15 @@ impl TypedActionView for FileView {
                     self.cursor = (0, 0);
                 }
             }
+            FileViewAction::Scroll(delta) => {
+                let max = self
+                    .files
+                    .get(self.active)
+                    .map(|f| f.lines.len().saturating_sub(1))
+                    .unwrap_or(0);
+                let next = self.scroll as i64 + *delta as i64;
+                self.scroll = next.clamp(0, max as i64) as usize;
+            }
         }
         ctx.notify();
     }
@@ -452,7 +467,16 @@ impl View for FileView {
         }
         let mut body = Flex::column();
         if let Some(f) = self.files.get(self.active) {
-            for (i, line) in f.lines.iter().take(RENDER_LINES).enumerate() {
+            // Render a WINDOW of lines from the scroll offset (manual scroll —
+            // same approach as the terminal, avoids unbounded element trees).
+            let start = self.scroll.min(f.lines.len().saturating_sub(1));
+            for (i, line) in f
+                .lines
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(RENDER_LINES)
+            {
                 // Editable panes show a text caret "|" at the cursor column.
                 let display = if !self.is_doc && i == self.cursor.0 {
                     let mut ch: Vec<char> = line.chars().collect();
@@ -469,7 +493,17 @@ impl View for FileView {
                 );
             }
         }
-        content = content.with_child(Expanded::new(1.0, body.finish()).finish());
+        // Scroll wheel adjusts the line window.
+        let scroll_body = EventHandler::new(Expanded::new(1.0, body.finish()).finish())
+            .on_scroll_wheel(move |ctx, _app, delta, _mods| {
+                let lines = (-delta.y() / 8.0).round() as i32;
+                if lines != 0 {
+                    ctx.dispatch_typed_action(FileViewAction::Scroll(lines));
+                }
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+        content = content.with_child(Expanded::new(1.0, scroll_body).finish());
         self.panel(theme::BG, content.finish())
     }
 }
