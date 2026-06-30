@@ -1262,6 +1262,8 @@ impl CraneShellView {
             }
         }
         self.panes.remove(&focused);
+        self.drag_states.remove(&focused);
+        self.pane_rects.borrow_mut().remove(&focused);
     }
 
     /// Drag-rearrange: detach `dragged` from the active tab's tree and re-dock
@@ -1364,12 +1366,28 @@ impl View for CraneShellView {
         // the pane whose rect contains the cursor. Reliable across the terminal's
         // view boundary because the shell owns the pane rects (via RectProbe).
         let focus_rects = self.pane_rects.clone();
+        // Live leaves of the ACTIVE tab — restrict click hit-testing to these so
+        // a CLOSED pane's stale rect (pane_rects is never pruned) can't capture a
+        // click in the area its surviving sibling expanded into.
+        let live_leaves: Vec<PaneId> = self
+            .active_tab
+            .and_then(|t| self.layouts.get(&t))
+            .map(|n| {
+                let mut v = Vec::new();
+                n.leaves(&mut v);
+                v
+            })
+            .unwrap_or_default();
         // App-level keyboard shortcuts. The terminal pane propagates Cmd combos
         // up to here (its own on_keydown returns PropagateToParent for cmd).
         EventHandler::new(root)
             .on_left_mouse_down(move |ctx, _app, pos| {
-                let snapshot: Vec<(PaneId, RectF)> =
-                    focus_rects.borrow().iter().map(|(k, v)| (*k, v.get())).collect();
+                let snapshot: Vec<(PaneId, RectF)> = focus_rects
+                    .borrow()
+                    .iter()
+                    .filter(|(k, _)| live_leaves.contains(k))
+                    .map(|(k, v)| (*k, v.get()))
+                    .collect();
                 // Pick the SMALLEST containing rect (the leaf), not the first in
                 // nondeterministic HashMap order — avoids stale/overlapping rects.
                 let hit = snapshot
