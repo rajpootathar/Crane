@@ -2063,9 +2063,17 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::Noop => {}
         }
-        // Keep KEYBOARD focus in sync with the focused pane (terminals only).
-        if let Some(handle) = self.focused.and_then(|id| self.terminal_at(id)) {
-            ctx.focus(&handle);
+        // Keep KEYBOARD focus in sync with the focused pane so it receives
+        // keys/mouse (terminal, file, or warp editor view).
+        if let Some(id) = self.focused {
+            if let Some(h) = self.terminal_at(id) {
+                ctx.focus(&h);
+            } else if let Some(h) = self.file_at(id) {
+                ctx.focus(&h);
+            } else if let Some(PaneContent::Editor(h)) = self.panes.get(&id) {
+                let h = h.clone();
+                ctx.focus(&h);
+            }
         }
         // Re-layout the active tab's panes so a CLOSE/SPLIT/DOCK resizes the
         // remaining terminals' grids NOW (SIGWINCH) instead of on the next PTY
