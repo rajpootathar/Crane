@@ -1634,7 +1634,11 @@ impl TypedActionView for CraneShellView {
                     let mut leaves = Vec::new();
                     node.leaves(&mut leaves);
                     for l in leaves {
+                        // Fully tear down each pane: view (kills PTY), drag
+                        // state, and cached rect — no ghosts left behind.
                         self.panes.remove(&l);
+                        self.drag_states.remove(&l);
+                        self.pane_rects.borrow_mut().remove(&l);
                     }
                 }
                 if let Some(tabs) = self.worktree_tabs.get_mut(&(*pi, *wi)) {
