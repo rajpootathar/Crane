@@ -76,6 +76,9 @@ parking_lot = "0.12"
 async-channel = "2"
 rust-embed = "8"
 anyhow = "1"
+# Warp's real text editor (rich-text/code), embeddable as warpui elements —
+# replaces the hand-rolled FileView so the file pane is warp-quality.
+warp_editor = { path = "vendor/warp/crates/editor" }
 log = "0.4"
 env_logger = "0.11"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
