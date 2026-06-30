@@ -1616,6 +1616,8 @@ impl View for CraneShellView {
                         "v" => Some(CraneShellAction::PasteFocused),
                         "k" => Some(CraneShellAction::ClearFocused),
                         "s" => Some(CraneShellAction::SaveFocusedFile),
+                        "z" if ks.shift => Some(CraneShellAction::RedoFocused),
+                        "z" => Some(CraneShellAction::UndoFocused),
                         _ => None,
                     };
                     if let Some(act) = act {
@@ -1690,6 +1692,9 @@ pub enum CraneShellAction {
     ClearFocused,
     /// Cmd+S save the focused File pane.
     SaveFocusedFile,
+    /// Cmd+Z undo / Cmd+Shift+Z redo in the focused File pane.
+    UndoFocused,
+    RedoFocused,
     /// Toggle stage/unstage for a changed file (click in the Changes tab).
     StageToggle { path: String, staged: bool },
     /// Give the commit message box keyboard focus.
@@ -1782,6 +1787,22 @@ impl TypedActionView for CraneShellView {
                 if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
                     h.update(ctx, |view, _| {
                         view.save();
+                    });
+                }
+            }
+            CraneShellAction::UndoFocused => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
+                    h.update(ctx, |view, vctx| {
+                        view.undo();
+                        vctx.notify();
+                    });
+                }
+            }
+            CraneShellAction::RedoFocused => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
+                    h.update(ctx, |view, vctx| {
+                        view.redo();
+                        vctx.notify();
                     });
                 }
             }

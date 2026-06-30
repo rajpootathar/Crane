@@ -123,6 +123,20 @@ impl FileView {
             return;
         }
         let active = self.active;
+        // Snapshot for undo on mutating keys (not pure cursor moves), capped.
+        let mutating = matches!(
+            ks.key.as_str(),
+            "backspace" | "enter" | "return" | "numpadenter" | "tab"
+        ) || ks.key.chars().count() == 1;
+        if mutating {
+            if let Some(f) = self.files.get(active) {
+                self.undo.push((active, f.lines.clone(), self.cursor));
+                if self.undo.len() > 200 {
+                    self.undo.remove(0);
+                }
+                self.redo.clear();
+            }
+        }
         let Some(f) = self.files.get_mut(active) else {
             return;
         };
@@ -213,6 +227,32 @@ impl FileView {
         self.cursor = (l, c);
         if changed {
             self.files[active].dirty = true;
+        }
+    }
+
+    /// Undo the last edit (restores buffer + cursor).
+    pub fn undo(&mut self) {
+        if let Some((idx, lines, cur)) = self.undo.pop() {
+            if let Some(f) = self.files.get_mut(idx) {
+                self.redo.push((idx, f.lines.clone(), self.cursor));
+                f.lines = lines;
+                f.dirty = true;
+                self.active = idx;
+                self.cursor = cur;
+            }
+        }
+    }
+
+    /// Redo the last undone edit.
+    pub fn redo(&mut self) {
+        if let Some((idx, lines, cur)) = self.redo.pop() {
+            if let Some(f) = self.files.get_mut(idx) {
+                self.undo.push((idx, f.lines.clone(), self.cursor));
+                f.lines = lines;
+                f.dirty = true;
+                self.active = idx;
+                self.cursor = cur;
+            }
         }
     }
 
