@@ -60,6 +60,12 @@ pub struct CraneShellView {
     active_cwd: Option<PathBuf>,
     /// Cached current branch of the active worktree (status bar).
     branch: String,
+    /// Git Log bottom dock (sits below the panes, outside the pane tree,
+    /// height-resizable). Old Crane renders the git log as a dock, not a pane.
+    show_git_log: bool,
+    git_log_lines: Vec<String>,
+    git_log_ratio: Rc<Cell<f32>>,
+    git_log_drag: Rc<Cell<bool>>,
     /// Commit message buffer + whether the commit box has keyboard focus
     /// (keys route to it instead of the terminal).
     commit_msg: String,
@@ -273,6 +279,10 @@ impl CraneShellView {
                 .unwrap_or_default(),
             commit_msg: String::new(),
             commit_focused: false,
+            show_git_log: false,
+            git_log_lines: Vec::new(),
+            git_log_ratio: Rc::new(Cell::new(0.7)),
+            git_log_drag: Rc::new(Cell::new(false)),
             active_cwd,
             left_ratio: Rc::new(Cell::new(0.18)),
             left_drag: Rc::new(Cell::new(false)),
@@ -1235,15 +1245,67 @@ impl CraneShellView {
         self.files_pane = self.split_with(PaneContent::File(handle));
     }
 
-    /// Open a Git log pane for the active worktree.
-    fn open_gitlog(&mut self, ctx: &mut ViewContext<Self>) {
-        let lines = self
-            .active_cwd
-            .as_deref()
-            .map(crate::warpui::git::log)
-            .unwrap_or_else(|| vec!["<no active workspace>".to_string()]);
-        let handle = ctx.add_view(move |ctx| FileView::from_text(ctx, "Git Log".to_string(), lines));
-        self.split_with(PaneContent::File(handle));
+    /// Toggle the Git Log bottom dock for the active worktree.
+    fn toggle_gitlog(&mut self) {
+        self.show_git_log = !self.show_git_log;
+        if self.show_git_log {
+            self.git_log_lines = self
+                .active_cwd
+                .as_deref()
+                .map(crate::warpui::git::log)
+                .unwrap_or_else(|| vec!["<no active workspace>".to_string()]);
+        }
+    }
+
+    /// The Git Log dock body — a header row (title + close) over the log lines.
+    fn git_log_dock(&self) -> Box<dyn Element> {
+        let header = ConstrainedBox::new(
+            Stack::new()
+                .with_child(Rect::new().with_background_color(theme::TOPBAR_BG).finish())
+                .with_child(
+                    Flex::row()
+                        .with_child(
+                            Container::new(
+                                self.icon(icons::GIT_BRANCH, 12.0, theme::TEXT_MUTED),
+                            )
+                            .with_padding_left(10.0)
+                            .with_padding_right(6.0)
+                            .with_padding_top(6.0)
+                            .finish(),
+                        )
+                        .with_child(
+                            Container::new(
+                                Text::new("Git Log".to_string(), self.ui_font, 11.0)
+                                    .with_color(theme::TEXT)
+                                    .finish(),
+                            )
+                            .with_padding_top(6.0)
+                            .finish(),
+                        )
+                        .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+                        .with_child(self.icon_button(icons::X, CraneShellAction::OpenGitLog))
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_height(26.0)
+        .finish();
+        let mut col = Flex::column();
+        for line in self.git_log_lines.iter().take(500) {
+            col = col.with_child(
+                Container::new(
+                    Text::new(line.clone(), self.ui_font, 11.0)
+                        .with_color(theme::TEXT_MUTED)
+                        .finish(),
+                )
+                .with_padding_left(10.0)
+                .finish(),
+            );
+        }
+        Flex::column()
+            .with_child(header)
+            .with_child(Expanded::new(1.0, self.panel(theme::BG, col.finish())).finish())
+            .finish()
     }
 
     /// Open a placeholder Browser pane (WKWebView embed pending).
@@ -1425,7 +1487,21 @@ impl View for CraneShellView {
     fn render(&self, _ctx: &AppContext) -> Box<dyn Element> {
         // Center region = just the active tab's panes. Tabs are managed in the
         // Left Panel (1:1 with old Crane — no mid-pane horizontal tab strip).
-        let center_region = self.center();
+        // Center = panes, with the Git Log docked at the BOTTOM (outside the
+        // pane tree) when toggled — height-resizable via the vertical splitter.
+        let center_region = if self.show_git_log {
+            SplitBox::new(
+                Dir::Vertical,
+                self.center(),
+                self.git_log_dock(),
+                self.git_log_ratio.clone(),
+                self.git_log_drag.clone(),
+                theme::DIVIDER,
+            )
+            .finish()
+        } else {
+            self.center()
+        };
 
         // Resizable left | center | right via nested draggable SplitBoxes.
         let body: Box<dyn Element> = match (self.show_left, self.show_right) {
@@ -1739,7 +1815,7 @@ impl TypedActionView for CraneShellView {
                     self.refresh_panel();
                 }
             }
-            CraneShellAction::OpenGitLog => self.open_gitlog(ctx),
+            CraneShellAction::OpenGitLog => self.toggle_gitlog(),
             CraneShellAction::OpenBrowser => self.open_browser(ctx),
             CraneShellAction::NewTab => {
                 if let Some((pi, wi, _)) = self.active_tab {
