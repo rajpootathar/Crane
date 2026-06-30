@@ -96,6 +96,12 @@ pub struct WarpuiState {
     pub next_tab_id: usize,
     #[serde(default)]
     pub next_pane_id: PaneId,
+    /// The File pane's leaf id (so it's restored as a File pane, not a terminal).
+    #[serde(default)]
+    pub files_pane: Option<PaneId>,
+    /// Files open in the File pane, restored as tabs.
+    #[serde(default)]
+    pub file_pane_paths: Vec<PathBuf>,
 }
 
 fn state_file() -> Option<PathBuf> {

@@ -44,6 +44,8 @@ pub struct CraneShellView {
     maximized: Option<PaneId>,
     /// The dedicated File pane (files open as TABS inside it), if open.
     files_pane: Option<PaneId>,
+    /// Open file paths in the File pane (shell-side mirror, for persistence).
+    file_pane_paths: Vec<PathBuf>,
     /// Persistent drag state per pane (survives re-renders; Arc-shared).
     drag_states: HashMap<PaneId, DraggableState>,
     /// Last painted window rect per pane (recorded by RectProbe) — used to
@@ -177,9 +179,12 @@ impl CraneShellView {
         let mut files_tab = true;
         let mut expanded_projects: HashSet<usize> = HashSet::from([0]);
         let mut expanded_worktrees: HashSet<(usize, usize)> = HashSet::from([(0, 0)]);
+        let mut restored_files_pane: Option<PaneId> = None;
+        let mut restored_file_paths: Vec<PathBuf> = Vec::new();
 
         // RESTORE: rebuild tabs + split layouts from the persisted state. Each
-        // saved leaf respawns a terminal in its worktree's cwd.
+        // saved leaf respawns a terminal in its worktree cwd — EXCEPT the saved
+        // File pane leaf, which is rebuilt as a File pane with its open files.
         if let Some(st) = crate::warpui::persist::load() {
             show_left = st.show_left;
             show_right = st.show_right;
@@ -188,6 +193,8 @@ impl CraneShellView {
             expanded_worktrees = st.expanded_worktrees.iter().copied().collect();
             next_tab_id = st.next_tab_id;
             next_pane_id = st.next_pane_id;
+            let saved_files_pane = st.files_pane;
+            let saved_paths = st.file_pane_paths.clone();
             for ((pi, wi), stabs) in &st.worktree_tabs {
                 let Some(wpath) = projects
                     .get(*pi)
@@ -201,10 +208,27 @@ impl CraneShellView {
                     let mut leaves = Vec::new();
                     stab.layout.leaves(&mut leaves);
                     for pid in leaves {
-                        panes.insert(
-                            pid,
-                            PaneContent::Terminal(Self::spawn_terminal(ctx, wpath.clone())),
-                        );
+                        // The File pane leaf is rebuilt as a File pane (with its
+                        // tabs); everything else is a terminal.
+                        if Some(pid) == saved_files_pane && !saved_paths.is_empty() {
+                            let first = saved_paths[0].clone();
+                            let rest = saved_paths[1..].to_vec();
+                            let h = ctx.add_view(move |ctx| {
+                                let mut fv = FileView::new(ctx, first);
+                                for p in rest {
+                                    fv.open(p);
+                                }
+                                fv
+                            });
+                            panes.insert(pid, PaneContent::File(h));
+                            restored_files_pane = Some(pid);
+                            restored_file_paths = saved_paths.clone();
+                        } else {
+                            panes.insert(
+                                pid,
+                                PaneContent::Terminal(Self::spawn_terminal(ctx, wpath.clone())),
+                            );
+                        }
                         drag_states.insert(pid, DraggableState::default());
                     }
                     layouts.insert((*pi, *wi, stab.id), stab.layout.to_node());
@@ -264,7 +288,8 @@ impl CraneShellView {
             layouts,
             focused,
             maximized: None,
-            files_pane: None,
+            files_pane: restored_files_pane,
+            file_pane_paths: restored_file_paths,
             drag_states,
             pane_rects: Rc::new(RefCell::new(HashMap::new())),
             drop_preview: Rc::new(RefCell::new(None)),
@@ -349,6 +374,8 @@ impl CraneShellView {
             worktree_tabs,
             next_tab_id: self.next_tab_id,
             next_pane_id: self.next_pane_id,
+            files_pane: self.files_pane,
+            file_pane_paths: self.file_pane_paths.clone(),
         });
     }
 
@@ -1230,6 +1257,9 @@ impl CraneShellView {
     /// Open `path` in the dedicated File pane (as a tab). Creates the pane the
     /// first time; thereafter adds/switches a tab inside it (old Crane FilesPane).
     fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        if !self.file_pane_paths.contains(&path) {
+            self.file_pane_paths.push(path.clone());
+        }
         // Existing File pane still alive? add a tab to it (and repaint it so the
         // new tab shows immediately).
         if let Some(fp) = self.files_pane {
@@ -1243,6 +1273,8 @@ impl CraneShellView {
                 return;
             }
             self.files_pane = None; // pane was closed
+            self.file_pane_paths.clear();
+            self.file_pane_paths.push(path.clone());
         }
         // First open: File pane goes on the RIGHT and takes ~65% width (the
         // existing pane keeps 35% as the first child). Full height by default;
