@@ -9,6 +9,7 @@ use warpui::elements::{
     ConstrainedBox, Container, DispatchEventResult, Element, EventHandler, Expanded, Flex,
     ParentElement, Rect, Stack, Text,
 };
+use crate::warpui::rect_probe::RectProbe;
 use warpui::fonts::FamilyId;
 use warpui::{AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext};
 
@@ -58,6 +59,11 @@ pub struct FileView {
     redo: Vec<(usize, Vec<String>, (usize, usize))>,
     /// First visible line (scroll offset).
     scroll: usize,
+    /// Monospace cell metrics for click→(line,col) mapping.
+    char_w: f32,
+    line_h: f32,
+    /// Window rect of the text body (recorded each paint by a RectProbe).
+    body_rect: std::rc::Rc<std::cell::Cell<warpui::geometry::rect::RectF>>,
     /// Set when this pane was created from pre-built text (git log etc.) — then
     /// it shows that single doc with no tab strip.
     is_doc: bool,
@@ -65,7 +71,7 @@ pub struct FileView {
 
 impl FileView {
     pub fn new(ctx: &mut ViewContext<Self>, path: PathBuf) -> Self {
-        let font = Self::font(ctx);
+        let (font, char_w, line_h) = Self::font(ctx);
         Self {
             font,
             files: vec![read_file(&path)],
@@ -74,13 +80,19 @@ impl FileView {
             undo: Vec::new(),
             redo: Vec::new(),
             scroll: 0,
+            char_w,
+            line_h,
+            body_rect: std::rc::Rc::new(std::cell::Cell::new(warpui::geometry::rect::RectF::new(
+                warpui::geometry::vector::vec2f(0.0, 0.0),
+                warpui::geometry::vector::vec2f(0.0, 0.0),
+            ))),
             is_doc: false,
         }
     }
 
     /// A single read-only doc pane from pre-built lines (git log, placeholders).
     pub fn from_text(ctx: &mut ViewContext<Self>, title: String, lines: Vec<String>) -> Self {
-        let font = Self::font(ctx);
+        let (font, char_w, line_h) = Self::font(ctx);
         Self {
             font,
             files: vec![OpenFile {
@@ -94,13 +106,31 @@ impl FileView {
             undo: Vec::new(),
             redo: Vec::new(),
             scroll: 0,
+            char_w,
+            line_h,
+            body_rect: std::rc::Rc::new(std::cell::Cell::new(warpui::geometry::rect::RectF::new(
+                warpui::geometry::vector::vec2f(0.0, 0.0),
+                warpui::geometry::vector::vec2f(0.0, 0.0),
+            ))),
             is_doc: true,
         }
     }
 
-    fn font(ctx: &mut ViewContext<Self>) -> FamilyId {
+    /// Load the mono font and measure its cell width + line height at 12pt.
+    fn font(ctx: &mut ViewContext<Self>) -> (FamilyId, f32, f32) {
+        use warpui::fonts::Properties;
         warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            cache.load_system_font("Menlo").expect("load Menlo")
+            let family = cache.load_system_font("Menlo").expect("load Menlo");
+            let size = 12.0;
+            let font = cache.select_font(family, Properties::default());
+            let char_w = cache
+                .glyph_for_char(font, 'M', false)
+                .and_then(|(gid, mf)| cache.glyph_advance(mf, size, gid).ok())
+                .map(|v| v.x())
+                .filter(|w| *w > 0.0)
+                .unwrap_or(size * 0.6);
+            let line_h = (cache.ascent(font, size) - cache.descent(font, size)).max(size);
+            (family, char_w, line_h)
         })
     }
 
@@ -498,40 +528,36 @@ impl View for FileView {
                 .skip(start)
                 .take(RENDER_LINES)
             {
-                // Cursor line: split at the caret column and insert a thin caret
-                // Rect (no character shift). Other lines: plain text.
-                if !self.is_doc && i == self.cursor.0 {
-                    let ch: Vec<char> = line.chars().collect();
-                    let col = self.cursor.1.min(ch.len());
-                    let before: String = ch[..col].iter().collect();
-                    let after: String = ch[col..].iter().collect();
-                    let caret = ConstrainedBox::new(
-                        Rect::new().with_background_color(theme::ACCENT).finish(),
-                    )
-                    .with_width(2.0)
-                    .with_height(15.0)
+                // Each line is ALWAYS a single Text (so soft-wrap is consistent).
+                // The caret is OVERLAID via a Stack — positioned with a spacer of
+                // width col*char_w — so it never changes how the line wraps.
+                let text = Text::new(line.clone(), self.font, 12.0)
+                    .with_color(theme::TEXT)
                     .finish();
-                    body = body.with_child(
-                        Flex::row()
-                            .with_child(
-                                Text::new(before, self.font, 12.0)
-                                    .with_color(theme::TEXT)
-                                    .finish(),
+                if !self.is_doc && i == self.cursor.0 {
+                    let col = self.cursor.1.min(line.chars().count());
+                    let caret_x = col as f32 * self.char_w;
+                    let caret_overlay = Flex::row()
+                        .with_child(
+                            ConstrainedBox::new(Rect::new().finish())
+                                .with_width(caret_x)
+                                .with_height(1.0)
+                                .finish(),
+                        )
+                        .with_child(
+                            ConstrainedBox::new(
+                                Rect::new().with_background_color(theme::ACCENT).finish(),
                             )
-                            .with_child(caret)
-                            .with_child(
-                                Text::new(after, self.font, 12.0)
-                                    .with_color(theme::TEXT)
-                                    .finish(),
-                            )
+                            .with_width(2.0)
+                            .with_height(self.line_h.max(12.0))
                             .finish(),
+                        )
+                        .finish();
+                    body = body.with_child(
+                        Stack::new().with_child(text).with_child(caret_overlay).finish(),
                     );
                 } else {
-                    body = body.with_child(
-                        Text::new(line.clone(), self.font, 12.0)
-                            .with_color(theme::TEXT)
-                            .finish(),
-                    );
+                    body = body.with_child(text);
                 }
             }
         }
