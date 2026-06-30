@@ -260,6 +260,25 @@ pub struct WarpEditorView {
 }
 
 impl WarpEditorView {
+    pub fn undo(&self, ctx: &mut ViewContext<Self>) {
+        let m = self.model.clone();
+        m.update(ctx, |m: &mut CodeModel, mctx| m.undo(mctx));
+    }
+    pub fn redo(&self, ctx: &mut ViewContext<Self>) {
+        let m = self.model.clone();
+        m.update(ctx, |m: &mut CodeModel, mctx| m.redo(mctx));
+    }
+    pub fn select_all(&self, ctx: &mut ViewContext<Self>) {
+        let m = self.model.clone();
+        m.update(ctx, |m: &mut CodeModel, mctx| m.select_all(mctx));
+    }
+    /// Insert clipboard text at the cursor (Cmd+V).
+    pub fn paste(&self, text: &str, ctx: &mut ViewContext<Self>) {
+        let text = text.to_string();
+        let m = self.model.clone();
+        m.update(ctx, |m: &mut CodeModel, mctx| m.user_insert(&text, mctx));
+    }
+
     /// Write the buffer back to disk (Cmd+S). Returns true on success.
     pub fn save(&self, app: &AppContext) -> bool {
         if self.path.as_os_str().is_empty() {

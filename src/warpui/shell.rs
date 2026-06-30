@@ -1723,6 +1723,7 @@ impl View for CraneShellView {
                         "v" => Some(CraneShellAction::PasteFocused),
                         "k" => Some(CraneShellAction::ClearFocused),
                         "s" => Some(CraneShellAction::SaveFocusedFile),
+                        "a" => Some(CraneShellAction::SelectAllFocused),
                         "z" if ks.shift => Some(CraneShellAction::RedoFocused),
                         "z" => Some(CraneShellAction::UndoFocused),
                         "c" => Some(CraneShellAction::CopyFocused),
@@ -1810,6 +1811,8 @@ pub enum CraneShellAction {
     /// File pane tab strip: switch to / close file tab `i`.
     FileTabSelect(usize),
     FileTabClose(usize),
+    /// Cmd+A select-all in the focused editor.
+    SelectAllFocused,
     /// Toggle stage/unstage for a changed file (click in the Changes tab).
     StageToggle { path: String, staged: bool },
     /// Give the commit message box keyboard focus.
@@ -1915,6 +1918,8 @@ impl TypedActionView for CraneShellView {
                         view.undo();
                         vctx.notify();
                     });
+                } else if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |view, vctx| view.undo(vctx));
                 }
             }
             CraneShellAction::RedoFocused => {
@@ -1923,6 +1928,8 @@ impl TypedActionView for CraneShellView {
                         view.redo();
                         vctx.notify();
                     });
+                } else if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |view, vctx| view.redo(vctx));
                 }
             }
             CraneShellAction::CopyFocused => {
@@ -1993,7 +2000,14 @@ impl TypedActionView for CraneShellView {
                             view.paste_at_cursor(&text);
                             vctx.notify();
                         });
+                    } else if let Some(h) = self.editor_at(id) {
+                        h.update(ctx, |view, vctx| view.paste(&text, vctx));
                     }
+                }
+            }
+            CraneShellAction::SelectAllFocused => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |view, vctx| view.select_all(vctx));
                 }
             }
             CraneShellAction::ClearFocused => {
