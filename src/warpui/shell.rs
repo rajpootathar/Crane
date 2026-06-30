@@ -1337,9 +1337,19 @@ impl CraneShellView {
         let mono = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
             cache.load_system_font("Menlo").expect("load Menlo")
         });
-        let handle = ctx
-            .add_view(move |ctx| crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono));
+        let p = path.clone();
+        let handle = ctx.add_view(move |ctx| {
+            crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, p)
+        });
         self.files_pane = self.split_with_at(PaneContent::Editor(handle), false, 0.35);
+    }
+
+    /// The warp editor view handle for a pane, if it is an Editor pane.
+    fn editor_at(&self, id: PaneId) -> Option<ViewHandle<crate::warpui::editor_view::WarpEditorView>> {
+        match self.panes.get(&id) {
+            Some(PaneContent::Editor(h)) => Some(h.clone()),
+            _ => None,
+        }
     }
 
     /// Toggle the Git Log bottom dock for the active worktree.
@@ -1892,6 +1902,10 @@ impl TypedActionView for CraneShellView {
                 if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
                     h.update(ctx, |view, _| {
                         view.save();
+                    });
+                } else if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |view, vctx| {
+                        view.save(vctx);
                     });
                 }
             }

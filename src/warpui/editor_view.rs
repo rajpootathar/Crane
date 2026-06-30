@@ -220,10 +220,26 @@ pub struct WarpEditorView {
     model: ModelHandle<CodeModel>,
     self_handle: WeakViewHandle<Self>,
     display_state: DisplayStateHandle,
+    path: std::path::PathBuf,
 }
 
 impl WarpEditorView {
-    pub fn new(ctx: &mut ViewContext<Self>, content: String, font: FamilyId) -> Self {
+    /// Write the buffer back to disk (Cmd+S). Returns true on success.
+    pub fn save(&self, app: &AppContext) -> bool {
+        if self.path.as_os_str().is_empty() {
+            return false;
+        }
+        let buffer = self.model.as_ref(app).buffer.clone();
+        let text = buffer.as_ref(app).text().to_string();
+        std::fs::write(&self.path, text).is_ok()
+    }
+
+    pub fn new(
+        ctx: &mut ViewContext<Self>,
+        content: String,
+        font: FamilyId,
+        path: std::path::PathBuf,
+    ) -> Self {
         let buffer = ctx.add_model(|_| Buffer::new(Box::new(|_, _| IndentBehavior::Ignore)));
         let buffer_sel = ctx.add_model(|_| BufferSelectionModel::new(buffer.clone()));
         let bsel2 = buffer_sel.clone();
@@ -252,6 +268,7 @@ impl WarpEditorView {
             model,
             self_handle: ctx.handle(),
             display_state: Arc::new(DisplayState::default()),
+            path,
         }
     }
 }
