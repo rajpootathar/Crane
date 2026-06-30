@@ -44,8 +44,11 @@ pub struct CraneShellView {
     maximized: Option<PaneId>,
     /// The dedicated File pane (files open as TABS inside it), if open.
     files_pane: Option<PaneId>,
-    /// Open file paths in the File pane (shell-side mirror, for persistence).
+    /// Open file paths in the File pane (shell-side mirror, drives the header
+    /// tab strip + persistence).
     file_pane_paths: Vec<PathBuf>,
+    /// Active file tab index in the File pane.
+    file_pane_active: usize,
     /// Persistent drag state per pane (survives re-renders; Arc-shared).
     drag_states: HashMap<PaneId, DraggableState>,
     /// Last painted window rect per pane (recorded by RectProbe) — used to
@@ -290,6 +293,7 @@ impl CraneShellView {
             maximized: None,
             files_pane: restored_files_pane,
             file_pane_paths: restored_file_paths,
+            file_pane_active: 0,
             drag_states,
             pane_rects: Rc::new(RefCell::new(HashMap::new())),
             drop_preview: Rc::new(RefCell::new(None)),
@@ -1170,32 +1174,76 @@ impl CraneShellView {
         let focused = self.focused == Some(id);
         let bg = if focused { theme::SURFACE } else { theme::TOPBAR_BG };
         let fg = if focused { theme::TEXT } else { theme::TEXT_MUTED };
+        let is_file_pane = self.files_pane == Some(id);
 
-        // Title — clicking focuses this pane.
-        let title = EventHandler::new(
-            Container::new(
-                Flex::row()
-                    .with_child(
-                        Container::new(self.icon(icons::TERMINAL_WINDOW, 12.0, fg))
-                            .with_padding_right(5.0)
-                            .finish(),
-                    )
-                    .with_child(
-                        Text::new("Terminal".to_string(), self.ui_font, 11.0)
-                            .with_color(fg)
-                            .finish(),
-                    )
-                    .finish(),
+        // For a File pane the header IS the file tab strip (shell-driven, so
+        // clicks route here). Other panes show a simple "Terminal" title.
+        let title: Box<dyn Element> = if is_file_pane {
+            let mut strip = Flex::row();
+            for (i, path) in self.file_pane_paths.iter().enumerate() {
+                let active = i == self.file_pane_active;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let tbg = if active { theme::SURFACE } else { theme::TOPBAR_BG };
+                let tfg = if active { theme::TEXT } else { theme::TEXT_MUTED };
+                let chip = EventHandler::new(
+                    Container::new(Text::new(name, self.ui_font, 11.0).with_color(tfg).finish())
+                        .with_background_color(tbg)
+                        .with_padding_left(10.0)
+                        .with_padding_right(4.0)
+                        .with_padding_top(6.0)
+                        .with_padding_bottom(6.0)
+                        .finish(),
+                )
+                .on_left_mouse_down(move |ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::FileTabSelect(i));
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
+                let close = EventHandler::new(
+                    Container::new(self.icon(icons::X, 10.0, theme::TEXT_MUTED))
+                        .with_background_color(tbg)
+                        .with_padding_right(8.0)
+                        .with_padding_top(6.0)
+                        .with_padding_bottom(6.0)
+                        .finish(),
+                )
+                .on_left_mouse_down(move |ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::FileTabClose(i));
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
+                strip = strip.with_child(Flex::row().with_child(chip).with_child(close).finish());
+            }
+            strip.finish()
+        } else {
+            EventHandler::new(
+                Container::new(
+                    Flex::row()
+                        .with_child(
+                            Container::new(self.icon(icons::TERMINAL_WINDOW, 12.0, fg))
+                                .with_padding_right(5.0)
+                                .finish(),
+                        )
+                        .with_child(
+                            Text::new("Terminal".to_string(), self.ui_font, 11.0)
+                                .with_color(fg)
+                                .finish(),
+                        )
+                        .finish(),
+                )
+                .with_padding_left(8.0)
+                .with_padding_top(6.0)
+                .finish(),
             )
-            .with_padding_left(8.0)
-            .with_padding_top(6.0)
-            .finish(),
-        )
-        .on_left_mouse_down(move |ctx, _app, _pos| {
-            ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
-            DispatchEventResult::StopPropagation
-        })
-        .finish();
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+        };
 
         // The Expanded title fills the row, pushing these to the right edge.
         let buttons = Flex::row()
@@ -1257,8 +1305,11 @@ impl CraneShellView {
     /// Open `path` in the dedicated File pane (as a tab). Creates the pane the
     /// first time; thereafter adds/switches a tab inside it (old Crane FilesPane).
     fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
-        if !self.file_pane_paths.contains(&path) {
+        if let Some(i) = self.file_pane_paths.iter().position(|p| p == &path) {
+            self.file_pane_active = i;
+        } else {
             self.file_pane_paths.push(path.clone());
+            self.file_pane_active = self.file_pane_paths.len() - 1;
         }
         // Existing File pane still alive? add a tab to it (and repaint it so the
         // new tab shows immediately).
@@ -1738,6 +1789,9 @@ pub enum CraneShellAction {
     /// Cmd+C copy / Cmd+X cut (whole line) in the focused File pane.
     CopyFocused,
     CutFocused,
+    /// File pane tab strip: switch to / close file tab `i`.
+    FileTabSelect(usize),
+    FileTabClose(usize),
     /// Toggle stage/unstage for a changed file (click in the Changes tab).
     StageToggle { path: String, staged: bool },
     /// Give the commit message box keyboard focus.
@@ -1866,6 +1920,42 @@ impl TypedActionView for CraneShellView {
                     }) {
                         ctx.clipboard()
                             .write(warpui::clipboard::ClipboardContent::plain_text(text));
+                    }
+                }
+            }
+            CraneShellAction::FileTabSelect(i) => {
+                if let Some(fp) = self.files_pane {
+                    self.focused = Some(fp);
+                    if *i < self.file_pane_paths.len() {
+                        self.file_pane_active = *i;
+                        let idx = *i;
+                        if let Some(h) = self.file_at(fp) {
+                            h.update(ctx, |view, vctx| {
+                                view.switch(idx);
+                                vctx.notify();
+                            });
+                        }
+                    }
+                }
+            }
+            CraneShellAction::FileTabClose(i) => {
+                if let Some(fp) = self.files_pane {
+                    if *i < self.file_pane_paths.len() && self.file_pane_paths.len() > 1 {
+                        self.file_pane_paths.remove(*i);
+                        if self.file_pane_active >= self.file_pane_paths.len() {
+                            self.file_pane_active = self.file_pane_paths.len() - 1;
+                        } else if self.file_pane_active > *i {
+                            self.file_pane_active -= 1;
+                        }
+                        let idx = *i;
+                        let active = self.file_pane_active;
+                        if let Some(h) = self.file_at(fp) {
+                            h.update(ctx, |view, vctx| {
+                                view.close_tab(idx);
+                                view.switch(active);
+                                vctx.notify();
+                            });
+                        }
                     }
                 }
             }

@@ -120,6 +120,28 @@ impl FileView {
         self.files.get(self.active).map(|f| f.dirty).unwrap_or(false)
     }
 
+    /// Switch the active file tab (shell-driven).
+    pub fn switch(&mut self, i: usize) {
+        if i < self.files.len() {
+            self.active = i;
+            self.cursor = (0, 0);
+            self.scroll = 0;
+        }
+    }
+
+    /// Close file tab `i` (shell-driven; keeps >=1 file).
+    pub fn close_tab(&mut self, i: usize) {
+        if i < self.files.len() && self.files.len() > 1 {
+            self.files.remove(i);
+            if self.active >= self.files.len() {
+                self.active = self.files.len() - 1;
+            } else if self.active > i {
+                self.active -= 1;
+            }
+            self.cursor = (0, 0);
+        }
+    }
+
     /// Apply an editing keystroke to the active file. Char-indexed so unicode
     /// stays correct. Returns false for doc panes (read-only).
     pub fn edit(&mut self, ks: &warpui::keymap::Keystroke) {
@@ -460,11 +482,10 @@ impl View for FileView {
     }
 
     fn render(&self, _ctx: &AppContext) -> Box<dyn Element> {
+        // NOTE: the file TAB STRIP is rendered by the SHELL in the pane header
+        // (so clicks route through the shell), not here. This view shows only
+        // the active file's content.
         let mut content = Flex::column();
-        // Tab strip only for real file panes with >0 files (doc panes are single).
-        if !self.is_doc {
-            content = content.with_child(self.tab_strip());
-        }
         let mut body = Flex::column();
         if let Some(f) = self.files.get(self.active) {
             // Render a WINDOW of lines from the scroll offset (manual scroll —
