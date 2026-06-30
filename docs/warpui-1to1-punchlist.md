@@ -2,7 +2,19 @@
 
 > Ordered, deduplicated build checklist from the chunk-by-chunk comparison review (egui Crane vs warpui port). Execute top-to-bottom. Companion to warpui-1to1-spec.md (visual) and warpui-migration-execution.md (Phase 0-6).
 
-Confirmed: `load_from_bytes` exists at fonts.rs:779, `egui-phosphor 0.12` is available, and the current spike state matches the chunk summaries exactly. I have everything needed.
+## ⟳ LIVE STATUS (updated as work lands)
+
+**Two architecture decisions superseded parts of the original list below:**
+1. **PIVOT** — the warpui frontend now lives **inside `src/warpui/`** (same `crane` crate), launched via `CRANE_WARP=1 ./crane`. It **reuses** `crate::git`, `crate::state::layout` (Node/Layout/DockEdge/PaneContent), `crate::state::session`, `crate::format`, etc. — NOT a separate spike crate. References to `crates/warp_term_spike` are obsolete. egui remains the default until parity, then dropped.
+2. **Tabs live in the Left Panel** (rows under each worktree + "New tab" row), 1:1 with old Crane — NOT a mid-pane horizontal tab strip (removed).
+
+**DONE so far:** phosphor icons, theme tokens, recursive Node tree (split/close/resize/maximize), pane headers, drag-drop dock-zones (1:1 dock_zone + half-pane preview + center-swap), pane focus (dim inactive + click-to-focus via smallest live-leaf rect), shell-routed keyboard input to active-tab pane, terminal scrollback/paste/clear/scroll-to-bottom, PaneContent (Terminal|File), editable File pane (insert/backspace/enter/tab/arrows/caret/Cmd+S/paste/dirty/close-tab), files-as-tabs, git stage/unstage + commit box, git-log & browser panes, status-bar branch, persistent per-tab terminals (history retained), no-ghost pane teardown.
+
+**NEXT (faithful-port-checklist global order):** (1) session persistence WRITE-BACK — reuse `crate::state::session::Session` + atomic write so splits/tabs survive restart; (2) reuse `crate::git` (delete the warpui git copy); (3) editor undo/selection/copy/syntect; (4) right-panel grouped tree + branch toolbar; (5) left-panel project mgmt (Add Project, context menus, tints).
+
+---
+
+Confirmed: `load_from_bytes` exists at fonts.rs:779, `egui-phosphor 0.12` is available. (Original note below predates the pivot.)
 
 # THE 1:1 PUNCH LIST — warpui Crane → 100% match of egui Crane
 
