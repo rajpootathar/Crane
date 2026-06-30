@@ -12,6 +12,7 @@ use warpui::{platform, AddWindowOptions, AssetProvider};
 
 pub mod color;
 pub mod controller;
+pub mod editor_view;
 pub mod file_pane;
 pub mod file_tree;
 pub mod git;
