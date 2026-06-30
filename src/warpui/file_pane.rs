@@ -230,6 +230,41 @@ impl FileView {
         }
     }
 
+    /// Copy the active (cursor) line — old Crane's empty-selection Cmd+C.
+    /// Returns the line text (with trailing newline) for the clipboard.
+    pub fn copy_line(&self) -> Option<String> {
+        let f = self.files.get(self.active)?;
+        let line = f.lines.get(self.cursor.0)?;
+        Some(format!("{line}\n"))
+    }
+
+    /// Cut the active line — old Crane's empty-selection Cmd+X. Returns the line
+    /// text and removes it (kept undoable).
+    pub fn cut_line(&mut self) -> Option<String> {
+        if self.is_doc {
+            return None;
+        }
+        let idx = self.active;
+        let l = self.cursor.0;
+        let f = self.files.get(idx)?;
+        if l >= f.lines.len() {
+            return None;
+        }
+        let text = format!("{}\n", f.lines[l]);
+        // Snapshot for undo.
+        self.undo.push((idx, f.lines.clone(), self.cursor));
+        self.redo.clear();
+        let f = self.files.get_mut(idx)?;
+        f.lines.remove(l);
+        if f.lines.is_empty() {
+            f.lines.push(String::new());
+        }
+        f.dirty = true;
+        let new_l = l.min(f.lines.len() - 1);
+        self.cursor = (new_l, 0);
+        Some(text)
+    }
+
     /// Undo the last edit (restores buffer + cursor).
     pub fn undo(&mut self) {
         if let Some((idx, lines, cur)) = self.undo.pop() {

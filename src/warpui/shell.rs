@@ -1618,6 +1618,8 @@ impl View for CraneShellView {
                         "s" => Some(CraneShellAction::SaveFocusedFile),
                         "z" if ks.shift => Some(CraneShellAction::RedoFocused),
                         "z" => Some(CraneShellAction::UndoFocused),
+                        "c" => Some(CraneShellAction::CopyFocused),
+                        "x" => Some(CraneShellAction::CutFocused),
                         _ => None,
                     };
                     if let Some(act) = act {
@@ -1695,6 +1697,9 @@ pub enum CraneShellAction {
     /// Cmd+Z undo / Cmd+Shift+Z redo in the focused File pane.
     UndoFocused,
     RedoFocused,
+    /// Cmd+C copy / Cmd+X cut (whole line) in the focused File pane.
+    CopyFocused,
+    CutFocused,
     /// Toggle stage/unstage for a changed file (click in the Changes tab).
     StageToggle { path: String, staged: bool },
     /// Give the commit message box keyboard focus.
@@ -1804,6 +1809,26 @@ impl TypedActionView for CraneShellView {
                         view.redo();
                         vctx.notify();
                     });
+                }
+            }
+            CraneShellAction::CopyFocused => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
+                    if let Some(text) = h.update(ctx, |view, _| view.copy_line()) {
+                        ctx.clipboard()
+                            .write(warpui::clipboard::ClipboardContent::plain_text(text));
+                    }
+                }
+            }
+            CraneShellAction::CutFocused => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
+                    if let Some(text) = h.update(ctx, |view, vctx| {
+                        let t = view.cut_line();
+                        vctx.notify();
+                        t
+                    }) {
+                        ctx.clipboard()
+                            .write(warpui::clipboard::ClipboardContent::plain_text(text));
+                    }
                 }
             }
             CraneShellAction::FocusCommit => self.commit_focused = true,
