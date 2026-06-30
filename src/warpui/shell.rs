@@ -713,12 +713,28 @@ impl CraneShellView {
         } else {
             (icons::PLUS, theme::TEXT_MUTED)
         };
-        let inner = Flex::row()
-            .with_child(
-                Container::new(self.icon(marker, 11.0, marker_color))
-                    .with_padding_right(4.0)
-                    .finish(),
-            )
+        // Leading +/- marker: click to stage / unstage (own hit target).
+        let stage_action = CraneShellAction::StageToggle {
+            path: ch.path.clone(),
+            staged: ch.staged,
+        };
+        let marker_btn = EventHandler::new(
+            Container::new(self.icon(marker, 11.0, marker_color))
+                .with_background_color(theme::SIDEBAR_BG)
+                .with_padding_left(10.0)
+                .with_padding_right(4.0)
+                .with_padding_top(3.0)
+                .with_padding_bottom(3.0)
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(stage_action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+
+        // Status letter + filename: click to OPEN the file in the editor pane.
+        let label_inner = Flex::row()
             .with_child(
                 ConstrainedBox::new(
                     Text::new(ch.status.clone(), self.ui_font, 11.0)
@@ -734,23 +750,29 @@ impl CraneShellView {
                     .finish(),
             )
             .finish();
-        let action = CraneShellAction::StageToggle {
-            path: ch.path.clone(),
-            staged: ch.staged,
-        };
-        EventHandler::new(
-            Container::new(inner)
+        let abs = self
+            .active_cwd
+            .as_ref()
+            .map(|c| c.join(&ch.path))
+            .unwrap_or_else(|| PathBuf::from(&ch.path));
+        let open_action = CraneShellAction::SelectFile(abs);
+        let label_btn = EventHandler::new(
+            Container::new(label_inner)
                 .with_background_color(theme::SIDEBAR_BG)
-                .with_padding_left(10.0)
                 .with_padding_top(3.0)
                 .with_padding_bottom(3.0)
                 .finish(),
         )
         .on_left_mouse_down(move |ctx, _app, _pos| {
-            ctx.dispatch_typed_action(action.clone());
+            ctx.dispatch_typed_action(open_action.clone());
             DispatchEventResult::StopPropagation
         })
-        .finish()
+        .finish();
+
+        Flex::row()
+            .with_child(marker_btn)
+            .with_child(Expanded::new(1.0, label_btn).finish())
+            .finish()
     }
 
     fn right_sidebar(&self) -> Box<dyn Element> {
