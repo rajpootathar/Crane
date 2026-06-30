@@ -28,9 +28,43 @@ use warpui::{
     AppContext, Entity, ModelHandle, TypedActionView, View, ViewContext, WeakViewHandle,
 };
 
+use rangemap::RangeMap;
+
 use crate::warpui::theme;
 
 const BASELINE: f32 = 0.78;
+
+/// Syntect-highlight `content` into a CharOffset→color map for warp's editor
+/// `text_decorations`. Reuses the egui app's shared SyntaxSet + theme.
+fn highlight(content: &str, path: &std::path::Path) -> RangeMap<CharOffset, ColorU> {
+    use syntect::easy::HighlightLines;
+    use syntect::util::LinesWithEndings;
+    let ss = crate::views::file_view::syntaxes();
+    let syntax = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(|e| ss.find_syntax_by_extension(e))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let mut hl = HighlightLines::new(syntax, crate::views::file_view::fallback_theme());
+    let mut map = RangeMap::new();
+    let mut off: usize = 0;
+    for line in LinesWithEndings::from(content) {
+        let Ok(spans) = hl.highlight_line(line, ss) else {
+            off += line.chars().count();
+            continue;
+        };
+        for (style, text) in spans {
+            let len = text.chars().count();
+            if len > 0 {
+                let c = style.foreground;
+                let color = ColorU::new(c.r, c.g, c.b, 255);
+                map.insert(CharOffset::from(off)..CharOffset::from(off + len), color);
+            }
+            off += len;
+        }
+    }
+    map
+}
 
 fn solid(c: ColorU) -> Fill {
     Fill::Solid(c)
@@ -221,6 +255,8 @@ pub struct WarpEditorView {
     self_handle: WeakViewHandle<Self>,
     display_state: DisplayStateHandle,
     path: std::path::PathBuf,
+    /// Syntect color map (CharOffset → fg color) for syntax highlighting.
+    colors: RangeMap<CharOffset, ColorU>,
 }
 
 impl WarpEditorView {
@@ -264,11 +300,13 @@ impl WarpEditorView {
             selection,
             render_state,
         });
+        let colors = highlight(&content, &path);
         WarpEditorView {
             model,
             self_handle: ctx.handle(),
             display_state: Arc::new(DisplayState::default()),
             path,
+            colors,
         }
     }
 }
@@ -368,5 +406,18 @@ impl EditorView for WarpEditorView {
         _x: &'a AppContext,
     ) -> Option<&'a dyn EmbeddedItemModel> {
         None
+    }
+
+    fn text_decorations<'a>(
+        &'a self,
+        _viewport: rangemap::RangeSet<CharOffset>,
+        _version: Option<warp_editor::content::version::BufferVersion>,
+        _ctx: &'a AppContext,
+    ) -> warp_editor::editor::TextDecoration<'a> {
+        // Syntax highlighting via the precomputed syntect color map.
+        warp_editor::editor::TextDecoration {
+            override_color_map: Some(self.colors.clone()),
+            ..Default::default()
+        }
     }
 }
