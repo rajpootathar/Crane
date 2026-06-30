@@ -1,0 +1,139 @@
+//! warpui-frontend state persistence. During egui↔warpui coexistence this
+//! writes to a SEPARATE `~/.crane/warpui-state.json` so it can never corrupt
+//! the egui app's rich `session.json`. Restores panels, the tab list per
+//! worktree, the active tab, expand state, and each tab's split layout
+//! (terminals are respawned in the worktree cwd).
+
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::rc::Rc;
+
+use serde::{Deserialize, Serialize};
+
+use crate::warpui::layout::{Dir, Node, PaneId};
+
+/// Serializable mirror of `layout::Node` (drops the live Rc<Cell> handles).
+#[derive(Serialize, Deserialize, Clone)]
+pub enum SNode {
+    Leaf(PaneId),
+    Split {
+        vertical: bool,
+        ratio: f32,
+        first: Box<SNode>,
+        second: Box<SNode>,
+    },
+}
+
+impl SNode {
+    pub fn from_node(n: &Node) -> SNode {
+        match n {
+            Node::Leaf(id) => SNode::Leaf(*id),
+            Node::Split {
+                dir, ratio, first, second, ..
+            } => SNode::Split {
+                vertical: matches!(dir, Dir::Vertical),
+                ratio: ratio.get(),
+                first: Box::new(SNode::from_node(first)),
+                second: Box::new(SNode::from_node(second)),
+            },
+        }
+    }
+
+    pub fn to_node(&self) -> Node {
+        match self {
+            SNode::Leaf(id) => Node::Leaf(*id),
+            SNode::Split {
+                vertical, ratio, first, second,
+            } => Node::Split {
+                dir: if *vertical { Dir::Vertical } else { Dir::Horizontal },
+                ratio: Rc::new(Cell::new(*ratio)),
+                dragging: Rc::new(Cell::new(false)),
+                first: Box::new(first.to_node()),
+                second: Box::new(second.to_node()),
+            },
+        }
+    }
+
+    /// Collect every leaf pane id in this tree.
+    pub fn leaves(&self, out: &mut Vec<PaneId>) {
+        match self {
+            SNode::Leaf(id) => out.push(*id),
+            SNode::Split { first, second, .. } => {
+                first.leaves(out);
+                second.leaves(out);
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct STab {
+    pub id: usize,
+    pub name: String,
+    pub layout: SNode,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct WarpuiState {
+    #[serde(default)]
+    pub show_left: bool,
+    #[serde(default)]
+    pub show_right: bool,
+    #[serde(default)]
+    pub files_tab: bool,
+    /// Active tab as (project_idx, worktree_idx, tab_id).
+    #[serde(default)]
+    pub active_tab: Option<(usize, usize, usize)>,
+    #[serde(default)]
+    pub expanded_projects: Vec<usize>,
+    #[serde(default)]
+    pub expanded_worktrees: Vec<(usize, usize)>,
+    /// Per (project_idx, worktree_idx): the tabs in that worktree.
+    #[serde(default)]
+    pub worktree_tabs: Vec<((usize, usize), Vec<STab>)>,
+    #[serde(default)]
+    pub next_tab_id: usize,
+    #[serde(default)]
+    pub next_pane_id: PaneId,
+}
+
+fn state_file() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".crane").join("warpui-state.json"))
+}
+
+/// Load persisted warpui state, or None if absent/corrupt.
+pub fn load() -> Option<WarpuiState> {
+    let path = state_file()?;
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write state atomically (tmp → rename) so a crash mid-write can't truncate it.
+pub fn save(state: &WarpuiState) {
+    let Some(path) = state_file() else { return };
+    let Ok(bytes) = serde_json::to_vec_pretty(state) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Helper to rebuild HashMap fields from the flat Vecs.
+pub fn worktree_tabs_map(state: &WarpuiState) -> HashMap<(usize, usize), Vec<STab>> {
+    state.worktree_tabs.iter().cloned().collect()
+}
+
+pub fn expanded_sets(
+    state: &WarpuiState,
+) -> (HashSet<usize>, HashSet<(usize, usize)>) {
+    (
+        state.expanded_projects.iter().copied().collect(),
+        state.expanded_worktrees.iter().copied().collect(),
+    )
+}

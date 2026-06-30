@@ -165,7 +165,66 @@ impl CraneShellView {
         let mut selected = (0, 0, usize::MAX);
         let mut next_pane_id: PaneId = 0;
         let mut next_tab_id: usize = 0;
-        if let Some(path) = default_cwd {
+        // UI prefs, restored from warpui-state.json if present.
+        let mut show_left = true;
+        let mut show_right = true;
+        let mut files_tab = true;
+        let mut expanded_projects: HashSet<usize> = HashSet::from([0]);
+        let mut expanded_worktrees: HashSet<(usize, usize)> = HashSet::from([(0, 0)]);
+
+        // RESTORE: rebuild tabs + split layouts from the persisted state. Each
+        // saved leaf respawns a terminal in its worktree's cwd.
+        if let Some(st) = crate::warpui::persist::load() {
+            show_left = st.show_left;
+            show_right = st.show_right;
+            files_tab = st.files_tab;
+            expanded_projects = st.expanded_projects.iter().copied().collect();
+            expanded_worktrees = st.expanded_worktrees.iter().copied().collect();
+            next_tab_id = st.next_tab_id;
+            next_pane_id = st.next_pane_id;
+            for ((pi, wi), stabs) in &st.worktree_tabs {
+                let Some(wpath) = projects
+                    .get(*pi)
+                    .and_then(|p| p.worktrees.get(*wi))
+                    .map(|w| PathBuf::from(&w.path))
+                else {
+                    continue;
+                };
+                let mut metas = Vec::new();
+                for stab in stabs {
+                    let mut leaves = Vec::new();
+                    stab.layout.leaves(&mut leaves);
+                    for pid in leaves {
+                        panes.insert(
+                            pid,
+                            PaneContent::Terminal(Self::spawn_terminal(ctx, wpath.clone())),
+                        );
+                        drag_states.insert(pid, DraggableState::default());
+                    }
+                    layouts.insert((*pi, *wi, stab.id), stab.layout.to_node());
+                    metas.push(TabMeta {
+                        id: stab.id,
+                        name: stab.name.clone(),
+                    });
+                }
+                if !metas.is_empty() {
+                    worktree_tabs.insert((*pi, *wi), metas);
+                }
+            }
+            // Restore the active tab if its layout survived.
+            if let Some(at) = st.active_tab {
+                if layouts.contains_key(&at) {
+                    active_tab = Some(at);
+                    selected = at;
+                    focused = layouts.get(&at).map(|n| n.first_leaf());
+                }
+            }
+        }
+
+        // DEFAULT SEED (only if nothing was restored).
+        if active_tab.is_none()
+            && let Some(path) = default_cwd
+        {
             let names: Vec<String> = projects
                 .first()
                 .and_then(|p| p.worktrees.first())
@@ -220,15 +279,15 @@ impl CraneShellView {
             right_ratio: Rc::new(Cell::new(0.80)),
             right_drag: Rc::new(Cell::new(false)),
             selected,
-            show_left: true,
-            show_right: true,
-            files_tab: true,
+            show_left,
+            show_right,
+            files_tab,
             expanded_dirs: HashSet::new(),
             selected_file: None,
             file_rows,
             changes: Vec::new(),
-            expanded_projects: HashSet::from([0]),
-            expanded_worktrees: HashSet::from([(0, 0)]),
+            expanded_projects,
+            expanded_worktrees,
         }
     }
 
@@ -249,6 +308,40 @@ impl CraneShellView {
     /// Rebuild the cached right-panel contents for the active tab. Called from
     /// `handle_action` (never from render) so the FS walk / `git` shell-out
     /// happens once per change, not every repaint.
+    /// Snapshot the persistable UI state and write it to ~/.crane/warpui-state.json.
+    fn save_state(&self) {
+        use crate::warpui::persist::{save, SNode, STab, WarpuiState};
+        let worktree_tabs = self
+            .worktree_tabs
+            .iter()
+            .map(|(k, tabs)| {
+                let stabs = tabs
+                    .iter()
+                    .filter_map(|t| {
+                        let node = self.layouts.get(&(k.0, k.1, t.id))?;
+                        Some(STab {
+                            id: t.id,
+                            name: t.name.clone(),
+                            layout: SNode::from_node(node),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (*k, stabs)
+            })
+            .collect();
+        save(&WarpuiState {
+            show_left: self.show_left,
+            show_right: self.show_right,
+            files_tab: self.files_tab,
+            active_tab: self.active_tab,
+            expanded_projects: self.expanded_projects.iter().copied().collect(),
+            expanded_worktrees: self.expanded_worktrees.iter().copied().collect(),
+            worktree_tabs,
+            next_tab_id: self.next_tab_id,
+            next_pane_id: self.next_pane_id,
+        });
+    }
+
     fn refresh_panel(&mut self) {
         let root = self.active_cwd.clone();
         self.branch = root
@@ -1690,6 +1783,9 @@ impl TypedActionView for CraneShellView {
         if let Some(handle) = self.focused.and_then(|id| self.terminal_at(id)) {
             ctx.focus(&handle);
         }
+        // Persist UI state (panels/tabs/layout) after every action so a restart
+        // restores the workspace. Cheap (a few KB) + atomic write.
+        self.save_state();
         // Mark the view dirty so warpui re-renders.
         ctx.notify();
     }

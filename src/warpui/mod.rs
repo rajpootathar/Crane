@@ -19,6 +19,7 @@ pub mod grid_element;
 pub mod icons;
 pub mod input;
 pub mod layout;
+pub mod persist;
 pub mod projects;
 pub mod rect_probe;
 pub mod shell;
