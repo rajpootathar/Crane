@@ -498,20 +498,41 @@ impl View for FileView {
                 .skip(start)
                 .take(RENDER_LINES)
             {
-                // Editable panes show a text caret "|" at the cursor column.
-                let display = if !self.is_doc && i == self.cursor.0 {
-                    let mut ch: Vec<char> = line.chars().collect();
+                // Cursor line: split at the caret column and insert a thin caret
+                // Rect (no character shift). Other lines: plain text.
+                if !self.is_doc && i == self.cursor.0 {
+                    let ch: Vec<char> = line.chars().collect();
                     let col = self.cursor.1.min(ch.len());
-                    ch.insert(col, '|');
-                    ch.into_iter().collect()
+                    let before: String = ch[..col].iter().collect();
+                    let after: String = ch[col..].iter().collect();
+                    let caret = ConstrainedBox::new(
+                        Rect::new().with_background_color(theme::ACCENT).finish(),
+                    )
+                    .with_width(2.0)
+                    .with_height(15.0)
+                    .finish();
+                    body = body.with_child(
+                        Flex::row()
+                            .with_child(
+                                Text::new(before, self.font, 12.0)
+                                    .with_color(theme::TEXT)
+                                    .finish(),
+                            )
+                            .with_child(caret)
+                            .with_child(
+                                Text::new(after, self.font, 12.0)
+                                    .with_color(theme::TEXT)
+                                    .finish(),
+                            )
+                            .finish(),
+                    );
                 } else {
-                    line.clone()
-                };
-                body = body.with_child(
-                    Text::new(display, self.font, 12.0)
-                        .with_color(theme::TEXT)
-                        .finish(),
-                );
+                    body = body.with_child(
+                        Text::new(line.clone(), self.font, 12.0)
+                            .with_color(theme::TEXT)
+                            .finish(),
+                    );
+                }
             }
         }
         // Scroll wheel adjusts the line window.
