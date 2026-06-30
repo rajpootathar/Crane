@@ -1217,11 +1217,15 @@ impl CraneShellView {
     /// Open `path` in the dedicated File pane (as a tab). Creates the pane the
     /// first time; thereafter adds/switches a tab inside it (old Crane FilesPane).
     fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
-        // Existing File pane still alive? add a tab to it.
+        // Existing File pane still alive? add a tab to it (and repaint it so the
+        // new tab shows immediately).
         if let Some(fp) = self.files_pane {
             if let Some(PaneContent::File(h)) = self.panes.get(&fp) {
                 let h = h.clone();
-                h.update(ctx, |fv, _| fv.open(path));
+                h.update(ctx, |fv, vctx| {
+                    fv.open(path);
+                    vctx.notify();
+                });
                 self.focused = Some(fp);
                 return;
             }
