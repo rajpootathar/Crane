@@ -9,7 +9,6 @@ use warpui::elements::{
     ConstrainedBox, Container, DispatchEventResult, Element, EventHandler, Expanded, Flex,
     ParentElement, Rect, Stack, Text,
 };
-use crate::warpui::rect_probe::RectProbe;
 use warpui::fonts::FamilyId;
 use warpui::{AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext};
 
