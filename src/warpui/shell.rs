@@ -1937,6 +1937,23 @@ impl TypedActionView for CraneShellView {
         if let Some(handle) = self.focused.and_then(|id| self.terminal_at(id)) {
             ctx.focus(&handle);
         }
+        // Re-layout the active tab's panes so a CLOSE/SPLIT/DOCK resizes the
+        // remaining terminals' grids NOW (SIGWINCH) instead of on the next PTY
+        // byte. ChildView caches the child's element tree, so the child view
+        // must be notified to re-run its layout at the new pane size.
+        if let Some(tab) = self.active_tab {
+            if let Some(node) = self.layouts.get(&tab) {
+                let mut leaves = Vec::new();
+                node.leaves(&mut leaves);
+                for id in leaves {
+                    if let Some(h) = self.terminal_at(id) {
+                        h.update(ctx, |_, vctx| vctx.notify());
+                    } else if let Some(h) = self.file_at(id) {
+                        h.update(ctx, |_, vctx| vctx.notify());
+                    }
+                }
+            }
+        }
         // Persist UI state (panels/tabs/layout) after every action so a restart
         // restores the workspace. Cheap (a few KB) + atomic write.
         self.save_state();
