@@ -329,7 +329,26 @@ impl TypedActionView for WarpEditorView {
             }
             EditAction::InsertChars(chars) => {
                 let chars = chars.clone();
-                model.update(ctx, |m: &mut CodeModel, mctx| m.user_insert(&chars, mctx));
+                // Auto-close brackets: typing an opener inserts the pair and
+                // places the cursor between them.
+                let close = match chars.as_str() {
+                    "{" => Some("}"),
+                    "(" => Some(")"),
+                    "[" => Some("]"),
+                    _ => None,
+                };
+                model.update(ctx, |m: &mut CodeModel, mctx| match close {
+                    Some(c) => {
+                        let pair = format!("{chars}{c}");
+                        m.user_insert(&pair, mctx);
+                        let sel = m.selection.clone();
+                        sel.update(mctx, |s, sctx| {
+                            let end = s.selection_end(sctx);
+                            s.set_cursor(end.add_signed(-1), sctx);
+                        });
+                    }
+                    None => m.user_insert(&chars, mctx),
+                });
             }
             EditAction::Backspace => {
                 model.update(ctx, |m: &mut CodeModel, mctx| m.backspace(mctx));
