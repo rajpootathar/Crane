@@ -1093,16 +1093,14 @@ impl CraneShellView {
                 leaves.len() <= 1
             })
             .unwrap_or(true);
+        let _ = (single, is_preview);
         let mut stack = Stack::new().with_child(probed);
-        // Focus indication: dim INACTIVE panes only (Warp-style, no outline).
-        if !single && self.focused != Some(id) && !is_preview {
-            stack = stack.with_child(
-                Rect::new()
-                    .with_background_color(theme::PANE_DIM)
-                    .finish(),
-            );
-        }
-        // Drop preview painted last, above everything.
+        // NOTE: no dim/overlay on inactive panes — a hit-recording Rect on top
+        // would COVER and swallow clicks to the pane content (warpui's Rect
+        // always records hits, with no opt-out), making file tabs / buttons in
+        // a non-focused pane unclickable. Focus is still tracked for input
+        // routing; a non-blocking indicator can live in the header later.
+        // Drop preview painted last, above everything (only during a drag).
         if let Some((pid, edge)) = preview {
             if pid == id {
                 stack = stack.with_child(self.zone_highlight(edge));

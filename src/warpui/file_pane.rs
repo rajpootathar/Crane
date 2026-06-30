@@ -416,7 +416,6 @@ impl TypedActionView for FileView {
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
             FileViewAction::Switch(i) => {
-                eprintln!("[FILEVIEW] Switch({i}) of {}", self.files.len());
                 if *i < self.files.len() {
                     self.active = *i;
                     self.cursor = (0, 0);
