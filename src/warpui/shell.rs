@@ -1202,9 +1202,14 @@ impl CraneShellView {
         id
     }
 
-    /// Insert `content` as a new pane split beside the focused pane. Returns the
-    /// new pane id (None if there was nowhere to split).
+    /// Insert `content` beside the focused pane (even split). Returns the id.
     fn split_with(&mut self, content: PaneContent) -> Option<PaneId> {
+        self.split_with_at(content, false, 0.5)
+    }
+
+    /// Insert `content` beside the focused pane. `before` = new pane on the
+    /// left/top; `ratio` = first-child width fraction.
+    fn split_with_at(&mut self, content: PaneContent, before: bool, ratio: f32) -> Option<PaneId> {
         let tab = self.active_tab?;
         let target = self
             .focused
@@ -1215,7 +1220,7 @@ impl CraneShellView {
         self.panes.insert(id, content);
         self.drag_states.insert(id, DraggableState::default());
         if let Some(node) = self.layouts.get_mut(&tab) {
-            if node.split_leaf(target, id, Dir::Horizontal) {
+            if node.split_leaf_at(target, id, Dir::Horizontal, before, ratio) {
                 self.focused = Some(id);
                 return Some(id);
             }
@@ -1241,8 +1246,11 @@ impl CraneShellView {
             }
             self.files_pane = None; // pane was closed
         }
+        // First open: File pane goes on the RIGHT and takes ~65% width (the
+        // existing pane keeps 35% as the first child). Full height by default;
+        // the user can drag the splitter to resize.
         let handle = ctx.add_view(move |ctx| FileView::new(ctx, path));
-        self.files_pane = self.split_with(PaneContent::File(handle));
+        self.files_pane = self.split_with_at(PaneContent::File(handle), false, 0.35);
     }
 
     /// Toggle the Git Log bottom dock for the active worktree.

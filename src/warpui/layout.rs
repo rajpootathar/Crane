@@ -61,6 +61,18 @@ impl Node {
         dir: Dir,
         before: bool,
     ) -> bool {
+        self.split_leaf_at(target, new_pane, dir, before, 0.5)
+    }
+
+    /// Like `split_leaf_ordered` but with an explicit first-child `ratio`.
+    pub fn split_leaf_at(
+        &mut self,
+        target: PaneId,
+        new_pane: PaneId,
+        dir: Dir,
+        before: bool,
+        ratio: f32,
+    ) -> bool {
         match self {
             Node::Leaf(id) if *id == target => {
                 let existing = *id;
@@ -71,7 +83,7 @@ impl Node {
                 };
                 *self = Node::Split {
                     dir,
-                    ratio: Rc::new(Cell::new(0.5)),
+                    ratio: Rc::new(Cell::new(ratio)),
                     dragging: Rc::new(Cell::new(false)),
                     first: Box::new(Node::Leaf(first)),
                     second: Box::new(Node::Leaf(second)),
@@ -80,8 +92,8 @@ impl Node {
             }
             Node::Leaf(_) => false,
             Node::Split { first, second, .. } => {
-                first.split_leaf_ordered(target, new_pane, dir, before)
-                    || second.split_leaf_ordered(target, new_pane, dir, before)
+                first.split_leaf_at(target, new_pane, dir, before, ratio)
+                    || second.split_leaf_at(target, new_pane, dir, before, ratio)
             }
         }
     }
