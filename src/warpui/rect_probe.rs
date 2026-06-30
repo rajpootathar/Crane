@@ -12,7 +12,7 @@ use warpui::{
     AfterLayoutContext, AppContext, EventContext, LayoutContext, PaintContext, SizeConstraint,
 };
 
-use crate::layout::PaneId;
+use crate::warpui::layout::PaneId;
 
 /// Which edge of a pane a drop landed on. `Center` = swap. Ported 1:1 from
 /// old Crane `src/state/layout.rs::DockEdge`.

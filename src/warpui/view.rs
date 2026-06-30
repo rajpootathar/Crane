@@ -16,10 +16,10 @@ use warpui::{
     AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext,
 };
 
-use crate::color;
-use crate::controller::{TerminalController, Wake};
-use crate::grid_element::{GridCell, GridElement};
-use crate::input::keystroke_to_pty_bytes;
+use crate::warpui::color;
+use crate::warpui::controller::{TerminalController, Wake};
+use crate::warpui::grid_element::{GridCell, GridElement};
+use crate::warpui::input::keystroke_to_pty_bytes;
 
 const FONT_SIZE: f32 = 14.0;
 

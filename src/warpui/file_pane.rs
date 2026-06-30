@@ -12,7 +12,7 @@ use warpui::elements::{
 use warpui::fonts::FamilyId;
 use warpui::{AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext};
 
-use crate::theme;
+use crate::warpui::theme;
 
 /// Render cap (NOT a storage cap — the full file is kept; only a window is
 /// drawn until real scroll/virtualization lands, so a huge file can't blow up
@@ -52,6 +52,10 @@ pub struct FileView {
     /// Edit cursor (line, column) in CHAR units — char-indexed to stay
     /// unicode-safe.
     cursor: (usize, usize),
+    /// Undo/redo snapshots of (active-file lines, cursor), keyed per active
+    /// file index so switching tabs doesn't cross-contaminate history.
+    undo: Vec<(usize, Vec<String>, (usize, usize))>,
+    redo: Vec<(usize, Vec<String>, (usize, usize))>,
     /// Set when this pane was created from pre-built text (git log etc.) — then
     /// it shows that single doc with no tab strip.
     is_doc: bool,
@@ -65,6 +69,8 @@ impl FileView {
             files: vec![read_file(&path)],
             active: 0,
             cursor: (0, 0),
+            undo: Vec::new(),
+            redo: Vec::new(),
             is_doc: false,
         }
     }
@@ -82,6 +88,8 @@ impl FileView {
             }],
             active: 0,
             cursor: (0, 0),
+            undo: Vec::new(),
+            redo: Vec::new(),
             is_doc: true,
         }
     }

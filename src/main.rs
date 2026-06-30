@@ -20,6 +20,7 @@ mod ui;
 mod update;
 mod util;
 mod views;
+mod warpui;
 
 use modals::{
     render_empty_state, render_help_modal, render_lsp_download_toast,
@@ -34,6 +35,13 @@ use ui::pane_view::PaneAction;
 fn main() -> eframe::Result {
     env_logger::init();
     startup::fix_path_for_gui_launch();
+    // The warpui frontend (GPU rendering) reuses all of this crate's logic and
+    // owns its own event loop. Opt in with CRANE_WARP=1 until it reaches parity
+    // and becomes the default; the egui path below is removed at that point.
+    if std::env::var_os("CRANE_WARP").is_some() {
+        warpui::run();
+        return Ok(());
+    }
     // GTK has to be initialised on the main thread BEFORE any
     // gtk/gdk/webkit2gtk object is constructed. wry's Linux backend
     // creates its GTK window in `build_as_child`, so this has to

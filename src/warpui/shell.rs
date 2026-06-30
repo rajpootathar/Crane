@@ -9,12 +9,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::file_pane::FileView;
-use crate::file_tree;
-use crate::icons;
-use crate::layout::{Dir, Node, PaneId};
-use crate::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
-use crate::split::SplitBox;
+use crate::warpui::file_pane::FileView;
+use crate::warpui::file_tree;
+use crate::warpui::icons;
+use crate::warpui::layout::{Dir, Node, PaneId};
+use crate::warpui::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
+use crate::warpui::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
     ChildView, ConstrainedBox, Container, DispatchEventResult, Draggable, DraggableState,
@@ -28,8 +28,8 @@ use warpui::{
     ViewHandle,
 };
 
-use crate::theme;
-use crate::view::TerminalView;
+use crate::warpui::theme;
+use crate::warpui::view::TerminalView;
 
 pub struct CraneShellView {
     ui_font: FamilyId,
@@ -55,7 +55,7 @@ pub struct CraneShellView {
     next_pane_id: PaneId,
     /// Which tab's layout is shown in the center.
     active_tab: Option<(usize, usize, usize)>,
-    projects: Vec<crate::projects::ProjectNode>,
+    projects: Vec<crate::warpui::projects::ProjectNode>,
     /// Active worktree dir — drives the Files/Changes panel root.
     active_cwd: Option<PathBuf>,
     /// Cached current branch of the active worktree (status bar).
@@ -84,7 +84,7 @@ pub struct CraneShellView {
     /// in render() (which runs every repaint). Avoids shelling out `git` /
     /// walking the FS every frame.
     file_rows: Vec<file_tree::FileRow>,
-    changes: Vec<crate::git::Change>,
+    changes: Vec<crate::warpui::git::Change>,
     /// Left tree expand state.
     expanded_projects: HashSet<usize>,
     expanded_worktrees: HashSet<(usize, usize)>,
@@ -132,11 +132,11 @@ impl CraneShellView {
             cache
                 .load_family_from_bytes(
                     "phosphor",
-                    vec![include_bytes!("../assets/Phosphor.ttf").to_vec()],
+                    vec![include_bytes!("assets/Phosphor.ttf").to_vec()],
                 )
                 .expect("load phosphor")
         });
-        let projects = crate::projects::load_projects();
+        let projects = crate::warpui::projects::load_projects();
         // Default the terminal to the first project's first worktree folder.
         let default_cwd = projects
             .first()
@@ -210,7 +210,7 @@ impl CraneShellView {
             projects,
             branch: active_cwd
                 .as_deref()
-                .map(crate::git::current_branch)
+                .map(crate::warpui::git::current_branch)
                 .unwrap_or_default(),
             commit_msg: String::new(),
             commit_focused: false,
@@ -239,7 +239,7 @@ impl CraneShellView {
         path: PathBuf,
     ) -> ViewHandle<TerminalView> {
         let (tx, rx) = async_channel::bounded::<()>(1);
-        let wake: crate::controller::Wake = std::sync::Arc::new(move || {
+        let wake: crate::warpui::controller::Wake = std::sync::Arc::new(move || {
             let _ = tx.try_send(());
         });
         let cwd = Rc::new(RefCell::new(Some(path)));
@@ -253,14 +253,14 @@ impl CraneShellView {
         let root = self.active_cwd.clone();
         self.branch = root
             .as_deref()
-            .map(crate::git::current_branch)
+            .map(crate::warpui::git::current_branch)
             .unwrap_or_default();
         match root {
             Some(root) if self.files_tab => {
                 self.file_rows = file_tree::build_rows(&root, &self.expanded_dirs);
             }
             Some(root) => {
-                self.changes = crate::git::changes(&root);
+                self.changes = crate::warpui::git::changes(&root);
             }
             None => {
                 self.file_rows.clear();
@@ -591,7 +591,7 @@ impl CraneShellView {
             .finish()
     }
 
-    fn change_row(&self, ch: &crate::git::Change) -> Box<dyn Element> {
+    fn change_row(&self, ch: &crate::warpui::git::Change) -> Box<dyn Element> {
         let color = match ch.status.as_str() {
             "A" => theme::SUCCESS,
             "D" | "U" => theme::ERROR,
@@ -1106,7 +1106,7 @@ impl CraneShellView {
         let lines = self
             .active_cwd
             .as_deref()
-            .map(crate::git::log)
+            .map(crate::warpui::git::log)
             .unwrap_or_else(|| vec!["<no active workspace>".to_string()]);
         let handle = ctx.add_view(move |ctx| FileView::from_text(ctx, "Git Log".to_string(), lines));
         self.split_with(PaneContent::File(handle));
@@ -1143,7 +1143,7 @@ impl CraneShellView {
             return;
         }
         if let Some(root) = self.active_cwd.clone() {
-            if crate::git::commit(&root, &msg).is_ok() {
+            if crate::warpui::git::commit(&root, &msg).is_ok() {
                 self.commit_msg.clear();
                 self.commit_focused = false;
                 self.refresh_panel();
@@ -1609,9 +1609,9 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::StageToggle { path, staged } => {
                 if let Some(root) = self.active_cwd.clone() {
                     let _ = if *staged {
-                        crate::git::unstage(&root, path)
+                        crate::warpui::git::unstage(&root, path)
                     } else {
-                        crate::git::stage(&root, path)
+                        crate::warpui::git::stage(&root, path)
                     };
                     self.refresh_panel();
                 }

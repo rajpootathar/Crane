@@ -72,6 +72,10 @@ warpui = { path = "vendor/warp/crates/warpui" }
 crane_term = { path = "crates/crane_term" }
 portable-pty = "0.9"
 parking_lot = "0.12"
+# warpui frontend (src/warpui): async repaint channel + embedded phosphor TTF.
+async-channel = "2"
+rust-embed = "8"
+anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }

@@ -16,7 +16,7 @@ use warpui::{
     AfterLayoutContext, AppContext, EventContext, LayoutContext, PaintContext, SizeConstraint,
 };
 
-use crate::layout::Dir;
+use crate::warpui::layout::Dir;
 
 const SPLIT_W: f32 = 5.0;
 
