@@ -117,6 +117,8 @@ pub struct TabMeta {
 pub enum PaneContent {
     Terminal(ViewHandle<TerminalView>),
     File(ViewHandle<FileView>),
+    /// Warp's real text editor (warp_editor) — warp-quality file editing.
+    Editor(ViewHandle<crate::warpui::editor_view::WarpEditorView>),
 }
 
 /// Map a dock edge to (split direction, dragged-goes-first?). Center → None
@@ -1044,6 +1046,7 @@ impl CraneShellView {
         let body: Box<dyn Element> = match self.panes.get(&id) {
             Some(PaneContent::Terminal(h)) => ChildView::new(h).finish(),
             Some(PaneContent::File(h)) => ChildView::new(h).finish(),
+            Some(PaneContent::Editor(h)) => ChildView::new(h).finish(),
             None => Rect::new().with_background_color(theme::BG).finish(),
         };
         let state = self.drag_states.get(&id).cloned().unwrap_or_default();
@@ -1329,9 +1332,14 @@ impl CraneShellView {
         }
         // First open: File pane goes on the RIGHT and takes ~65% width (the
         // existing pane keeps 35% as the first child). Full height by default;
-        // the user can drag the splitter to resize.
-        let handle = ctx.add_view(move |ctx| FileView::new(ctx, path));
-        self.files_pane = self.split_with_at(PaneContent::File(handle), false, 0.35);
+        // the user can drag the splitter to resize. Backed by Warp's REAL editor.
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let mono = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
+            cache.load_system_font("Menlo").expect("load Menlo")
+        });
+        let handle = ctx
+            .add_view(move |ctx| crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono));
+        self.files_pane = self.split_with_at(PaneContent::Editor(handle), false, 0.35);
     }
 
     /// Toggle the Git Log bottom dock for the active worktree.
