@@ -186,6 +186,12 @@ impl View for TerminalView {
                 fg: default_fg,
                 bg: default_bg,
                 is_wide: false,
+                bold: false,
+                italic: false,
+                underline: false,
+                dim: false,
+                hidden: false,
+                strikethrough: false,
             };
             let mut cells = vec![blank; rows * cols];
 
@@ -220,6 +226,12 @@ impl View for TerminalView {
                     fg,
                     bg,
                     is_wide: cell.flags.contains(Flags::WIDE_CHAR),
+                    bold: cell.flags.contains(Flags::BOLD),
+                    italic: cell.flags.contains(Flags::ITALIC),
+                    underline: cell.flags.contains(Flags::UNDERLINE),
+                    dim: cell.flags.contains(Flags::DIM),
+                    hidden: cell.flags.contains(Flags::HIDDEN),
+                    strikethrough: cell.flags.contains(Flags::STRIKEOUT),
                 };
             }
 

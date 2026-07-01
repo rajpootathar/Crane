@@ -8,7 +8,7 @@ use std::sync::Arc;
 use string_offset::CharOffset;
 use warp_editor::content::buffer::{Buffer, BufferEvent};
 use warp_editor::content::selection_model::BufferSelectionModel;
-use warp_editor::content::text::{IndentBehavior, TextStyles};
+use warp_editor::content::text::{IndentBehavior, IndentUnit, TextStyles};
 use warp_editor::editor::{EditorView, EmbeddedItemModel, RunnableCommandModel};
 use warp_editor::model::{CoreEditorModel, PlainTextEditorModel};
 use warp_editor::render::element::{
@@ -187,6 +187,10 @@ pub enum EditAction {
     /// Jump the vertical scroll to a track fraction (0.0 top … 1.0 bottom) —
     /// from dragging the scrollbar thumb.
     ScrollToFrac(f32),
+    /// Indent the current line(s) forward (Tab) or backward (Shift+Tab).
+    Indent { outdent: bool },
+    /// Scroll up or down by one full viewport height (Page Up / Page Down).
+    PageScroll { down: bool },
 }
 
 impl<V> RichTextAction<V> for EditAction {
@@ -367,14 +371,16 @@ impl WarpEditorView {
         font: FamilyId,
         path: std::path::PathBuf,
     ) -> Self {
-        let buffer = ctx.add_model(|_| Buffer::new(Box::new(|_, _| IndentBehavior::Ignore)));
+        let buffer = ctx.add_model(|_| {
+            Buffer::new(Box::new(|_, _| IndentBehavior::TabIndent(IndentUnit::Space(4))))
+        });
         let buffer_sel = ctx.add_model(|_| BufferSelectionModel::new(buffer.clone()));
         let bsel2 = buffer_sel.clone();
         buffer.update(ctx, |buf, mctx| {
             *buf = Buffer::from_plain_text(
                 &content,
                 None,
-                Box::new(|_, _| IndentBehavior::Ignore),
+                Box::new(|_, _| IndentBehavior::TabIndent(IndentUnit::Space(4))),
                 bsel2,
                 mctx,
             );
@@ -533,7 +539,30 @@ impl WarpEditorView {
                 model.update(ctx, |m: &mut CodeModel, mctx| m.backspace(mctx));
             }
             EditAction::Enter => {
-                model.update(ctx, |m: &mut CodeModel, mctx| m.enter(mctx));
+                model.update(ctx, |m: &mut CodeModel, mctx| {
+                    // Capture the leading whitespace of the current line so Enter
+                    // auto-indents to match the previous line's indentation.
+                    let leading_ws: String = {
+                        let cursor_off =
+                            m.selection.as_ref(mctx).cursors(mctx).last().as_usize();
+                        // Buffer offset 0 is a sentinel; text characters start at index
+                        // cursor_off - 1 within the string returned by text().
+                        let text = m.buffer.as_ref(mctx).text().into_string();
+                        let text_idx = cursor_off.saturating_sub(1).min(text.len());
+                        let line_start = text[..text_idx]
+                            .rfind('\n')
+                            .map(|p| p + 1)
+                            .unwrap_or(0);
+                        text[line_start..text_idx]
+                            .chars()
+                            .take_while(|c| *c == ' ' || *c == '\t')
+                            .collect()
+                    };
+                    m.enter(mctx);
+                    if !leading_ws.is_empty() {
+                        m.user_insert(&leading_ws, mctx);
+                    }
+                });
             }
             EditAction::CursorMove { dir, unit, extend } => {
                 let (dir, unit, extend) = (*dir, unit.clone(), *extend);
@@ -571,6 +600,21 @@ impl WarpEditorView {
                     });
                 });
             }
+            EditAction::Indent { outdent } => {
+                let outdent = *outdent;
+                model.update(ctx, |m: &mut CodeModel, mctx| m.indent(outdent, mctx));
+            }
+            EditAction::PageScroll { down } => {
+                let down = *down;
+                model.update(ctx, |m: &mut CodeModel, mctx| {
+                    let rs = m.render_state.clone();
+                    rs.update(mctx, |r, rctx| {
+                        let view_h = r.viewport().height().as_f32();
+                        let delta = if down { view_h } else { -view_h };
+                        r.scroll(Pixels::new(delta), rctx);
+                    });
+                });
+            }
         }
         ctx.notify();
     }
@@ -594,7 +638,11 @@ impl WarpEditorView {
         let action = match ks.key.as_str() {
             "backspace" | "delete" => EditAction::Backspace,
             "enter" | "return" | "numpadenter" => EditAction::Enter,
-            "tab" => EditAction::InsertChars("    ".to_string()),
+            // Shift+Tab outdents; plain Tab indents. "backtab" is an alternate
+            // name some backends send for Shift+Tab.
+            "tab" if ks.shift => EditAction::Indent { outdent: true },
+            "tab" => EditAction::Indent { outdent: false },
+            "backtab" => EditAction::Indent { outdent: true },
             "space" => EditAction::InsertChars(" ".to_string()),
             "left" => mv(
                 TextDirection::Backwards,
@@ -608,8 +656,10 @@ impl WarpEditorView {
             "down" => mv(TextDirection::Forwards, TextUnit::Line),
             "home" => mv(TextDirection::Backwards, TextUnit::LineBoundary),
             "end" => mv(TextDirection::Forwards, TextUnit::LineBoundary),
+            "pageup" => EditAction::PageScroll { down: false },
+            "pagedown" => EditAction::PageScroll { down: true },
             k if k.chars().count() == 1 => EditAction::InsertChars(k.to_string()),
-            _ => return, // fn keys, pageup/down — TODO
+            _ => return,
         };
         self.apply(&action, ctx);
     }

@@ -11,7 +11,7 @@ use crane_term::selection::SelectionRange;
 use warpui::color::ColorU;
 use warpui::elements::{Element, Fill, Point};
 use warpui::event::{DispatchedEvent, Event};
-use warpui::fonts::{FamilyId, Properties};
+use warpui::fonts::{FamilyId, Properties, Style, Weight};
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::{vec2f, Vector2F};
 use warpui::{AfterLayoutContext, AppContext, EventContext, LayoutContext, PaintContext, SizeConstraint};
@@ -32,6 +32,18 @@ pub struct GridCell {
     /// True for the leading column of a double-width (CJK/emoji) glyph;
     /// the trailing WIDE_CHAR_SPACER column is a blank cell.
     pub is_wide: bool,
+    /// SGR bold (weight: bold font variant).
+    pub bold: bool,
+    /// SGR italic (style: italic font variant).
+    pub italic: bool,
+    /// SGR underline (draw 1px line under glyph).
+    pub underline: bool,
+    /// SGR dim (reduce fg alpha to ~50%).
+    pub dim: bool,
+    /// SGR hidden / conceal (suppress glyph rendering).
+    pub hidden: bool,
+    /// SGR strikethrough (draw 1px line through cell mid-height).
+    pub strikethrough: bool,
 }
 
 pub struct GridElement {
@@ -229,24 +241,64 @@ impl Element for GridElement {
             }
         }
 
-        // 5) Glyphs on top.
+        // 5) Glyphs + decorations (underline, strikethrough).
         for r in 0..self.rows {
             for c in 0..self.cols {
                 let cell = self.cells[r * self.cols + c];
-                if cell.ch == ' ' || cell.ch == '\0' {
+
+                // SGR hidden: suppress the glyph entirely.
+                if cell.hidden {
                     continue;
                 }
-                // Invert the glyph under the block cursor for legibility.
-                let color = match self.cursor {
-                    Some((cr, cc)) if cr == r && cc == c => self.default_bg,
-                    _ => cell.fg,
+
+                let is_cursor = matches!(self.cursor, Some((cr, cc)) if cr == r && cc == c);
+
+                // Resolve fg color: invert under cursor, dim otherwise.
+                let mut fg = if is_cursor { self.default_bg } else { cell.fg };
+                if cell.dim && !is_cursor {
+                    fg = ColorU::new(fg.r, fg.g, fg.b, fg.a / 2);
+                }
+
+                // Select the appropriate font variant for bold / italic.
+                let props = match (cell.bold, cell.italic) {
+                    (true, true) => Properties { weight: Weight::Bold, style: Style::Italic },
+                    (true, false) => Properties { weight: Weight::Bold, style: Style::Normal },
+                    (false, true) => Properties { weight: Weight::Normal, style: Style::Italic },
+                    (false, false) => Properties::default(),
                 };
-                if let Some((gid, render_font)) = fc.glyph_for_char(font, cell.ch, true) {
-                    let pos = vec2f(
-                        origin.x() + c as f32 * cw,
-                        origin.y() + r as f32 * ch + baseline,
-                    );
-                    ctx.scene.draw_glyph(pos, gid, render_font, self.font_size, color);
+                let cell_font = if props == Properties::default() {
+                    font
+                } else {
+                    fc.select_font(self.font_family, props)
+                };
+
+                // Draw the glyph (skip whitespace).
+                if cell.ch != ' ' && cell.ch != '\0' {
+                    if let Some((gid, render_font)) = fc.glyph_for_char(cell_font, cell.ch, true) {
+                        let pos = vec2f(
+                            origin.x() + c as f32 * cw,
+                            origin.y() + r as f32 * ch + baseline,
+                        );
+                        ctx.scene.draw_glyph(pos, gid, render_font, self.font_size, fg);
+                    }
+                }
+
+                // Underline: 1px line just below the baseline.
+                if cell.underline {
+                    let x = origin.x() + c as f32 * cw;
+                    let y = origin.y() + r as f32 * ch + baseline + 2.0;
+                    ctx.scene
+                        .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(cw, 1.0)))
+                        .with_background(Fill::Solid(fg));
+                }
+
+                // Strikethrough: 1px line at cell vertical midpoint.
+                if cell.strikethrough {
+                    let x = origin.x() + c as f32 * cw;
+                    let y = origin.y() + r as f32 * ch + ch * 0.5;
+                    ctx.scene
+                        .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(cw, 1.0)))
+                        .with_background(Fill::Solid(fg));
                 }
             }
         }
