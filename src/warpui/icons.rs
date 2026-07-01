@@ -30,3 +30,7 @@ pub const KEYBOARD: &str = "\u{E2D8}";
 pub const LIGHTNING: &str = "\u{E2DE}";
 pub const CIRCLE: &str = "\u{E18A}";
 pub const SIDEBAR: &str = "\u{EAB6}";
+pub const FOLDER_PLUS: &str = "\u{E258}";
+pub const COPY: &str = "\u{E1CA}";
+pub const PENCIL_SIMPLE: &str = "\u{E3B4}";
+pub const TRASH: &str = "\u{E4A6}";

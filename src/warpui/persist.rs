@@ -87,6 +87,13 @@ pub struct STerminal {
     pub history: String,
 }
 
+/// A project added via the warpui "Add Project" flow (not sourced from session.json).
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct AddedProject {
+    pub name: String,
+    pub path: String,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct WarpuiState {
     #[serde(default)]
@@ -121,6 +128,15 @@ pub struct WarpuiState {
     /// Per terminal pane: cwd + ANSI scrollback snapshot, keyed by pane id.
     #[serde(default)]
     pub terminals: Vec<(PaneId, STerminal)>,
+    /// Projects the user added via "Add Project" (not from session.json).
+    #[serde(default)]
+    pub added_projects: Vec<AddedProject>,
+    /// Paths of session.json projects the user explicitly removed.
+    #[serde(default)]
+    pub removed_project_paths: Vec<String>,
+    /// Per-project tint overrides keyed by project path.
+    #[serde(default)]
+    pub project_tints: Vec<(String, [u8; 3])>,
     /// Last saved window width in logical pixels (0.0 = unset / use default).
     #[serde(default)]
     pub window_w: f32,

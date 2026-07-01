@@ -17,8 +17,8 @@ use crate::warpui::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
 use crate::warpui::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
-    ChildView, ConstrainedBox, Container, DispatchEventResult, Draggable, DraggableState,
-    EventHandler, Expanded, Flex, ParentElement, Rect, Stack, Text,
+    Border, ChildView, ConstrainedBox, Container, Dismiss, DispatchEventResult, Draggable,
+    DraggableState, EventHandler, Expanded, Flex, ParentElement, Rect, Stack, Text,
 };
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::vec2f;
@@ -30,6 +30,14 @@ use warpui::{
 
 use crate::warpui::theme;
 use crate::warpui::view::TerminalView;
+
+/// State for an open project right-click context menu.
+struct ProjectContextMenu {
+    project_idx: usize,
+    /// Window-relative position of the right-click that opened the menu.
+    x: f32,
+    y: f32,
+}
 
 pub struct CraneShellView {
     ui_font: FamilyId,
@@ -118,6 +126,14 @@ pub struct CraneShellView {
     worktree_tabs: HashMap<(usize, usize), Vec<TabMeta>>,
     /// Monotonic tab id source.
     next_tab_id: usize,
+    /// Projects added by the user via "Add Project" (not sourced from session.json).
+    added_projects: Vec<crate::warpui::persist::AddedProject>,
+    /// Paths of session.json projects the user explicitly removed.
+    removed_project_paths: Vec<String>,
+    /// Per-project tint overrides keyed by project path.
+    project_tints: HashMap<String, [u8; 3]>,
+    /// Active project context menu, or None when no menu is open.
+    context_menu: Option<ProjectContextMenu>,
 }
 
 #[derive(Clone)]
@@ -163,7 +179,24 @@ impl CraneShellView {
                 )
                 .expect("load phosphor")
         });
-        let projects = crate::warpui::projects::load_projects();
+        // Load warpui persisted state early so we can apply the project overlay
+        // (added/removed/tints) when building the initial project list.
+        let saved_state = crate::warpui::persist::load();
+        let init_added: Vec<crate::warpui::persist::AddedProject> = saved_state
+            .as_ref()
+            .map(|s| s.added_projects.clone())
+            .unwrap_or_default();
+        let init_removed: Vec<String> = saved_state
+            .as_ref()
+            .map(|s| s.removed_project_paths.clone())
+            .unwrap_or_default();
+        let init_tints: HashMap<String, [u8; 3]> = saved_state
+            .as_ref()
+            .map(|s| s.project_tints.iter().cloned().collect())
+            .unwrap_or_default();
+        let projects = crate::warpui::projects::load_projects_extended(
+            &init_added, &init_removed, &init_tints,
+        );
         // Default the terminal to the first project's first worktree folder.
         let default_cwd = projects
             .first()
@@ -216,7 +249,7 @@ impl CraneShellView {
         // RESTORE: rebuild tabs + split layouts from the persisted state. Each
         // saved leaf respawns a terminal in its worktree cwd — EXCEPT the saved
         // File pane leaf, which is rebuilt as a File pane with its open files.
-        if let Some(st) = crate::warpui::persist::load() {
+        if let Some(st) = saved_state {
             // Restore the active theme BEFORE building any UI so every colour
             // token call below reads the right palette.
             if !st.theme_name.is_empty() {
@@ -400,6 +433,10 @@ impl CraneShellView {
             changes: Vec::new(),
             expanded_projects,
             expanded_worktrees,
+            added_projects: init_added,
+            removed_project_paths: init_removed,
+            project_tints: init_tints,
+            context_menu: None,
         }
     }
 
@@ -526,7 +563,169 @@ impl CraneShellView {
             window_w,
             window_h,
             theme_name: crate::theme::current().name.clone(),
+            added_projects: self.added_projects.clone(),
+            removed_project_paths: self.removed_project_paths.clone(),
+            project_tints: self.project_tints.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         });
+    }
+
+    /// Resolve the tint color for the project at `idx`: uses the user-chosen tint
+    /// stored on the `ProjectNode` if present, otherwise the palette default.
+    fn project_color_for(&self, idx: usize) -> ColorU {
+        if let Some(p) = self.projects.get(idx) {
+            if let Some([r, g, b]) = p.tint {
+                return ColorU::new(r, g, b, 255);
+            }
+        }
+        project_tint(idx)
+    }
+
+    /// A single row inside the context menu (icon + label). Dispatches
+    /// CloseContextMenu then the real `action` when clicked.
+    fn menu_item(&self, glyph: &str, label: &str, action: CraneShellAction) -> Box<dyn Element> {
+        let row = Flex::row()
+            .with_child(
+                Container::new(self.icon(glyph, 12.0, theme::text_muted()))
+                    .with_padding_right(8.0)
+                    .finish(),
+            )
+            .with_child(
+                Text::new(label.to_string(), self.ui_font, 12.0)
+                    .with_color(theme::text())
+                    .finish(),
+            )
+            .finish();
+        let content = Container::new(row)
+            .with_padding_left(10.0)
+            .with_padding_right(20.0)
+            .with_padding_top(6.0)
+            .with_padding_bottom(6.0)
+            .finish();
+        EventHandler::new(content)
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    /// A thin horizontal divider for use inside the context menu.
+    fn menu_separator(&self) -> Box<dyn Element> {
+        Container::new(
+            ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                .with_height(1.0)
+                .finish(),
+        )
+        .with_padding_top(4.0)
+        .with_padding_bottom(4.0)
+        .finish()
+    }
+
+    /// Build the project context menu overlay anchored at the stored click position.
+    fn project_context_menu(&self, pm: &ProjectContextMenu) -> Box<dyn Element> {
+        let pi = pm.project_idx;
+        let mut items = Flex::column();
+
+        items = items.with_child(self.menu_item(
+            icons::FOLDER_OPEN,
+            "Reveal in Finder",
+            CraneShellAction::RevealProjectInFinder(pi),
+        ));
+        items = items.with_child(self.menu_item(
+            icons::COPY,
+            "Copy Path",
+            CraneShellAction::CopyProjectPath(pi),
+        ));
+        items = items.with_child(self.menu_separator());
+
+        // Tint palette — 8 colored CUBE swatches in a single row.
+        const PALETTE: [(&str, [u8; 3]); 8] = [
+            ("Red",    [239,  83,  80]),
+            ("Orange", [255, 152,   0]),
+            ("Yellow", [255, 202,  40]),
+            ("Green",  [102, 187, 106]),
+            ("Teal",   [ 38, 166, 154]),
+            ("Blue",   [ 66, 165, 245]),
+            ("Purple", [171,  71, 188]),
+            ("Pink",   [236,  64, 122]),
+        ];
+        let icon_font = self.icon_font;
+        let mut swatches = Flex::row();
+        for (_name, rgb) in &PALETTE {
+            let color = ColorU::new(rgb[0], rgb[1], rgb[2], 255);
+            let rgb_copy = *rgb;
+            let swatch = EventHandler::new(
+                Container::new(
+                    Text::new(icons::CUBE.to_string(), icon_font, 14.0)
+                        .with_color(color)
+                        .finish(),
+                )
+                .with_uniform_padding(4.0)
+                .finish(),
+            )
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+                ctx.dispatch_typed_action(CraneShellAction::SetProjectTint(pi, Some(rgb_copy)));
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            swatches = swatches.with_child(swatch);
+        }
+        let palette_row = Container::new(swatches.finish())
+            .with_padding_left(6.0)
+            .with_padding_right(6.0)
+            .with_padding_top(4.0)
+            .with_padding_bottom(2.0)
+            .finish();
+        items = items.with_child(palette_row);
+
+        items = items.with_child(self.menu_item(
+            icons::ARROW_COUNTER_CLOCKWISE,
+            "Default color",
+            CraneShellAction::SetProjectTint(pi, None),
+        ));
+        items = items.with_child(self.menu_separator());
+
+        items = items.with_child(self.menu_item(
+            icons::TRASH,
+            "Remove Project",
+            CraneShellAction::RemoveProject(pi),
+        ));
+
+        let menu_box = ConstrainedBox::new(
+            Container::new(items.finish())
+                .with_background_color(theme::surface())
+                .with_border(Border::all(1.0).with_border_color(theme::border()))
+                .with_padding_top(4.0)
+                .with_padding_bottom(4.0)
+                .finish(),
+        )
+        .with_min_width(180.0)
+        .finish();
+
+        let positioned = Container::new(menu_box)
+            .with_padding_top(pm.y)
+            .with_padding_left(pm.x)
+            .finish();
+
+        Box::new(
+            Dismiss::new(positioned)
+                .prevent_interaction_with_other_elements()
+                .on_dismiss(|ctx, _| {
+                    ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+                }),
+        )
+    }
+
+    /// Reload the project list from session.json + the current overlay
+    /// (added / removed / tints). Call after mutating any of those three fields.
+    fn reload_projects(&mut self) {
+        self.projects = crate::warpui::projects::load_projects_extended(
+            &self.added_projects,
+            &self.removed_project_paths,
+            &self.project_tints,
+        );
     }
 
     fn refresh_panel(&mut self) {
@@ -715,12 +914,39 @@ impl CraneShellView {
     }
 
     fn left_sidebar(&self) -> Box<dyn Element> {
+        // Header row: "PROJECTS" label + "+" Add Project button.
+        let header_label = Container::new(
+            Text::new("PROJECTS", self.ui_font, 11.0)
+                .with_color(theme::text_header())
+                .finish(),
+        )
+        .with_padding_left(8.0)
+        .with_padding_top(8.0)
+        .with_padding_bottom(8.0)
+        .finish();
+        let add_btn = EventHandler::new(
+            Container::new(self.icon(icons::FOLDER_PLUS, 13.0, theme::text_muted()))
+                .with_padding_right(8.0)
+                .with_padding_top(6.0)
+                .with_padding_bottom(6.0)
+                .finish(),
+        )
+        .on_left_mouse_down(|ctx, _, _| {
+            ctx.dispatch_typed_action(CraneShellAction::AddProject);
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+        let header_row = Flex::row()
+            .with_child(Expanded::new(1.0, header_label).finish())
+            .with_child(add_btn)
+            .finish();
+
         // Real project tree loaded from ~/.crane/session.json: the user's
         // actual projects -> worktrees (branches) -> tabs.
-        let mut col = Flex::column().with_child(self.header("PROJECTS"));
+        let mut col = Flex::column().with_child(header_row);
         if self.projects.is_empty() {
             col = col.with_child(self.tree_row(
-                "(no ~/.crane/session.json)",
+                "No projects. Click + to add one.",
                 12.0,
                 theme::text_muted(),
                 12.0,
@@ -731,17 +957,31 @@ impl CraneShellView {
             let p_expanded = self.expanded_projects.contains(&pi);
             let psel = sel == (pi, usize::MAX, usize::MAX);
             let pcol = if psel { theme::text_hover() } else { theme::text() };
-            col = col.with_child(self.nav_row(
+            let tint = self.project_color_for(pi);
+            let base_row = self.nav_row(
                 Some(p_expanded),
                 icons::CUBE,
-                project_tint(pi),
+                tint,
                 &p.name,
                 13.0,
                 pcol,
                 10.0,
                 psel,
                 CraneShellAction::ToggleProject(pi),
-            ));
+            );
+            // Wrap in a second EventHandler to capture right-click for the
+            // context menu without interfering with the left-click toggle.
+            let project_row = EventHandler::new(base_row)
+                .on_right_mouse_down(move |ctx, _, pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::ShowProjectMenu {
+                        project_idx: pi,
+                        x: pos.x(),
+                        y: pos.y(),
+                    });
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
+            col = col.with_child(project_row);
             if !p_expanded {
                 continue;
             }
@@ -1860,10 +2100,16 @@ impl View for CraneShellView {
             .with_child(self.status_bar())
             .finish();
 
-        let root = Stack::new()
+        let mut root_stack = Stack::new()
             .with_child(Rect::new().with_background_color(theme::bg()).finish())
-            .with_child(column)
-            .finish();
+            .with_child(column);
+
+        // Overlay the context menu on top of everything when it is open.
+        if let Some(pm) = &self.context_menu {
+            root_stack = root_stack.with_child(self.project_context_menu(pm));
+        }
+
+        let root = root_stack.finish();
 
         // Press-to-focus (old Crane's `pressed_inside`): on any left press, focus
         // the pane whose rect contains the cursor. Reliable across the terminal's
@@ -2032,6 +2278,20 @@ pub enum CraneShellAction {
     CloseTab((usize, usize, usize)),
     /// Switch to a named theme (cycles through all installed themes).
     SetTheme(String),
+    /// Open a native folder picker and add the chosen directory as a new project.
+    AddProject,
+    /// Remove the project at index `i` from the project list and persist.
+    RemoveProject(usize),
+    /// Show the project context menu anchored at the given window position.
+    ShowProjectMenu { project_idx: usize, x: f32, y: f32 },
+    /// Dismiss the active project context menu.
+    CloseContextMenu,
+    /// Reveal the project folder in the system file manager.
+    RevealProjectInFinder(usize),
+    /// Copy the project path to the clipboard.
+    CopyProjectPath(usize),
+    /// Set or clear a per-project tint. `None` resets to the palette default.
+    SetProjectTint(usize, Option<[u8; 3]>),
     Noop,
 }
 
@@ -2314,6 +2574,84 @@ impl TypedActionView for CraneShellView {
                 if let Some(t) = crate::theme::find_by_name(name) {
                     crate::theme::set(t);
                 }
+            }
+            CraneShellAction::AddProject => {
+                // Blocking native folder picker; the OS modal takes over until
+                // the user confirms or cancels.
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Choose project folder")
+                    .pick_folder()
+                {
+                    let path_str = folder.to_string_lossy().to_string();
+                    let name = folder
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path_str.clone());
+                    if !self.projects.iter().any(|p| p.path == path_str) {
+                        let ap = crate::warpui::persist::AddedProject {
+                            name,
+                            path: path_str.clone(),
+                        };
+                        self.added_projects.push(ap);
+                        // Re-add in case the user had previously removed it.
+                        self.removed_project_paths.retain(|r| r != &path_str);
+                        self.reload_projects();
+                    }
+                }
+            }
+            CraneShellAction::RemoveProject(i) => {
+                self.context_menu = None;
+                if let Some(p) = self.projects.get(*i) {
+                    let path = p.path.clone();
+                    self.added_projects.retain(|ap| ap.path != path);
+                    if !self.removed_project_paths.contains(&path) {
+                        self.removed_project_paths.push(path);
+                    }
+                }
+                self.reload_projects();
+            }
+            CraneShellAction::ShowProjectMenu { project_idx, x, y } => {
+                self.context_menu = Some(ProjectContextMenu {
+                    project_idx: *project_idx,
+                    x: *x,
+                    y: *y,
+                });
+            }
+            CraneShellAction::CloseContextMenu => {
+                self.context_menu = None;
+            }
+            CraneShellAction::RevealProjectInFinder(i) => {
+                self.context_menu = None;
+                if let Some(p) = self.projects.get(*i) {
+                    let path = p.path.clone();
+                    #[cfg(target_os = "macos")]
+                    let _ = std::process::Command::new("open").arg(&path).spawn();
+                    #[cfg(target_os = "linux")]
+                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                }
+            }
+            CraneShellAction::CopyProjectPath(i) => {
+                self.context_menu = None;
+                if let Some(p) = self.projects.get(*i) {
+                    ctx.clipboard().write(
+                        warpui::clipboard::ClipboardContent::plain_text(p.path.clone()),
+                    );
+                }
+            }
+            CraneShellAction::SetProjectTint(i, tint) => {
+                self.context_menu = None;
+                if let Some(p) = self.projects.get(*i) {
+                    let path = p.path.clone();
+                    match tint {
+                        Some(rgb) => {
+                            self.project_tints.insert(path, *rgb);
+                        }
+                        None => {
+                            self.project_tints.remove(&path);
+                        }
+                    }
+                }
+                self.reload_projects();
             }
             CraneShellAction::Noop => {}
         }

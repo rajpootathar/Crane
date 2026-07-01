@@ -4,6 +4,8 @@
 //! is new. Parsed via serde_json::Value to avoid importing the crane crate's
 //! full session schema.
 
+use std::collections::HashMap;
+
 pub struct WorktreeNode {
     pub name: String,
     pub path: String,
@@ -14,6 +16,8 @@ pub struct ProjectNode {
     pub name: String,
     pub path: String,
     pub worktrees: Vec<WorktreeNode>,
+    /// Per-project accent tint set by the user (overrides the palette default).
+    pub tint: Option<[u8; 3]>,
 }
 
 /// Load the project tree from the live Crane session, or empty if missing.
@@ -77,8 +81,36 @@ pub fn load_projects() -> Vec<ProjectNode> {
                 name,
                 path,
                 worktrees,
+                tint: None,
             });
         }
     }
     out
+}
+
+/// Load projects with overlay data from warpui-state.json:
+/// - `added`: extra projects appended by the user via "Add Project"
+/// - `removed`: paths of session.json projects to exclude
+/// - `tints`: per-path tint overrides
+pub fn load_projects_extended(
+    added: &[crate::warpui::persist::AddedProject],
+    removed: &[String],
+    tints: &HashMap<String, [u8; 3]>,
+) -> Vec<ProjectNode> {
+    let mut projects = load_projects();
+    projects.retain(|p| !removed.contains(&p.path));
+    for p in &mut projects {
+        p.tint = tints.get(&p.path).copied();
+    }
+    for ap in added {
+        if !projects.iter().any(|p| p.path == ap.path) {
+            projects.push(ProjectNode {
+                name: ap.name.clone(),
+                path: ap.path.clone(),
+                worktrees: Vec::new(),
+                tint: tints.get(&ap.path).copied(),
+            });
+        }
+    }
+    projects
 }
