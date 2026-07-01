@@ -6,6 +6,69 @@ use std::cell::{Cell as StdCell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
+// ── URL scanning ─────────────────────────────────────────────────────────────
+
+/// One HTTP/HTTPS URL detected in a row of the visible grid. `col_end` is
+/// exclusive. Ported from `src/terminal/view.rs:15-96`.
+struct UrlHit {
+    col_start: usize,
+    col_end: usize,
+    url: String,
+}
+
+/// Scan a row of plain text for `http://` / `https://` URLs. Stops at
+/// whitespace and trims trailing punctuation that is almost never part of the
+/// URL itself. Ported verbatim from `src/terminal/view.rs:43-96`.
+fn scan_urls(row: &str) -> Vec<UrlHit> {
+    let mut hits = Vec::new();
+    let chars: Vec<char> = row.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let starts_http = i + 7 <= n
+            && chars[i..i + 7].iter().collect::<String>().eq_ignore_ascii_case("http://");
+        let starts_https = i + 8 <= n
+            && chars[i..i + 8].iter().collect::<String>().eq_ignore_ascii_case("https://");
+        if !(starts_http || starts_https) {
+            i += 1;
+            continue;
+        }
+        // Require a word-boundary before the scheme to avoid mid-word matches.
+        if i > 0 {
+            let prev = chars[i - 1];
+            if prev.is_alphanumeric() || prev == '/' || prev == '.' {
+                i += 1;
+                continue;
+            }
+        }
+        let mut end = i;
+        while end < n {
+            let c = chars[end];
+            if c.is_whitespace() || c == '\0' || (c as u32) < 0x20 {
+                break;
+            }
+            end += 1;
+        }
+        // Trim trailing sentence punctuation.
+        while end > i {
+            let c = chars[end - 1];
+            if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\'') {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        if end > i + 8 {
+            let url: String = chars[i..end].iter().collect();
+            hits.push(UrlHit { col_start: i, col_end: end, url });
+        }
+        i = end.max(i + 1);
+    }
+    hits
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 use crane_term::index::{Column as TermColumn, Line as TermLine, Point as TermPoint, Side};
 use crane_term::selection::{expand_to_line, expand_to_word, Selection, SelectionAnchor, SelectionType};
 use crane_term::{Flags, TermMode};
@@ -57,6 +120,13 @@ pub struct TerminalView {
     /// Consecutive click count (1 = simple, 2 = word, 3+ = line).
     click_count: Rc<StdCell<u32>>,
     _repaint: SpawnedLocalStream,
+    /// Hovered URL span: (row, col_start, col_end). Persists across per-frame
+    /// rebuilds so GridElement can draw the underline between MouseMoved events.
+    url_hover: Rc<StdCell<Option<(usize, usize, usize)>>>,
+    /// URL that was pressed at the last LeftMouseDown (click-without-drag detection).
+    url_pressed: Rc<RefCell<Option<String>>>,
+    /// Whether LeftMouseDragged fired since the last LeftMouseDown.
+    url_did_drag: Rc<StdCell<bool>>,
 }
 
 impl TerminalView {
@@ -104,6 +174,9 @@ impl TerminalView {
             last_click: Rc::new(RefCell::new(None)),
             click_count: Rc::new(StdCell::new(0)),
             _repaint: repaint,
+            url_hover: Rc::new(StdCell::new(None)),
+            url_pressed: Rc::new(RefCell::new(None)),
+            url_did_drag: Rc::new(StdCell::new(false)),
         }
     }
 
@@ -253,6 +326,23 @@ impl View for TerminalView {
             (cells, rows, cols, cursor, sel_range, disp_off)
         };
 
+        // Scan visible rows for clickable URLs.
+        let url_spans: Vec<crate::warpui::grid_element::UrlSpan> = {
+            let mut spans = Vec::new();
+            for r in 0..rows {
+                let row_text: String = (0..cols).map(|c| cells[r * cols + c].ch).collect();
+                for hit in scan_urls(&row_text) {
+                    spans.push(crate::warpui::grid_element::UrlSpan {
+                        row: r,
+                        col_start: hit.col_start,
+                        col_end: hit.col_end,
+                        url: hit.url,
+                    });
+                }
+            }
+            spans
+        };
+
         // Build the mouse-selection callback. Captures Rc-cloned state from the
         // view so it survives the per-frame element rebuild.
         let sel_ctrl = self.controller.clone();
@@ -378,7 +468,13 @@ impl View for TerminalView {
             self.desired.clone(),
         )
         .with_selection(sel_range, disp_off)
-        .on_mouse_select(self.sel_dragging.clone(), mouse_sel_cb);
+        .on_mouse_select(self.sel_dragging.clone(), mouse_sel_cb)
+        .with_url_spans(
+            url_spans,
+            self.url_hover.clone(),
+            self.url_pressed.clone(),
+            self.url_did_drag.clone(),
+        );
 
         // Scrollbar metrics from crane_term (rows, not pixels). In alt-screen
         // (vim/less/htop) there's no scrollback and the app owns its own
@@ -538,9 +634,11 @@ impl TerminalView {
         ctrl.write_input(&bytes);
     }
 
-    /// Clear THIS terminal (Ctrl+L — shell clears + redraws prompt).
+    /// Clear THIS terminal — two-regime Cmd+K clear:
+    /// • Alt-screen / TUI active: erase scrollback only (`\x1b[3J`).
+    /// • Bare shell: cursor home + erase display + erase scrollback + Ctrl+L.
     pub fn clear_screen(&self) {
-        self.controller.borrow().write_input(b"\x0c");
+        self.controller.borrow().clear_screen_two_regime();
     }
 }
 
@@ -574,7 +672,7 @@ impl TypedActionView for TerminalView {
                 ctrl.write_input(&bytes);
             }
             TerminalViewAction::Clear => {
-                self.controller.borrow().write_input(b"\x0c");
+                self.controller.borrow().clear_screen_two_regime();
             }
         }
     }

@@ -3,7 +3,7 @@
 //! from a cell snapshot every frame — no damage tracking, so it cannot
 //! "drop" rows the way the egui grid did.
 
-use std::cell::Cell as StdCell;
+use std::cell::{Cell as StdCell, RefCell};
 use std::rc::Rc;
 
 use crane_term::index::{Column as TermColumn, Line as TermLine, Point as TermPoint, Side};
@@ -14,6 +14,7 @@ use warpui::event::{DispatchedEvent, Event};
 use warpui::fonts::{FamilyId, Properties, Style, Weight};
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::{vec2f, Vector2F};
+use warpui::platform::Cursor;
 use warpui::{AfterLayoutContext, AppContext, EventContext, LayoutContext, PaintContext, SizeConstraint};
 
 /// Phase of a mouse selection gesture.
@@ -22,6 +23,15 @@ pub enum MouseSelPhase {
     Down,
     Drag,
     Up,
+}
+
+/// One clickable URL span in the visible grid. `col_end` is exclusive.
+#[derive(Clone)]
+pub struct UrlSpan {
+    pub row: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+    pub url: String,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +86,16 @@ pub struct GridElement {
     mouse_sel_cb: Option<Rc<dyn Fn(MouseSelPhase, usize, usize, Side)>>,
     /// Shared drag state (persisted by the owning View across per-frame rebuilds).
     mouse_dragging: Rc<StdCell<bool>>,
+    /// URL spans detected in the visible grid rows (built by the View each frame).
+    url_spans: Vec<UrlSpan>,
+    /// Which span is currently hovered: (row, col_start, col_end). Persisted
+    /// across rebuilds so the underline is visible between MouseMoved events.
+    url_hover: Rc<StdCell<Option<(usize, usize, usize)>>>,
+    /// URL recorded at the last LeftMouseDown (for click-without-drag detection).
+    url_pressed: Rc<RefCell<Option<String>>>,
+    /// True if LeftMouseDragged fired since the last LeftMouseDown. Shared so
+    /// the View can also inspect it (e.g. suppress copy on drag-release).
+    url_did_drag: Rc<StdCell<bool>>,
 }
 
 impl GridElement {
@@ -112,6 +132,10 @@ impl GridElement {
             display_offset: 0,
             mouse_sel_cb: None,
             mouse_dragging: Rc::new(StdCell::new(false)),
+            url_spans: Vec::new(),
+            url_hover: Rc::new(StdCell::new(None)),
+            url_pressed: Rc::new(RefCell::new(None)),
+            url_did_drag: Rc::new(StdCell::new(false)),
         }
     }
 
@@ -142,6 +166,22 @@ impl GridElement {
     ) -> Self {
         self.mouse_dragging = dragging;
         self.mouse_sel_cb = Some(cb);
+        self
+    }
+
+    /// Attach URL spans computed by the View, plus shared hover/press/drag
+    /// state that persists across per-frame rebuilds.
+    pub fn with_url_spans(
+        mut self,
+        spans: Vec<UrlSpan>,
+        hover: Rc<StdCell<Option<(usize, usize, usize)>>>,
+        pressed: Rc<RefCell<Option<String>>>,
+        did_drag: Rc<StdCell<bool>>,
+    ) -> Self {
+        self.url_spans = spans;
+        self.url_hover = hover;
+        self.url_pressed = pressed;
+        self.url_did_drag = did_drag;
         self
     }
 }
@@ -302,6 +342,21 @@ impl Element for GridElement {
                 }
             }
         }
+
+        // 6) URL hover underline — a single accent-coloured rect spanning the
+        // whole URL token, drawn above the glyph layer so it is always visible.
+        if let Some((hr, hcs, hce)) = self.url_hover.get() {
+            if hr < self.rows && hcs < self.cols {
+                let eff_end = hce.min(self.cols);
+                let x = origin.x() + hcs as f32 * cw;
+                let w = (eff_end.saturating_sub(hcs)) as f32 * cw;
+                let y = origin.y() + hr as f32 * ch + baseline + 2.0;
+                let ul_color = crate::warpui::theme::accent();
+                ctx.scene
+                    .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(w, 1.0)))
+                    .with_background(Fill::Solid(ul_color));
+            }
+        }
     }
 
     fn size(&self) -> Option<Vector2F> {
@@ -315,7 +370,7 @@ impl Element for GridElement {
     fn dispatch_event(
         &mut self,
         event: &DispatchedEvent,
-        _ctx: &mut EventContext,
+        ctx: &mut EventContext,
         _app: &AppContext,
     ) -> bool {
         // Scroll wheel — handled first; no bounds check needed (hit rect covers all).
@@ -326,45 +381,92 @@ impl Element for GridElement {
             }
         }
 
-        // Mouse selection — only when a callback is registered.
+        // URL hover + click — runs before selection so we can detect a
+        // click-without-drag on a URL and open it instead of clearing selection.
+        let (Some(o), Some(s)) = (self.origin_vec, self.size) else {
+            return false;
+        };
+        let (cw, ch) = (self.cell_w, self.cell_h);
+        let in_bounds = |p: &Vector2F| -> bool {
+            p.x() >= o.x()
+                && p.x() <= o.x() + s.x()
+                && p.y() >= o.y()
+                && p.y() <= o.y() + s.y()
+        };
+        let pos_to_cell = |p: &Vector2F| -> (usize, usize, Side) {
+            let rel_x = (p.x() - o.x()).max(0.0);
+            let rel_y = (p.y() - o.y()).max(0.0);
+            let col = ((rel_x / cw).floor() as usize).min(self.cols.saturating_sub(1));
+            let row = ((rel_y / ch).floor() as usize).min(self.rows.saturating_sub(1));
+            let cell_frac = (rel_x % cw) / cw.max(1.0);
+            let side = if cell_frac < 0.5 { Side::Left } else { Side::Right };
+            (row, col, side)
+        };
+        // Return the URL span hit at (row, col), if any.
+        let url_hit_at = |row: usize, col: usize| -> Option<&UrlSpan> {
+            self.url_spans
+                .iter()
+                .find(|sp| sp.row == row && col >= sp.col_start && col < sp.col_end)
+        };
+
+        match event.raw_event() {
+            Event::MouseMoved { position, .. } if in_bounds(position) => {
+                let (row, col, _) = pos_to_cell(position);
+                if let Some(sp) = url_hit_at(row, col) {
+                    self.url_hover.set(Some((sp.row, sp.col_start, sp.col_end)));
+                    if let Some(origin_pt) = self.origin {
+                        ctx.set_cursor(Cursor::PointingHand, origin_pt.z_index());
+                    }
+                } else {
+                    self.url_hover.set(None);
+                    ctx.reset_cursor();
+                }
+                // Don't consume — selection drag and scrollbar need hover too.
+            }
+            Event::MouseMoved { .. } => {
+                // Cursor left the terminal area — clear any lingering hover.
+                self.url_hover.set(None);
+            }
+            _ => {}
+        }
+
+        // Mouse selection + URL click — only when a selection callback is registered.
         if let Some(cb) = self.mouse_sel_cb.clone() {
-            let (Some(o), Some(s)) = (self.origin_vec, self.size) else {
-                return false;
-            };
-            let (cw, ch) = (self.cell_w, self.cell_h);
-            let in_bounds = |p: &Vector2F| {
-                p.x() >= o.x()
-                    && p.x() <= o.x() + s.x()
-                    && p.y() >= o.y()
-                    && p.y() <= o.y() + s.y()
-            };
-            // Convert a window-space position to (viewport_row, col, side).
-            let pos_to_cell = |p: &Vector2F| -> (usize, usize, Side) {
-                let rel_x = (p.x() - o.x()).max(0.0);
-                let rel_y = (p.y() - o.y()).max(0.0);
-                let col = ((rel_x / cw).floor() as usize)
-                    .min(self.cols.saturating_sub(1));
-                let row = ((rel_y / ch).floor() as usize)
-                    .min(self.rows.saturating_sub(1));
-                let cell_frac = (rel_x % cw) / cw.max(1.0);
-                let side = if cell_frac < 0.5 { Side::Left } else { Side::Right };
-                (row, col, side)
-            };
             match event.raw_event() {
                 Event::LeftMouseDown { position, .. } if in_bounds(position) => {
-                    self.mouse_dragging.set(true);
+                    // Record URL under the press (if any) and reset drag flag.
                     let (row, col, side) = pos_to_cell(position);
+                    let pressed_url = url_hit_at(row, col).map(|sp| sp.url.clone());
+                    *self.url_pressed.borrow_mut() = pressed_url;
+                    self.url_did_drag.set(false);
+                    self.mouse_dragging.set(true);
                     cb(MouseSelPhase::Down, row, col, side);
                     return true;
                 }
                 Event::LeftMouseDragged { position, .. } if self.mouse_dragging.get() => {
+                    self.url_did_drag.set(true);
                     let (row, col, side) = pos_to_cell(position);
                     cb(MouseSelPhase::Drag, row, col, side);
                     return true;
                 }
-                Event::LeftMouseUp { .. } if self.mouse_dragging.get() => {
+                Event::LeftMouseUp { position, .. } if self.mouse_dragging.get() => {
                     self.mouse_dragging.set(false);
                     cb(MouseSelPhase::Up, 0, 0, Side::Left);
+                    // URL click: only when no drag happened and the release is on
+                    // the same URL that was pressed. This keeps text selection
+                    // (drag) completely unaffected.
+                    if !self.url_did_drag.get() {
+                        let pressed = self.url_pressed.borrow().clone();
+                        if let Some(url) = pressed {
+                            let (row, col, _) = pos_to_cell(position);
+                            if url_hit_at(row, col)
+                                .is_some_and(|sp| sp.url == url)
+                            {
+                                let _ = webbrowser::open(&url);
+                            }
+                        }
+                    }
+                    *self.url_pressed.borrow_mut() = None;
                     return true;
                 }
                 _ => {}

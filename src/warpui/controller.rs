@@ -204,6 +204,51 @@ impl TerminalController {
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
+
+    /// True when an alt-screen TUI (vim, htop, less, etc.) is active.
+    ///
+    /// Used as a proxy for `has_foreground_process()`: crane_term has no
+    /// foreground-pgid API, but an alt-screen implies a TUI owns the viewport,
+    /// which is exactly the case where we must not send a full cursor-home +
+    /// erase-display sequence. Bare shells never enter alt-screen, so the proxy
+    /// is correct for the clear-screen use-case. Limitation: a CPU-spinning
+    /// background process that does not use alt-screen is indistinguishable from
+    /// an idle shell prompt — same behaviour as iTerm2 / Terminal.app.
+    pub fn has_foreground_process(&self) -> bool {
+        self.term.lock().is_alt_screen()
+    }
+
+    /// Two-regime Cmd+K clear (matches old egui Crane `src/terminal/view.rs`
+    /// lines 1569-1599):
+    ///
+    /// • **TUI / alt-screen active** (`has_foreground_process()` == true):
+    ///   erase scrollback only — `\x1b[3J` — so the TUI widget is left intact
+    ///   and its next write lands in the right place.
+    ///
+    /// • **Bare shell** (no alt-screen): cursor home + erase display + erase
+    ///   scrollback (`\x1b[H\x1b[2J\x1b[3J`) parsed directly into crane_term,
+    ///   then `\x0c` (Ctrl+L) sent to the PTY so zsh/bash repaints the prompt
+    ///   at row 0. `\x1b[3J` triggers `ClearMode::Saved` in crane_term which
+    ///   calls `scrollback.clear()` — no separate byte-log flush is needed.
+    pub fn clear_screen_two_regime(&self) {
+        let tui_active = self.has_foreground_process();
+        {
+            // Lock order: parser then term (same order as the reader thread —
+            // critical for deadlock avoidance).
+            let mut p = self.parser.lock();
+            let mut t = self.term.lock();
+            if tui_active {
+                p.parse_bytes(&mut *t, b"\x1b[3J");
+            } else {
+                p.parse_bytes(&mut *t, b"\x1b[H\x1b[2J\x1b[3J");
+                t.scroll_to_bottom();
+            }
+        }
+        if !tui_active {
+            // Ask the shell to repaint its prompt at row 0.
+            self.write_input(b"\x0c");
+        }
+    }
 }
 
 impl Drop for TerminalController {

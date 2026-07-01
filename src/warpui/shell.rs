@@ -2166,6 +2166,8 @@ impl View for CraneShellView {
                         // Canonical: Cmd+T splits a pane, Cmd+Shift+T adds a tab.
                         "t" if ks.shift => Some(CraneShellAction::NewTab),
                         "t" => Some(CraneShellAction::SplitFocused(Dir::Horizontal)),
+                        // Cmd+Shift+W closes the whole active tab; Cmd+W closes the focused pane.
+                        "w" if ks.shift => Some(CraneShellAction::CloseActiveTab),
                         "w" => Some(CraneShellAction::CloseFocused),
                         "v" => Some(CraneShellAction::PasteFocused),
                         "k" => Some(CraneShellAction::ClearFocused),
@@ -2175,6 +2177,11 @@ impl View for CraneShellView {
                         "z" => Some(CraneShellAction::UndoFocused),
                         "c" => Some(CraneShellAction::CopyFocused),
                         "x" => Some(CraneShellAction::CutFocused),
+                        // Cmd+[ / Cmd+] cycle focus across panes in the active tab.
+                        "[" => Some(CraneShellAction::FocusPrevPane),
+                        "]" => Some(CraneShellAction::FocusNextPane),
+                        // Cmd+9 toggles the Git log panel.
+                        "9" => Some(CraneShellAction::OpenGitLog),
                         _ => None,
                     };
                     if let Some(act) = act {
@@ -2266,6 +2273,12 @@ pub enum CraneShellAction {
     FocusCommit,
     /// Commit staged changes with the current message.
     CommitStaged,
+    /// Cmd+[ focus the previous leaf pane (in-order traversal, wrapping).
+    FocusPrevPane,
+    /// Cmd+] focus the next leaf pane (in-order traversal, wrapping).
+    FocusNextPane,
+    /// Cmd+Shift+W close the active tab (all panes in it).
+    CloseActiveTab,
     /// Open a Git log pane.
     OpenGitLog,
     /// Open a Browser pane (placeholder).
@@ -2504,6 +2517,31 @@ impl TypedActionView for CraneShellView {
                         crate::warpui::git::stage(&root, path)
                     };
                     self.refresh_panel();
+                }
+            }
+            CraneShellAction::FocusPrevPane | CraneShellAction::FocusNextPane => {
+                if let Some(tab) = self.active_tab {
+                    if let Some(node) = self.layouts.get(&tab) {
+                        let mut leaves = Vec::new();
+                        node.leaves(&mut leaves);
+                        if leaves.len() > 1 {
+                            let cur = self.focused.and_then(|f| leaves.iter().position(|&l| l == f)).unwrap_or(0);
+                            let next = if matches!(action, CraneShellAction::FocusNextPane) {
+                                (cur + 1) % leaves.len()
+                            } else {
+                                (cur + leaves.len() - 1) % leaves.len()
+                            };
+                            self.focused = Some(leaves[next]);
+                            self.commit_focused = false;
+                        }
+                    }
+                }
+            }
+            CraneShellAction::CloseActiveTab => {
+                if let Some(tab) = self.active_tab {
+                    // Reuse the full CloseTab teardown path.
+                    let cloned = CraneShellAction::CloseTab(tab);
+                    self.handle_action(&cloned, ctx);
                 }
             }
             CraneShellAction::OpenGitLog => self.toggle_gitlog(),
