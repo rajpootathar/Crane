@@ -49,6 +49,20 @@ pub struct CraneShellView {
     file_pane_paths: Vec<PathBuf>,
     /// Active file tab index in the File pane.
     file_pane_active: usize,
+    /// Live warp editor per open file path — kept alive across tab switches so
+    /// each tab preserves its own cursor / scroll / unsaved edits. The Editor
+    /// pane shows the one for `file_pane_paths[file_pane_active]`.
+    editor_views: HashMap<PathBuf, ViewHandle<crate::warpui::editor_view::WarpEditorView>>,
+    /// Cached terminal snapshots (cwd + ANSI scrollback) for persistence.
+    /// Refreshed on every action but time-debounced so per-keystroke cost stays
+    /// low while still capturing recent command output.
+    term_cache: RefCell<HashMap<PaneId, crate::warpui::persist::STerminal>>,
+    /// Last time `term_cache` was refreshed (debounce clock).
+    last_term_snapshot: std::cell::Cell<Option<std::time::Instant>>,
+    /// Panes cleared via Cmd+K since the last snapshot — allows their persisted
+    /// history to shrink (otherwise we never shrink, to keep a restored session
+    /// sticky across save/restore generations instead of degrading).
+    term_cleared: RefCell<HashSet<PaneId>>,
     /// Persistent drag state per pane (survives re-renders; Arc-shared).
     drag_states: HashMap<PaneId, DraggableState>,
     /// Last painted window rect per pane (recorded by RectProbe) — used to
@@ -186,11 +200,30 @@ impl CraneShellView {
         let mut expanded_worktrees: HashSet<(usize, usize)> = HashSet::from([(0, 0)]);
         let mut restored_files_pane: Option<PaneId> = None;
         let mut restored_file_paths: Vec<PathBuf> = Vec::new();
+        let mut restored_active: usize = 0;
+        let mut restored_editor_views: HashMap<
+            PathBuf,
+            ViewHandle<crate::warpui::editor_view::WarpEditorView>,
+        > = HashMap::new();
+        let mut restored_term_cache: HashMap<PaneId, crate::warpui::persist::STerminal> =
+            HashMap::new();
+        let mut saved_active: usize = 0;
+
+        // Ensure built-in theme TOML files are written to ~/.crane/themes/ on
+        // first launch so users have a working template for each palette.
+        crate::theme::ensure_builtin_tomls_on_disk();
 
         // RESTORE: rebuild tabs + split layouts from the persisted state. Each
         // saved leaf respawns a terminal in its worktree cwd — EXCEPT the saved
         // File pane leaf, which is rebuilt as a File pane with its open files.
         if let Some(st) = crate::warpui::persist::load() {
+            // Restore the active theme BEFORE building any UI so every colour
+            // token call below reads the right palette.
+            if !st.theme_name.is_empty() {
+                if let Some(t) = crate::theme::find_by_name(&st.theme_name) {
+                    crate::theme::set(t);
+                }
+            }
             show_left = st.show_left;
             show_right = st.show_right;
             files_tab = st.files_tab;
@@ -200,6 +233,8 @@ impl CraneShellView {
             next_pane_id = st.next_pane_id;
             let saved_files_pane = st.files_pane;
             let saved_paths = st.file_pane_paths.clone();
+            saved_active = st.file_pane_active;
+            restored_term_cache = st.terminals.iter().cloned().collect();
             for ((pi, wi), stabs) in &st.worktree_tabs {
                 let Some(wpath) = projects
                     .get(*pi)
@@ -216,18 +251,41 @@ impl CraneShellView {
                         // The File pane leaf is rebuilt as a File pane (with its
                         // tabs); everything else is a terminal.
                         if Some(pid) == saved_files_pane && !saved_paths.is_empty() {
-                            let first = saved_paths[0].clone();
-                            let rest = saved_paths[1..].to_vec();
-                            let h = ctx.add_view(move |ctx| {
-                                let mut fv = FileView::new(ctx, first);
-                                for p in rest {
-                                    fv.open(p);
-                                }
-                                fv
+                            // Rebuild the file pane with Warp's REAL editor. Build a
+                            // live editor for EVERY saved path (kept in editor_views)
+                            // so all tabs restore and switch; show the active one.
+                            let mono = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
+                                cache.load_system_font("Menlo").expect("load Menlo")
                             });
-                            panes.insert(pid, PaneContent::File(h));
+                            for p in &saved_paths {
+                                let content = std::fs::read_to_string(p).unwrap_or_default();
+                                let pc = p.clone();
+                                let h = ctx.add_typed_action_view(move |ctx| {
+                                    crate::warpui::editor_view::WarpEditorView::new(
+                                        ctx, content, mono, pc,
+                                    )
+                                });
+                                restored_editor_views.insert(p.clone(), h);
+                            }
+                            let active = saved_active.min(saved_paths.len() - 1);
+                            let active_h = restored_editor_views[&saved_paths[active]].clone();
+                            panes.insert(pid, PaneContent::Editor(active_h));
                             restored_files_pane = Some(pid);
                             restored_file_paths = saved_paths.clone();
+                            restored_active = active;
+                        } else if let Some(st) = restored_term_cache.get(&pid) {
+                            // Restore the terminal in its saved cwd and replay its
+                            // ANSI scrollback so it looks as it did last session.
+                            let cwd = if st.cwd.as_os_str().is_empty() {
+                                wpath.clone()
+                            } else {
+                                st.cwd.clone()
+                            };
+                            let history = st.history.clone();
+                            let h = ctx.add_view(move |ctx| {
+                                crate::warpui::view::TerminalView::new_restore(ctx, cwd, history)
+                            });
+                            panes.insert(pid, PaneContent::Terminal(h));
                         } else {
                             panes.insert(
                                 pid,
@@ -251,7 +309,16 @@ impl CraneShellView {
                 if layouts.contains_key(&at) {
                     active_tab = Some(at);
                     selected = at;
-                    focused = layouts.get(&at).map(|n| n.first_leaf());
+                    // Prefer the saved per-tab focus (if it's still a live leaf),
+                    // otherwise fall back to the layout's first leaf.
+                    let saved_focus = st
+                        .worktree_tabs
+                        .iter()
+                        .find(|((pi, wi), _)| *pi == at.0 && *wi == at.1)
+                        .and_then(|(_, stabs)| stabs.iter().find(|s| s.id == at.2))
+                        .and_then(|s| s.focus)
+                        .filter(|pid| panes.contains_key(pid));
+                    focused = saved_focus.or_else(|| layouts.get(&at).map(|n| n.first_leaf()));
                 }
             }
         }
@@ -295,7 +362,11 @@ impl CraneShellView {
             maximized: None,
             files_pane: restored_files_pane,
             file_pane_paths: restored_file_paths,
-            file_pane_active: 0,
+            file_pane_active: restored_active,
+            editor_views: restored_editor_views,
+            term_cache: RefCell::new(restored_term_cache),
+            last_term_snapshot: std::cell::Cell::new(None),
+            term_cleared: RefCell::new(HashSet::new()),
             drag_states,
             pane_rects: Rc::new(RefCell::new(HashMap::new())),
             drop_preview: Rc::new(RefCell::new(None)),
@@ -349,9 +420,61 @@ impl CraneShellView {
     /// Rebuild the cached right-panel contents for the active tab. Called from
     /// `handle_action` (never from render) so the FS walk / `git` shell-out
     /// happens once per change, not every repaint.
+    /// Refresh the terminal snapshot cache from the live views. Expensive
+    /// (renders every terminal's scrollback to ANSI), so callers only invoke it
+    /// on "heavy" actions, not per keystroke.
+    fn refresh_term_cache(&self, app: &AppContext) {
+        // Debounce: at most once every 400ms so per-keystroke saves stay cheap
+        // while still capturing recent command output.
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_term_snapshot.get() {
+            if now.duration_since(last) < std::time::Duration::from_millis(400) {
+                return;
+            }
+        }
+        self.last_term_snapshot.set(Some(now));
+        let cleared = self.term_cleared.borrow().clone();
+        let mut cache = self.term_cache.borrow_mut();
+        // Drop snapshots for panes that no longer exist.
+        cache.retain(|id, _| self.panes.contains_key(id));
+        for (id, pc) in self.panes.iter() {
+            if let PaneContent::Terminal(h) = pc {
+                let view = h.as_ref(app);
+                let cwd = view.cwd();
+                let hist = view.snapshot();
+                // Never let a terminal's persisted history SHRINK (>64 bytes)
+                // unless it was explicitly cleared (Cmd+K). This keeps a restored
+                // session sticky: replaying the saved scrollback then re-snapshotting
+                // can yield slightly less, which would otherwise erode the history
+                // across generations until it's empty.
+                let keep_old = !cleared.contains(id)
+                    && cache
+                        .get(id)
+                        .is_some_and(|prev| hist.len() + 64 < prev.history.len());
+                let history = if keep_old {
+                    cache.get(id).map(|p| p.history.clone()).unwrap_or(hist)
+                } else {
+                    hist
+                };
+                cache.insert(*id, crate::warpui::persist::STerminal { cwd, history });
+            }
+        }
+        self.term_cleared.borrow_mut().clear();
+    }
+
     /// Snapshot the persistable UI state and write it to ~/.crane/warpui-state.json.
-    fn save_state(&self) {
+    /// `refresh_terminals` re-snapshots terminal scrollback first (skip on keystrokes).
+    fn save_state(&self, app: &AppContext) {
         use crate::warpui::persist::{save, SNode, STab, WarpuiState};
+        // Always attempt a terminal refresh; it self-debounces (400ms) so this
+        // is cheap even when called on every keystroke.
+        self.refresh_term_cache(app);
+        let terminals: Vec<(PaneId, crate::warpui::persist::STerminal)> = self
+            .term_cache
+            .borrow()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
         let worktree_tabs = self
             .worktree_tabs
             .iter()
@@ -360,16 +483,32 @@ impl CraneShellView {
                     .iter()
                     .filter_map(|t| {
                         let node = self.layouts.get(&(k.0, k.1, t.id))?;
+                        let snode = SNode::from_node(node);
+                        // Only record the focused pane if it is a leaf of THIS tab.
+                        let focus = self.focused.filter(|&pid| {
+                            let mut leaves = Vec::new();
+                            snode.leaves(&mut leaves);
+                            leaves.contains(&pid)
+                        });
                         Some(STab {
                             id: t.id,
                             name: t.name.clone(),
-                            layout: SNode::from_node(node),
+                            layout: snode,
+                            focus,
                         })
                     })
                     .collect::<Vec<_>>();
                 (*k, stabs)
             })
             .collect();
+        // Read current window size via AppContext so it can be restored on next launch.
+        let (window_w, window_h) = app
+            .window_ids()
+            .into_iter()
+            .next()
+            .and_then(|id| app.window_bounds(&id))
+            .map(|r| (r.size().x(), r.size().y()))
+            .unwrap_or((0.0, 0.0));
         save(&WarpuiState {
             show_left: self.show_left,
             show_right: self.show_right,
@@ -382,6 +521,11 @@ impl CraneShellView {
             next_pane_id: self.next_pane_id,
             files_pane: self.files_pane,
             file_pane_paths: self.file_pane_paths.clone(),
+            file_pane_active: self.file_pane_active,
+            terminals,
+            window_w,
+            window_h,
+            theme_name: crate::theme::current().name.clone(),
         });
     }
 
@@ -416,8 +560,8 @@ impl CraneShellView {
 
     /// A bare icon button — Container records the hit + sizes to content.
     fn icon_button(&self, glyph: &str, action: CraneShellAction) -> Box<dyn Element> {
-        let content = Container::new(self.icon(glyph, 15.0, theme::TEXT_MUTED))
-            .with_background_color(theme::TOPBAR_BG)
+        let content = Container::new(self.icon(glyph, 15.0, theme::text_muted()))
+            .with_background_color(theme::topbar_bg())
             .with_uniform_padding(5.0)
             .finish();
         EventHandler::new(content)
@@ -432,18 +576,18 @@ impl CraneShellView {
     fn pill_button(&self, glyph: &str, label: &str, action: CraneShellAction) -> Box<dyn Element> {
         let inner = Flex::row()
             .with_child(
-                Container::new(self.icon(glyph, 12.0, theme::TEXT_MUTED))
+                Container::new(self.icon(glyph, 12.0, theme::text_muted()))
                     .with_padding_right(5.0)
                     .finish(),
             )
             .with_child(
                 Text::new(label.to_string(), self.ui_font, 12.0)
-                    .with_color(theme::TEXT_MUTED)
+                    .with_color(theme::text_muted())
                     .finish(),
             )
             .finish();
         let content = Container::new(inner)
-            .with_background_color(theme::SURFACE)
+            .with_background_color(theme::surface())
             .with_padding_left(10.0)
             .with_padding_right(10.0)
             .with_padding_top(4.0)
@@ -477,7 +621,7 @@ impl CraneShellView {
         let row_h = size + 8.0;
         let mut bg = Rect::new();
         if selected {
-            bg = bg.with_background_color(theme::ROW_ACTIVE);
+            bg = bg.with_background_color(theme::row_active());
         }
         let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
 
@@ -489,7 +633,7 @@ impl CraneShellView {
                 icons::CARET_RIGHT
             };
             label_inner = label_inner.with_child(
-                Container::new(self.icon(glyph, 9.0, theme::TEXT_MUTED))
+                Container::new(self.icon(glyph, 9.0, theme::text_muted()))
                     .with_padding_right(3.0)
                     .finish(),
             );
@@ -536,7 +680,7 @@ impl CraneShellView {
     fn header(&self, text: &'static str) -> Box<dyn Element> {
         Container::new(
             Text::new(text, self.ui_font, 11.0)
-                .with_color(theme::TEXT_HEADER)
+                .with_color(theme::text_header())
                 .finish(),
         )
         .with_uniform_padding(8.0)
@@ -565,7 +709,7 @@ impl CraneShellView {
     }
 
     fn divider(&self) -> Box<dyn Element> {
-        ConstrainedBox::new(Rect::new().with_background_color(theme::DIVIDER).finish())
+        ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
             .with_width(1.0)
             .finish()
     }
@@ -578,7 +722,7 @@ impl CraneShellView {
             col = col.with_child(self.tree_row(
                 "(no ~/.crane/session.json)",
                 12.0,
-                theme::TEXT_MUTED,
+                theme::text_muted(),
                 12.0,
             ));
         }
@@ -586,7 +730,7 @@ impl CraneShellView {
         for (pi, p) in self.projects.iter().enumerate() {
             let p_expanded = self.expanded_projects.contains(&pi);
             let psel = sel == (pi, usize::MAX, usize::MAX);
-            let pcol = if psel { theme::TEXT_HOVER } else { theme::TEXT };
+            let pcol = if psel { theme::text_hover() } else { theme::text() };
             col = col.with_child(self.nav_row(
                 Some(p_expanded),
                 icons::CUBE,
@@ -604,7 +748,7 @@ impl CraneShellView {
             for (wi, w) in p.worktrees.iter().enumerate() {
                 let w_expanded = self.expanded_worktrees.contains(&(pi, wi));
                 let wsel = sel == (pi, wi, usize::MAX);
-                let wcol = if wsel { theme::TEXT_HOVER } else { theme::ACCENT };
+                let wcol = if wsel { theme::text_hover() } else { theme::accent() };
                 col = col.with_child(self.nav_row(
                     Some(w_expanded),
                     icons::GIT_BRANCH,
@@ -624,7 +768,7 @@ impl CraneShellView {
                     for t in tabs {
                         let tkey = (pi, wi, t.id);
                         let tsel = sel == tkey;
-                        let tcol = if tsel { theme::TEXT_HOVER } else { theme::TEXT_MUTED };
+                        let tcol = if tsel { theme::text_hover() } else { theme::text_muted() };
                         col = col.with_child(self.nav_row(
                             None,
                             icons::TERMINAL_WINDOW,
@@ -645,10 +789,10 @@ impl CraneShellView {
                 col = col.with_child(self.nav_row(
                     None,
                     icons::PLUS,
-                    theme::TEXT_MUTED,
+                    theme::text_muted(),
                     "New tab",
                     11.0,
-                    theme::TEXT_MUTED,
+                    theme::text_muted(),
                     42.0,
                     false,
                     CraneShellAction::NewTabIn(pi, wi),
@@ -656,17 +800,17 @@ impl CraneShellView {
             }
         }
         // No fixed width — the enclosing SplitBox sizes it (draggable).
-        self.panel(theme::SIDEBAR_BG, col.finish())
+        self.panel(theme::sidebar_bg(), col.finish())
     }
 
     fn tab_label(&self, text: &str, active: bool, action: CraneShellAction) -> Box<dyn Element> {
-        let color = if active { theme::TEXT_HOVER } else { theme::TEXT_MUTED };
+        let color = if active { theme::text_hover() } else { theme::text_muted() };
         let content = Container::new(
             Text::new(text.to_string(), self.ui_font, 12.0)
                 .with_color(color)
                 .finish(),
         )
-        .with_background_color(theme::SIDEBAR_BG)
+        .with_background_color(theme::sidebar_bg())
         .with_padding_top(2.0)
         .with_padding_bottom(2.0)
         .finish();
@@ -690,7 +834,7 @@ impl CraneShellView {
                     icons::CARET_RIGHT
                 },
                 10.0,
-                theme::TEXT_MUTED,
+                theme::text_muted(),
             ))
             .with_padding_right(4.0)
             .finish()
@@ -698,11 +842,11 @@ impl CraneShellView {
             Self::spacer(13.0)
         };
         let glyph = if r.is_dir { icons::FOLDER } else { icons::FILE };
-        let text_color = if r.is_dir { theme::TEXT } else { theme::TEXT_MUTED };
+        let text_color = if r.is_dir { theme::text() } else { theme::text_muted() };
         let label_inner = Flex::row()
             .with_child(chevron)
             .with_child(
-                Container::new(self.icon(glyph, 12.0, theme::TEXT_MUTED))
+                Container::new(self.icon(glyph, 12.0, theme::text_muted()))
                     .with_padding_right(5.0)
                     .finish(),
             )
@@ -718,7 +862,7 @@ impl CraneShellView {
             .finish();
         let mut bg = Rect::new();
         if is_sel {
-            bg = bg.with_background_color(theme::ROW_ACTIVE);
+            bg = bg.with_background_color(theme::row_active());
         }
         let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
         let hit_layer = ConstrainedBox::new(Rect::new().finish())
@@ -744,17 +888,17 @@ impl CraneShellView {
 
     fn change_row(&self, ch: &crate::warpui::git::Change) -> Box<dyn Element> {
         let color = match ch.status.as_str() {
-            "A" => theme::SUCCESS,
-            "D" | "U" => theme::ERROR,
-            "M" => theme::WARNING,
-            "R" | "C" => theme::ACCENT,
-            _ => theme::TEXT_MUTED, // "?" untracked
+            "A" => theme::success(),
+            "D" | "U" => theme::error(),
+            "M" => theme::warning(),
+            "R" | "C" => theme::accent(),
+            _ => theme::text_muted(), // "?" untracked
         };
         // Leading marker: + = click to stage, − = click to unstage.
         let (marker, marker_color) = if ch.staged {
-            (icons::MINUS, theme::SUCCESS)
+            (icons::MINUS, theme::success())
         } else {
-            (icons::PLUS, theme::TEXT_MUTED)
+            (icons::PLUS, theme::text_muted())
         };
         // Leading +/- marker: click to stage / unstage (own hit target).
         let stage_action = CraneShellAction::StageToggle {
@@ -763,7 +907,7 @@ impl CraneShellView {
         };
         let marker_btn = EventHandler::new(
             Container::new(self.icon(marker, 11.0, marker_color))
-                .with_background_color(theme::SIDEBAR_BG)
+                .with_background_color(theme::sidebar_bg())
                 .with_padding_left(10.0)
                 .with_padding_right(4.0)
                 .with_padding_top(3.0)
@@ -789,7 +933,7 @@ impl CraneShellView {
             )
             .with_child(
                 Text::new(ch.path.clone(), self.ui_font, 12.0)
-                    .with_color(if ch.staged { theme::TEXT } else { theme::TEXT_MUTED })
+                    .with_color(if ch.staged { theme::text() } else { theme::text_muted() })
                     .finish(),
             )
             .finish();
@@ -801,7 +945,7 @@ impl CraneShellView {
         let open_action = CraneShellAction::SelectFile(abs);
         let label_btn = EventHandler::new(
             Container::new(label_inner)
-                .with_background_color(theme::SIDEBAR_BG)
+                .with_background_color(theme::sidebar_bg())
                 .with_padding_top(3.0)
                 .with_padding_bottom(3.0)
                 .finish(),
@@ -842,14 +986,14 @@ impl CraneShellView {
         // Read CACHED contents (rebuilt in refresh_panel on action, not here).
         if self.files_tab {
             if self.file_rows.is_empty() {
-                col = col.with_child(self.tree_row("(empty)", 12.0, theme::TEXT_MUTED, 12.0));
+                col = col.with_child(self.tree_row("(empty)", 12.0, theme::text_muted(), 12.0));
             }
             for r in &self.file_rows {
                 col = col.with_child(self.file_row(r));
             }
         } else {
             if self.changes.is_empty() {
-                col = col.with_child(self.tree_row("No changes", 12.0, theme::TEXT_MUTED, 12.0));
+                col = col.with_child(self.tree_row("No changes", 12.0, theme::text_muted(), 12.0));
             }
             for ch in &self.changes {
                 col = col.with_child(self.change_row(ch));
@@ -857,26 +1001,26 @@ impl CraneShellView {
             col = col.with_child(self.commit_box());
         }
         // No fixed width — the enclosing SplitBox sizes it (draggable).
-        self.panel(theme::SIDEBAR_BG, col.finish())
+        self.panel(theme::sidebar_bg(), col.finish())
     }
 
     /// Commit message field + Commit button at the bottom of the Changes tab.
     fn commit_box(&self) -> Box<dyn Element> {
         let staged = self.changes.iter().filter(|c| c.staged).count();
         let (text, color) = if self.commit_msg.is_empty() {
-            ("Commit message…".to_string(), theme::TEXT_MUTED)
+            ("Commit message…".to_string(), theme::text_muted())
         } else {
             // Caret when focused.
             let caret = if self.commit_focused { "|" } else { "" };
-            (format!("{}{}", self.commit_msg, caret), theme::TEXT)
+            (format!("{}{}", self.commit_msg, caret), theme::text())
         };
         // Click the field to focus it (keys route here instead of the terminal).
         let field = EventHandler::new(
             Container::new(Text::new(text, self.ui_font, 12.0).with_color(color).finish())
                 .with_background_color(if self.commit_focused {
-                    theme::ROW_ACTIVE
+                    theme::row_active()
                 } else {
-                    theme::SURFACE
+                    theme::surface()
                 })
                 .with_padding_left(8.0)
                 .with_padding_right(8.0)
@@ -943,12 +1087,28 @@ impl CraneShellView {
     fn top_bar(&self) -> Box<dyn Element> {
         let crumb = Container::new(
             Text::new(self.breadcrumb(), self.ui_font, 12.0)
-                .with_color(theme::TEXT_MUTED)
+                .with_color(theme::text_muted())
                 .finish(),
         )
         .with_padding_left(6.0)
         .with_padding_top(9.0)
         .finish();
+
+        // Theme-cycle button: shows the active theme name; click advances to
+        // the next theme in alphabetical order from load_all().
+        let current_name = crate::theme::current().name;
+        let next_theme = {
+            let all = crate::theme::load_all();
+            let pos = all.iter().position(|t| t.name == current_name);
+            let next_pos = pos.map(|p| (p + 1) % all.len()).unwrap_or(0);
+            all.into_iter().nth(next_pos).map(|t| t.name).unwrap_or_default()
+        };
+        let theme_btn = self.pill_button(
+            icons::PAINT_BRUSH,
+            &current_name,
+            CraneShellAction::SetTheme(next_theme),
+        );
+
         let row = Flex::row()
             .with_child(Self::spacer(80.0)) // macOS traffic-light inset
             .with_child(self.icon_button(icons::SIDEBAR, CraneShellAction::ToggleLeft))
@@ -961,12 +1121,14 @@ impl CraneShellView {
             ))
             .with_child(Self::spacer(6.0))
             .with_child(self.pill_button(icons::GLOBE, "Browser", CraneShellAction::OpenBrowser))
+            .with_child(Self::spacer(6.0))
+            .with_child(theme_btn)
             .with_child(Self::spacer(8.0))
             .with_child(self.icon_button(icons::GIT_BRANCH, CraneShellAction::OpenGitLog))
             .with_child(self.icon_button(icons::SIDEBAR, CraneShellAction::ToggleRight))
             .with_child(Self::spacer(8.0))
             .finish();
-        ConstrainedBox::new(self.panel(theme::TOPBAR_BG, row))
+        ConstrainedBox::new(self.panel(theme::topbar_bg(), row))
             .with_height(theme::TOPBAR_H)
             .finish()
     }
@@ -978,7 +1140,7 @@ impl CraneShellView {
             format!("{}  -  ready", self.branch)
         };
         let mut row = Flex::row().with_child(
-            Container::new(self.icon(icons::GIT_BRANCH, 11.0, theme::TEXT_MUTED))
+            Container::new(self.icon(icons::GIT_BRANCH, 11.0, theme::text_muted()))
                 .with_padding_left(10.0)
                 .with_padding_right(5.0)
                 .with_padding_top(7.0)
@@ -987,39 +1149,39 @@ impl CraneShellView {
         row = row.with_child(
             Container::new(
                 Text::new(label, self.ui_font, 11.0)
-                    .with_color(theme::TEXT_MUTED)
+                    .with_color(theme::text_muted())
                     .finish(),
             )
             .with_padding_top(7.0)
             .finish(),
         );
         let content = row.finish();
-        ConstrainedBox::new(self.panel(theme::TOPBAR_BG, content))
+        ConstrainedBox::new(self.panel(theme::topbar_bg(), content))
             .with_height(theme::STATUS_H)
             .finish()
     }
 
-    fn center(&self) -> Box<dyn Element> {
+    fn center(&self, app: &AppContext) -> Box<dyn Element> {
         // Expand-to-full: render only the maximized pane.
         if let Some(id) = self.maximized {
             if self.panes.contains_key(&id) {
-                return self.panel(theme::BG, self.render_pane(id));
+                return self.panel(theme::bg(), self.render_pane(id, app));
             }
         }
         // Otherwise render the active tab's split tree. Each leaf is a persistent
         // terminal pane (history retained); inactive tabs' panes stay alive.
         let body: Box<dyn Element> = match self.active_tab.and_then(|k| self.layouts.get(&k)) {
-            Some(node) => self.render_node(node),
-            None => Rect::new().with_background_color(theme::BG).finish(),
+            Some(node) => self.render_node(node, app),
+            None => Rect::new().with_background_color(theme::bg()).finish(),
         };
-        self.panel(theme::BG, body)
+        self.panel(theme::bg(), body)
     }
 
     /// Recursively render a layout `Node` — leaves become terminal `ChildView`s,
     /// splits become draggable `SplitBox`es.
-    fn render_node(&self, node: &Node) -> Box<dyn Element> {
+    fn render_node(&self, node: &Node, app: &AppContext) -> Box<dyn Element> {
         match node {
-            Node::Leaf(id) => self.render_pane(*id),
+            Node::Leaf(id) => self.render_pane(*id, app),
             Node::Split {
                 dir,
                 ratio,
@@ -1028,11 +1190,11 @@ impl CraneShellView {
                 second,
             } => SplitBox::new(
                 *dir,
-                self.render_node(first),
-                self.render_node(second),
+                self.render_node(first, app),
+                self.render_node(second, app),
                 ratio.clone(),
                 dragging.clone(),
-                theme::DIVIDER,
+                theme::divider(),
             )
             .finish(),
         }
@@ -1042,13 +1204,23 @@ impl CraneShellView {
     /// that records the pane's window rect. Drag the header over another pane:
     /// the dock edge is computed 1:1 from the cursor position (`dock_zone`),
     /// shown as a half-pane preview, and applied on drop (edge=split, center=swap).
-    fn render_pane(&self, id: PaneId) -> Box<dyn Element> {
-        let body: Box<dyn Element> = match self.panes.get(&id) {
+    fn render_pane(&self, id: PaneId, app: &AppContext) -> Box<dyn Element> {
+        let inner: Box<dyn Element> = match self.panes.get(&id) {
             Some(PaneContent::Terminal(h)) => ChildView::new(h).finish(),
             Some(PaneContent::File(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Editor(h)) => ChildView::new(h).finish(),
-            None => Rect::new().with_background_color(theme::BG).finish(),
+            None => Rect::new().with_background_color(theme::bg()).finish(),
         };
+        // Click anywhere inside the pane body focuses it. `with_always_handle` so
+        // it fires even when the child (e.g. the editor) consumes the click to
+        // place its caret — otherwise clicking into the file wouldn't focus it.
+        let body = EventHandler::new(inner)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
+                DispatchEventResult::PropagateToParent
+            })
+            .with_always_handle()
+            .finish();
         let state = self.drag_states.get(&id).cloned().unwrap_or_default();
 
         // Leaves of the ACTIVE tab — restrict drop targets to these so a drag
@@ -1069,7 +1241,7 @@ impl CraneShellView {
         let rects = self.pane_rects.clone();
         let preview_drag = self.drop_preview.clone();
         let preview_drop = self.drop_preview.clone();
-        let header = Draggable::new(state, self.pane_header(id))
+        let header = Draggable::new(state, self.pane_header(id, app))
             .on_drag_start(move |ctx, _app, _rect| {
                 ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
             })
@@ -1147,7 +1319,7 @@ impl CraneShellView {
     /// matches old Crane's `zone_rect`.
     fn zone_highlight(&self, edge: DockEdge) -> Box<dyn Element> {
         let hl = || -> Box<dyn Element> {
-            Rect::new().with_background_color(theme::DROP_ZONE).finish()
+            Rect::new().with_background_color(theme::drop_zone()).finish()
         };
         let empty = || -> Box<dyn Element> { Rect::new().finish() };
         match edge {
@@ -1172,11 +1344,11 @@ impl CraneShellView {
     }
 
     /// Pane header: title (click to focus) + expand-to-full + close.
-    fn pane_header(&self, id: PaneId) -> Box<dyn Element> {
+    fn pane_header(&self, id: PaneId, app: &AppContext) -> Box<dyn Element> {
         const H: f32 = 26.0;
         let focused = self.focused == Some(id);
-        let bg = if focused { theme::SURFACE } else { theme::TOPBAR_BG };
-        let fg = if focused { theme::TEXT } else { theme::TEXT_MUTED };
+        let bg = if focused { theme::surface() } else { theme::topbar_bg() };
+        let fg = if focused { theme::text() } else { theme::text_muted() };
         let is_file_pane = self.files_pane == Some(id);
 
         // For a File pane the header IS the file tab strip (shell-driven, so
@@ -1189,16 +1361,38 @@ impl CraneShellView {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                let tbg = if active { theme::SURFACE } else { theme::TOPBAR_BG };
-                let tfg = if active { theme::TEXT } else { theme::TEXT_MUTED };
+                let tbg = if active { theme::surface() } else { theme::topbar_bg() };
+                let tfg = if active { theme::text() } else { theme::text_muted() };
+                // Unsaved indicator: a filled dot before the name when dirty.
+                let dirty = self
+                    .editor_views
+                    .get(path)
+                    .map(|h| h.as_ref(app).is_dirty(app))
+                    .unwrap_or(false);
+                let label = if dirty { format!("{name}  ") } else { name };
+                let mut chip_row = Flex::row();
+                if dirty {
+                    chip_row = chip_row.with_child(
+                        Container::new(self.icon(icons::CIRCLE, 8.0, theme::accent()))
+                            .with_padding_left(8.0)
+                            .with_padding_top(8.0)
+                            .finish(),
+                    );
+                }
                 let chip = EventHandler::new(
-                    Container::new(Text::new(name, self.ui_font, 11.0).with_color(tfg).finish())
-                        .with_background_color(tbg)
-                        .with_padding_left(10.0)
-                        .with_padding_right(4.0)
-                        .with_padding_top(6.0)
-                        .with_padding_bottom(6.0)
-                        .finish(),
+                    Container::new(
+                        chip_row
+                            .with_child(
+                                Text::new(label, self.ui_font, 11.0).with_color(tfg).finish(),
+                            )
+                            .finish(),
+                    )
+                    .with_background_color(tbg)
+                    .with_padding_left(if dirty { 2.0 } else { 10.0 })
+                    .with_padding_right(4.0)
+                    .with_padding_top(6.0)
+                    .with_padding_bottom(6.0)
+                    .finish(),
                 )
                 .on_left_mouse_down(move |ctx, _app, _pos| {
                     ctx.dispatch_typed_action(CraneShellAction::FileTabSelect(i));
@@ -1206,7 +1400,7 @@ impl CraneShellView {
                 })
                 .finish();
                 let close = EventHandler::new(
-                    Container::new(self.icon(icons::X, 10.0, theme::TEXT_MUTED))
+                    Container::new(self.icon(icons::X, 10.0, theme::text_muted()))
                         .with_background_color(tbg)
                         .with_padding_right(8.0)
                         .with_padding_top(6.0)
@@ -1308,39 +1502,46 @@ impl CraneShellView {
     /// Open `path` in the dedicated File pane (as a tab). Creates the pane the
     /// first time; thereafter adds/switches a tab inside it (old Crane FilesPane).
     fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        // Track the tab order + active index.
         if let Some(i) = self.file_pane_paths.iter().position(|p| p == &path) {
             self.file_pane_active = i;
         } else {
             self.file_pane_paths.push(path.clone());
             self.file_pane_active = self.file_pane_paths.len() - 1;
         }
-        // Existing File pane still alive? add a tab to it (and repaint it so the
-        // new tab shows immediately).
+        // Build the editor for this file once; reuse it on later opens/switches
+        // so each tab keeps its own cursor / scroll / unsaved edits.
+        let handle = if let Some(h) = self.editor_views.get(&path) {
+            h.clone()
+        } else {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let mono = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
+                cache.load_system_font("Menlo").expect("load Menlo")
+            });
+            let p = path.clone();
+            let h = ctx.add_typed_action_view(move |ctx| {
+                crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, p)
+            });
+            self.editor_views.insert(path.clone(), h.clone());
+            h
+        };
+        // Existing editor pane still alive? Swap its content to the active file.
         if let Some(fp) = self.files_pane {
-            if let Some(PaneContent::File(h)) = self.panes.get(&fp) {
-                let h = h.clone();
-                h.update(ctx, |fv, vctx| {
-                    fv.open(path);
-                    vctx.notify();
-                });
+            if matches!(
+                self.panes.get(&fp),
+                Some(PaneContent::Editor(_)) | Some(PaneContent::File(_))
+            ) {
+                self.panes.insert(fp, PaneContent::Editor(handle));
                 self.focused = Some(fp);
                 return;
             }
             self.files_pane = None; // pane was closed
-            self.file_pane_paths.clear();
-            self.file_pane_paths.push(path.clone());
+            self.file_pane_paths = vec![path.clone()];
+            self.file_pane_active = 0;
         }
         // First open: File pane goes on the RIGHT and takes ~65% width (the
         // existing pane keeps 35% as the first child). Full height by default;
         // the user can drag the splitter to resize. Backed by Warp's REAL editor.
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let mono = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            cache.load_system_font("Menlo").expect("load Menlo")
-        });
-        let p = path.clone();
-        let handle = ctx.add_view(move |ctx| {
-            crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, p)
-        });
         self.files_pane = self.split_with_at(PaneContent::Editor(handle), false, 0.35);
     }
 
@@ -1368,12 +1569,12 @@ impl CraneShellView {
     fn git_log_dock(&self) -> Box<dyn Element> {
         let header = ConstrainedBox::new(
             Stack::new()
-                .with_child(Rect::new().with_background_color(theme::TOPBAR_BG).finish())
+                .with_child(Rect::new().with_background_color(theme::topbar_bg()).finish())
                 .with_child(
                     Flex::row()
                         .with_child(
                             Container::new(
-                                self.icon(icons::GIT_BRANCH, 12.0, theme::TEXT_MUTED),
+                                self.icon(icons::GIT_BRANCH, 12.0, theme::text_muted()),
                             )
                             .with_padding_left(10.0)
                             .with_padding_right(6.0)
@@ -1383,7 +1584,7 @@ impl CraneShellView {
                         .with_child(
                             Container::new(
                                 Text::new("Git Log".to_string(), self.ui_font, 11.0)
-                                    .with_color(theme::TEXT)
+                                    .with_color(theme::text())
                                     .finish(),
                             )
                             .with_padding_top(6.0)
@@ -1402,7 +1603,7 @@ impl CraneShellView {
             col = col.with_child(
                 Container::new(
                     Text::new(line.clone(), self.ui_font, 11.0)
-                        .with_color(theme::TEXT_MUTED)
+                        .with_color(theme::text_muted())
                         .finish(),
                 )
                 .with_padding_left(10.0)
@@ -1411,7 +1612,7 @@ impl CraneShellView {
         }
         Flex::column()
             .with_child(header)
-            .with_child(Expanded::new(1.0, self.panel(theme::BG, col.finish())).finish())
+            .with_child(Expanded::new(1.0, self.panel(theme::bg(), col.finish())).finish())
             .finish()
     }
 
@@ -1591,7 +1792,7 @@ impl View for CraneShellView {
         "CraneShellView"
     }
 
-    fn render(&self, _ctx: &AppContext) -> Box<dyn Element> {
+    fn render(&self, app: &AppContext) -> Box<dyn Element> {
         // Center region = just the active tab's panes. Tabs are managed in the
         // Left Panel (1:1 with old Crane — no mid-pane horizontal tab strip).
         // Center = panes, with the Git Log docked at the BOTTOM (outside the
@@ -1599,15 +1800,15 @@ impl View for CraneShellView {
         let center_region = if self.show_git_log {
             SplitBox::new(
                 Dir::Vertical,
-                self.center(),
+                self.center(app),
                 self.git_log_dock(),
                 self.git_log_ratio.clone(),
                 self.git_log_drag.clone(),
-                theme::DIVIDER,
+                theme::divider(),
             )
             .finish()
         } else {
-            self.center()
+            self.center(app)
         };
 
         // Resizable left | center | right via nested draggable SplitBoxes.
@@ -1619,7 +1820,7 @@ impl View for CraneShellView {
                     self.right_sidebar(),
                     self.right_ratio.clone(),
                     self.right_drag.clone(),
-                    theme::DIVIDER,
+                    theme::divider(),
                 )
                 .finish();
                 SplitBox::new(
@@ -1628,7 +1829,7 @@ impl View for CraneShellView {
                     inner,
                     self.left_ratio.clone(),
                     self.left_drag.clone(),
-                    theme::DIVIDER,
+                    theme::divider(),
                 )
                 .finish()
             }
@@ -1638,7 +1839,7 @@ impl View for CraneShellView {
                 center_region,
                 self.left_ratio.clone(),
                 self.left_drag.clone(),
-                theme::DIVIDER,
+                theme::divider(),
             )
             .finish(),
             (false, true) => SplitBox::new(
@@ -1647,7 +1848,7 @@ impl View for CraneShellView {
                 self.right_sidebar(),
                 self.right_ratio.clone(),
                 self.right_drag.clone(),
-                theme::DIVIDER,
+                theme::divider(),
             )
             .finish(),
             (false, false) => center_region,
@@ -1660,7 +1861,7 @@ impl View for CraneShellView {
             .finish();
 
         let root = Stack::new()
-            .with_child(Rect::new().with_background_color(theme::BG).finish())
+            .with_child(Rect::new().with_background_color(theme::bg()).finish())
             .with_child(column)
             .finish();
 
@@ -1829,6 +2030,8 @@ pub enum CraneShellAction {
     NewTabIn(usize, usize),
     /// Close a tab (project, worktree, tab_id) from the strip.
     CloseTab((usize, usize, usize)),
+    /// Switch to a named theme (cycles through all installed themes).
+    SetTheme(String),
     Noop,
 }
 
@@ -1892,6 +2095,9 @@ impl TypedActionView for CraneShellView {
                 } else if let Some(id) = self.active_input_pane() {
                     if let Some(h) = self.terminal_at(id) {
                         h.update(ctx, |view, _| view.write_keystroke(ks));
+                    } else if let Some(h) = self.editor_at(id) {
+                        // Warp editor pane: translate the keystroke and apply it.
+                        h.update(ctx, |view, vctx| view.input_key(ks, vctx));
                     } else if let Some(h) = self.file_at(id) {
                         // Editable File pane: route keys to its buffer.
                         h.update(ctx, |view, vctx| {
@@ -1933,7 +2139,14 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::CopyFocused => {
-                if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.terminal_at(id)) {
+                    if let Some(text) = h.update(ctx, |view, _| view.copy_selection()) {
+                        ctx.clipboard()
+                            .write(warpui::clipboard::ClipboardContent::plain_text(text));
+                    }
+                } else if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |view, vctx| view.copy(vctx));
+                } else if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
                     if let Some(text) = h.update(ctx, |view, _| view.copy_line()) {
                         ctx.clipboard()
                             .write(warpui::clipboard::ClipboardContent::plain_text(text));
@@ -1941,7 +2154,9 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::CutFocused => {
-                if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |view, vctx| view.cut(vctx));
+                } else if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
                     if let Some(text) = h.update(ctx, |view, vctx| {
                         let t = view.cut_line();
                         vctx.notify();
@@ -1955,35 +2170,36 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::FileTabSelect(i) => {
                 if let Some(fp) = self.files_pane {
                     self.focused = Some(fp);
-                    if *i < self.file_pane_paths.len() {
+                    if let Some(path) = self.file_pane_paths.get(*i).cloned() {
                         self.file_pane_active = *i;
-                        let idx = *i;
-                        if let Some(h) = self.file_at(fp) {
-                            h.update(ctx, |view, vctx| {
-                                view.switch(idx);
-                                vctx.notify();
-                            });
+                        // Swap the Editor pane to show this file's live editor.
+                        if let Some(h) = self.editor_views.get(&path).cloned() {
+                            self.panes.insert(fp, PaneContent::Editor(h));
                         }
                     }
                 }
             }
             CraneShellAction::FileTabClose(i) => {
                 if let Some(fp) = self.files_pane {
-                    if *i < self.file_pane_paths.len() && self.file_pane_paths.len() > 1 {
-                        self.file_pane_paths.remove(*i);
-                        if self.file_pane_active >= self.file_pane_paths.len() {
-                            self.file_pane_active = self.file_pane_paths.len() - 1;
-                        } else if self.file_pane_active > *i {
-                            self.file_pane_active -= 1;
-                        }
-                        let idx = *i;
-                        let active = self.file_pane_active;
-                        if let Some(h) = self.file_at(fp) {
-                            h.update(ctx, |view, vctx| {
-                                view.close_tab(idx);
-                                view.switch(active);
-                                vctx.notify();
-                            });
+                    if *i < self.file_pane_paths.len() {
+                        let removed = self.file_pane_paths.remove(*i);
+                        self.editor_views.remove(&removed);
+                        if self.file_pane_paths.is_empty() {
+                            // Last tab closed — close the whole editor pane.
+                            self.files_pane = None;
+                            self.file_pane_active = 0;
+                            self.focused = Some(fp);
+                            self.close_focused();
+                        } else {
+                            if self.file_pane_active >= self.file_pane_paths.len() {
+                                self.file_pane_active = self.file_pane_paths.len() - 1;
+                            } else if self.file_pane_active > *i {
+                                self.file_pane_active -= 1;
+                            }
+                            let path = self.file_pane_paths[self.file_pane_active].clone();
+                            if let Some(h) = self.editor_views.get(&path).cloned() {
+                                self.panes.insert(fp, PaneContent::Editor(h));
+                            }
                         }
                     }
                 }
@@ -2011,8 +2227,13 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::ClearFocused => {
-                if let Some(h) = self.active_input_pane().and_then(|id| self.terminal_at(id)) {
-                    h.update(ctx, |view, _| view.clear_screen());
+                if let Some(id) = self.active_input_pane() {
+                    if let Some(h) = self.terminal_at(id) {
+                        h.update(ctx, |view, _| view.clear_screen());
+                        // Allow this terminal's persisted history to shrink to the
+                        // cleared state (overrides the never-shrink guard).
+                        self.term_cleared.borrow_mut().insert(id);
+                    }
                 }
             }
             CraneShellAction::StageToggle { path, staged } => {
@@ -2089,6 +2310,11 @@ impl TypedActionView for CraneShellView {
                     self.expanded_worktrees.insert(k);
                 }
             }
+            CraneShellAction::SetTheme(name) => {
+                if let Some(t) = crate::theme::find_by_name(name) {
+                    crate::theme::set(t);
+                }
+            }
             CraneShellAction::Noop => {}
         }
         // Keep KEYBOARD focus in sync with the focused pane so it receives
@@ -2120,9 +2346,11 @@ impl TypedActionView for CraneShellView {
                 }
             }
         }
-        // Persist UI state (panels/tabs/layout) after every action so a restart
-        // restores the workspace. Cheap (a few KB) + atomic write.
-        self.save_state();
+        // Persist UI state after every action so a restart restores the
+        // workspace. Re-snapshotting terminal scrollback is expensive, so only
+        // do it on non-keystroke actions (a keystroke's output is captured on
+        // the next heavier action, e.g. focus/switch/split).
+        self.save_state(&*ctx);
         // Mark the view dirty so warpui re-renders.
         ctx.notify();
     }

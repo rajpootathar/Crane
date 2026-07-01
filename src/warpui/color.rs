@@ -46,20 +46,24 @@ fn rgb(t: (u8, u8, u8)) -> ColorU {
     ColorU::new(t.0, t.1, t.2, 255)
 }
 
-/// Default terminal foreground — Crane DEFAULT theme `terminal_fg`.
+#[inline]
+fn theme_rgb(c: crate::theme::Rgb) -> ColorU {
+    ColorU::new(c.r, c.g, c.b, 255)
+}
+
+/// Default terminal foreground — the active theme's `terminal_fg`.
 pub fn default_fg() -> ColorU {
-    ColorU::new(176, 180, 192, 255)
+    theme_rgb(crate::theme::current().terminal_fg)
 }
 
-/// Default terminal background — Crane DEFAULT theme `terminal_bg`.
-/// (Not `palette(0)`: the theme bg is (14,16,24), palette(0) is (26,28,40).)
+/// Default terminal background — the active theme's `terminal_bg`.
 pub fn default_bg() -> ColorU {
-    ColorU::new(14, 16, 24, 255)
+    theme_rgb(crate::theme::current().terminal_bg)
 }
 
-/// Cursor color.
+/// Cursor color — the active theme's accent.
 pub fn cursor_color() -> ColorU {
-    ColorU::new(176, 180, 192, 255)
+    theme_rgb(crate::theme::current().accent)
 }
 
 /// Port of `view.rs::color_to_egui`.

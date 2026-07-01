@@ -28,6 +28,9 @@ pub struct TerminalController {
     pub cols: usize,
     pub rows: usize,
     alive: Arc<AtomicBool>,
+    /// The directory the shell was spawned in — persisted so a restored
+    /// session reopens the terminal in the same place (old Crane parity).
+    pub cwd: std::path::PathBuf,
 }
 
 impl TerminalController {
@@ -127,6 +130,10 @@ impl TerminalController {
             }))
         };
 
+        let cwd = cwd
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+            .unwrap_or_default();
         Ok(Self {
             term,
             parser,
@@ -137,7 +144,27 @@ impl TerminalController {
             cols,
             rows,
             alive,
+            cwd,
         })
+    }
+
+    /// Render the current grid + scrollback to an ANSI snapshot (for session
+    /// persistence). Reuses `crane_term::Term::snapshot_ansi`.
+    pub fn snapshot(&self) -> String {
+        self.term.lock().snapshot_ansi()
+    }
+
+    /// Replay a persisted ANSI history into the terminal (session restore).
+    /// Feeds the bytes through the VT parser so colors/decorations survive, then
+    /// homes the cursor so the live shell prompt appends cleanly after it.
+    pub fn replay(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut parser = self.parser.lock();
+        let mut term = self.term.lock();
+        parser.parse_bytes(&mut *term, text.as_bytes());
+        parser.parse_bytes(&mut *term, b"\r\n");
     }
 
     /// Write input bytes to the PTY. `&self` (interior Arc<Mutex>) so the

@@ -322,6 +322,12 @@ impl Term {
         self.grid.display_offset
     }
 
+    /// Number of rows currently held in scrollback (above the live viewport).
+    /// Used to size the scrollbar thumb.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
     /// Adjust the display offset by `delta`. Positive `delta`
     /// scrolls upward into scrollback; negative scrolls back toward
     /// the live screen. Clamped to `[0, scrollback.len()]`.

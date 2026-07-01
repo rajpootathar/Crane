@@ -1,48 +1,50 @@
-//! Crane DEFAULT (dark) theme tokens, ported verbatim from
-//! `src/theme.rs::Theme::dark()` as warpui ColorU. In the real migration
-//! these come from the reused theme.rs data via an `Rgb::to_warp()` shim;
-//! here they are inlined so the shell prototype matches Crane exactly.
+//! Crane warpui colour tokens — all values come from the global `crate::theme::current()`
+//! so themes switch at runtime without restarting the process.
 
 use warpui::color::ColorU;
 
-const fn c(r: u8, g: u8, b: u8) -> ColorU {
-    ColorU { r, g, b, a: 255 }
+fn rgb(c: crate::theme::Rgb) -> ColorU {
+    ColorU { r: c.r, g: c.g, b: c.b, a: 255 }
 }
 
-pub const BG: ColorU = c(14, 16, 24);
-pub const SIDEBAR_BG: ColorU = c(18, 20, 28);
-pub const TOPBAR_BG: ColorU = c(20, 22, 32);
-pub const SURFACE: ColorU = c(40, 45, 60);
-pub const BORDER: ColorU = c(60, 66, 86);
-pub const DIVIDER: ColorU = c(36, 40, 52);
-pub const TEXT: ColorU = c(212, 216, 228);
-pub const TEXT_HOVER: ColorU = c(234, 238, 248);
-pub const TEXT_MUTED: ColorU = c(150, 156, 172);
-pub const TEXT_HEADER: ColorU = c(140, 146, 162);
-pub const ACCENT: ColorU = c(90, 135, 220);
-pub const ROW_ACTIVE: ColorU = c(48, 56, 80);
-pub const ROW_HOVER: ColorU = c(30, 34, 46);
-pub const FOCUS_BORDER: ColorU = c(100, 140, 220);
-/// Translucent accent for drag drop-zone overlays.
-pub const DROP_ZONE: ColorU = ColorU {
-    r: 100,
-    g: 140,
-    b: 220,
-    a: 120,
-};
-/// Translucent black dim over INACTIVE panes (Warp-style focus = no dim).
-pub const PANE_DIM: ColorU = ColorU {
-    r: 0,
-    g: 0,
-    b: 0,
-    a: 45,
-};
-pub const ERROR: ColorU = c(220, 95, 95);
-pub const SUCCESS: ColorU = c(90, 190, 140);
-pub const WARNING: ColorU = c(232, 170, 70);
+pub fn bg() -> ColorU            { rgb(crate::theme::current().bg) }
+pub fn sidebar_bg() -> ColorU    { rgb(crate::theme::current().sidebar_bg) }
+pub fn topbar_bg() -> ColorU     { rgb(crate::theme::current().topbar_bg) }
+pub fn surface() -> ColorU       { rgb(crate::theme::current().surface) }
+pub fn border() -> ColorU        { rgb(crate::theme::current().border) }
+pub fn divider() -> ColorU       { rgb(crate::theme::current().divider) }
+pub fn text() -> ColorU          { rgb(crate::theme::current().text) }
+pub fn text_hover() -> ColorU    { rgb(crate::theme::current().text_hover) }
+pub fn text_muted() -> ColorU    { rgb(crate::theme::current().text_muted) }
+pub fn text_header() -> ColorU   { rgb(crate::theme::current().text_header) }
+pub fn accent() -> ColorU        { rgb(crate::theme::current().accent) }
+pub fn row_active() -> ColorU    { rgb(crate::theme::current().row_active) }
+pub fn row_hover() -> ColorU     { rgb(crate::theme::current().row_hover) }
+pub fn focus_border() -> ColorU  { rgb(crate::theme::current().focus_border) }
+pub fn error() -> ColorU         { rgb(crate::theme::current().error) }
+pub fn success() -> ColorU       { rgb(crate::theme::current().success) }
+pub fn warning() -> ColorU       { rgb(crate::theme::current().warning) }
 
-// Panel dimensions (from src/ui/top.rs, src/ui/status.rs, src/state/state.rs).
+/// Text selection highlight background.
+pub fn selection() -> ColorU {
+    let c = crate::theme::current().selection;
+    ColorU { r: c.r, g: c.g, b: c.b, a: 180 }
+}
+
+/// Translucent accent for drag drop-zone overlays.
+pub fn drop_zone() -> ColorU {
+    let c = crate::theme::current().accent;
+    ColorU { r: c.r, g: c.g, b: c.b, a: 70 }
+}
+
+/// Translucent dim over inactive panes (currently unused — no dim mode).
+pub fn pane_dim() -> ColorU {
+    let c = crate::theme::current().bg;
+    ColorU { r: c.r, g: c.g, b: c.b, a: 120 }
+}
+
+// Panel dimensions — not colours, never change with themes.
 pub const TOPBAR_H: f32 = 34.0;
 pub const STATUS_H: f32 = 28.0;
-pub const LEFT_W: f32 = 240.0;
-pub const RIGHT_W: f32 = 300.0;
+pub const LEFT_W: f32   = 240.0;
+pub const RIGHT_W: f32  = 300.0;

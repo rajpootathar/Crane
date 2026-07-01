@@ -400,8 +400,8 @@ impl FileView {
         let mut row = Flex::row();
         for (i, f) in self.files.iter().enumerate() {
             let active = i == self.active;
-            let bg = if active { theme::SURFACE } else { theme::TOPBAR_BG };
-            let fg = if active { theme::TEXT } else { theme::TEXT_MUTED };
+            let bg = if active { theme::surface() } else { theme::topbar_bg() };
+            let fg = if active { theme::text() } else { theme::text_muted() };
             // Per-file dirty marker.
             let label = if f.dirty {
                 format!("* {}", f.name)
@@ -426,7 +426,7 @@ impl FileView {
             let close = EventHandler::new(
                 Container::new(
                     Text::new("x".to_string(), self.font, 11.0)
-                        .with_color(theme::TEXT_MUTED)
+                        .with_color(theme::text_muted())
                         .finish(),
                 )
                 .with_background_color(bg)
@@ -443,7 +443,7 @@ impl FileView {
             .finish();
             row = row.with_child(Flex::row().with_child(chip).with_child(close).finish());
         }
-        ConstrainedBox::new(self.panel(theme::TOPBAR_BG, row.finish()))
+        ConstrainedBox::new(self.panel(theme::topbar_bg(), row.finish()))
             .with_height(28.0)
             .finish()
     }
@@ -531,7 +531,7 @@ impl View for FileView {
                 // The caret is OVERLAID via a Stack — positioned with a spacer of
                 // width col*char_w — so it never changes how the line wraps.
                 let text = Text::new(line.clone(), self.font, 12.0)
-                    .with_color(theme::TEXT)
+                    .with_color(theme::text())
                     .finish();
                 if !self.is_doc && i == self.cursor.0 {
                     let col = self.cursor.1.min(line.chars().count());
@@ -545,7 +545,7 @@ impl View for FileView {
                         )
                         .with_child(
                             ConstrainedBox::new(
-                                Rect::new().with_background_color(theme::ACCENT).finish(),
+                                Rect::new().with_background_color(theme::accent()).finish(),
                             )
                             .with_width(2.0)
                             .with_height(self.line_h.max(12.0))
@@ -571,6 +571,6 @@ impl View for FileView {
             })
             .finish();
         content = content.with_child(Expanded::new(1.0, scroll_body).finish());
-        self.panel(theme::BG, content.finish())
+        self.panel(theme::bg(), content.finish())
     }
 }

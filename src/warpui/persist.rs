@@ -72,6 +72,19 @@ pub struct STab {
     pub id: usize,
     pub name: String,
     pub layout: SNode,
+    /// The focused pane within this tab at the time of save (None if unknown or
+    /// the focused pane was not a leaf of this tab's layout).
+    #[serde(default)]
+    pub focus: Option<PaneId>,
+}
+
+/// Persisted terminal state (old-Crane parity): spawn cwd + an ANSI snapshot of
+/// the scrollback + grid, replayed on restore.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct STerminal {
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub history: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -102,6 +115,21 @@ pub struct WarpuiState {
     /// Files open in the File pane, restored as tabs.
     #[serde(default)]
     pub file_pane_paths: Vec<PathBuf>,
+    /// The active file tab index within `file_pane_paths`.
+    #[serde(default)]
+    pub file_pane_active: usize,
+    /// Per terminal pane: cwd + ANSI scrollback snapshot, keyed by pane id.
+    #[serde(default)]
+    pub terminals: Vec<(PaneId, STerminal)>,
+    /// Last saved window width in logical pixels (0.0 = unset / use default).
+    #[serde(default)]
+    pub window_w: f32,
+    /// Last saved window height in logical pixels (0.0 = unset / use default).
+    #[serde(default)]
+    pub window_h: f32,
+    /// Name of the active colour theme, persisted so it is restored on next launch.
+    #[serde(default)]
+    pub theme_name: String,
 }
 
 fn state_file() -> Option<PathBuf> {
