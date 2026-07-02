@@ -625,6 +625,7 @@ impl CraneShellView {
     /// Build the project context menu overlay anchored at the stored click position.
     fn project_context_menu(&self, pm: &ProjectContextMenu) -> Box<dyn Element> {
         let pi = pm.project_idx;
+        let is_loose = self.projects.get(pi).map(|p| p.is_loose).unwrap_or(false);
         let mut items = Flex::column();
 
         items = items.with_child(self.menu_item(
@@ -638,6 +639,17 @@ impl CraneShellView {
             CraneShellAction::CopyProjectPath(pi),
         ));
         items = items.with_child(self.menu_separator());
+
+        // Loose projects (no .git) get an "Initialize Git" option that runs
+        // `git init` and reloads so the project flips to non-loose immediately.
+        if is_loose {
+            items = items.with_child(self.menu_item(
+                icons::GIT_BRANCH,
+                "Initialize Git",
+                CraneShellAction::InitGitProject(pi),
+            ));
+            items = items.with_child(self.menu_separator());
+        }
 
         // Tint palette — 8 colored CUBE swatches in a single row.
         const PALETTE: [(&str, [u8; 3]); 8] = [
@@ -869,6 +881,165 @@ impl CraneShellView {
             .finish()
     }
 
+    /// A worktree row: caret + GIT_BRANCH icon + name, with an optional `+N -M` diff-stat
+    /// badge pushed to the right side. `selected` drives the active background highlight.
+    #[allow(clippy::too_many_arguments)]
+    fn worktree_nav_row(
+        &self,
+        expanded: bool,
+        name: &str,
+        icon_color: ColorU,
+        label_color: ColorU,
+        selected: bool,
+        diff_stat: (u32, u32),
+        action: CraneShellAction,
+    ) -> Box<dyn Element> {
+        let size = 12.0_f32;
+        let row_h = size + 8.0;
+        let mut bg = Rect::new();
+        if selected {
+            bg = bg.with_background_color(theme::row_active());
+        }
+        let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
+
+        let caret_glyph = if expanded {
+            icons::CARET_DOWN
+        } else {
+            icons::CARET_RIGHT
+        };
+        let mut row_inner = Flex::row()
+            .with_child(
+                Container::new(self.icon(caret_glyph, 9.0, theme::text_muted()))
+                    .with_padding_right(3.0)
+                    .finish(),
+            )
+            .with_child(
+                Container::new(self.icon(icons::GIT_BRANCH, size, icon_color))
+                    .with_padding_right(6.0)
+                    .finish(),
+            )
+            .with_child(
+                Expanded::new(
+                    1.0,
+                    Text::new(name.to_string(), self.ui_font, size)
+                        .with_color(label_color)
+                        .finish(),
+                )
+                .finish(),
+            );
+
+        // +N / -M badges appended at right when there are line changes.
+        let (added, deleted) = diff_stat;
+        if added > 0 {
+            row_inner = row_inner.with_child(
+                Container::new(
+                    Text::new(format!("+{added}"), self.ui_font, size - 2.0)
+                        .with_color(theme::success())
+                        .finish(),
+                )
+                .with_padding_right(2.0)
+                .finish(),
+            );
+        }
+        if deleted > 0 {
+            row_inner = row_inner.with_child(
+                Container::new(
+                    Text::new(format!("-{deleted}"), self.ui_font, size - 2.0)
+                        .with_color(theme::error())
+                        .finish(),
+                )
+                .with_padding_right(6.0)
+                .finish(),
+            );
+        }
+
+        let label = Container::new(row_inner.finish())
+            .with_padding_left(24.0)
+            .with_padding_top(4.0)
+            .finish();
+        let hit_layer = ConstrainedBox::new(Rect::new().finish())
+            .with_height(row_h)
+            .finish();
+        let stack = Stack::new()
+            .with_child(bg_layer)
+            .with_child(label)
+            .with_child(hit_layer)
+            .finish();
+        EventHandler::new(stack)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    /// A tab row with a trailing close button. The close button's EventHandler returns
+    /// `StopPropagation` so the outer select handler never fires when close is clicked.
+    fn tab_closeable_row(
+        &self,
+        icon_color: ColorU,
+        name: &str,
+        selected: bool,
+        indent: f32,
+        select_action: CraneShellAction,
+        close_action: CraneShellAction,
+    ) -> Box<dyn Element> {
+        let size = 11.0_f32;
+        let row_h = size + 8.0;
+        let mut bg = Rect::new();
+        if selected {
+            bg = bg.with_background_color(theme::row_active());
+        }
+        let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
+
+        // Label: icon + text (no caret for tab leaves).
+        let label_content = Flex::row()
+            .with_child(
+                Container::new(self.icon(icons::TERMINAL_WINDOW, size, icon_color))
+                    .with_padding_right(6.0)
+                    .finish(),
+            )
+            .with_child(
+                Text::new(name.to_string(), self.ui_font, size)
+                    .with_color(icon_color)
+                    .finish(),
+            )
+            .finish();
+        let label = Container::new(label_content)
+            .with_padding_left(indent)
+            .with_padding_top(4.0)
+            .finish();
+
+        // Close button — inner EventHandler stops propagation so select doesn't fire.
+        let close_btn = EventHandler::new(
+            Container::new(self.icon(icons::X, 9.0, theme::text_muted()))
+                .with_padding_right(6.0)
+                .with_padding_top(5.0)
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(close_action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+
+        // Compose: Expanded(label) + close button, layered over background.
+        let row_content = Flex::row()
+            .with_child(Expanded::new(1.0, label).finish())
+            .with_child(close_btn)
+            .finish();
+        let stack = Stack::new()
+            .with_child(bg_layer)
+            .with_child(row_content)
+            .finish();
+        EventHandler::new(stack)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(select_action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
     fn panel(&self, bg: warpui::color::ColorU, content: Box<dyn Element>) -> Box<dyn Element> {
         Stack::new()
             .with_child(Rect::new().with_background_color(bg).finish())
@@ -956,11 +1127,23 @@ impl CraneShellView {
         for (pi, p) in self.projects.iter().enumerate() {
             let p_expanded = self.expanded_projects.contains(&pi);
             let psel = sel == (pi, usize::MAX, usize::MAX);
-            let pcol = if psel { theme::text_hover() } else { theme::text() };
             let tint = self.project_color_for(pi);
+            // Feature 3: when the user has set an explicit tint, also apply it to the
+            // project name text (not just the CUBE icon). Fall back to the normal
+            // text color when no explicit tint is set, mirroring old egui projects.rs.
+            let has_explicit_tint = self.projects.get(pi).and_then(|p| p.tint).is_some();
+            let pcol = if psel {
+                theme::text_hover()
+            } else if has_explicit_tint {
+                tint
+            } else {
+                theme::text()
+            };
+            // Loose projects (non-git folders) use a FOLDER icon; git projects use CUBE.
+            let project_icon = if p.is_loose { icons::FOLDER } else { icons::CUBE };
             let base_row = self.nav_row(
                 Some(p_expanded),
-                icons::CUBE,
+                project_icon,
                 tint,
                 &p.name,
                 13.0,
@@ -987,17 +1170,30 @@ impl CraneShellView {
             }
             for (wi, w) in p.worktrees.iter().enumerate() {
                 let w_expanded = self.expanded_worktrees.contains(&(pi, wi));
-                let wsel = sel == (pi, wi, usize::MAX);
-                let wcol = if wsel { theme::text_hover() } else { theme::accent() };
-                col = col.with_child(self.nav_row(
-                    Some(w_expanded),
-                    icons::GIT_BRANCH,
-                    wcol,
+                // Feature 2: the worktree row lights up as "active" when any of its tabs
+                // is the current active tab, not only when the worktree row itself is
+                // selected. This mirrors old egui Crane's `active_wt` flag.
+                let w_active = self
+                    .active_tab
+                    .map(|(api, awi, _)| api == pi && awi == wi)
+                    .unwrap_or(false);
+                let wsel = sel == (pi, wi, usize::MAX) || w_active;
+                // Tint priority: explicit user tint wins over active-branch accent so
+                // a user-tinted active worktree shows its tint, not the accent, on the icon.
+                let wcol = if wsel {
+                    theme::accent()
+                } else {
+                    theme::text_muted()
+                };
+                // Feature 1: pass the worktree's cached diff-stat to the row builder so
+                // it renders the +N -M badge at the right side of the branch row.
+                col = col.with_child(self.worktree_nav_row(
+                    w_expanded,
                     &w.name,
-                    12.0,
                     wcol,
-                    24.0,
+                    wcol,
                     wsel,
+                    w.diff_stat,
                     CraneShellAction::ToggleWorktree(pi, wi),
                 ));
                 if !w_expanded {
@@ -1009,19 +1205,19 @@ impl CraneShellView {
                         let tkey = (pi, wi, t.id);
                         let tsel = sel == tkey;
                         let tcol = if tsel { theme::text_hover() } else { theme::text_muted() };
-                        col = col.with_child(self.nav_row(
-                            None,
-                            icons::TERMINAL_WINDOW,
+                        // Feature 4: each tab row has a trailing close button.
+                        // The close button's EventHandler returns StopPropagation so
+                        // clicking it does not also trigger the row's select action.
+                        col = col.with_child(self.tab_closeable_row(
                             tcol,
                             &t.name,
-                            11.0,
-                            tcol,
-                            42.0,
                             tsel,
+                            42.0,
                             CraneShellAction::Select {
                                 sel: tkey,
                                 path: PathBuf::from(&w.path),
                             },
+                            CraneShellAction::CloseTab(tkey),
                         ));
                     }
                 }
@@ -2305,6 +2501,9 @@ pub enum CraneShellAction {
     CopyProjectPath(usize),
     /// Set or clear a per-project tint. `None` resets to the palette default.
     SetProjectTint(usize, Option<[u8; 3]>),
+    /// Run `git init` in the project folder and reload the project list so it
+    /// flips from loose (FOLDER icon) to a real git project (CUBE icon + branches).
+    InitGitProject(usize),
     Noop,
 }
 
@@ -2689,6 +2888,17 @@ impl TypedActionView for CraneShellView {
                         }
                     }
                 }
+                self.reload_projects();
+            }
+            CraneShellAction::InitGitProject(i) => {
+                self.context_menu = None;
+                if let Some(p) = self.projects.get(*i) {
+                    let dir = std::path::PathBuf::from(&p.path);
+                    // Shell out `git init` — never libgit2, per project rules.
+                    let _ = crate::warpui::git::init(&dir);
+                }
+                // Reload so `is_loose` is recomputed and the CUBE icon / branch
+                // rows appear on the next render.
                 self.reload_projects();
             }
             CraneShellAction::Noop => {}

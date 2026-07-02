@@ -91,6 +91,39 @@ pub fn log(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Sum of added/deleted lines across all uncommitted changes (`git diff --numstat HEAD`).
+/// Returns `(added, deleted)`. Runs synchronously — call at reload/load time only, never
+/// per frame. Binary files produce `-` in the numstat output which is silently skipped.
+pub fn diff_numstat(root: &Path) -> (u32, u32) {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--numstat", "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    else {
+        return (0, 0);
+    };
+    if !out.status.success() {
+        return (0, 0);
+    }
+    let mut added = 0u32;
+    let mut deleted = 0u32;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut cols = line.splitn(3, '\t');
+        added += cols.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        deleted += cols.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    }
+    (added, deleted)
+}
+
+/// `git init` in `dir` — turns a loose folder into a git repository.
+/// On success the folder gains a `.git` directory; reload the project list
+/// afterwards so the `is_loose` flag reflects the new state.
+pub fn init(dir: &Path) -> Result<(), String> {
+    run(dir, &["init"])
+}
+
 /// Working-tree changes in `root`, or empty on any error / non-repo.
 pub fn changes(root: &Path) -> Vec<Change> {
     let Ok(out) = Command::new("git")

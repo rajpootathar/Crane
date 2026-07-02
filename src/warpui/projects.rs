@@ -10,6 +10,9 @@ pub struct WorktreeNode {
     pub name: String,
     pub path: String,
     pub tabs: Vec<String>,
+    /// Cached `git diff --numstat HEAD` totals: (added_lines, deleted_lines).
+    /// Computed once at load/reload time — never per frame.
+    pub diff_stat: (u32, u32),
 }
 
 pub struct ProjectNode {
@@ -18,6 +21,10 @@ pub struct ProjectNode {
     pub worktrees: Vec<WorktreeNode>,
     /// Per-project accent tint set by the user (overrides the palette default).
     pub tint: Option<[u8; 3]>,
+    /// True when the project folder has no `.git` entry (directory or file).
+    /// Computed once at load time. A loose project shows a FOLDER icon, hides
+    /// branch/worktree rows, and offers "Initialize Git" in its context menu.
+    pub is_loose: bool,
 }
 
 /// Load the project tree from the live Crane session, or empty if missing.
@@ -70,18 +77,26 @@ pub fn load_projects() -> Vec<ProjectNode> {
                             );
                         }
                     }
+                    let diff_stat = if !wpath.is_empty() {
+                        crate::warpui::git::diff_numstat(std::path::Path::new(&wpath))
+                    } else {
+                        (0, 0)
+                    };
                     worktrees.push(WorktreeNode {
                         name: wname,
                         path: wpath,
                         tabs,
+                        diff_stat,
                     });
                 }
             }
+            let is_loose = !std::path::Path::new(&path).join(".git").exists();
             out.push(ProjectNode {
                 name,
                 path,
                 worktrees,
                 tint: None,
+                is_loose,
             });
         }
     }
@@ -104,11 +119,13 @@ pub fn load_projects_extended(
     }
     for ap in added {
         if !projects.iter().any(|p| p.path == ap.path) {
+            let is_loose = !std::path::Path::new(&ap.path).join(".git").exists();
             projects.push(ProjectNode {
                 name: ap.name.clone(),
                 path: ap.path.clone(),
                 worktrees: Vec::new(),
                 tint: tints.get(&ap.path).copied(),
+                is_loose,
             });
         }
     }
