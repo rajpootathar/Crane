@@ -15,6 +15,7 @@ pub mod color;
 pub mod controller;
 pub mod editor_view;
 pub mod file_pane;
+pub mod find_bar_element;
 pub mod file_tree;
 pub mod git;
 pub mod grid_element;

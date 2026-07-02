@@ -15,9 +15,9 @@ use warp_editor::render::element::{
     DisplayOptions, DisplayState, DisplayStateHandle, RichTextAction, RichTextElement,
 };
 use warp_editor::render::model::{
-    BrokenLinkStyle, CheckBoxStyle, HorizontalRuleStyle, InlineCodeStyle, Location, ParagraphStyles,
-    RenderState, RichTextStyles, TableStyle, WidthSetting, DEFAULT_BLOCK_SPACINGS,
-    PARAGRAPH_MIN_HEIGHT,
+    AutoScrollMode, BrokenLinkStyle, CheckBoxStyle, Decoration, HorizontalRuleStyle, InlineCodeStyle,
+    Location, ParagraphStyles, RenderState, RichTextStyles, TableStyle, WidthSetting,
+    DEFAULT_BLOCK_SPACINGS, PARAGRAPH_MIN_HEIGHT,
 };
 use warp_editor::selection::{SelectionModel, TextDirection, TextUnit};
 use warpui::text::word_boundaries::WordBoundariesPolicy;
@@ -36,6 +36,7 @@ use warpui::{
 
 use rangemap::RangeMap;
 
+use crate::warpui::find_bar_element::{BarMode, FindBarElement};
 use crate::warpui::theme;
 
 const BASELINE: f32 = 0.78;
@@ -191,6 +192,18 @@ pub enum EditAction {
     Indent { outdent: bool },
     /// Scroll up or down by one full viewport height (Page Up / Page Down).
     PageScroll { down: bool },
+    // ── Find / Replace / Goto-line actions (dispatched by the find bar buttons
+    //    or the editor's own key handling). ──────────────────────────────────
+    /// Move selection to the next match (wraps). `false` = previous match.
+    FindNext { forward: bool },
+    /// Close the find/replace/goto bar and clear match highlights.
+    FindClose,
+    /// Replace the current match with the replacement text.
+    FindReplaceCurrent,
+    /// Replace every match with the replacement text (reverse-order edits).
+    FindReplaceAll,
+    /// Focus the find field (`true`) or the replace field (`false`) for typing.
+    FindFocusField { find_field: bool },
 }
 
 impl<V> RichTextAction<V> for EditAction {
@@ -288,6 +301,51 @@ impl CoreEditorModel for CodeModel {
 
 impl PlainTextEditorModel for CodeModel {}
 
+/// Which bar is showing.
+#[derive(Clone, Copy, PartialEq)]
+enum FindMode {
+    Find,
+    Replace,
+    Goto,
+}
+
+/// Live state for the Find / Replace / Goto-line bar. `WarpEditorView::find` is
+/// `None` when the bar is closed.
+struct FindState {
+    mode: FindMode,
+    /// The search query (Find/Replace) or the line-number text (Goto).
+    query: String,
+    /// The replacement text (Replace mode).
+    replace: String,
+    /// Which field captures typed characters: `true` = query, `false` = replace.
+    find_field_active: bool,
+    /// Match ranges as 0-based char offsets into the buffer text `(start, end)`,
+    /// `end` exclusive. Same offset space as the syntect color map.
+    matches: Vec<(usize, usize)>,
+    /// Index into `matches` of the currently-highlighted match.
+    current: Option<usize>,
+}
+
+impl FindState {
+    fn new(mode: FindMode) -> Self {
+        Self {
+            mode,
+            query: String::new(),
+            replace: String::new(),
+            find_field_active: true,
+            matches: Vec::new(),
+            current: None,
+        }
+    }
+    fn bar_mode(&self) -> BarMode {
+        match self.mode {
+            FindMode::Find => BarMode::Find,
+            FindMode::Replace => BarMode::FindReplace,
+            FindMode::Goto => BarMode::GotoLine,
+        }
+    }
+}
+
 pub struct WarpEditorView {
     model: ModelHandle<CodeModel>,
     self_handle: WeakViewHandle<Self>,
@@ -305,6 +363,8 @@ pub struct WarpEditorView {
     selecting: std::cell::Cell<bool>,
     /// Persisted scrollbar-thumb drag state (element rebuilt each frame).
     scrollbar_drag: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Find / Replace / Goto-line bar state; `None` = closed.
+    find: Option<FindState>,
 }
 
 impl WarpEditorView {
@@ -460,7 +520,372 @@ impl WarpEditorView {
             saved_text: content,
             selecting: std::cell::Cell::new(false),
             scrollbar_drag: std::rc::Rc::new(std::cell::Cell::new(false)),
+            find: None,
         }
+    }
+}
+
+impl WarpEditorView {
+    // ── Public entry points (a shell keybinding can call these) ────────────
+
+    /// Open the Find bar (Cmd+F). Pre-fills the query with the current
+    /// single-line selection, if any.
+    pub fn open_find(&mut self, ctx: &mut ViewContext<Self>) {
+        self.open_find_mode(FindMode::Find, ctx);
+    }
+    /// Open the Find + Replace bar (Cmd+H).
+    pub fn open_replace(&mut self, ctx: &mut ViewContext<Self>) {
+        self.open_find_mode(FindMode::Replace, ctx);
+    }
+    /// Open the Goto-line bar (Cmd+G).
+    pub fn open_goto_line(&mut self, ctx: &mut ViewContext<Self>) {
+        self.find = Some(FindState::new(FindMode::Goto));
+        ctx.notify();
+    }
+    /// Close the bar and clear match highlights (Escape).
+    pub fn close_find(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.find.take().is_some() {
+            self.clear_match_decorations(ctx);
+        }
+        ctx.notify();
+    }
+    /// True when the find/replace/goto bar is open (lets the shell gate keys).
+    pub fn find_open(&self) -> bool {
+        self.find.is_some()
+    }
+
+    // ── Internal helpers ────────────────────────────────────────────────────
+
+    fn open_find_mode(&mut self, mode: FindMode, ctx: &mut ViewContext<Self>) {
+        // Keep an existing query when switching Find <-> Replace; otherwise
+        // pre-fill from the current selection.
+        let prev_query = self.find.as_ref().map(|f| f.query.clone());
+        let mut state = FindState::new(mode);
+        if let Some(q) = prev_query {
+            state.query = q;
+        } else if let Some(sel) = self.selected_text(ctx) {
+            if !sel.is_empty() && !sel.contains('\n') {
+                state.query = sel;
+            }
+        }
+        self.find = Some(state);
+        self.recompute_matches(ctx);
+        ctx.notify();
+    }
+
+    /// The whole buffer as an owned `String`.
+    fn buffer_text(&self, ctx: &impl warpui::ModelAsRef) -> String {
+        self.model.as_ref(ctx).buffer.as_ref(ctx).text().to_string()
+    }
+
+    /// The current caret position as a 0-based char offset into `buffer_text`.
+    fn cursor_text_offset(&self, ctx: &impl warpui::ModelAsRef) -> usize {
+        let m = self.model.as_ref(ctx);
+        let cur = m.selection.as_ref(ctx).cursors(ctx);
+        cur.last().as_usize().saturating_sub(1)
+    }
+
+    /// The current selection as text, or `None` if the selection is empty.
+    fn selected_text(&self, ctx: &impl warpui::ModelAsRef) -> Option<String> {
+        let m = self.model.as_ref(ctx);
+        let sel = m.selection.as_ref(ctx);
+        let start = sel.selection_start(ctx).as_usize().saturating_sub(1);
+        let end = sel.selection_end(ctx).as_usize().saturating_sub(1);
+        if end <= start {
+            return None;
+        }
+        let chars: Vec<char> = m.buffer.as_ref(ctx).text().to_string().chars().collect();
+        if start >= chars.len() {
+            return None;
+        }
+        Some(chars[start..end.min(chars.len())].iter().collect())
+    }
+
+    /// Case-insensitive (ASCII) non-overlapping substring search. Returns
+    /// `(start, end)` char offsets (end exclusive) into `text`.
+    fn find_all(text: &str, query: &str) -> Vec<(usize, usize)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let hay: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let needle: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let (n, m) = (hay.len(), needle.len());
+        let mut out = Vec::new();
+        if m == 0 || m > n {
+            return out;
+        }
+        let mut i = 0;
+        while i + m <= n {
+            if hay[i..i + m] == needle[..] {
+                out.push((i, i + m));
+                i += m;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The 0-based char offset of the start of 1-based `line`. Clamps to the
+    /// buffer end when `line` exceeds the line count.
+    fn line_start_offset(text: &str, line: usize) -> usize {
+        if line <= 1 {
+            return 0;
+        }
+        let mut newlines = 0usize;
+        for (i, ch) in text.chars().enumerate() {
+            if ch == '\n' {
+                newlines += 1;
+                if newlines == line - 1 {
+                    return i + 1;
+                }
+            }
+        }
+        text.chars().count()
+    }
+
+    /// Re-run the search for the current query and refresh highlights. No-op in
+    /// Goto mode.
+    fn recompute_matches(&mut self, ctx: &mut ViewContext<Self>) {
+        let (mode, query) = match self.find.as_ref() {
+            Some(f) => (f.mode, f.query.clone()),
+            None => return,
+        };
+        if mode == FindMode::Goto {
+            return;
+        }
+        let text = self.buffer_text(ctx);
+        let matches = Self::find_all(&text, &query);
+        let cursor = self.cursor_text_offset(ctx);
+        let current = if matches.is_empty() {
+            None
+        } else {
+            Some(
+                matches
+                    .iter()
+                    .position(|(s, _)| *s >= cursor)
+                    .unwrap_or(0),
+            )
+        };
+        if let Some(f) = self.find.as_mut() {
+            f.matches = matches;
+            f.current = current;
+        }
+        self.apply_match_decorations(ctx);
+    }
+
+    /// Push the match ranges into the render state as background decorations
+    /// (brighter for the current match). Reuses warp's search highlight fills.
+    fn apply_match_decorations(&mut self, ctx: &mut ViewContext<Self>) {
+        let decs: Vec<Decoration> = match self.find.as_ref() {
+            Some(f) => f
+                .matches
+                .iter()
+                .enumerate()
+                .map(|(idx, (s, e))| {
+                    let fill = if Some(idx) == f.current {
+                        *warp_editor::search::SELECTED_MATCH_FILL
+                    } else {
+                        *warp_editor::search::MATCH_FILL
+                    };
+                    Decoration::new(CharOffset::from(*s), CharOffset::from(*e))
+                        .with_background(fill)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let rs = m.render_state.clone();
+            rs.update(mctx, |r, rctx| r.set_text_decorations(decs, rctx));
+        });
+    }
+
+    fn clear_match_decorations(&mut self, ctx: &mut ViewContext<Self>) {
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let rs = m.render_state.clone();
+            rs.update(mctx, |r, rctx| r.set_text_decorations(Vec::new(), rctx));
+        });
+    }
+
+    /// Select match `idx` (as a selection range) and scroll it into view.
+    fn goto_match(&mut self, idx: usize, ctx: &mut ViewContext<Self>) {
+        let range = match self.find.as_ref() {
+            Some(f) if idx < f.matches.len() => f.matches[idx],
+            _ => return,
+        };
+        if let Some(f) = self.find.as_mut() {
+            f.current = Some(idx);
+        }
+        let (s, e) = range;
+        let start = CharOffset::from(s).add_signed(1);
+        let end = CharOffset::from(e).add_signed(1);
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let sel = m.selection.clone();
+            sel.update(mctx, |sm, sctx| {
+                sm.set_cursor(start, sctx);
+                sm.set_last_head(end, sctx);
+            });
+            let rs = m.render_state.clone();
+            rs.update(mctx, |r, _rctx| {
+                r.request_autoscroll_to(AutoScrollMode::ScrollOffsetsIntoViewport(start..end));
+            });
+        });
+        self.apply_match_decorations(ctx);
+        ctx.notify();
+    }
+
+    /// Move to the next (`forward`) or previous match, wrapping around.
+    fn find_step(&mut self, forward: bool, ctx: &mut ViewContext<Self>) {
+        let (len, current) = match self.find.as_ref() {
+            Some(f) if !f.matches.is_empty() => (f.matches.len(), f.current),
+            _ => return,
+        };
+        let idx = match current {
+            Some(c) => {
+                if forward {
+                    (c + 1) % len
+                } else {
+                    (c + len - 1) % len
+                }
+            }
+            None => {
+                let cursor = self.cursor_text_offset(ctx);
+                let pos = self
+                    .find
+                    .as_ref()
+                    .unwrap()
+                    .matches
+                    .iter()
+                    .position(|(s, _)| *s >= cursor)
+                    .unwrap_or(0);
+                if forward {
+                    pos
+                } else {
+                    (pos + len - 1) % len
+                }
+            }
+        };
+        self.goto_match(idx, ctx);
+    }
+
+    /// Jump the caret to the line typed into the Goto bar, then close it.
+    fn do_goto_line(&mut self, ctx: &mut ViewContext<Self>) {
+        let n: usize = match self.find.as_ref() {
+            Some(f) => f.query.trim().parse::<usize>().unwrap_or(1).max(1),
+            None => return,
+        };
+        let text = self.buffer_text(ctx);
+        let offset = Self::line_start_offset(&text, n);
+        let buf_off = CharOffset::from(offset).add_signed(1);
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let sel = m.selection.clone();
+            sel.update(mctx, |sm, sctx| sm.set_cursor(buf_off, sctx));
+            let rs = m.render_state.clone();
+            rs.update(mctx, |r, _rctx| r.request_autoscroll());
+        });
+        self.close_find(ctx);
+    }
+
+    /// Replace the current match with the replacement text, then re-search.
+    fn replace_current(&mut self, ctx: &mut ViewContext<Self>) {
+        let (range, replacement) = match self.find.as_ref() {
+            Some(f) if f.mode == FindMode::Replace => match f.current {
+                Some(c) if c < f.matches.len() => (f.matches[c], f.replace.clone()),
+                _ => return,
+            },
+            _ => return,
+        };
+        let (s, e) = range;
+        let start = CharOffset::from(s).add_signed(1);
+        let end = CharOffset::from(e).add_signed(1);
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let sel = m.selection.clone();
+            sel.update(mctx, |sm, sctx| {
+                sm.set_cursor(start, sctx);
+                sm.set_last_head(end, sctx);
+            });
+            m.user_insert(&replacement, mctx);
+        });
+        self.recompute_matches(ctx);
+        ctx.notify();
+    }
+
+    /// Replace every match. Applies edits in REVERSE offset order so that the
+    /// yet-to-be-applied (earlier) match offsets stay valid as we go.
+    fn replace_all(&mut self, ctx: &mut ViewContext<Self>) {
+        let (mut matches, replacement) = match self.find.as_ref() {
+            Some(f) if f.mode == FindMode::Replace && !f.matches.is_empty() => {
+                (f.matches.clone(), f.replace.clone())
+            }
+            _ => return,
+        };
+        matches.sort_by(|a, b| b.0.cmp(&a.0));
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            for (s, e) in &matches {
+                let start = CharOffset::from(*s).add_signed(1);
+                let end = CharOffset::from(*e).add_signed(1);
+                let sel = m.selection.clone();
+                sel.update(mctx, |sm, sctx| {
+                    sm.set_cursor(start, sctx);
+                    sm.set_last_head(end, sctx);
+                });
+                m.user_insert(&replacement, mctx);
+            }
+        });
+        self.recompute_matches(ctx);
+        ctx.notify();
+    }
+
+    /// Route a typed string into the active find-bar field.
+    fn find_type(&mut self, s: &str, ctx: &mut ViewContext<Self>) {
+        let mut recompute = false;
+        if let Some(f) = self.find.as_mut() {
+            match f.mode {
+                FindMode::Goto => {
+                    for ch in s.chars() {
+                        if ch.is_ascii_digit() {
+                            f.query.push(ch);
+                        }
+                    }
+                }
+                _ => {
+                    if f.find_field_active {
+                        f.query.push_str(s);
+                        recompute = true;
+                    } else {
+                        f.replace.push_str(s);
+                    }
+                }
+            }
+        }
+        if recompute {
+            self.recompute_matches(ctx);
+        }
+        ctx.notify();
+    }
+
+    /// Delete the last char of the active find-bar field.
+    fn find_backspace(&mut self, ctx: &mut ViewContext<Self>) {
+        let mut recompute = false;
+        if let Some(f) = self.find.as_mut() {
+            let goto = f.mode == FindMode::Goto;
+            if goto || f.find_field_active {
+                f.query.pop();
+                recompute = !goto;
+            } else {
+                f.replace.pop();
+            }
+        }
+        if recompute {
+            self.recompute_matches(ctx);
+        }
+        ctx.notify();
     }
 }
 
@@ -615,6 +1040,30 @@ impl WarpEditorView {
                     });
                 });
             }
+            // ── Find / Replace / Goto ──────────────────────────────────────
+            EditAction::FindNext { forward } => {
+                self.find_step(*forward, ctx);
+                return;
+            }
+            EditAction::FindClose => {
+                self.close_find(ctx);
+                return;
+            }
+            EditAction::FindReplaceCurrent => {
+                self.replace_current(ctx);
+                return;
+            }
+            EditAction::FindReplaceAll => {
+                self.replace_all(ctx);
+                return;
+            }
+            EditAction::FindFocusField { find_field } => {
+                if let Some(f) = self.find.as_mut() {
+                    f.find_field_active = *find_field;
+                }
+                ctx.notify();
+                return;
+            }
         }
         ctx.notify();
     }
@@ -624,8 +1073,45 @@ impl WarpEditorView {
     /// is unreliable), so typing/backspace/enter reach the editor through here
     /// rather than the element's own focus-delivered events.
     pub fn input_key(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
-        // Command/control shortcuts are handled by the shell, not inserted.
+        // Find / Replace / Goto shortcuts — handled here IF the editor view
+        // receives the keystroke. (The shell currently owns most Cmd shortcuts;
+        // if it never routes these here, the public `open_find` / `open_replace`
+        // / `open_goto_line` methods are the hookup — a 1-line shell keybinding.)
         if ks.cmd || ks.ctrl {
+            match ks.key.as_str() {
+                "f" => self.open_find(ctx),
+                "h" => self.open_replace(ctx),
+                "g" => self.open_goto_line(ctx),
+                _ => {}
+            }
+            return;
+        }
+        // While the find bar is open, all typing is captured by it.
+        if self.find.is_some() {
+            match ks.key.as_str() {
+                "escape" => self.close_find(ctx),
+                "enter" | "return" | "numpadenter" => {
+                    let mode = self.find.as_ref().map(|f| f.mode);
+                    match mode {
+                        Some(FindMode::Goto) => self.do_goto_line(ctx),
+                        // Enter = next, Shift+Enter = previous.
+                        _ => self.find_step(!ks.shift, ctx),
+                    }
+                }
+                "backspace" | "delete" => self.find_backspace(ctx),
+                "space" => self.find_type(" ", ctx),
+                // Tab toggles between the find and replace fields (Replace mode).
+                "tab" => {
+                    if let Some(f) = self.find.as_mut() {
+                        if f.mode == FindMode::Replace {
+                            f.find_field_active = !f.find_field_active;
+                        }
+                    }
+                    ctx.notify();
+                }
+                k if k.chars().count() == 1 => self.find_type(k, ctx),
+                _ => {}
+            }
             return;
         }
         // Caret motion: arrows / home / end. Alt = by word; Shift = extend selection.
@@ -759,10 +1245,43 @@ impl View for WarpEditorView {
         )
         .draggable(self.scrollbar_drag.clone(), on_drag)
         .finish();
-        Flex::row()
+        let body = Flex::row()
             .with_child(gutter)
             .with_child(Expanded::new(1.0, editor).finish())
             .with_child(scrollbar)
+            .finish();
+        // Find / Replace / Goto bar above the editor body when open.
+        let Some(find) = self.find.as_ref() else {
+            return body;
+        };
+        // Each button dispatches an `EditAction` that routes back to
+        // `handle_action` → `apply` (same mechanism as the scroll wheel).
+        type Cb = std::rc::Rc<dyn Fn(&mut warpui::elements::EventContext)>;
+        let mk = |action: EditAction| -> Cb {
+            std::rc::Rc::new(move |ctx: &mut warpui::elements::EventContext| {
+                ctx.dispatch_typed_action(action.clone());
+            })
+        };
+        let find_bar = FindBarElement::new(
+            find.bar_mode(),
+            find.query.clone(),
+            find.replace.clone(),
+            find.matches.len(),
+            find.current,
+            find.find_field_active,
+            self.gutter_font,
+            mk(EditAction::FindNext { forward: false }),
+            mk(EditAction::FindNext { forward: true }),
+            mk(EditAction::FindClose),
+            mk(EditAction::FindReplaceCurrent),
+            mk(EditAction::FindReplaceAll),
+            mk(EditAction::FindFocusField { find_field: true }),
+            mk(EditAction::FindFocusField { find_field: false }),
+        )
+        .finish();
+        Flex::column()
+            .with_child(find_bar)
+            .with_child(Expanded::new(1.0, body).finish())
             .finish()
     }
 }

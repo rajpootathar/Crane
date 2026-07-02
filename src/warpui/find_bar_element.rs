@@ -60,6 +60,7 @@ pub struct FindBarElement {
 
     // layout
     size: Option<Vector2F>,
+    origin: Option<Point>,
     origin_vec: Option<Vector2F>,
     /// Hit regions set during `paint`; order matches `Hit` discriminants above.
     regions: Vec<(Hit, RectF)>,
@@ -101,6 +102,7 @@ impl FindBarElement {
             find_field_active,
             font,
             size: None,
+            origin: None,
             origin_vec: None,
             regions: Vec::new(),
             on_prev,
@@ -214,6 +216,7 @@ impl Element for FindBarElement {
     fn after_layout(&mut self, _: &mut AfterLayoutContext, _: &AppContext) {}
 
     fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+        self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
         self.origin_vec = Some(origin);
         self.regions.clear();
         let size = self.size.unwrap_or_else(|| vec2f(300.0, ROW_H));
@@ -416,7 +419,7 @@ impl Element for FindBarElement {
     }
 
     fn origin(&self) -> Option<Point> {
-        self.origin_vec.map(|v| Point::from_vec2f(v, 0))
+        self.origin
     }
 
     fn dispatch_event(

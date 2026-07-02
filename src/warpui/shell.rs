@@ -1085,8 +1085,9 @@ impl CraneShellView {
     }
 
     fn left_sidebar(&self) -> Box<dyn Element> {
-        // Header row: "PROJECTS" label + "+" Add Project button.
-        let header_label = Container::new(
+        // Header row: just the "PROJECTS" label. The Add Project affordance is a
+        // prominent accent pill pinned at the bottom of the panel (below).
+        let header_row = Container::new(
             Text::new("PROJECTS", self.ui_font, 11.0)
                 .with_color(theme::text_header())
                 .finish(),
@@ -1095,26 +1096,10 @@ impl CraneShellView {
         .with_padding_top(8.0)
         .with_padding_bottom(8.0)
         .finish();
-        let add_btn = EventHandler::new(
-            Container::new(self.icon(icons::FOLDER_PLUS, 13.0, theme::text_muted()))
-                .with_padding_right(8.0)
-                .with_padding_top(6.0)
-                .with_padding_bottom(6.0)
-                .finish(),
-        )
-        .on_left_mouse_down(|ctx, _, _| {
-            ctx.dispatch_typed_action(CraneShellAction::AddProject);
-            DispatchEventResult::StopPropagation
-        })
-        .finish();
-        let header_row = Flex::row()
-            .with_child(Expanded::new(1.0, header_label).finish())
-            .with_child(add_btn)
-            .finish();
 
         // Real project tree loaded from ~/.crane/session.json: the user's
         // actual projects -> worktrees (branches) -> tabs.
-        let mut col = Flex::column().with_child(header_row);
+        let mut col = Flex::column();
         if self.projects.is_empty() {
             col = col.with_child(self.tree_row(
                 "No projects. Click + to add one.",
@@ -1235,8 +1220,58 @@ impl CraneShellView {
                 ));
             }
         }
+        // Prominent "Add Project" pill, pinned at the bottom: accent border +
+        // accent icon on a surface bg so it stands out from the dark sidebar.
+        let add_inner = Flex::row()
+            .with_child(self.icon(icons::FOLDER_PLUS, 13.0, theme::accent()))
+            .with_child(
+                Container::new(
+                    Text::new("Add Project", self.ui_font, 12.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_padding_left(8.0)
+                .finish(),
+            )
+            .with_child(
+                Expanded::new(
+                    1.0,
+                    Container::new(Text::new("", self.ui_font, 12.0).finish()).finish(),
+                )
+                .finish(),
+            )
+            .finish();
+        let add_pill = EventHandler::new(
+            Container::new(
+                Container::new(add_inner)
+                    .with_background_color(theme::surface())
+                    .with_border(Border::all(1.0).with_border_color(theme::accent()))
+                    .with_padding_left(10.0)
+                    .with_padding_right(10.0)
+                    .with_padding_top(8.0)
+                    .with_padding_bottom(8.0)
+                    .finish(),
+            )
+            .with_padding_left(8.0)
+            .with_padding_right(8.0)
+            .with_padding_top(6.0)
+            .with_padding_bottom(8.0)
+            .finish(),
+        )
+        .on_left_mouse_down(|ctx, _, _| {
+            ctx.dispatch_typed_action(CraneShellAction::AddProject);
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+
+        // Header, then the project list (fills), then the pinned Add Project pill.
+        let outer = Flex::column()
+            .with_child(header_row)
+            .with_child(Expanded::new(1.0, col.finish()).finish())
+            .with_child(add_pill)
+            .finish();
         // No fixed width — the enclosing SplitBox sizes it (draggable).
-        self.panel(theme::sidebar_bg(), col.finish())
+        self.panel(theme::sidebar_bg(), outer)
     }
 
     fn tab_label(&self, text: &str, active: bool, action: CraneShellAction) -> Box<dyn Element> {
@@ -2373,6 +2408,11 @@ impl View for CraneShellView {
                         "z" => Some(CraneShellAction::UndoFocused),
                         "c" => Some(CraneShellAction::CopyFocused),
                         "x" => Some(CraneShellAction::CutFocused),
+                        // Editor find / replace / goto-line (open the bar; keys then
+                        // route through the editor's own input_key).
+                        "f" => Some(CraneShellAction::FindFocused),
+                        "h" => Some(CraneShellAction::ReplaceFocused),
+                        "g" => Some(CraneShellAction::GotoLineFocused),
                         // Cmd+[ / Cmd+] cycle focus across panes in the active tab.
                         "[" => Some(CraneShellAction::FocusPrevPane),
                         "]" => Some(CraneShellAction::FocusNextPane),
@@ -2452,6 +2492,10 @@ pub enum CraneShellAction {
     ClearFocused,
     /// Cmd+S save the focused File pane.
     SaveFocusedFile,
+    /// Open the editor's Find bar / Replace bar / Goto-line input.
+    FindFocused,
+    ReplaceFocused,
+    GotoLineFocused,
     /// Cmd+Z undo / Cmd+Shift+Z redo in the focused File pane.
     UndoFocused,
     RedoFocused,
@@ -2588,6 +2632,21 @@ impl TypedActionView for CraneShellView {
                     h.update(ctx, |view, vctx| {
                         view.save(vctx);
                     });
+                }
+            }
+            CraneShellAction::FindFocused => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |view, vctx| view.open_find(vctx));
+                }
+            }
+            CraneShellAction::ReplaceFocused => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |view, vctx| view.open_replace(vctx));
+                }
+            }
+            CraneShellAction::GotoLineFocused => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |view, vctx| view.open_goto_line(vctx));
                 }
             }
             CraneShellAction::UndoFocused => {
