@@ -29,6 +29,42 @@ pub struct ProjectNode {
     /// Computed once at load time. A loose project shows a FOLDER icon, hides
     /// branch/worktree rows, and offers "Initialize Git" in its context menu.
     pub is_loose: bool,
+    /// Shared-parent folder group. `Some(parent_dir)` when 2+ loaded projects
+    /// live directly under the same parent directory — those projects nest
+    /// under a collapsible FOLDER header named by the parent's basename.
+    /// `None` for projects with no shared-parent sibling (rendered top-level).
+    /// Derived at load time by `assign_groups`.
+    pub group_path: Option<String>,
+}
+
+/// Group projects that share an immediate parent directory. When 2+ projects
+/// in the list live directly under the same parent, each of those projects gets
+/// `group_path = Some(parent)` so the sidebar renders them under a collapsible
+/// FOLDER header. Projects with no shared-parent sibling stay ungrouped.
+///
+/// Simplification vs. old egui: the original derived groups from a live repo
+/// discovery walk (`git::discover_repos`); here we group purely by the loaded
+/// projects' immediate parent directory path, which is deterministic and needs
+/// no filesystem scan.
+fn assign_groups(projects: &mut [ProjectNode]) {
+    let parent_of = |path: &str| -> Option<String> {
+        std::path::Path::new(path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+    };
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for p in projects.iter() {
+        if let Some(parent) = parent_of(&p.path) {
+            *counts.entry(parent).or_insert(0) += 1;
+        }
+    }
+    for p in projects.iter_mut() {
+        if let Some(parent) = parent_of(&p.path) {
+            if counts.get(&parent).copied().unwrap_or(0) >= 2 {
+                p.group_path = Some(parent);
+            }
+        }
+    }
 }
 
 /// Load the project tree from the live Crane session, or empty if missing.
@@ -106,6 +142,7 @@ pub fn load_projects() -> Vec<ProjectNode> {
                 worktrees,
                 tint: None,
                 is_loose,
+                group_path: None,
             });
         }
     }
@@ -135,8 +172,12 @@ pub fn load_projects_extended(
                 worktrees: Vec::new(),
                 tint: tints.get(&ap.path).copied(),
                 is_loose,
+                group_path: None,
             });
         }
     }
+    // Derive folder groups on the FINAL list (session + added projects) so a
+    // newly added project can join an existing parent-folder group.
+    assign_groups(&mut projects);
     projects
 }

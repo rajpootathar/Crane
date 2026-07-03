@@ -140,6 +140,9 @@ pub struct CraneShellView {
     project_tints: HashMap<String, [u8; 3]>,
     /// Active project context menu, or None when no menu is open.
     context_menu: Option<ProjectContextMenu>,
+    /// Collapsed folder groups, keyed by `ProjectNode::group_path`. Absent →
+    /// expanded (members visible). Toggled via `CraneShellAction::ToggleGroup`.
+    collapsed_groups: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -450,6 +453,7 @@ impl CraneShellView {
             removed_project_paths: init_removed,
             project_tints: init_tints,
             context_menu: None,
+            collapsed_groups: HashSet::new(),
         }
     }
 
@@ -745,7 +749,10 @@ impl CraneShellView {
                 .with_padding_bottom(4.0)
                 .finish(),
         )
-        .with_min_width(180.0)
+        // FIX: fixed 220px width so the menu is a compact popover anchored at
+        // the click point, not a full-panel-width strip. The menu rows use
+        // padded Containers (no Expanded/full-width fills) so nothing stretches.
+        .with_width(220.0)
         .finish();
 
         let positioned = Container::new(menu_box)
@@ -925,6 +932,7 @@ impl CraneShellView {
         selected: bool,
         diff_stat: (u32, u32),
         dirty: bool,
+        indent: f32,
         action: CraneShellAction,
     ) -> Box<dyn Element> {
         let size = 12.0_f32;
@@ -1008,7 +1016,7 @@ impl CraneShellView {
         }
 
         let label = Container::new(row_inner.finish())
-            .with_padding_left(24.0)
+            .with_padding_left(indent)
             .with_padding_top(4.0)
             .finish();
         let hit_layer = ConstrainedBox::new(Rect::new().finish())
@@ -1164,7 +1172,53 @@ impl CraneShellView {
             ));
         }
         let sel = self.selected;
+        // Tracks the group_path of the previous project so a FOLDER header is
+        // emitted exactly once per contiguous run of same-group projects.
+        let mut last_group: Option<String> = None;
         for (pi, p) in self.projects.iter().enumerate() {
+            // Folder groups: when 2+ projects share a parent directory, emit a
+            // collapsible FOLDER header once, then nest the member projects one
+            // indent deeper. Ungrouped projects render flush-left exactly as
+            // before (group_offset == 0).
+            let in_group = p.group_path.is_some();
+            let group_collapsed = p
+                .group_path
+                .as_ref()
+                .map(|g| self.collapsed_groups.contains(g))
+                .unwrap_or(false);
+            if in_group && p.group_path != last_group {
+                let gp = p.group_path.clone().unwrap();
+                let group_label = std::path::Path::new(&gp)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("group")
+                    .to_string();
+                let folder_glyph = if group_collapsed {
+                    icons::FOLDER
+                } else {
+                    icons::FOLDER_OPEN
+                };
+                col = col.with_child(self.nav_row(
+                    Some(!group_collapsed),
+                    folder_glyph,
+                    theme::text(),
+                    &group_label,
+                    13.0,
+                    theme::text(),
+                    10.0,
+                    false,
+                    CraneShellAction::ToggleGroup(gp),
+                ));
+            }
+            last_group = p.group_path.clone();
+            // Hide member projects (and their subtree) while the group is
+            // collapsed — the header remains and can be re-expanded.
+            if in_group && group_collapsed {
+                continue;
+            }
+            // Group members indent one level in under the FOLDER header.
+            let group_offset = if in_group { 14.0 } else { 0.0 };
+
             let p_expanded = self.expanded_projects.contains(&pi);
             let psel = sel == (pi, usize::MAX, usize::MAX);
             let tint = self.project_color_for(pi);
@@ -1188,7 +1242,7 @@ impl CraneShellView {
                 &p.name,
                 13.0,
                 pcol,
-                10.0,
+                10.0 + group_offset,
                 psel,
                 CraneShellAction::ToggleProject(pi),
             );
@@ -1209,6 +1263,47 @@ impl CraneShellView {
                 continue;
             }
             for (wi, w) in p.worktrees.iter().enumerate() {
+                // FIX: loose (non-git) projects have NO branch/worktree row.
+                // Render the worktree's tabs DIRECTLY under the project folder
+                // at one indent, plus the "+ New tab" affordance — never the
+                // bogus "(no git)" branch row. (Old egui flattens loose
+                // projects; see ui/projects.rs is_loose handling.)
+                if p.is_loose {
+                    if let Some(tabs) = self.worktree_tabs.get(&(pi, wi)) {
+                        for t in tabs {
+                            let tkey = (pi, wi, t.id);
+                            let tsel = sel == tkey;
+                            let tcol = if tsel {
+                                theme::text_hover()
+                            } else {
+                                theme::text_muted()
+                            };
+                            col = col.with_child(self.tab_closeable_row(
+                                tcol,
+                                &t.name,
+                                tsel,
+                                24.0 + group_offset,
+                                CraneShellAction::Select {
+                                    sel: tkey,
+                                    path: PathBuf::from(&w.path),
+                                },
+                                CraneShellAction::CloseTab(tkey),
+                            ));
+                        }
+                    }
+                    col = col.with_child(self.nav_row(
+                        None,
+                        icons::PLUS,
+                        theme::text_muted(),
+                        "New tab",
+                        11.0,
+                        theme::text_muted(),
+                        24.0 + group_offset,
+                        false,
+                        CraneShellAction::NewTabIn(pi, wi),
+                    ));
+                    continue;
+                }
                 let w_expanded = self.expanded_worktrees.contains(&(pi, wi));
                 // Feature 2: the worktree row lights up as "active" when any of its tabs
                 // is the current active tab, not only when the worktree row itself is
@@ -1235,6 +1330,7 @@ impl CraneShellView {
                     wsel,
                     w.diff_stat,
                     w.dirty,
+                    24.0 + group_offset,
                     CraneShellAction::ToggleWorktree(pi, wi),
                 ));
                 if !w_expanded {
@@ -1253,7 +1349,7 @@ impl CraneShellView {
                             tcol,
                             &t.name,
                             tsel,
-                            42.0,
+                            42.0 + group_offset,
                             CraneShellAction::Select {
                                 sel: tkey,
                                 path: PathBuf::from(&w.path),
@@ -1270,7 +1366,7 @@ impl CraneShellView {
                     "New tab",
                     11.0,
                     theme::text_muted(),
-                    42.0,
+                    42.0 + group_offset,
                     false,
                     CraneShellAction::NewTabIn(pi, wi),
                 ));
@@ -2639,6 +2735,9 @@ pub enum CraneShellAction {
     SelectFile(PathBuf),
     ToggleProject(usize),
     ToggleWorktree(usize, usize),
+    /// Toggle collapse/expand of a folder group, keyed by its shared parent
+    /// directory path (`ProjectNode::group_path`).
+    ToggleGroup(String),
     /// Split the focused pane (Horizontal = side by side, Vertical = stacked).
     SplitFocused(Dir),
     /// Close the focused pane.
@@ -3073,6 +3172,11 @@ impl TypedActionView for CraneShellView {
                 let k = (*p, *w);
                 if !self.expanded_worktrees.remove(&k) {
                     self.expanded_worktrees.insert(k);
+                }
+            }
+            CraneShellAction::ToggleGroup(g) => {
+                if !self.collapsed_groups.remove(g) {
+                    self.collapsed_groups.insert(g.clone());
                 }
             }
             CraneShellAction::SetTheme(name) => {
