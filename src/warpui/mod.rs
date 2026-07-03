@@ -18,6 +18,7 @@ pub mod editor_view;
 pub mod file_pane;
 pub mod find_bar_element;
 pub mod file_tree;
+pub mod fontsize;
 pub mod git;
 pub mod markdown_view;
 pub mod grid_element;

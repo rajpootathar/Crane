@@ -98,7 +98,7 @@ fn solid(c: ColorU) -> Fill {
 fn styles(font: FamilyId) -> RichTextStyles {
     let para = |tab: Option<u8>| ParagraphStyles {
         font_family: font,
-        font_size: 13.0,
+        font_size: crate::warpui::fontsize::editor(),
         font_weight: Weight::Normal,
         line_height_ratio: 1.3,
         text_color: theme::text(),
@@ -150,7 +150,7 @@ fn styles(font: FamilyId) -> RichTextStyles {
             scrollbar_nonactive_thumb_color: theme::border(),
             scrollbar_active_thumb_color: theme::accent(),
             font_family: font,
-            font_size: 13.0,
+            font_size: crate::warpui::fontsize::editor(),
             cell_padding: 8.0,
             outer_border: true,
             column_dividers: true,
@@ -1349,7 +1349,7 @@ impl View for WarpEditorView {
         let gutter = crate::warpui::gutter_element::GutterElement::new(
             render_state.clone(),
             self.gutter_font,
-            13.0,
+            crate::warpui::fontsize::editor(),
             PARAGRAPH_MIN_HEIGHT.as_f32(),
             cursor_line,
             theme::text_muted(),

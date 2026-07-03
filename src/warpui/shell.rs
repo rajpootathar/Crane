@@ -373,6 +373,9 @@ impl CraneShellView {
                     crate::theme::set(t);
                 }
             }
+            if st.font_size > 0.0 {
+                crate::warpui::fontsize::set(st.font_size);
+            }
             show_left = st.show_left;
             show_right = st.show_right;
             files_tab = st.files_tab;
@@ -708,6 +711,7 @@ impl CraneShellView {
             window_w,
             window_h,
             theme_name: crate::theme::current().name.clone(),
+            font_size: crate::warpui::fontsize::base(),
             added_projects: self.added_projects.clone(),
             removed_project_paths: self.removed_project_paths.clone(),
             project_tints: self.project_tints.iter().map(|(k, v)| (k.clone(), *v)).collect(),
@@ -3638,9 +3642,6 @@ impl View for CraneShellView {
             .on_keydown(|ctx, _app, ks| {
                 if ks.cmd && !ks.ctrl && !ks.alt {
                     // Shift uppercases the key ("D"), so normalize the case.
-                    // TODO(parity): Cmd+= / Cmd+- / Cmd+0 font zoom (+1 max 40 /
-                    // -1 min 8 / reset 14.0) — deferred until warpui carries a
-                    // shell-level font-size setting to drive.
                     let key = ks.key.to_ascii_lowercase();
                     let act = match key.as_str() {
                         "b" => Some(CraneShellAction::ToggleLeft),
@@ -3683,6 +3684,11 @@ impl View for CraneShellView {
                         // Cmd+Shift+N opens the Welcome / landing pane beside the
                         // focused pane (default new-tab stays a terminal).
                         "n" if ks.shift => Some(CraneShellAction::OpenWelcome),
+                        // Font zoom (Cmd+= / Cmd+- / Cmd+0) — +1 (max 40) / -1
+                        // (min 8) / reset 14, matching old shortcuts.rs.
+                        "=" | "+" => Some(CraneShellAction::FontZoomIn),
+                        "-" => Some(CraneShellAction::FontZoomOut),
+                        "0" => Some(CraneShellAction::FontZoomReset),
                         _ => None,
                     };
                     if let Some(act) = act {
@@ -3813,6 +3819,10 @@ pub enum CraneShellAction {
     OpenDiff(PathBuf),
     /// Open the Welcome / landing pane beside the focused pane.
     OpenWelcome,
+    /// App-wide font zoom (Cmd+= / Cmd+- / Cmd+0).
+    FontZoomIn,
+    FontZoomOut,
+    FontZoomReset,
     /// Add a new tab to the active workspace.
     NewTab,
     /// Add a new tab to a specific worktree (left-panel + button).
@@ -4227,6 +4237,33 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::OpenBrowser => self.open_browser(ctx),
             CraneShellAction::OpenDiff(p) => self.open_diff(p.clone(), ctx),
             CraneShellAction::OpenWelcome => self.open_welcome(ctx),
+            CraneShellAction::FontZoomIn
+            | CraneShellAction::FontZoomOut
+            | CraneShellAction::FontZoomReset => {
+                match action {
+                    CraneShellAction::FontZoomIn => {
+                        crate::warpui::fontsize::zoom(1.0);
+                    }
+                    CraneShellAction::FontZoomOut => {
+                        crate::warpui::fontsize::zoom(-1.0);
+                    }
+                    _ => crate::warpui::fontsize::reset(),
+                }
+                // Repaint every live terminal + editor so they pick up the new
+                // size (terminals read fontsize::base() each frame and re-fit to
+                // the new cell height; editors re-read on next render). Then persist.
+                let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+                for id in ids {
+                    if let Some(h) = self.terminal_at(id) {
+                        h.update(ctx, |_, vctx| vctx.notify());
+                    }
+                    if let Some(h) = self.editor_at(id) {
+                        h.update(ctx, |_, vctx| vctx.notify());
+                    }
+                }
+                self.save_state(&*ctx);
+                ctx.notify();
+            }
             CraneShellAction::NewTab => {
                 if let Some((pi, wi, _)) = self.active_tab {
                     self.add_tab(pi, wi, ctx);

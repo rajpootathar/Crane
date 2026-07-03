@@ -88,7 +88,6 @@ use crate::warpui::controller::{TerminalController, Wake};
 use crate::warpui::grid_element::{GridCell, GridElement, MouseSelPhase};
 use crate::warpui::input::keystroke_to_pty_bytes;
 
-const FONT_SIZE: f32 = 14.0;
 
 /// True when `col` looks like a TUI vertical divider: a box-drawing vertical
 /// bar occupies it on ≥60% of the visible rows. Ported verbatim from old
@@ -534,7 +533,7 @@ impl View for TerminalView {
             cells,
             cursor,
             self.font_family,
-            FONT_SIZE,
+            crate::warpui::fontsize::base(),
             color::default_bg(),
             color::cursor_color(),
             self.desired.clone(),
@@ -604,9 +603,9 @@ impl View for TerminalView {
         // bypasses). Positive delta.y() = scroll up. Warp keeps scroll_top as
         // fractional lines across events; we mirror that by keeping `scroll_pos`
         // (fractional display_offset) and truncating to integer rows on apply.
-        const CELL_H: f32 = FONT_SIZE * 1.2;
+        let cell_h = crate::warpui::fontsize::base() * 1.2;
         let scroll_cb: std::rc::Rc<dyn Fn(f32, bool)> = std::rc::Rc::new(move |dy: f32, precise: bool| {
-            let delta_lines = if precise { dy / CELL_H } else { dy };
+            let delta_lines = if precise { dy / cell_h } else { dy };
             let ctrl = scroll_ctrl.borrow();
             let (alt, mouse, max, cur) = {
                 let t = ctrl.term.lock();

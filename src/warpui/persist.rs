@@ -146,6 +146,9 @@ pub struct WarpuiState {
     /// Name of the active colour theme, persisted so it is restored on next launch.
     #[serde(default)]
     pub theme_name: String,
+    /// App-wide base font size (Cmd+= / Cmd+- / Cmd+0), 0.0 = unset / use default.
+    #[serde(default)]
+    pub font_size: f32,
 }
 
 fn state_file() -> Option<PathBuf> {
