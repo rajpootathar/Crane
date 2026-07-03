@@ -193,6 +193,15 @@ pub fn init(dir: &Path) -> Result<(), String> {
     run(dir, &["init"])
 }
 
+/// `git worktree remove --force <wt_path>` run from the main repo `main`.
+/// `--force` so a worktree with uncommitted changes / a locked state is still
+/// removed (matches old Crane's remove_worktree intent). Never removes the
+/// primary working tree — the caller guards that case.
+pub fn remove_worktree(main: &Path, wt_path: &Path) -> Result<(), String> {
+    let p = wt_path.to_string_lossy();
+    run(main, &["worktree", "remove", "--force", &p])
+}
+
 /// Working-tree changes in `root`, or empty on any error / non-repo.
 pub fn changes(root: &Path) -> Vec<Change> {
     let Ok(out) = Command::new("git")

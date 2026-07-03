@@ -137,6 +137,17 @@ pub struct WarpuiState {
     /// Per-project tint overrides keyed by project path.
     #[serde(default)]
     pub project_tints: Vec<(String, [u8; 3])>,
+    /// Per-worktree display-name overrides keyed by the worktree's checkout PATH
+    /// (paths are stable across reloads; indices shift).
+    #[serde(default)]
+    pub worktree_names: Vec<(String, String)>,
+    /// Per-worktree tint overrides keyed by the worktree's checkout PATH.
+    #[serde(default)]
+    pub worktree_tints: Vec<(String, [u8; 3])>,
+    /// Per-tab tint overrides keyed by (worktree_path, tab_id) — stable across
+    /// reloads even though (project_idx, worktree_idx) shift.
+    #[serde(default)]
+    pub tab_tints: Vec<((String, usize), [u8; 3])>,
     /// Last saved window width in logical pixels (0.0 = unset / use default).
     #[serde(default)]
     pub window_w: f32,

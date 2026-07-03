@@ -253,12 +253,44 @@ pub struct CraneShellView {
     worktree_menu: Option<(usize, usize, f32, f32)>,
     /// Active Tab row context menu ((pi, wi, tid), x, y), or None.
     tab_menu: Option<((usize, usize, usize), f32, f32)>,
+    /// In-flight inline rename (worktree or tab), or None. While `Some`, typed
+    /// keys route to its buffer (top priority in `SendKeys`).
+    renaming: Option<RenameState>,
+    /// Per-worktree display-name overrides, keyed by the worktree checkout PATH
+    /// (stable across reloads; indices shift). Wins over the branch name.
+    worktree_names: HashMap<String, String>,
+    /// Per-worktree tint overrides keyed by the worktree checkout PATH; applied
+    /// to the GIT_BRANCH icon + name in the nav row.
+    worktree_tints: HashMap<String, [u8; 3]>,
+    /// Per-tab tint overrides keyed by (worktree_path, tab_id); applied to the
+    /// Tab row icon + label.
+    tab_tints: HashMap<(String, usize), [u8; 3]>,
+    /// Last worktree-row click ((pi, wi), instant) — drives double-click → rename.
+    last_wt_click: Option<((usize, usize), std::time::Instant)>,
+    /// Last tab-row click ((pi, wi, tid), instant) — drives double-click → rename.
+    last_tab_click: Option<((usize, usize, usize), std::time::Instant)>,
 }
 
 #[derive(Clone)]
 pub struct TabMeta {
     pub id: usize,
     pub name: String,
+}
+
+/// In-flight inline rename of a worktree/branch row or a Tab row. `buffer` is
+/// the live edit text; typed keys route here (see `edit_rename`) while it is
+/// `Some`, exactly like the commit box captures keys via `commit_focused`.
+pub struct RenameState {
+    pub target: RenameTarget,
+    pub buffer: String,
+}
+
+/// What the active inline rename targets.
+pub enum RenameTarget {
+    /// A worktree/branch row — commits to a per-path display-name override.
+    Worktree { pi: usize, wi: usize },
+    /// A Tab row — commits to `TabMeta.name`.
+    Tab { key: (usize, usize, usize) },
 }
 
 /// What a leaf pane holds (warpui port of old Crane's `PaneContent`). More
@@ -318,6 +350,18 @@ impl CraneShellView {
         let init_tints: HashMap<String, [u8; 3]> = saved_state
             .as_ref()
             .map(|s| s.project_tints.iter().cloned().collect())
+            .unwrap_or_default();
+        let init_wt_names: HashMap<String, String> = saved_state
+            .as_ref()
+            .map(|s| s.worktree_names.iter().cloned().collect())
+            .unwrap_or_default();
+        let init_wt_tints: HashMap<String, [u8; 3]> = saved_state
+            .as_ref()
+            .map(|s| s.worktree_tints.iter().cloned().collect())
+            .unwrap_or_default();
+        let init_tab_tints: HashMap<(String, usize), [u8; 3]> = saved_state
+            .as_ref()
+            .map(|s| s.tab_tints.iter().cloned().collect())
             .unwrap_or_default();
         let projects = crate::warpui::projects::load_projects_extended(
             &init_added, &init_removed, &init_tints,
@@ -599,6 +643,12 @@ impl CraneShellView {
             branch_scroll: ClippedScrollStateHandle::new(),
             worktree_menu: None,
             tab_menu: None,
+            renaming: None,
+            worktree_names: init_wt_names,
+            worktree_tints: init_wt_tints,
+            tab_tints: init_tab_tints,
+            last_wt_click: None,
+            last_tab_click: None,
         }
     }
 
@@ -729,6 +779,21 @@ impl CraneShellView {
             added_projects: self.added_projects.clone(),
             removed_project_paths: self.removed_project_paths.clone(),
             project_tints: self.project_tints.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            worktree_names: self
+                .worktree_names
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            worktree_tints: self
+                .worktree_tints
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            tab_tints: self
+                .tab_tints
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
         });
     }
 
@@ -802,6 +867,54 @@ impl CraneShellView {
         .with_padding_top(4.0)
         .with_padding_bottom(4.0)
         .finish()
+    }
+
+    /// A single-row palette of 8 coloured CUBE swatches for a context menu.
+    /// `on_pick` maps a chosen RGB to the action dispatched (after closing the
+    /// menu). Mirrors the project menu's inline swatch row, reused for the
+    /// worktree + tab Highlight rows.
+    fn tint_palette_row<F>(&self, on_pick: F) -> Box<dyn Element>
+    where
+        F: Fn([u8; 3]) -> CraneShellAction,
+    {
+        const PALETTE: [[u8; 3]; 8] = [
+            [239, 83, 80],
+            [255, 152, 0],
+            [255, 202, 40],
+            [102, 187, 106],
+            [38, 166, 154],
+            [66, 165, 245],
+            [171, 71, 188],
+            [236, 64, 122],
+        ];
+        let icon_font = self.icon_font;
+        let mut swatches = Flex::row();
+        for rgb in PALETTE {
+            let color = ColorU::new(rgb[0], rgb[1], rgb[2], 255);
+            let action = on_pick(rgb);
+            let swatch = EventHandler::new(
+                Container::new(
+                    Text::new(icons::CUBE.to_string(), icon_font, 14.0)
+                        .with_color(color)
+                        .finish(),
+                )
+                .with_uniform_padding(4.0)
+                .finish(),
+            )
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            swatches = swatches.with_child(swatch);
+        }
+        Container::new(swatches.finish())
+            .with_padding_left(6.0)
+            .with_padding_right(6.0)
+            .with_padding_top(4.0)
+            .with_padding_bottom(2.0)
+            .finish()
     }
 
     /// Build the project context menu overlay anchored at the stored click position.
@@ -1148,12 +1261,37 @@ impl CraneShellView {
         items = items.with_child(self.menu_item(
             icons::COPY,
             "Copy Path",
-            CraneShellAction::CopyPathStr(wt_path),
+            CraneShellAction::CopyPathStr(wt_path.clone()),
         ));
-        // NOTE(completion): Rename branch, per-worktree Highlight palette, and
-        // Remove Worktree are deferred — they need infra not in this port (an
-        // inline-rename modal, a per-worktree tint store, and worktree-level
-        // index teardown/remap). Reveal + Copy Path reuse working plumbing.
+        items = items.with_child(self.menu_separator());
+        // Inline rename → per-path display-name override on commit.
+        items = items.with_child(self.menu_item(
+            icons::PENCIL_SIMPLE,
+            "Rename",
+            CraneShellAction::StartRenameWorktree { pi, wi },
+        ));
+        // Highlight: an 8-swatch tint palette + a Default-color reset. Keyed by
+        // the worktree path so it survives index shifts on reload.
+        items = items.with_child(
+            self.tint_palette_row(move |rgb| CraneShellAction::SetWorktreeTint {
+                pi,
+                wi,
+                tint: Some(rgb),
+            }),
+        );
+        items = items.with_child(self.menu_item(
+            icons::ARROW_COUNTER_CLOCKWISE,
+            "Default color",
+            CraneShellAction::SetWorktreeTint { pi, wi, tint: None },
+        ));
+        items = items.with_child(self.menu_separator());
+        // Remove Worktree runs `git worktree remove --force` (unless this IS the
+        // main working tree, where the handler no-ops) then tears down its panes.
+        items = items.with_child(self.menu_item(
+            icons::TRASH,
+            "Remove Worktree",
+            CraneShellAction::RemoveWorktree { pi, wi },
+        ));
         self.menu_popover(items.finish(), x, y)
     }
 
@@ -1176,8 +1314,25 @@ impl CraneShellView {
             "Close Other Tabs",
             CraneShellAction::CloseOtherTabs(key),
         ));
-        // NOTE(completion): Rename + Highlight palette deferred (need an
-        // inline-rename modal + a per-tab tint store, unported in warpui).
+        items = items.with_child(self.menu_separator());
+        // Inline rename → updates TabMeta.name (persisted via worktree_tabs).
+        items = items.with_child(self.menu_item(
+            icons::PENCIL_SIMPLE,
+            "Rename",
+            CraneShellAction::StartRenameTab { key },
+        ));
+        // Highlight: tint palette keyed by (worktree_path, tab_id) + reset.
+        items = items.with_child(
+            self.tint_palette_row(move |rgb| CraneShellAction::SetTabTint {
+                key,
+                tint: Some(rgb),
+            }),
+        );
+        items = items.with_child(self.menu_item(
+            icons::ARROW_COUNTER_CLOCKWISE,
+            "Default color",
+            CraneShellAction::SetTabTint { key, tint: None },
+        ));
         self.menu_popover(items.finish(), x, y)
     }
 
@@ -1490,6 +1645,7 @@ impl CraneShellView {
         diff_stat: (u32, u32),
         dirty: bool,
         indent: f32,
+        rename_buf: Option<String>,
         action: CraneShellAction,
     ) -> Box<dyn Element> {
         let size = 12.0_f32;
@@ -1519,15 +1675,34 @@ impl CraneShellView {
             .with_child(
                 Expanded::new(
                     1.0,
-                    Text::new(name.to_string(), self.ui_font, size)
-                        .with_color(label_color)
-                        .finish(),
+                    // Inline rename: show an editable field (buffer + caret) on a
+                    // highlighted bg in place of the branch name, mirroring the
+                    // commit box's text rendering.
+                    if let Some(buf) = &rename_buf {
+                        Container::new(
+                            Text::new(format!("{buf}|"), self.ui_font, size)
+                                .with_color(theme::text())
+                                .finish(),
+                        )
+                        .with_background_color(theme::row_active())
+                        .with_padding_left(4.0)
+                        .with_padding_right(4.0)
+                        .with_padding_top(1.0)
+                        .with_padding_bottom(1.0)
+                        .finish()
+                    } else {
+                        Text::new(name.to_string(), self.ui_font, size)
+                            .with_color(label_color)
+                            .finish()
+                    },
                 )
                 .finish(),
             );
 
-        // +N / -M badges appended at right when there are line changes.
-        let (added, deleted) = diff_stat;
+        // +N / -M badges appended at right when there are line changes. Hidden
+        // while renaming so the input has room.
+        let (added, deleted) = if rename_buf.is_some() { (0, 0) } else { diff_stat };
+        let dirty = dirty && rename_buf.is_none();
         // Dirty-dot fallback: the tree is dirty but `diff --numstat HEAD` shows
         // no line changes (e.g. only untracked files). Old egui paints a small
         // 3px filled add-colour dot so the branch still signals uncommitted
@@ -1600,6 +1775,7 @@ impl CraneShellView {
         name: &str,
         selected: bool,
         indent: f32,
+        rename_buf: Option<String>,
         select_action: CraneShellAction,
         close_action: CraneShellAction,
     ) -> Box<dyn Element> {
@@ -1611,18 +1787,32 @@ impl CraneShellView {
         }
         let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
 
-        // Label: icon + text (no caret for tab leaves).
+        // Label: icon + text (no caret for tab leaves). While renaming, the text
+        // becomes an editable field (buffer + caret) on a highlighted bg.
+        let label_text: Box<dyn Element> = if let Some(buf) = &rename_buf {
+            Container::new(
+                Text::new(format!("{buf}|"), self.ui_font, size)
+                    .with_color(theme::text())
+                    .finish(),
+            )
+            .with_background_color(theme::row_active())
+            .with_padding_left(4.0)
+            .with_padding_right(4.0)
+            .with_padding_top(1.0)
+            .with_padding_bottom(1.0)
+            .finish()
+        } else {
+            Text::new(name.to_string(), self.ui_font, size)
+                .with_color(icon_color)
+                .finish()
+        };
         let label_content = Flex::row()
             .with_child(
                 Container::new(self.icon(icons::TERMINAL_WINDOW, size, icon_color))
                     .with_padding_right(6.0)
                     .finish(),
             )
-            .with_child(
-                Text::new(name.to_string(), self.ui_font, size)
-                    .with_color(icon_color)
-                    .finish(),
-            )
+            .with_child(label_text)
             .finish();
         let label = Container::new(label_content)
             .with_padding_left(indent)
@@ -1838,20 +2028,30 @@ impl CraneShellView {
                         for t in tabs {
                             let tkey = (pi, wi, t.id);
                             let tsel = sel == tkey;
-                            let tcol = if tsel {
+                            let tab_tint = self.tab_tints.get(&(w.path.clone(), t.id)).copied();
+                            let tcol = if let Some([r, g, b]) = tab_tint {
+                                ColorU::new(r, g, b, 255)
+                            } else if tsel {
                                 theme::text_hover()
                             } else {
                                 theme::text_muted()
+                            };
+                            let rbuf = self.tab_rename_buf(tkey);
+                            let select = if rbuf.is_some() {
+                                CraneShellAction::Noop
+                            } else {
+                                CraneShellAction::TabRowClick {
+                                    key: tkey,
+                                    path: PathBuf::from(&w.path),
+                                }
                             };
                             let tab_base = self.tab_closeable_row(
                                 tcol,
                                 &t.name,
                                 tsel,
                                 24.0 + group_offset,
-                                CraneShellAction::Select {
-                                    sel: tkey,
-                                    path: PathBuf::from(&w.path),
-                                },
+                                rbuf,
+                                select,
                                 CraneShellAction::CloseTab(tkey),
                             );
                             col = col.with_child(self.tab_right_click(tab_base, tkey));
@@ -1879,25 +2079,43 @@ impl CraneShellView {
                     .map(|(api, awi, _)| api == pi && awi == wi)
                     .unwrap_or(false);
                 let wsel = sel == (pi, wi, usize::MAX) || w_active;
-                // Tint priority: explicit user tint wins over active-branch accent so
-                // a user-tinted active worktree shows its tint, not the accent, on the icon.
-                let wcol = if wsel {
+                // Tint priority: explicit per-worktree tint wins over the
+                // active-branch accent so a user-tinted active worktree shows its
+                // tint (icon + name), not the accent.
+                let wt_tint = self.worktree_tints.get(&w.path).copied();
+                let wcol = if let Some([r, g, b]) = wt_tint {
+                    ColorU::new(r, g, b, 255)
+                } else if wsel {
                     theme::accent()
                 } else {
                     theme::text_muted()
+                };
+                // Display-name override (per-path) wins over the branch name.
+                let display = self
+                    .worktree_names
+                    .get(&w.path)
+                    .cloned()
+                    .unwrap_or_else(|| w.name.clone());
+                let rbuf = self.worktree_rename_buf(pi, wi);
+                // While renaming, the row click must not toggle expand.
+                let wt_action = if rbuf.is_some() {
+                    CraneShellAction::Noop
+                } else {
+                    CraneShellAction::WorktreeRowClick { pi, wi }
                 };
                 // Feature 1: pass the worktree's cached diff-stat to the row builder so
                 // it renders the +N -M badge at the right side of the branch row.
                 let wt_base = self.worktree_nav_row(
                     w_expanded,
-                    &w.name,
+                    &display,
                     wcol,
                     wcol,
                     wsel,
                     w.diff_stat,
                     w.dirty,
                     24.0 + group_offset,
-                    CraneShellAction::ToggleWorktree(pi, wi),
+                    rbuf,
+                    wt_action,
                 );
                 // Right-click opens the worktree/branch context menu (mirrors the
                 // project row) without disturbing the left-click toggle.
@@ -1921,7 +2139,25 @@ impl CraneShellView {
                     for t in tabs {
                         let tkey = (pi, wi, t.id);
                         let tsel = sel == tkey;
-                        let tcol = if tsel { theme::text_hover() } else { theme::text_muted() };
+                        let tab_tint = self.tab_tints.get(&(w.path.clone(), t.id)).copied();
+                        let tcol = if let Some([r, g, b]) = tab_tint {
+                            ColorU::new(r, g, b, 255)
+                        } else if tsel {
+                            theme::text_hover()
+                        } else {
+                            theme::text_muted()
+                        };
+                        let rbuf = self.tab_rename_buf(tkey);
+                        // Double-click → rename; single click → select. Noop while
+                        // this row is the one being renamed.
+                        let select = if rbuf.is_some() {
+                            CraneShellAction::Noop
+                        } else {
+                            CraneShellAction::TabRowClick {
+                                key: tkey,
+                                path: PathBuf::from(&w.path),
+                            }
+                        };
                         // Feature 4: each tab row has a trailing close button.
                         // The close button's EventHandler returns StopPropagation so
                         // clicking it does not also trigger the row's select action.
@@ -1930,10 +2166,8 @@ impl CraneShellView {
                             &t.name,
                             tsel,
                             42.0 + group_offset,
-                            CraneShellAction::Select {
-                                sel: tkey,
-                                path: PathBuf::from(&w.path),
-                            },
+                            rbuf,
+                            select,
                             CraneShellAction::CloseTab(tkey),
                         );
                         col = col.with_child(self.tab_right_click(tab_base, tkey));
@@ -3414,6 +3648,73 @@ impl CraneShellView {
         self.split_with(PaneContent::Welcome(handle));
     }
 
+    /// The live rename buffer for worktree (pi, wi), or None when that row is
+    /// not the active rename target.
+    fn worktree_rename_buf(&self, pi: usize, wi: usize) -> Option<String> {
+        self.renaming.as_ref().and_then(|r| match &r.target {
+            RenameTarget::Worktree { pi: rp, wi: rw } if *rp == pi && *rw == wi => {
+                Some(r.buffer.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// The live rename buffer for tab `key`, or None when that row is not the
+    /// active rename target.
+    fn tab_rename_buf(&self, key: (usize, usize, usize)) -> Option<String> {
+        self.renaming.as_ref().and_then(|r| match &r.target {
+            RenameTarget::Tab { key: k } if *k == key => Some(r.buffer.clone()),
+            _ => None,
+        })
+    }
+
+    /// Apply a keystroke to the active inline rename buffer. Enter commits,
+    /// Escape cancels, Backspace deletes, printable chars append — mirrors
+    /// `edit_commit` / `edit_new_entry`.
+    fn edit_rename(&mut self, ks: &warpui::keymap::Keystroke) {
+        match ks.key.as_str() {
+            "enter" | "return" | "numpadenter" => self.commit_rename(),
+            "escape" => self.renaming = None,
+            "backspace" => {
+                if let Some(r) = self.renaming.as_mut() {
+                    r.buffer.pop();
+                }
+            }
+            k if k.chars().count() == 1 => {
+                if let Some(r) = self.renaming.as_mut() {
+                    r.buffer.push_str(k);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Commit the active inline rename: a worktree rename stores a per-path
+    /// display-name override; a tab rename updates `TabMeta.name`. Empty names
+    /// cancel. Persistence happens via the global save at the end of the action.
+    fn commit_rename(&mut self) {
+        let Some(r) = self.renaming.take() else { return };
+        let name = r.buffer.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        match r.target {
+            RenameTarget::Worktree { pi, wi } => {
+                if let Some(w) = self.projects.get(pi).and_then(|p| p.worktrees.get(wi)) {
+                    self.worktree_names.insert(w.path.clone(), name);
+                }
+            }
+            RenameTarget::Tab { key } => {
+                let (pi, wi, tid) = key;
+                if let Some(tabs) = self.worktree_tabs.get_mut(&(pi, wi)) {
+                    if let Some(t) = tabs.iter_mut().find(|t| t.id == tid) {
+                        t.name = name;
+                    }
+                }
+            }
+        }
+    }
+
     /// Edit the commit message buffer from a keystroke (commit box focused).
     fn edit_commit(&mut self, ks: &warpui::keymap::Keystroke) {
         match ks.key.as_str() {
@@ -3546,7 +3847,7 @@ impl CraneShellView {
         // bar is open (its keys route to the bar). A file/editor pane merely
         // being focused must NOT block Cmd+B / Cmd+/ — mirrors old egui's
         // real-keyboard-focus guard.
-        if self.commit_focused || self.pending_new_entry.is_some() {
+        if self.commit_focused || self.pending_new_entry.is_some() || self.renaming.is_some() {
             return true;
         }
         self.active_input_pane()
@@ -4108,6 +4409,32 @@ pub enum CraneShellAction {
     ShowTabMenu { key: (usize, usize, usize), x: f32, y: f32 },
     /// Close every tab in `key`'s worktree except `key` itself.
     CloseOtherTabs((usize, usize, usize)),
+    /// A left-click on a worktree/branch row: double-click starts an inline
+    /// rename, a single click toggles expand.
+    WorktreeRowClick { pi: usize, wi: usize },
+    /// A left-click on a Tab row: double-click starts an inline rename, a single
+    /// click selects the tab (routes to Select).
+    TabRowClick {
+        key: (usize, usize, usize),
+        path: PathBuf,
+    },
+    /// Start an inline rename of the worktree/branch row (from its menu).
+    StartRenameWorktree { pi: usize, wi: usize },
+    /// Start an inline rename of the Tab row (from its menu).
+    StartRenameTab { key: (usize, usize, usize) },
+    /// `git worktree remove --force` the worktree, then tear down its panes.
+    RemoveWorktree { pi: usize, wi: usize },
+    /// Set / clear a per-worktree tint (keyed by the worktree path).
+    SetWorktreeTint {
+        pi: usize,
+        wi: usize,
+        tint: Option<[u8; 3]>,
+    },
+    /// Set / clear a per-tab tint (keyed by (worktree_path, tab_id)).
+    SetTabTint {
+        key: (usize, usize, usize),
+        tint: Option<[u8; 3]>,
+    },
     /// Dismiss the active project context menu.
     CloseContextMenu,
     /// Reveal the project folder in the system file manager.
@@ -4199,7 +4526,9 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::SendKeys(ks) => {
-                if self.pending_new_entry.is_some() {
+                if self.renaming.is_some() {
+                    self.edit_rename(ks);
+                } else if self.pending_new_entry.is_some() {
                     self.edit_new_entry(ks);
                 } else if self.commit_focused {
                     self.edit_commit(ks);
@@ -4814,6 +5143,254 @@ impl TypedActionView for CraneShellView {
                     self.active_tab = Some(key);
                     self.selected = key;
                     self.focused = self.layouts.get(&key).map(|n| n.first_leaf());
+                }
+            }
+            CraneShellAction::WorktreeRowClick { pi, wi } => {
+                // Double-click (same row within 400ms) starts an inline rename;
+                // a single click toggles expand (mirrors old egui behaviour).
+                let now = std::time::Instant::now();
+                let dbl = self
+                    .last_wt_click
+                    .map(|((lp, lw), t)| {
+                        lp == *pi
+                            && lw == *wi
+                            && now.duration_since(t) < std::time::Duration::from_millis(400)
+                    })
+                    .unwrap_or(false);
+                if dbl {
+                    self.last_wt_click = None;
+                    let a = CraneShellAction::StartRenameWorktree { pi: *pi, wi: *wi };
+                    self.handle_action(&a, ctx);
+                } else {
+                    self.last_wt_click = Some(((*pi, *wi), now));
+                    let k = (*pi, *wi);
+                    if !self.expanded_worktrees.remove(&k) {
+                        self.expanded_worktrees.insert(k);
+                    }
+                }
+            }
+            CraneShellAction::TabRowClick { key, path } => {
+                let now = std::time::Instant::now();
+                let dbl = self
+                    .last_tab_click
+                    .map(|(k, t)| {
+                        k == *key
+                            && now.duration_since(t) < std::time::Duration::from_millis(400)
+                    })
+                    .unwrap_or(false);
+                if dbl {
+                    self.last_tab_click = None;
+                    let a = CraneShellAction::StartRenameTab { key: *key };
+                    self.handle_action(&a, ctx);
+                } else {
+                    self.last_tab_click = Some((*key, now));
+                    let a = CraneShellAction::Select {
+                        sel: *key,
+                        path: path.clone(),
+                    };
+                    self.handle_action(&a, ctx);
+                }
+            }
+            CraneShellAction::StartRenameWorktree { pi, wi } => {
+                self.worktree_menu = None;
+                if let Some(w) = self.projects.get(*pi).and_then(|p| p.worktrees.get(*wi)) {
+                    let cur = self
+                        .worktree_names
+                        .get(&w.path)
+                        .cloned()
+                        .unwrap_or_else(|| w.name.clone());
+                    self.renaming = Some(RenameState {
+                        target: RenameTarget::Worktree { pi: *pi, wi: *wi },
+                        buffer: cur,
+                    });
+                }
+            }
+            CraneShellAction::StartRenameTab { key } => {
+                self.tab_menu = None;
+                let cur = self
+                    .worktree_tabs
+                    .get(&(key.0, key.1))
+                    .and_then(|tabs| tabs.iter().find(|t| t.id == key.2))
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                self.renaming = Some(RenameState {
+                    target: RenameTarget::Tab { key: *key },
+                    buffer: cur,
+                });
+            }
+            CraneShellAction::RemoveWorktree { pi, wi } => {
+                self.worktree_menu = None;
+                let pi = *pi;
+                let wi = *wi;
+                let Some(main_path) = self.projects.get(pi).map(|p| p.path.clone()) else {
+                    return;
+                };
+                let Some(wt_path) = self
+                    .projects
+                    .get(pi)
+                    .and_then(|p| p.worktrees.get(wi))
+                    .map(|w| w.path.clone())
+                else {
+                    return;
+                };
+                // Guard: the primary working tree can't be `git worktree remove`d.
+                // NOTE(completion): removing the main working tree is a no-op —
+                // there is no worktree to detach; the project itself would have to
+                // be removed instead (RemoveProject).
+                if wt_path.is_empty() || wt_path == main_path {
+                    return;
+                }
+                // Detach the worktree from git (local op; `--force` so dirty trees
+                // still remove). Ignore failure — we still drop it from the UI.
+                let _ = crate::warpui::git::remove_worktree(
+                    std::path::Path::new(&main_path),
+                    std::path::Path::new(&wt_path),
+                );
+                // Remove it in-memory and remap every (pi, wi, *)-keyed structure
+                // by PATH (robust to the index shift), mirroring RemoveProject.
+                let old_wt_paths: Vec<String> = self
+                    .projects
+                    .get(pi)
+                    .map(|p| p.worktrees.iter().map(|w| w.path.clone()).collect())
+                    .unwrap_or_default();
+                if let Some(p) = self.projects.get_mut(pi) {
+                    if wi < p.worktrees.len() {
+                        p.worktrees.remove(wi);
+                    }
+                }
+                let new_wt_index: HashMap<String, usize> = self
+                    .projects
+                    .get(pi)
+                    .map(|p| {
+                        p.worktrees
+                            .iter()
+                            .enumerate()
+                            .map(|(i, w)| (w.path.clone(), i))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // old worktree index (within pi) -> new index, None = removed.
+                let remap_w = |w: usize| -> Option<usize> {
+                    old_wt_paths.get(w).and_then(|pt| new_wt_index.get(pt).copied())
+                };
+                // 1) Tear down layouts (+ PTYs) for the vanished worktree in pi.
+                let dead: Vec<(usize, usize, usize)> = self
+                    .layouts
+                    .keys()
+                    .copied()
+                    .filter(|(p, w, _)| *p == pi && remap_w(*w).is_none())
+                    .collect();
+                for key in dead {
+                    self.tear_down_layout(key);
+                }
+                // 2) Rekey the surviving layouts within pi.
+                let old_layouts = std::mem::take(&mut self.layouts);
+                for ((p, w, tid), node) in old_layouts {
+                    if p == pi {
+                        if let Some(nw) = remap_w(w) {
+                            self.layouts.insert((p, nw, tid), node);
+                        }
+                    } else {
+                        self.layouts.insert((p, w, tid), node);
+                    }
+                }
+                // 3) Rekey worktree_tabs.
+                let old_tabs = std::mem::take(&mut self.worktree_tabs);
+                for ((p, w), tabs) in old_tabs {
+                    if p == pi {
+                        if let Some(nw) = remap_w(w) {
+                            self.worktree_tabs.insert((p, nw), tabs);
+                        }
+                    } else {
+                        self.worktree_tabs.insert((p, w), tabs);
+                    }
+                }
+                // 4) Rekey expand state.
+                self.expanded_worktrees = self
+                    .expanded_worktrees
+                    .iter()
+                    .filter_map(|(p, w)| {
+                        if *p == pi {
+                            remap_w(*w).map(|nw| (*p, nw))
+                        } else {
+                            Some((*p, *w))
+                        }
+                    })
+                    .collect();
+                // 5) Repoint active_tab / selected.
+                self.active_tab = self.active_tab.and_then(|(p, w, tid)| {
+                    if p == pi {
+                        remap_w(w).map(|nw| (p, nw, tid))
+                    } else {
+                        Some((p, w, tid))
+                    }
+                });
+                let (sp, sw, st) = self.selected;
+                self.selected = if sp == pi {
+                    match remap_w(sw) {
+                        Some(nw) => (sp, nw, st),
+                        None => (0, 0, usize::MAX),
+                    }
+                } else {
+                    (sp, sw, st)
+                };
+                // 6) Clear focused / files pane whose backing pane was torn down.
+                if let Some(fp) = self.files_pane {
+                    if !self.panes.contains_key(&fp) {
+                        self.files_pane = None;
+                        self.file_pane_paths.clear();
+                        self.file_pane_active = 0;
+                    }
+                }
+                if let Some(f) = self.focused {
+                    if !self.panes.contains_key(&f) {
+                        self.focused = None;
+                    }
+                }
+                match self.active_tab {
+                    Some(at) => {
+                        if self.focused.is_none() {
+                            self.focused = self.layouts.get(&at).map(|n| n.first_leaf());
+                        }
+                    }
+                    None => {
+                        self.focused = None;
+                        self.active_cwd = None;
+                    }
+                }
+                // Drop the removed worktree's path-keyed overrides.
+                self.worktree_names.remove(&wt_path);
+                self.worktree_tints.remove(&wt_path);
+                self.tab_tints.retain(|(pt, _), _| pt != &wt_path);
+                self.refresh_panel();
+            }
+            CraneShellAction::SetWorktreeTint { pi, wi, tint } => {
+                self.worktree_menu = None;
+                if let Some(w) = self.projects.get(*pi).and_then(|p| p.worktrees.get(*wi)) {
+                    let path = w.path.clone();
+                    match tint {
+                        Some(rgb) => {
+                            self.worktree_tints.insert(path, *rgb);
+                        }
+                        None => {
+                            self.worktree_tints.remove(&path);
+                        }
+                    }
+                }
+            }
+            CraneShellAction::SetTabTint { key, tint } => {
+                self.tab_menu = None;
+                let (pi, wi, tid) = *key;
+                if let Some(w) = self.projects.get(pi).and_then(|p| p.worktrees.get(wi)) {
+                    let path = w.path.clone();
+                    match tint {
+                        Some(rgb) => {
+                            self.tab_tints.insert((path, tid), *rgb);
+                        }
+                        None => {
+                            self.tab_tints.remove(&(path, tid));
+                        }
+                    }
                 }
             }
             CraneShellAction::CloseContextMenu => {
