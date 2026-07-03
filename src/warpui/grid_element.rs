@@ -422,19 +422,32 @@ impl Element for GridElement {
             Event::MouseMoved { position, .. } if in_bounds(position) => {
                 let (row, col, _) = pos_to_cell(position);
                 if let Some(sp) = url_hit_at(row, col) {
-                    self.url_hover.set(Some((sp.row, sp.col_start, sp.col_end)));
+                    let next = Some((sp.row, sp.col_start, sp.col_end));
+                    // Repaint immediately when the hovered span changes so the
+                    // accent underline appears at idle (no unrelated repaint).
+                    if self.url_hover.get() != next {
+                        self.url_hover.set(next);
+                        ctx.notify();
+                    }
                     if let Some(origin_pt) = self.origin {
                         ctx.set_cursor(Cursor::PointingHand, origin_pt.z_index());
                     }
                 } else {
-                    self.url_hover.set(None);
+                    // Repaint immediately when clearing so a stale underline erases.
+                    if self.url_hover.get().is_some() {
+                        self.url_hover.set(None);
+                        ctx.notify();
+                    }
                     ctx.reset_cursor();
                 }
                 // Don't consume — selection drag and scrollbar need hover too.
             }
             Event::MouseMoved { .. } => {
                 // Cursor left the terminal area — clear any lingering hover.
-                self.url_hover.set(None);
+                if self.url_hover.get().is_some() {
+                    self.url_hover.set(None);
+                    ctx.notify();
+                }
             }
             _ => {}
         }

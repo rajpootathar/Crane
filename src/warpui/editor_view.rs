@@ -346,13 +346,24 @@ impl FindState {
     }
 }
 
+/// Cache backing `WarpEditorView::colors`: the highlighted color map plus the
+/// buffer version and syntax-theme name it was computed for. `text_decorations`
+/// re-highlights whenever the version (an edit) or the theme name changes, so
+/// colors track edits exactly (no delta-drift) and follow theme switches.
+struct ColorCache {
+    map: RangeMap<CharOffset, ColorU>,
+    version: Option<warp_editor::content::version::BufferVersion>,
+    theme: String,
+}
+
 pub struct WarpEditorView {
     model: ModelHandle<CodeModel>,
     self_handle: WeakViewHandle<Self>,
     display_state: DisplayStateHandle,
     path: std::path::PathBuf,
-    /// Syntect color map (CharOffset → fg color) for syntax highlighting.
-    colors: RangeMap<CharOffset, ColorU>,
+    /// Syntect color-map cache (CharOffset → fg color) for syntax highlighting,
+    /// recomputed lazily on edit / theme change — see `ColorCache`.
+    colors: std::cell::RefCell<ColorCache>,
     /// Mono font for the line-number gutter (same face as the editor text).
     gutter_font: FamilyId,
     /// Last on-disk content; `is_dirty` compares the live buffer against it.
@@ -627,7 +638,13 @@ impl WarpEditorView {
         });
         // Lay out the initial buffer content into the render state.
         model.update(ctx, |m: &mut CodeModel, mctx| m.rebuild_layout(mctx));
-        let colors = highlight(&content, &path);
+        let colors = std::cell::RefCell::new(ColorCache {
+            map: highlight(&content, &path),
+            // `version: None` forces the first `text_decorations` call (which
+            // carries the real render buffer version) to recompute once.
+            version: None,
+            theme: crate::theme::current().syntax_theme.clone(),
+        });
         WarpEditorView {
             model,
             self_handle: ctx.handle(),
@@ -1213,10 +1230,30 @@ impl WarpEditorView {
                 let down = *down;
                 model.update(ctx, |m: &mut CodeModel, mctx| {
                     let rs = m.render_state.clone();
+                    // A page in pixels, and how many rows fit in it. Rows lay out
+                    // at PARAGRAPH_MIN_HEIGHT — the same constant the gutter uses —
+                    // so the caret page and the gutter line numbers stay aligned.
+                    let view_h = rs.as_ref(mctx).viewport().height().as_f32();
+                    let lines =
+                        ((view_h / PARAGRAPH_MIN_HEIGHT.as_f32()).floor() as usize).max(1);
+                    // Move the viewport one page …
                     rs.update(mctx, |r, rctx| {
-                        let view_h = r.viewport().height().as_f32();
                         let delta = if down { view_h } else { -view_h };
                         r.scroll(Pixels::new(delta), rctx);
+                    });
+                    // … and move the caret the same page of lines so it follows the
+                    // view instead of being left behind (otherwise a later arrow key
+                    // snaps the viewport back to the stale caret position).
+                    let dir = if down {
+                        TextDirection::Forwards
+                    } else {
+                        TextDirection::Backwards
+                    };
+                    let sel = m.selection.clone();
+                    sel.update(mctx, |s, sctx| {
+                        for _ in 0..lines {
+                            s.move_selection(dir, TextUnit::Line, sctx);
+                        }
                     });
                 });
             }
@@ -1486,12 +1523,27 @@ impl EditorView for WarpEditorView {
     fn text_decorations<'a>(
         &'a self,
         _viewport: rangemap::RangeSet<CharOffset>,
-        _version: Option<warp_editor::content::version::BufferVersion>,
-        _ctx: &'a AppContext,
+        version: Option<warp_editor::content::version::BufferVersion>,
+        ctx: &'a AppContext,
     ) -> warp_editor::editor::TextDecoration<'a> {
-        // Syntax highlighting via the precomputed syntect color map.
+        // Re-highlight lazily: the render state hands us the buffer version it is
+        // about to paint, so recompute the color map whenever the content changes
+        // (version bumps) or the user switches syntax themes. Computing once in
+        // `new()` and returning it forever smeared colors after the first edit
+        // (every range drifted by the edit delta) and went stale on theme change.
+        let theme_name = crate::theme::current().syntax_theme.clone();
+        let map = {
+            let mut cache = self.colors.borrow_mut();
+            if cache.version != version || cache.theme != theme_name {
+                let text = self.model.as_ref(ctx).buffer.as_ref(ctx).text().to_string();
+                cache.map = highlight(&text, &self.path);
+                cache.version = version;
+                cache.theme = theme_name;
+            }
+            cache.map.clone()
+        };
         warp_editor::editor::TextDecoration {
-            override_color_map: Some(self.colors.clone()),
+            override_color_map: Some(map),
             ..Default::default()
         }
     }

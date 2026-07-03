@@ -20,9 +20,9 @@ use crate::warpui::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
 use crate::warpui::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
-    Border, ChildView, ConstrainedBox, Container, CornerRadius, Dismiss, DispatchEventResult,
-    Draggable, DraggableState, EventHandler, Expanded, Flex, ParentElement, Radius, Rect, Stack,
-    Text,
+    Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
+    CornerRadius, Dismiss, DispatchEventResult, Draggable, DraggableState, EventHandler, Expanded,
+    Fill, Flex, ParentElement, Radius, Rect, ScrollbarWidth, Stack, Text,
 };
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::vec2f;
@@ -244,6 +244,15 @@ pub struct CraneShellView {
     branch_picker: Option<(f32, f32)>,
     /// Cached local + remote branch names for the picker (refreshed on open).
     branch_list: Vec<String>,
+    /// Scroll state for the Right Panel change/file list (so the commit box
+    /// stays reachable when there are many rows). Persists across re-renders.
+    right_scroll: ClippedScrollStateHandle,
+    /// Scroll state for the branch-picker overlay list.
+    branch_scroll: ClippedScrollStateHandle,
+    /// Active worktree/branch row context menu (pi, wi, x, y), or None.
+    worktree_menu: Option<(usize, usize, f32, f32)>,
+    /// Active Tab row context menu ((pi, wi, tid), x, y), or None.
+    tab_menu: Option<((usize, usize, usize), f32, f32)>,
 }
 
 #[derive(Clone)]
@@ -586,6 +595,10 @@ impl CraneShellView {
             pending_delete: None,
             branch_picker: None,
             branch_list: Vec::new(),
+            right_scroll: ClippedScrollStateHandle::new(),
+            branch_scroll: ClippedScrollStateHandle::new(),
+            worktree_menu: None,
+            tab_menu: None,
         }
     }
 
@@ -959,13 +972,15 @@ impl CraneShellView {
                 items = items.with_child(self.menu_item(
                     icons::FILE,
                     "Open as File",
-                    CraneShellAction::OpenFileAt(abs),
+                    CraneShellAction::OpenFileAt(abs.clone()),
                 ));
                 items = items.with_child(self.menu_separator());
+                // Copy the ABSOLUTE path (matches the Files-row menu), so the
+                // pasted value is usable outside the repo root.
                 items = items.with_child(self.menu_item(
                     icons::COPY,
                     "Copy Path",
-                    CraneShellAction::CopyPathStr(path.clone()),
+                    CraneShellAction::CopyPathStr(abs.to_string_lossy().to_string()),
                 ));
                 self.menu_popover(items.finish(), *x, *y)
             }
@@ -1062,6 +1077,107 @@ impl CraneShellView {
             .finish();
             items = items.with_child(item);
         }
+        // Cap the list height and make it scroll so a long branch list (or one
+        // opened near the window bottom) stays fully reachable instead of drawing
+        // off-screen. The (x, y) origin is clamped on-screen by the caller.
+        const ROW_H: f32 = 27.0;
+        const MAX_H: f32 = 300.0;
+        let content_h = (self.branch_list.len().max(1) as f32) * ROW_H;
+        let body: Box<dyn Element> = if content_h > MAX_H {
+            ConstrainedBox::new(
+                ClippedScrollable::vertical(
+                    self.branch_scroll.clone(),
+                    items.finish(),
+                    ScrollbarWidth::Auto,
+                    Fill::Solid(theme::border()),
+                    Fill::Solid(theme::text_muted()),
+                    Fill::None,
+                )
+                .finish(),
+            )
+            .with_height(MAX_H)
+            .finish()
+        } else {
+            items.finish()
+        };
+        self.menu_popover(body, x, y)
+    }
+
+    /// Estimated pixel height of the branch-picker popover — used to clamp its
+    /// origin so it stays on-screen.
+    fn branch_picker_height(&self) -> f32 {
+        let rows = self.branch_list.len().max(1) as f32;
+        (rows * 27.0).min(300.0) + 12.0
+    }
+
+    /// Wrap a Tab row so a right-click opens the Tab context menu.
+    fn tab_right_click(
+        &self,
+        base: Box<dyn Element>,
+        key: (usize, usize, usize),
+    ) -> Box<dyn Element> {
+        EventHandler::new(base)
+            .on_right_mouse_down(move |ctx, _, pos| {
+                ctx.dispatch_typed_action(CraneShellAction::ShowTabMenu {
+                    key,
+                    x: pos.x(),
+                    y: pos.y(),
+                });
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    /// The worktree/branch-row context menu overlay. Reveal in Finder + Copy
+    /// Path reuse the existing path actions; both operate on the worktree's
+    /// checkout directory.
+    fn worktree_menu_overlay(&self, pi: usize, wi: usize, x: f32, y: f32) -> Box<dyn Element> {
+        let wt_path = self
+            .projects
+            .get(pi)
+            .and_then(|p| p.worktrees.get(wi))
+            .map(|w| w.path.clone())
+            .unwrap_or_default();
+        let path = PathBuf::from(&wt_path);
+        let mut items = Flex::column();
+        items = items.with_child(self.menu_item(
+            icons::FOLDER_OPEN,
+            "Reveal in Finder",
+            CraneShellAction::RevealPathInFinder(path.clone()),
+        ));
+        items = items.with_child(self.menu_item(
+            icons::COPY,
+            "Copy Path",
+            CraneShellAction::CopyPathStr(wt_path),
+        ));
+        // NOTE(completion): Rename branch, per-worktree Highlight palette, and
+        // Remove Worktree are deferred — they need infra not in this port (an
+        // inline-rename modal, a per-worktree tint store, and worktree-level
+        // index teardown/remap). Reveal + Copy Path reuse working plumbing.
+        self.menu_popover(items.finish(), x, y)
+    }
+
+    /// The Tab-row context menu overlay. Close Tab / Close Other Tabs are wired;
+    /// Rename + Highlight are deferred (need modal / tint infra).
+    fn tab_menu_overlay(
+        &self,
+        key: (usize, usize, usize),
+        x: f32,
+        y: f32,
+    ) -> Box<dyn Element> {
+        let mut items = Flex::column();
+        items = items.with_child(self.menu_item(
+            icons::X,
+            "Close Tab",
+            CraneShellAction::CloseTab(key),
+        ));
+        items = items.with_child(self.menu_item(
+            icons::X,
+            "Close Other Tabs",
+            CraneShellAction::CloseOtherTabs(key),
+        ));
+        // NOTE(completion): Rename + Highlight palette deferred (need an
+        // inline-rename modal + a per-tab tint store, unported in warpui).
         self.menu_popover(items.finish(), x, y)
     }
 
@@ -1665,7 +1781,11 @@ impl CraneShellView {
             let group_offset = if in_group { 14.0 } else { 0.0 };
 
             let p_expanded = self.expanded_projects.contains(&pi);
-            let psel = sel == (pi, usize::MAX, usize::MAX);
+            // Highlight the project row when any of its tabs is the active tab
+            // (the `selected` tuple is never assigned (pi, MAX, MAX), so deriving
+            // from `active_tab` — like the worktree row's `w_active` — is what
+            // actually lights the row up). Mirrors old egui's active-project tint.
+            let psel = self.active_tab.map(|(api, _, _)| api == pi).unwrap_or(false);
             let tint = self.project_color_for(pi);
             // Feature 3: when the user has set an explicit tint, also apply it to the
             // project name text (not just the CUBE icon). Fall back to the normal
@@ -1723,7 +1843,7 @@ impl CraneShellView {
                             } else {
                                 theme::text_muted()
                             };
-                            col = col.with_child(self.tab_closeable_row(
+                            let tab_base = self.tab_closeable_row(
                                 tcol,
                                 &t.name,
                                 tsel,
@@ -1733,7 +1853,8 @@ impl CraneShellView {
                                     path: PathBuf::from(&w.path),
                                 },
                                 CraneShellAction::CloseTab(tkey),
-                            ));
+                            );
+                            col = col.with_child(self.tab_right_click(tab_base, tkey));
                         }
                     }
                     col = col.with_child(self.nav_row(
@@ -1767,7 +1888,7 @@ impl CraneShellView {
                 };
                 // Feature 1: pass the worktree's cached diff-stat to the row builder so
                 // it renders the +N -M badge at the right side of the branch row.
-                col = col.with_child(self.worktree_nav_row(
+                let wt_base = self.worktree_nav_row(
                     w_expanded,
                     &w.name,
                     wcol,
@@ -1777,7 +1898,21 @@ impl CraneShellView {
                     w.dirty,
                     24.0 + group_offset,
                     CraneShellAction::ToggleWorktree(pi, wi),
-                ));
+                );
+                // Right-click opens the worktree/branch context menu (mirrors the
+                // project row) without disturbing the left-click toggle.
+                let wt_row = EventHandler::new(wt_base)
+                    .on_right_mouse_down(move |ctx, _, pos| {
+                        ctx.dispatch_typed_action(CraneShellAction::ShowWorktreeMenu {
+                            pi,
+                            wi,
+                            x: pos.x(),
+                            y: pos.y(),
+                        });
+                        DispatchEventResult::StopPropagation
+                    })
+                    .finish();
+                col = col.with_child(wt_row);
                 if !w_expanded {
                     continue;
                 }
@@ -1790,7 +1925,7 @@ impl CraneShellView {
                         // Feature 4: each tab row has a trailing close button.
                         // The close button's EventHandler returns StopPropagation so
                         // clicking it does not also trigger the row's select action.
-                        col = col.with_child(self.tab_closeable_row(
+                        let tab_base = self.tab_closeable_row(
                             tcol,
                             &t.name,
                             tsel,
@@ -1800,7 +1935,8 @@ impl CraneShellView {
                                 path: PathBuf::from(&w.path),
                             },
                             CraneShellAction::CloseTab(tkey),
-                        ));
+                        );
+                        col = col.with_child(self.tab_right_click(tab_base, tkey));
                     }
                 }
                 // "+ New tab" row for this worktree.
@@ -2023,9 +2159,12 @@ impl CraneShellView {
 
         let mut col = Flex::column().with_child(tabs);
         if show_changes {
+            // Fixed header (branch + Push/Pull/Fetch) stays pinned above the
+            // scroll region.
             col = col.with_child(self.changes_header());
+            let mut list = Flex::column();
             if self.changes.is_empty() {
-                col = col.with_child(self.tree_row(
+                list = list.with_child(self.tree_row(
                     "working tree clean",
                     12.0,
                     theme::text_muted(),
@@ -2036,23 +2175,48 @@ impl CraneShellView {
                 let mut rows: Vec<Box<dyn Element>> = Vec::new();
                 self.change_node_rows(&tree, "", 0, &mut rows);
                 for r in rows {
-                    col = col.with_child(r);
+                    list = list.with_child(r);
                 }
             }
+            // Scroll the change rows so the commit box + Commit button stay
+            // reachable no matter how many files changed.
+            col = col.with_child(
+                Expanded::new(1.0, self.scroll_list(list.finish())).finish(),
+            );
             col = col.with_child(self.commit_box());
         } else {
+            let mut list = Flex::column();
             if let Some(p) = &self.pending_new_entry {
-                col = col.with_child(self.pending_entry_row(p));
+                list = list.with_child(self.pending_entry_row(p));
             }
             if self.file_rows.is_empty() {
-                col = col.with_child(self.tree_row("(empty)", 12.0, theme::text_muted(), 12.0));
+                list = list.with_child(self.tree_row("(empty)", 12.0, theme::text_muted(), 12.0));
             }
             for r in &self.file_rows {
-                col = col.with_child(self.file_row(r));
+                list = list.with_child(self.file_row(r));
             }
+            col = col.with_child(
+                Expanded::new(1.0, self.scroll_list(list.finish())).finish(),
+            );
         }
         // No fixed width — the enclosing SplitBox sizes it (draggable).
         self.panel(theme::sidebar_bg(), col.finish())
+    }
+
+    /// Wrap a Right-Panel row list in a vertical scroll container (theme-styled
+    /// thumb, no track) keyed to `right_scroll`. Rule: every reusable scroll
+    /// region carries stable scroll state so the list scrolls and pinned chrome
+    /// (the commit box) stays reachable.
+    fn scroll_list(&self, content: Box<dyn Element>) -> Box<dyn Element> {
+        ClippedScrollable::vertical(
+            self.right_scroll.clone(),
+            content,
+            ScrollbarWidth::Auto,
+            Fill::Solid(theme::border()),
+            Fill::Solid(theme::text_muted()),
+            Fill::None,
+        )
+        .finish()
     }
 
     /// The "Changes" tab chip. When the active Project is loose it renders greyed
@@ -3207,6 +3371,7 @@ impl CraneShellView {
 
     /// Open a placeholder Browser pane (WKWebView embed pending).
     fn open_browser(&mut self, ctx: &mut ViewContext<Self>) {
+        self.ensure_active_tab(ctx);
         let lines = vec![
             "Browser pane".to_string(),
             String::new(),
@@ -3220,6 +3385,7 @@ impl CraneShellView {
     /// Open a read-only unified Diff pane (HEAD vs working copy) for `path` in a
     /// fresh pane beside the focused one (same placement as `open_browser`).
     fn open_diff(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        self.ensure_active_tab(ctx);
         let repo_root = self.active_cwd.clone();
         let handle = ctx.add_typed_action_view(move |ctx| {
             crate::warpui::diff_view::WarpDiffView::new(ctx, repo_root, path)
@@ -3233,6 +3399,7 @@ impl CraneShellView {
     /// so the shell is recorded as the pane's responder-chain parent — without
     /// that, the card's `CraneShellAction` would never bubble up to the shell.
     fn open_welcome(&mut self, ctx: &mut ViewContext<Self>) {
+        self.ensure_active_tab(ctx);
         let on_action: WelcomeCallback = Rc::new(|action, ectx| match action {
             WelcomeAction::Terminal => {
                 ectx.dispatch_typed_action(CraneShellAction::SplitFocused(Dir::Horizontal))
@@ -3373,16 +3540,19 @@ impl CraneShellView {
     /// the terminal grid never registers as an egui-focused widget, so it is
     /// intentionally EXCLUDED here — otherwise panel-toggle shortcuts could
     /// never fire (the shell always has a focused pane).
-    fn any_text_input_focused(&self) -> bool {
+    fn any_text_input_focused(&self, app: &AppContext) -> bool {
+        // Only block panel toggles when we are GENUINELY capturing text: the
+        // commit box, the inline new-entry editor, or an editor pane whose Find
+        // bar is open (its keys route to the bar). A file/editor pane merely
+        // being focused must NOT block Cmd+B / Cmd+/ — mirrors old egui's
+        // real-keyboard-focus guard.
         if self.commit_focused || self.pending_new_entry.is_some() {
             return true;
         }
         self.active_input_pane()
-            .map(|id| {
-                matches!(
-                    self.panes.get(&id),
-                    Some(PaneContent::Editor(_)) | Some(PaneContent::File(_))
-                )
+            .and_then(|id| match self.panes.get(&id) {
+                Some(PaneContent::Editor(h)) => Some(h.read(app, |v, _| v.find_open())),
+                _ => None,
             })
             .unwrap_or(false)
     }
@@ -3509,6 +3679,43 @@ impl CraneShellView {
         self.pane_rects.borrow_mut().remove(&focused);
     }
 
+    /// Fully tear down the layout at `key`: drop the tab's split tree and every
+    /// pane it owns (dropping a Terminal pane's ViewHandle kills its PTY), plus
+    /// each pane's drag state and cached rect. Same teardown the CloseTab path
+    /// uses — call when a project/tab is removed so nothing keeps rendering or
+    /// leaks a PTY.
+    fn tear_down_layout(&mut self, key: (usize, usize, usize)) {
+        if let Some(node) = self.layouts.remove(&key) {
+            let mut leaves = Vec::new();
+            node.leaves(&mut leaves);
+            for l in leaves {
+                self.panes.remove(&l);
+                self.drag_states.remove(&l);
+                self.pane_rects.borrow_mut().remove(&l);
+            }
+        }
+    }
+
+    /// Seed a default tab/layout (project 0 / worktree 0) when nothing is open
+    /// so split-based openers (Welcome / Diff / Browser / new-tab) work from the
+    /// empty state instead of silently no-opping. Mirrors the startup seed.
+    fn ensure_active_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.active_tab.is_some() {
+            return;
+        }
+        self.add_tab(0, 0, ctx);
+    }
+
+    /// The current window's (width, height) in points, or (0, 0) if unavailable.
+    fn window_size(&self, app: &AppContext) -> (f32, f32) {
+        app.window_ids()
+            .into_iter()
+            .next()
+            .and_then(|id| app.window_bounds(&id))
+            .map(|r| (r.size().x(), r.size().y()))
+            .unwrap_or((0.0, 0.0))
+    }
+
     /// Drag-rearrange: detach `dragged` from the active tab's tree and re-dock
     /// it beside `target` in `dir`. Pane views stay alive (history retained).
     fn dock_pane(&mut self, src: PaneId, target: PaneId, edge: DockEdge) {
@@ -3625,8 +3832,27 @@ impl View for CraneShellView {
         if let Some(rm) = &self.row_menu {
             root_stack = root_stack.with_child(self.row_menu_overlay(rm));
         }
+        if let Some((pi, wi, x, y)) = self.worktree_menu {
+            root_stack = root_stack.with_child(self.worktree_menu_overlay(pi, wi, x, y));
+        }
+        if let Some((key, x, y)) = self.tab_menu {
+            root_stack = root_stack.with_child(self.tab_menu_overlay(key, x, y));
+        }
         if let Some((x, y)) = self.branch_picker {
-            root_stack = root_stack.with_child(self.branch_picker_overlay(x, y));
+            // Clamp the popover origin so a long list opened near the window edge
+            // stays on-screen (menu is 220px wide; height is estimated).
+            let (win_w, win_h) = self.window_size(app);
+            let cx = if win_w > 0.0 {
+                x.min((win_w - 220.0 - 8.0).max(8.0))
+            } else {
+                x
+            };
+            let cy = if win_h > 0.0 {
+                y.min((win_h - self.branch_picker_height() - 8.0).max(8.0))
+            } else {
+                y
+            };
+            root_stack = root_stack.with_child(self.branch_picker_overlay(cx, cy));
         }
         if let Some(p) = &self.pending_delete {
             root_stack = root_stack.with_child(self.delete_confirm_overlay(p));
@@ -3876,6 +4102,12 @@ pub enum CraneShellAction {
     RemoveProject(usize),
     /// Show the project context menu anchored at the given window position.
     ShowProjectMenu { project_idx: usize, x: f32, y: f32 },
+    /// Show the worktree/branch-row context menu anchored at (x, y).
+    ShowWorktreeMenu { pi: usize, wi: usize, x: f32, y: f32 },
+    /// Show the Tab-row context menu anchored at (x, y).
+    ShowTabMenu { key: (usize, usize, usize), x: f32, y: f32 },
+    /// Close every tab in `key`'s worktree except `key` itself.
+    CloseOtherTabs((usize, usize, usize)),
     /// Dismiss the active project context menu.
     CloseContextMenu,
     /// Reveal the project folder in the system file manager.
@@ -3920,7 +4152,20 @@ impl TypedActionView for CraneShellView {
             // Files/Editor pane has >1 tabs, and stage a running-process confirm
             // modal for terminals with a live foreground process. Both need the
             // (unported) confirm-modal framework; for now it tears the pane down.
-            CraneShellAction::CloseFocused => self.close_focused(),
+            CraneShellAction::CloseFocused => {
+                // Files pane with >1 open file tabs: close only the ACTIVE file
+                // tab (route to FileTabClose), which tears the pane down only when
+                // the last tab closes. Otherwise close the whole pane.
+                let close_file_tab = self.files_pane.is_some()
+                    && self.focused == self.files_pane
+                    && self.file_pane_paths.len() > 1;
+                if close_file_tab {
+                    let a = CraneShellAction::FileTabClose(self.file_pane_active);
+                    self.handle_action(&a, ctx);
+                } else {
+                    self.close_focused();
+                }
+            }
             CraneShellAction::FocusPane(id) => {
                 self.focused = Some(*id);
                 self.commit_focused = false;
@@ -4228,9 +4473,21 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::ShowBranchPicker { x, y } => {
                 if let Some(root) = self.active_cwd.clone() {
-                    let mut list = crate::warpui::git::list_local_branches(&root);
+                    // Locals first, then remotes with the `<remote>/` prefix
+                    // stripped and de-duplicated against the locals. Checking out
+                    // the bare short name lets `git checkout <name>` DWIM to a
+                    // tracking branch instead of landing on a detached HEAD.
+                    let locals = crate::warpui::git::list_local_branches(&root);
+                    let mut seen: HashSet<String> = locals.iter().cloned().collect();
+                    let mut list = locals;
                     for r in crate::warpui::git::list_remote_branches(&root) {
-                        list.push(r);
+                        let short = r.splitn(2, '/').nth(1).unwrap_or(r.as_str()).to_string();
+                        if short.is_empty() {
+                            continue;
+                        }
+                        if seen.insert(short.clone()) {
+                            list.push(short);
+                        }
                     }
                     self.branch_list = list;
                     self.branch_picker = Some((*x, *y));
@@ -4290,8 +4547,10 @@ impl TypedActionView for CraneShellView {
                 self.save_state(&*ctx);
             }
             CraneShellAction::NewTab => {
-                if let Some((pi, wi, _)) = self.active_tab {
-                    self.add_tab(pi, wi, ctx);
+                match self.active_tab {
+                    Some((pi, wi, _)) => self.add_tab(pi, wi, ctx),
+                    // Empty state: seed a default tab so Cmd+Shift+T still works.
+                    None => self.add_tab(0, 0, ctx),
                 }
             }
             CraneShellAction::NewTabIn(pi, wi) => self.add_tab(*pi, *wi, ctx),
@@ -4328,12 +4587,12 @@ impl TypedActionView for CraneShellView {
             // holds focus — don't toggle while typing in an editor / commit box.
             // Mirrors old shortcuts.rs `if toggle_left && !any_focus`.
             CraneShellAction::ToggleLeft => {
-                if !self.any_text_input_focused() {
+                if !self.any_text_input_focused(&*ctx) {
                     self.show_left = !self.show_left;
                 }
             }
             CraneShellAction::ToggleRight => {
-                if !self.any_text_input_focused() {
+                if !self.any_text_input_focused(&*ctx) {
                     self.show_right = !self.show_right;
                 }
             }
@@ -4421,18 +4680,107 @@ impl TypedActionView for CraneShellView {
                         this.selected_file = Some(path.clone());
                         this.open_file(path, vctx);
                     }
+                    // ctx.spawn does not auto-dirty the view — without this the
+                    // opened Editor pane stays invisible until an unrelated event.
+                    vctx.notify();
                 });
             }
             CraneShellAction::RemoveProject(i) => {
                 self.context_menu = None;
-                if let Some(p) = self.projects.get(*i) {
-                    let path = p.path.clone();
-                    self.added_projects.retain(|ap| ap.path != path);
-                    if !self.removed_project_paths.contains(&path) {
-                        self.removed_project_paths.push(path);
+                let Some(removed_path) = self.projects.get(*i).map(|p| p.path.clone()) else {
+                    return;
+                };
+                self.added_projects.retain(|ap| ap.path != removed_path);
+                if !self.removed_project_paths.contains(&removed_path) {
+                    self.removed_project_paths.push(removed_path.clone());
+                }
+                // Positional-index remap: every (pi, *)-keyed map (layouts,
+                // worktree_tabs, active_tab, selected, expanded_*) is keyed by a
+                // project's POSITION in `self.projects`. Removing a non-last (or
+                // the active) project shifts later projects' indices, so we must
+                // rekey those maps to the post-reload positions and tear down the
+                // vanished project's panes/PTYs. We match by PATH (robust to any
+                // reshuffle, not just a single shift).
+                let old_paths: Vec<String> =
+                    self.projects.iter().map(|p| p.path.clone()).collect();
+                self.reload_projects();
+                let new_index: HashMap<String, usize> = self
+                    .projects
+                    .iter()
+                    .enumerate()
+                    .map(|(ni, p)| (p.path.clone(), ni))
+                    .collect();
+                // old project index -> new project index (None = project gone).
+                let remap = |pi: usize| -> Option<usize> {
+                    old_paths.get(pi).and_then(|path| new_index.get(path).copied())
+                };
+                // 1) Tear down layouts (+ PTYs) for projects that vanished.
+                let dead_layouts: Vec<(usize, usize, usize)> = self
+                    .layouts
+                    .keys()
+                    .copied()
+                    .filter(|(pi, _, _)| remap(*pi).is_none())
+                    .collect();
+                for key in dead_layouts {
+                    self.tear_down_layout(key);
+                }
+                // 2) Rekey the surviving layouts to their new project indices.
+                let old_layouts = std::mem::take(&mut self.layouts);
+                for ((pi, wi, tid), node) in old_layouts {
+                    if let Some(np) = remap(pi) {
+                        self.layouts.insert((np, wi, tid), node);
                     }
                 }
-                self.reload_projects();
+                // 3) Rekey worktree_tabs.
+                let old_tabs = std::mem::take(&mut self.worktree_tabs);
+                for ((pi, wi), tabs) in old_tabs {
+                    if let Some(np) = remap(pi) {
+                        self.worktree_tabs.insert((np, wi), tabs);
+                    }
+                }
+                // 4) Rekey expand state.
+                self.expanded_projects =
+                    self.expanded_projects.iter().filter_map(|pi| remap(*pi)).collect();
+                self.expanded_worktrees = self
+                    .expanded_worktrees
+                    .iter()
+                    .filter_map(|(pi, wi)| remap(*pi).map(|np| (np, *wi)))
+                    .collect();
+                // 5) Repoint active_tab / selected.
+                self.active_tab =
+                    self.active_tab.and_then(|(pi, wi, tid)| remap(pi).map(|np| (np, wi, tid)));
+                let (spi, swi, stid) = self.selected;
+                self.selected = match remap(spi) {
+                    Some(np) => (np, swi, stid),
+                    None => (0, 0, usize::MAX),
+                };
+                // 6) Clear any focused/files pane whose backing pane was town down.
+                if let Some(fp) = self.files_pane {
+                    if !self.panes.contains_key(&fp) {
+                        self.files_pane = None;
+                        self.file_pane_paths.clear();
+                        self.file_pane_active = 0;
+                    }
+                }
+                if let Some(f) = self.focused {
+                    if !self.panes.contains_key(&f) {
+                        self.focused = None;
+                    }
+                }
+                // 7) If the active tab survived but lost focus, refocus its first
+                // leaf. If it was removed, drop the panel's cwd context.
+                match self.active_tab {
+                    Some(at) => {
+                        if self.focused.is_none() {
+                            self.focused = self.layouts.get(&at).map(|n| n.first_leaf());
+                        }
+                    }
+                    None => {
+                        self.focused = None;
+                        self.active_cwd = None;
+                    }
+                }
+                self.refresh_panel();
             }
             CraneShellAction::ShowProjectMenu { project_idx, x, y } => {
                 self.context_menu = Some(ProjectContextMenu {
@@ -4441,10 +4789,39 @@ impl TypedActionView for CraneShellView {
                     y: *y,
                 });
             }
+            CraneShellAction::ShowWorktreeMenu { pi, wi, x, y } => {
+                self.worktree_menu = Some((*pi, *wi, *x, *y));
+            }
+            CraneShellAction::ShowTabMenu { key, x, y } => {
+                self.tab_menu = Some((*key, *x, *y));
+            }
+            CraneShellAction::CloseOtherTabs((pi, wi, tid)) => {
+                self.tab_menu = None;
+                let others: Vec<usize> = self
+                    .worktree_tabs
+                    .get(&(*pi, *wi))
+                    .map(|tabs| {
+                        tabs.iter().filter(|t| t.id != *tid).map(|t| t.id).collect()
+                    })
+                    .unwrap_or_default();
+                for oid in others {
+                    let a = CraneShellAction::CloseTab((*pi, *wi, oid));
+                    self.handle_action(&a, ctx);
+                }
+                // The kept tab becomes the active one.
+                let key = (*pi, *wi, *tid);
+                if self.layouts.contains_key(&key) {
+                    self.active_tab = Some(key);
+                    self.selected = key;
+                    self.focused = self.layouts.get(&key).map(|n| n.first_leaf());
+                }
+            }
             CraneShellAction::CloseContextMenu => {
                 self.context_menu = None;
                 self.row_menu = None;
                 self.branch_picker = None;
+                self.worktree_menu = None;
+                self.tab_menu = None;
             }
             CraneShellAction::RevealProjectInFinder(i) => {
                 self.context_menu = None;

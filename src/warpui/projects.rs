@@ -154,7 +154,14 @@ fn default_worktree(path: &Path, folder_name: &str) -> WorktreeNode {
     }
 }
 
-fn expand_folder(opened: OpenedFolder, out: &mut Vec<ProjectNode>) {
+/// Expand one opened folder. `removed` is the raw removal set keyed by the path
+/// the user acted on. A top-level opened folder is filtered out before this is
+/// called (by `folders.retain`), but a container's discovered CHILD repos are
+/// keyed by their OWN path, not the container path — so "Remove Project" on a
+/// grouped child lands a child path in `removed` that the container filter can
+/// never see. We therefore re-check each child's own path here and suppress a
+/// removed child so container expansion does not re-emit it.
+fn expand_folder(opened: OpenedFolder, removed: &[String], out: &mut Vec<ProjectNode>) {
     let path = Path::new(&opened.path);
     let is_git = path.join(".git").exists();
     if is_git {
@@ -181,6 +188,16 @@ fn expand_folder(opened: OpenedFolder, out: &mut Vec<ProjectNode>) {
     };
     if !children.is_empty() {
         for child in &children {
+            // Suppress a child repo the user explicitly removed. "Remove Project"
+            // on a grouped child records the child's OWN path in `removed`; the
+            // top-level `folders.retain` keys on the container path and can't
+            // filter it, so it must be dropped here or it re-appears on reload.
+            // If every child is removed the container contributes nothing (it
+            // never falls through to render as a loose folder).
+            let cpath = child.to_string_lossy().to_string();
+            if removed.contains(&cpath) {
+                continue;
+            }
             out.push(child_project_node(child, &opened.path));
         }
         return;
@@ -310,7 +327,7 @@ pub fn load_projects_extended(
     // 2. Expand each opened folder into its flat ProjectNode(s).
     let mut projects = Vec::new();
     for folder in folders {
-        expand_folder(folder, &mut projects);
+        expand_folder(folder, removed, &mut projects);
     }
     // 3. Apply per-path tint overrides (git/loose keyed by opened path, child
     //    repos keyed by their own path).
