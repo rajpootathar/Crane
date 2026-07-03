@@ -5,9 +5,12 @@
 //! theme render in warpui exactly like the egui version.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::warpui::file_pane::FileView;
 use crate::warpui::file_tree;
@@ -39,6 +42,74 @@ struct ProjectContextMenu {
     /// Window-relative position of the right-click that opened the menu.
     x: f32,
     y: f32,
+}
+
+/// A right-click context menu over a row in the Right Panel — either a Changes
+/// row or a Files row. Anchored at the click position; rendered as a
+/// width-constrained popover with the `Dismiss` overlay pattern.
+enum RowMenu {
+    /// Changes-tab file row: Stage / Unstage / Open as File / Copy Path / Open Diff.
+    Change { path: String, staged: bool, x: f32, y: f32 },
+    /// Files-tab row: Open / Reveal / Copy Path / New File / New Folder / Delete.
+    File { path: PathBuf, is_dir: bool, x: f32, y: f32 },
+}
+
+/// Inline "new file / new folder" editor pending in the Files tree. Text is
+/// entered via the same keystroke route as the commit box (`SendKeys` →
+/// `edit_new_entry`). Ported from old egui `PendingNewEntry`.
+struct PendingNewEntry {
+    parent: PathBuf,
+    is_folder: bool,
+    name: String,
+    error: Option<String>,
+}
+
+/// A single node of the directory-grouped Changes tree (port of old egui
+/// `DirNode` in explorer.rs).
+#[derive(Default)]
+struct ChangeDir {
+    dirs: BTreeMap<String, ChangeDir>,
+    files: Vec<ChangeFile>,
+}
+
+struct ChangeFile {
+    name: String,
+    path: String,
+    staged: bool,
+    status: char,
+}
+
+impl ChangeDir {
+    /// Collect every descendant file's path (folder-level stage/unstage).
+    fn collect_paths(&self, out: &mut Vec<String>) {
+        for f in &self.files {
+            out.push(f.path.clone());
+        }
+        for child in self.dirs.values() {
+            child.collect_paths(out);
+        }
+    }
+
+    /// `(all_staged, any_staged)` across the subtree.
+    fn staged_state(&self) -> (bool, bool) {
+        let mut total = 0usize;
+        let mut staged = 0usize;
+        let mut any = false;
+        fn walk(n: &ChangeDir, total: &mut usize, staged: &mut usize, any: &mut bool) {
+            for c in n.dirs.values() {
+                walk(c, total, staged, any);
+            }
+            for f in &n.files {
+                *total += 1;
+                if f.staged {
+                    *staged += 1;
+                    *any = true;
+                }
+            }
+        }
+        walk(self, &mut total, &mut staged, &mut any);
+        (total > 0 && staged == total, any)
+    }
 }
 
 pub struct CraneShellView {
@@ -143,6 +214,36 @@ pub struct CraneShellView {
     /// Collapsed folder groups, keyed by `ProjectNode::group_path`. Absent →
     /// expanded (members visible). Toggled via `CraneShellAction::ToggleGroup`.
     collapsed_groups: HashSet<String>,
+    /// Collapsed directory groups in the Changes tree, keyed by their relative
+    /// path (e.g. "src/warpui"). Port of old egui `collapsed_change_dirs`.
+    collapsed_change_dirs: HashSet<String>,
+    /// Commit / stage error surfaced under the commit box (legacy `git_error`).
+    commit_error: Option<String>,
+    /// Cached `(ahead, behind)` of the active repo's upstream, or None when no
+    /// upstream is configured. Recomputed in `refresh_panel`.
+    ahead_behind: Option<(usize, usize)>,
+    /// Per-relative-path git status char for the Files tree colouring, plus the
+    /// set of directory rel-paths that contain a changed descendant. Rebuilt in
+    /// `refresh_panel` from `changes`.
+    file_status: HashMap<String, char>,
+    dirty_dirs: HashSet<String>,
+    /// Shared async git-op status (Push / Pull / Fetch / Commit). Written by the
+    /// background thread in `git::spawn_git_op`, polled each render for the pill.
+    git_op: Arc<Mutex<crate::warpui::git::OpStatus>>,
+    /// Repaint waker handed to background git-op threads.
+    git_wake: Arc<dyn Fn() + Send + Sync>,
+    /// Keeps the git-op repaint stream alive for the view's lifetime.
+    _git_repaint: warpui::r#async::SpawnedLocalStream,
+    /// Active Right-Panel row context menu (Changes or Files row), or None.
+    row_menu: Option<RowMenu>,
+    /// Inline pending new-file/new-folder editor in the Files tree.
+    pending_new_entry: Option<PendingNewEntry>,
+    /// Path pending a delete confirmation (confirm overlay).
+    pending_delete: Option<PathBuf>,
+    /// When set, the branch picker overlay is open at this (x, y).
+    branch_picker: Option<(f32, f32)>,
+    /// Cached local + remote branch names for the picker (refreshed on open).
+    branch_list: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -401,6 +502,20 @@ impl CraneShellView {
             focused = Some(pane);
             selected = key;
         }
+        // Async git-op wake: the background thread pings this channel; the
+        // spawned stream re-runs the panel refresh + repaints on the main thread.
+        let (git_tx, git_rx) = async_channel::bounded::<()>(1);
+        let git_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = git_tx.try_send(());
+        });
+        let git_repaint = ctx.spawn_stream_local(
+            git_rx,
+            |this: &mut Self, _item, vctx| {
+                this.refresh_panel();
+                vctx.notify();
+            },
+            |_this, _vctx| {},
+        );
         Self {
             ui_font,
             icon_font,
@@ -454,6 +569,19 @@ impl CraneShellView {
             project_tints: init_tints,
             context_menu: None,
             collapsed_groups: HashSet::new(),
+            collapsed_change_dirs: HashSet::new(),
+            commit_error: None,
+            ahead_behind: None,
+            file_status: HashMap::new(),
+            dirty_dirs: HashSet::new(),
+            git_op: Arc::new(Mutex::new(crate::warpui::git::OpStatus::default())),
+            git_wake,
+            _git_repaint: git_repaint,
+            row_menu: None,
+            pending_new_entry: None,
+            pending_delete: None,
+            branch_picker: None,
+            branch_list: Vec::new(),
         }
     }
 
@@ -769,6 +897,259 @@ impl CraneShellView {
         )
     }
 
+    /// Wrap a built menu column in the standard 220px popover chrome +
+    /// dismiss-on-outside-click overlay, positioned at (x, y).
+    fn menu_popover(&self, items: Box<dyn Element>, x: f32, y: f32) -> Box<dyn Element> {
+        let menu_box = ConstrainedBox::new(
+            Container::new(items)
+                .with_background_color(theme::surface())
+                .with_border(Border::all(1.0).with_border_color(theme::border()))
+                .with_padding_top(4.0)
+                .with_padding_bottom(4.0)
+                .finish(),
+        )
+        .with_width(220.0)
+        .finish();
+        let positioned = Container::new(menu_box)
+            .with_padding_top(y)
+            .with_padding_left(x)
+            .finish();
+        Box::new(
+            Dismiss::new(positioned)
+                .prevent_interaction_with_other_elements()
+                .on_dismiss(|ctx, _| {
+                    ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+                }),
+        )
+    }
+
+    /// Right-Panel row context menu (Changes row or Files row).
+    fn row_menu_overlay(&self, menu: &RowMenu) -> Box<dyn Element> {
+        match menu {
+            RowMenu::Change { path, staged, x, y } => {
+                let mut items = Flex::column();
+                if !*staged {
+                    items = items.with_child(self.menu_item(
+                        icons::PLUS,
+                        "Stage",
+                        CraneShellAction::StagePaths(vec![path.clone()]),
+                    ));
+                } else {
+                    items = items.with_child(self.menu_item(
+                        icons::MINUS,
+                        "Unstage",
+                        CraneShellAction::UnstagePaths(vec![path.clone()]),
+                    ));
+                }
+                let abs = self
+                    .active_cwd
+                    .as_ref()
+                    .map(|c| c.join(path))
+                    .unwrap_or_else(|| PathBuf::from(path));
+                items = items.with_child(self.menu_item(
+                    icons::GIT_DIFF,
+                    "Open Diff",
+                    CraneShellAction::OpenDiff(abs.clone()),
+                ));
+                items = items.with_child(self.menu_item(
+                    icons::FILE,
+                    "Open as File",
+                    CraneShellAction::OpenFileAt(abs),
+                ));
+                items = items.with_child(self.menu_separator());
+                items = items.with_child(self.menu_item(
+                    icons::COPY,
+                    "Copy Path",
+                    CraneShellAction::CopyPathStr(path.clone()),
+                ));
+                self.menu_popover(items.finish(), *x, *y)
+            }
+            RowMenu::File { path, is_dir, x, y } => {
+                let mut items = Flex::column();
+                if !*is_dir {
+                    items = items.with_child(self.menu_item(
+                        icons::FILE,
+                        "Open",
+                        CraneShellAction::OpenFileAt(path.clone()),
+                    ));
+                }
+                items = items.with_child(self.menu_item(
+                    icons::FOLDER_OPEN,
+                    "Reveal in Finder",
+                    CraneShellAction::RevealPathInFinder(path.clone()),
+                ));
+                items = items.with_child(self.menu_item(
+                    icons::COPY,
+                    "Copy Path",
+                    CraneShellAction::CopyPathStr(path.to_string_lossy().to_string()),
+                ));
+                items = items.with_child(self.menu_separator());
+                // New entries land in the dir itself (folder row) or the parent.
+                let parent = if *is_dir {
+                    path.clone()
+                } else {
+                    path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone())
+                };
+                items = items.with_child(self.menu_item(
+                    icons::FILE,
+                    "New File…",
+                    CraneShellAction::NewEntry { parent: parent.clone(), is_folder: false },
+                ));
+                items = items.with_child(self.menu_item(
+                    icons::FOLDER_PLUS,
+                    "New Folder…",
+                    CraneShellAction::NewEntry { parent, is_folder: true },
+                ));
+                items = items.with_child(self.menu_separator());
+                items = items.with_child(self.menu_item(
+                    icons::TRASH,
+                    "Delete",
+                    CraneShellAction::RequestDelete(path.clone()),
+                ));
+                self.menu_popover(items.finish(), *x, *y)
+            }
+        }
+    }
+
+    /// The branch-picker overlay: a scrollable list of local + remote branches;
+    /// clicking one checks it out. (Simple list — no fuzzy filter input yet.)
+    fn branch_picker_overlay(&self, x: f32, y: f32) -> Box<dyn Element> {
+        let mut items = Flex::column();
+        if self.branch_list.is_empty() {
+            items = items.with_child(
+                Container::new(
+                    Text::new("(no branches)".to_string(), self.ui_font, 12.0)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .with_uniform_padding(8.0)
+                .finish(),
+            );
+        }
+        for b in &self.branch_list {
+            let is_current = *b == self.branch;
+            let glyph = if is_current { icons::CHECK } else { icons::GIT_BRANCH };
+            let color = if is_current { theme::accent() } else { theme::text() };
+            let branch = b.clone();
+            let row = Flex::row()
+                .with_child(
+                    Container::new(self.icon(glyph, 12.0, color))
+                        .with_padding_right(8.0)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(b.clone(), self.ui_font, 12.0).with_color(color).finish(),
+                )
+                .finish();
+            let item = EventHandler::new(
+                Container::new(row)
+                    .with_padding_left(10.0)
+                    .with_padding_right(10.0)
+                    .with_padding_top(5.0)
+                    .with_padding_bottom(5.0)
+                    .finish(),
+            )
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+                ctx.dispatch_typed_action(CraneShellAction::CheckoutBranch(branch.clone()));
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            items = items.with_child(item);
+        }
+        self.menu_popover(items.finish(), x, y)
+    }
+
+    /// A centred confirm overlay for deleting a file/folder.
+    fn delete_confirm_overlay(&self, path: &std::path::Path) -> Box<dyn Element> {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let cancel = EventHandler::new(
+            Container::new(
+                Text::new("Cancel".to_string(), self.ui_font, 12.0)
+                    .with_color(theme::text())
+                    .finish(),
+            )
+            .with_background_color(theme::surface())
+            .with_padding_left(14.0)
+            .with_padding_right(14.0)
+            .with_padding_top(6.0)
+            .with_padding_bottom(6.0)
+            .finish(),
+        )
+        .on_left_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::CancelDelete);
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+        let del = EventHandler::new(
+            Container::new(
+                Text::new("Delete".to_string(), self.ui_font, 12.0)
+                    .with_color(ColorU::new(255, 255, 255, 255))
+                    .finish(),
+            )
+            .with_background_color(theme::error())
+            .with_padding_left(14.0)
+            .with_padding_right(14.0)
+            .with_padding_top(6.0)
+            .with_padding_bottom(6.0)
+            .finish(),
+        )
+        .on_left_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::ConfirmDelete);
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+        let dialog = Container::new(
+            Flex::column()
+                .with_child(
+                    Text::new(format!("Delete \"{name}\"?"), self.ui_font, 13.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_child(Self::spacer(6.0))
+                .with_child(
+                    Text::new(
+                        "This cannot be undone.".to_string(),
+                        self.ui_font,
+                        11.0,
+                    )
+                    .with_color(theme::text_muted())
+                    .finish(),
+                )
+                .with_child(Self::spacer(14.0))
+                .with_child(
+                    Flex::row()
+                        .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+                        .with_child(cancel)
+                        .with_child(Self::spacer(8.0))
+                        .with_child(del)
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_background_color(theme::surface())
+        .with_border(Border::all(1.0).with_border_color(theme::border()))
+        .with_uniform_padding(16.0)
+        .finish();
+        let boxed = ConstrainedBox::new(dialog).with_width(320.0).finish();
+        // Centre-ish: pad from the top/left. (Full centring would need window
+        // size; a fixed offset reads fine for a small confirm.)
+        let positioned = Container::new(boxed)
+            .with_padding_top(120.0)
+            .with_padding_left(120.0)
+            .finish();
+        Box::new(
+            Dismiss::new(positioned)
+                .prevent_interaction_with_other_elements()
+                .on_dismiss(|ctx, _| {
+                    ctx.dispatch_typed_action(CraneShellAction::CancelDelete);
+                }),
+        )
+    }
+
     /// Reload the project list from session.json + the current overlay
     /// (added / removed / tints). Call after mutating any of those three fields.
     fn reload_projects(&mut self) {
@@ -785,18 +1166,73 @@ impl CraneShellView {
             .as_deref()
             .map(crate::warpui::git::current_branch)
             .unwrap_or_default();
-        match root {
-            Some(root) if self.files_tab => {
-                self.file_rows = file_tree::build_rows(&root, &self.expanded_dirs);
-            }
-            Some(root) => {
-                self.changes = crate::warpui::git::changes(&root);
-            }
-            None => {
-                self.file_rows.clear();
-                self.changes.clear();
+        let Some(root) = root else {
+            self.file_rows.clear();
+            self.changes.clear();
+            self.file_status.clear();
+            self.dirty_dirs.clear();
+            self.ahead_behind = None;
+            return;
+        };
+        // Working-tree changes + upstream ahead/behind, always (the changes feed
+        // BOTH the Changes tree and the Files-tab per-row status colours).
+        self.changes = crate::warpui::git::changes(&root);
+        self.ahead_behind = crate::warpui::git::ahead_behind(&root);
+        // rel-path → status char, plus the set of directories that contain a
+        // changed descendant (for folder-row tinting). Port of old egui
+        // `git_status_map` in explorer.rs.
+        self.file_status.clear();
+        self.dirty_dirs.clear();
+        for c in &self.changes {
+            let rel = c.path.trim_end_matches('/').to_string();
+            let ch = c.status.chars().next().unwrap_or(' ');
+            self.file_status.insert(rel.clone(), ch);
+            // Mark every ancestor directory dirty.
+            let mut cur = std::path::Path::new(&rel);
+            while let Some(parent) = cur.parent() {
+                if parent.as_os_str().is_empty() {
+                    break;
+                }
+                self.dirty_dirs.insert(parent.to_string_lossy().to_string());
+                cur = parent;
             }
         }
+        if self.files_tab {
+            let skip = self.nested_repo_skip_set(&root);
+            let mut rows = file_tree::build_rows_with_skip(&root, &self.expanded_dirs, &skip);
+            for r in &mut rows {
+                let rel = r
+                    .path
+                    .strip_prefix(&root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string());
+                if let Some(rel) = rel {
+                    if r.is_dir {
+                        r.git_status = if self.dirty_dirs.contains(&rel) { Some('*') } else { None };
+                    } else {
+                        r.git_status = self.file_status.get(&rel).copied();
+                    }
+                }
+            }
+            self.file_rows = rows;
+        }
+    }
+
+    /// Directories under `root` that are surfaced as their own top-level
+    /// Projects (nested git repos beneath a loose parent) — hidden from the
+    /// Files tree so they don't appear twice. Port of `active_project_files_skip`.
+    fn nested_repo_skip_set(&self, root: &std::path::Path) -> HashSet<PathBuf> {
+        let mut skip = HashSet::new();
+        for p in &self.projects {
+            if p.path.is_empty() {
+                continue;
+            }
+            let pp = PathBuf::from(&p.path);
+            if pp != root && pp.starts_with(root) {
+                skip.insert(pp);
+            }
+        }
+        skip
     }
 
     /// A clickable project/worktree row — clicking respawns the terminal in
@@ -1445,6 +1881,18 @@ impl CraneShellView {
             .finish()
     }
 
+    /// Colour for a single-char git porcelain status. Mirrors old egui
+    /// `status_color` (added/untracked = success, modified/renamed = warning,
+    /// deleted/unmerged = error).
+    fn status_color(c: char) -> ColorU {
+        match c {
+            'A' | '?' => theme::success(),
+            'M' | 'R' | 'C' => theme::warning(),
+            'D' | 'U' => theme::error(),
+            _ => theme::text_muted(),
+        }
+    }
+
     fn file_row(&self, r: &file_tree::FileRow) -> Box<dyn Element> {
         let is_sel = self.selected_file.as_deref() == Some(r.path.as_path());
         let row_h = 21.0;
@@ -1464,13 +1912,25 @@ impl CraneShellView {
         } else {
             Self::spacer(13.0)
         };
-        let glyph = if r.is_dir { icons::FOLDER } else { icons::FILE };
-        let text_color = if r.is_dir { theme::text() } else { theme::text_muted() };
+        // Git-status colouring (old explorer.rs render_fs_dir): a changed file
+        // shows its status LETTER as the leading glyph in the status colour and
+        // tints the label; a directory with changed descendants keeps the folder
+        // glyph but tints it. Clean rows use the default folder / file glyph.
+        let (glyph, glyph_color, text_color): (String, ColorU, ColorU) = match r.git_status {
+            Some('*') if r.is_dir => (icons::FOLDER.to_string(), theme::warning(), theme::text()),
+            Some(c) if !r.is_dir => {
+                let col = Self::status_color(c);
+                let letter = if c == '?' { "?".to_string() } else { c.to_string() };
+                (letter, col, col)
+            }
+            _ if r.is_dir => (icons::FOLDER.to_string(), theme::text_muted(), theme::text()),
+            _ => (icons::FILE.to_string(), theme::text_muted(), theme::text_muted()),
+        };
         let label_inner = Flex::row()
             .with_child(chevron)
             .with_child(
-                Container::new(self.icon(glyph, 12.0, theme::text_muted()))
-                    .with_padding_right(5.0)
+                ConstrainedBox::new(self.icon(&glyph, 12.0, glyph_color))
+                    .with_width(16.0)
                     .finish(),
             )
             .with_child(
@@ -1501,7 +1961,229 @@ impl CraneShellView {
         } else {
             CraneShellAction::SelectFile(r.path.clone())
         };
-        EventHandler::new(row)
+        let menu_path = r.path.clone();
+        let is_dir = r.is_dir;
+        EventHandler::new(
+            EventHandler::new(row)
+                .on_left_mouse_down(move |ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(action.clone());
+                    DispatchEventResult::StopPropagation
+                })
+                .finish(),
+        )
+        .on_right_mouse_down(move |ctx, _app, pos| {
+            ctx.dispatch_typed_action(CraneShellAction::ShowFileMenu {
+                path: menu_path.clone(),
+                is_dir,
+                x: pos.x(),
+                y: pos.y(),
+            });
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
+    }
+
+    /// True when the active Project is a loose (non-git) folder — the Changes
+    /// tab has nothing to show, so it is disabled and Files is forced.
+    fn is_loose_active(&self) -> bool {
+        self.projects
+            .get(self.selected.0)
+            .map(|p| p.is_loose)
+            .unwrap_or(false)
+    }
+
+    fn right_sidebar(&self) -> Box<dyn Element> {
+        let loose = self.is_loose_active();
+        // Loose projects can't select Changes; its chip is greyed + inert and we
+        // always render Files (mirrors old egui right_tab auto-switch).
+        let show_changes = !self.files_tab && !loose;
+        let tabs = Flex::row()
+            .with_child(self.changes_tab_label(!self.files_tab && !loose, loose))
+            .with_child(Self::spacer(12.0))
+            .with_child(self.tab_label(
+                "Files",
+                self.files_tab || loose,
+                CraneShellAction::SetTab { files: true },
+            ))
+            .finish();
+        let tabs = Container::new(tabs)
+            .with_padding_left(10.0)
+            .with_padding_top(8.0)
+            .with_padding_bottom(6.0)
+            .finish();
+
+        let mut col = Flex::column().with_child(tabs);
+        if show_changes {
+            col = col.with_child(self.changes_header());
+            if self.changes.is_empty() {
+                col = col.with_child(self.tree_row(
+                    "working tree clean",
+                    12.0,
+                    theme::text_muted(),
+                    12.0,
+                ));
+            } else {
+                let tree = self.build_change_tree();
+                let mut rows: Vec<Box<dyn Element>> = Vec::new();
+                self.change_node_rows(&tree, "", 0, &mut rows);
+                for r in rows {
+                    col = col.with_child(r);
+                }
+            }
+            col = col.with_child(self.commit_box());
+        } else {
+            if let Some(p) = &self.pending_new_entry {
+                col = col.with_child(self.pending_entry_row(p));
+            }
+            if self.file_rows.is_empty() {
+                col = col.with_child(self.tree_row("(empty)", 12.0, theme::text_muted(), 12.0));
+            }
+            for r in &self.file_rows {
+                col = col.with_child(self.file_row(r));
+            }
+        }
+        // No fixed width — the enclosing SplitBox sizes it (draggable).
+        self.panel(theme::sidebar_bg(), col.finish())
+    }
+
+    /// The "Changes" tab chip. When the active Project is loose it renders greyed
+    /// and inert (dispatches Noop) so it can't be selected.
+    fn changes_tab_label(&self, active: bool, loose: bool) -> Box<dyn Element> {
+        if loose {
+            return Container::new(
+                Text::new("Changes".to_string(), self.ui_font, 12.0)
+                    .with_color(theme::pane_dim())
+                    .finish(),
+            )
+            .with_background_color(theme::sidebar_bg())
+            .with_padding_top(2.0)
+            .with_padding_bottom(2.0)
+            .finish();
+        }
+        self.tab_label("Changes", active, CraneShellAction::SetTab { files: false })
+    }
+
+    /// Branch + ahead/behind + Push/Pull/Fetch header at the top of the Changes
+    /// area. Port of old egui `render_changes` top toolbar.
+    fn changes_header(&self) -> Box<dyn Element> {
+        let op = self.git_op.lock().clone();
+        let running = op.is_running();
+        let run_kind = if running { op.kind } else { None };
+
+        let mut left = Flex::row()
+            .with_child(
+                Container::new(self.icon(icons::GIT_BRANCH, 12.0, theme::text()))
+                    .with_padding_right(6.0)
+                    .with_padding_top(4.0)
+                    .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Text::new(
+                        if self.branch.is_empty() { "—".to_string() } else { self.branch.clone() },
+                        self.ui_font,
+                        12.0,
+                    )
+                    .with_color(theme::text())
+                    .finish(),
+                )
+                .with_padding_top(4.0)
+                .finish(),
+            );
+        if let Some((ahead, behind)) = self.ahead_behind {
+            if ahead > 0 {
+                left = left.with_child(
+                    Container::new(
+                        Text::new(format!("{} {ahead}", icons::ARROW_UP), self.ui_font, 11.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    )
+                    .with_padding_left(8.0)
+                    .with_padding_top(5.0)
+                    .finish(),
+                );
+            }
+            if behind > 0 {
+                left = left.with_child(
+                    Container::new(
+                        Text::new(format!("{} {behind}", icons::ARROW_DOWN), self.ui_font, 11.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    )
+                    .with_padding_left(6.0)
+                    .with_padding_top(5.0)
+                    .finish(),
+                );
+            }
+        }
+        // Clicking the branch region opens the branch picker.
+        let left = EventHandler::new(left.finish())
+            .on_left_mouse_down(|ctx, _app, pos| {
+                ctx.dispatch_typed_action(CraneShellAction::ShowBranchPicker {
+                    x: pos.x(),
+                    y: pos.y(),
+                });
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+
+        // Push / Pull / Fetch buttons. The running op shows a spinner glyph; all
+        // buttons disable while any op is in flight (guarded in the handler too).
+        let buttons = Flex::row()
+            .with_child(self.git_op_button(icons::ARROW_UP, crate::warpui::git::OpKind::Push, run_kind, running))
+            .with_child(Self::spacer(4.0))
+            .with_child(self.git_op_button(icons::ARROW_DOWN, crate::warpui::git::OpKind::Pull, run_kind, running))
+            .with_child(Self::spacer(4.0))
+            .with_child(self.git_op_button(icons::ARROW_COUNTER_CLOCKWISE, crate::warpui::git::OpKind::Fetch, run_kind, running))
+            .finish();
+
+        let row = Flex::row()
+            .with_child(Expanded::new(1.0, left).finish())
+            .with_child(buttons)
+            .finish();
+        Container::new(row)
+            .with_padding_left(10.0)
+            .with_padding_right(8.0)
+            .with_padding_top(4.0)
+            .with_padding_bottom(6.0)
+            .finish()
+    }
+
+    /// A single Push/Pull/Fetch icon button. Shows a spinner glyph + accent when
+    /// this op is the one running; renders muted while any op runs.
+    fn git_op_button(
+        &self,
+        glyph: &str,
+        kind: crate::warpui::git::OpKind,
+        run_kind: Option<crate::warpui::git::OpKind>,
+        any_running: bool,
+    ) -> Box<dyn Element> {
+        let this_running = run_kind == Some(kind);
+        let (g, color) = if this_running {
+            (icons::ARROW_COUNTER_CLOCKWISE, theme::accent())
+        } else if any_running {
+            (glyph, theme::pane_dim())
+        } else {
+            (glyph, theme::text_muted())
+        };
+        let action = match kind {
+            crate::warpui::git::OpKind::Push => CraneShellAction::GitPush,
+            crate::warpui::git::OpKind::Pull => CraneShellAction::GitPull,
+            crate::warpui::git::OpKind::Fetch => CraneShellAction::GitFetch,
+            crate::warpui::git::OpKind::Commit => CraneShellAction::Noop,
+        };
+        let content = ConstrainedBox::new(
+            Container::new(self.icon(g, 13.0, color))
+                .with_background_color(theme::surface())
+                .with_padding_left(7.0)
+                .with_padding_right(7.0)
+                .with_padding_top(4.0)
+                .with_padding_bottom(4.0)
+                .finish(),
+        )
+        .with_width(28.0)
+        .finish();
+        EventHandler::new(content)
             .on_left_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(action.clone());
                 DispatchEventResult::StopPropagation
@@ -1509,29 +2191,93 @@ impl CraneShellView {
             .finish()
     }
 
-    fn change_row(&self, ch: &crate::warpui::git::Change) -> Box<dyn Element> {
-        let color = match ch.status.as_str() {
-            "A" => theme::success(),
-            "D" | "U" => theme::error(),
-            "M" => theme::warning(),
-            "R" | "C" => theme::accent(),
-            _ => theme::text_muted(), // "?" untracked
-        };
-        // Leading marker: + = click to stage, − = click to unstage.
-        let (marker, marker_color) = if ch.staged {
+    /// Build the directory-grouped change tree from `self.changes` (port of old
+    /// egui `build_tree`).
+    fn build_change_tree(&self) -> ChangeDir {
+        let mut root = ChangeDir::default();
+        for c in &self.changes {
+            let cleaned = c.path.trim_end_matches('/');
+            if cleaned.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = cleaned.split('/').collect();
+            let Some((file, dirs)) = parts.split_last() else { continue };
+            if file.is_empty() {
+                continue;
+            }
+            let mut node = &mut root;
+            for d in dirs {
+                node = node.dirs.entry((*d).to_string()).or_default();
+            }
+            let ch = c.status.chars().next().unwrap_or(' ');
+            node.files.push(ChangeFile {
+                name: (*file).to_string(),
+                path: c.path.clone(),
+                staged: c.staged,
+                status: ch,
+            });
+        }
+        root
+    }
+
+    /// Recursively emit change-tree rows (dirs first, then files) into `out`.
+    /// Port of old egui `render_change_node`.
+    fn change_node_rows(
+        &self,
+        node: &ChangeDir,
+        prefix: &str,
+        depth: usize,
+        out: &mut Vec<Box<dyn Element>>,
+    ) {
+        for (dir_name, child) in &node.dirs {
+            let key = if prefix.is_empty() {
+                dir_name.clone()
+            } else {
+                format!("{prefix}/{dir_name}")
+            };
+            let collapsed = self.collapsed_change_dirs.contains(&key);
+            let (all_staged, any_staged) = child.staged_state();
+            let mut paths = Vec::new();
+            child.collect_paths(&mut paths);
+            out.push(self.change_dir_row(dir_name, &key, depth, collapsed, all_staged, any_staged, paths));
+            if !collapsed {
+                self.change_node_rows(child, &key, depth + 1, out);
+            }
+        }
+        for f in &node.files {
+            out.push(self.change_file_row(f, depth));
+        }
+    }
+
+    /// A collapsible directory row in the Changes tree. The leading +/- marker
+    /// bulk-stages / unstages the whole subtree; the rest toggles collapse.
+    #[allow(clippy::too_many_arguments)]
+    fn change_dir_row(
+        &self,
+        name: &str,
+        key: &str,
+        depth: usize,
+        collapsed: bool,
+        all_staged: bool,
+        _any_staged: bool,
+        paths: Vec<String>,
+    ) -> Box<dyn Element> {
+        let indent = 8.0 + depth as f32 * 14.0;
+        // Marker: '-' (unstage all) when the subtree is fully staged, else '+'.
+        let (marker, marker_color) = if all_staged {
             (icons::MINUS, theme::success())
         } else {
             (icons::PLUS, theme::text_muted())
         };
-        // Leading +/- marker: click to stage / unstage (own hit target).
-        let stage_action = CraneShellAction::StageToggle {
-            path: ch.path.clone(),
-            staged: ch.staged,
+        let stage_action = if all_staged {
+            CraneShellAction::UnstagePaths(paths)
+        } else {
+            CraneShellAction::StagePaths(paths)
         };
         let marker_btn = EventHandler::new(
             Container::new(self.icon(marker, 11.0, marker_color))
                 .with_background_color(theme::sidebar_bg())
-                .with_padding_left(10.0)
+                .with_padding_left(indent)
                 .with_padding_right(4.0)
                 .with_padding_top(3.0)
                 .with_padding_bottom(3.0)
@@ -1543,30 +2289,96 @@ impl CraneShellView {
         })
         .finish();
 
-        // Status letter + filename: click to OPEN the file in the editor pane.
+        let caret = if collapsed { icons::CARET_RIGHT } else { icons::CARET_DOWN };
+        let label = Flex::row()
+            .with_child(
+                Container::new(self.icon(caret, 9.0, theme::text_muted()))
+                    .with_padding_right(3.0)
+                    .with_padding_top(4.0)
+                    .finish(),
+            )
+            .with_child(
+                Container::new(self.icon(icons::FOLDER, 12.0, theme::text_muted()))
+                    .with_padding_right(5.0)
+                    .with_padding_top(3.0)
+                    .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Text::new(name.to_string(), self.ui_font, 12.0)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .with_padding_top(3.0)
+                .finish(),
+            )
+            .finish();
+        let toggle_action = CraneShellAction::ToggleChangeDir(key.to_string());
+        let label_btn = EventHandler::new(
+            Container::new(label).with_background_color(theme::sidebar_bg()).finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(toggle_action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+
+        Flex::row()
+            .with_child(marker_btn)
+            .with_child(Expanded::new(1.0, label_btn).finish())
+            .finish()
+    }
+
+    /// A file row in the Changes tree — +/- stage marker + status letter +
+    /// name, opening the diff on click and a context menu on right-click.
+    fn change_file_row(&self, f: &ChangeFile, depth: usize) -> Box<dyn Element> {
+        let indent = 8.0 + depth as f32 * 14.0;
+        let color = Self::status_color(f.status);
+        let (marker, marker_color) = if f.staged {
+            (icons::MINUS, theme::success())
+        } else {
+            (icons::PLUS, theme::text_muted())
+        };
+        let stage_action = if f.staged {
+            CraneShellAction::UnstagePaths(vec![f.path.clone()])
+        } else {
+            CraneShellAction::StagePaths(vec![f.path.clone()])
+        };
+        let marker_btn = EventHandler::new(
+            Container::new(self.icon(marker, 11.0, marker_color))
+                .with_background_color(theme::sidebar_bg())
+                .with_padding_left(indent)
+                .with_padding_right(4.0)
+                .with_padding_top(3.0)
+                .with_padding_bottom(3.0)
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(stage_action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+
+        let letter = if f.status == '?' { "?".to_string() } else { f.status.to_string() };
         let label_inner = Flex::row()
             .with_child(
                 ConstrainedBox::new(
-                    Text::new(ch.status.clone(), self.ui_font, 11.0)
-                        .with_color(color)
-                        .finish(),
+                    Text::new(letter, self.ui_font, 11.0).with_color(color).finish(),
                 )
-                .with_width(18.0)
+                .with_width(16.0)
                 .finish(),
             )
             .with_child(
-                Text::new(ch.path.clone(), self.ui_font, 12.0)
-                    .with_color(if ch.staged { theme::text() } else { theme::text_muted() })
+                Text::new(f.name.clone(), self.ui_font, 12.0)
+                    .with_color(if f.staged { theme::text() } else { theme::text_muted() })
                     .finish(),
             )
             .finish();
         let abs = self
             .active_cwd
             .as_ref()
-            .map(|c| c.join(&ch.path))
-            .unwrap_or_else(|| PathBuf::from(&ch.path));
-        // Clicking a Changes row opens the file's read-only Diff pane (HEAD vs
-        // working copy), not the editor.
+            .map(|c| c.join(&f.path))
+            .unwrap_or_else(|| PathBuf::from(&f.path));
         let open_action = CraneShellAction::OpenDiff(abs);
         let label_btn = EventHandler::new(
             Container::new(label_inner)
@@ -1581,65 +2393,45 @@ impl CraneShellView {
         })
         .finish();
 
-        Flex::row()
+        let row = Flex::row()
             .with_child(marker_btn)
             .with_child(Expanded::new(1.0, label_btn).finish())
+            .finish();
+        // Right-click → Changes-row context menu.
+        let menu_path = f.path.clone();
+        let staged = f.staged;
+        EventHandler::new(row)
+            .on_right_mouse_down(move |ctx, _app, pos| {
+                ctx.dispatch_typed_action(CraneShellAction::ShowChangeMenu {
+                    path: menu_path.clone(),
+                    staged,
+                    x: pos.x(),
+                    y: pos.y(),
+                });
+                DispatchEventResult::StopPropagation
+            })
             .finish()
     }
 
-    fn right_sidebar(&self) -> Box<dyn Element> {
-        let tabs = Flex::row()
-            .with_child(self.tab_label(
-                "Changes",
-                !self.files_tab,
-                CraneShellAction::SetTab { files: false },
-            ))
-            .with_child(Self::spacer(12.0))
-            .with_child(self.tab_label(
-                "Files",
-                self.files_tab,
-                CraneShellAction::SetTab { files: true },
-            ))
-            .finish();
-        let tabs = Container::new(tabs)
-            .with_padding_left(10.0)
-            .with_padding_top(8.0)
-            .with_padding_bottom(6.0)
-            .finish();
-
-        let mut col = Flex::column().with_child(tabs);
-        // Read CACHED contents (rebuilt in refresh_panel on action, not here).
-        if self.files_tab {
-            if self.file_rows.is_empty() {
-                col = col.with_child(self.tree_row("(empty)", 12.0, theme::text_muted(), 12.0));
-            }
-            for r in &self.file_rows {
-                col = col.with_child(self.file_row(r));
-            }
-        } else {
-            if self.changes.is_empty() {
-                col = col.with_child(self.tree_row("No changes", 12.0, theme::text_muted(), 12.0));
-            }
-            for ch in &self.changes {
-                col = col.with_child(self.change_row(ch));
-            }
-            col = col.with_child(self.commit_box());
-        }
-        // No fixed width — the enclosing SplitBox sizes it (draggable).
-        self.panel(theme::sidebar_bg(), col.finish())
-    }
-
     /// Commit message field + Commit button at the bottom of the Changes tab.
+    /// Button disables when nothing is staged OR the message is empty; label is
+    /// "Commit to <branch> (<N staged>)". Commit / op errors show below.
     fn commit_box(&self) -> Box<dyn Element> {
         let staged = self.changes.iter().filter(|c| c.staged).count();
+        let has_message = !self.commit_msg.trim().is_empty();
+        let op = self.git_op.lock().clone();
+        let any_running = op.is_running();
+        let can_commit = staged > 0 && has_message && !any_running;
+
         let (text, color) = if self.commit_msg.is_empty() {
-            ("Commit message…".to_string(), theme::text_muted())
+            (
+                if staged > 0 { "Commit message".to_string() } else { "Stage files to commit".to_string() },
+                theme::text_muted(),
+            )
         } else {
-            // Caret when focused.
             let caret = if self.commit_focused { "|" } else { "" };
             (format!("{}{}", self.commit_msg, caret), theme::text())
         };
-        // Click the field to focus it (keys route here instead of the terminal).
         let field = EventHandler::new(
             Container::new(Text::new(text, self.ui_font, 12.0).with_color(color).finish())
                 .with_background_color(if self.commit_focused {
@@ -1659,20 +2451,118 @@ impl CraneShellView {
         })
         .finish();
 
-        let btn_label = format!("Commit ({staged})");
-        let commit_btn = self.pill_button(icons::GIT_BRANCH, &btn_label, CraneShellAction::CommitStaged);
-
-        Container::new(
-            Flex::column()
-                .with_child(field)
-                .with_child(Self::spacer(6.0))
-                .with_child(commit_btn)
-                .finish(),
+        // Primary Commit button — accent fill when enabled, dim when not. Label
+        // shows the target branch + staged count so the user sees where it lands.
+        let commit_running = any_running && op.kind == Some(crate::warpui::git::OpKind::Commit);
+        let btn_label = if commit_running {
+            format!("{}  Committing…", icons::ARROW_COUNTER_CLOCKWISE)
+        } else {
+            format!("{}  Commit to {} ({staged})", icons::CHECK, self.branch)
+        };
+        let (btn_bg, btn_fg) = if can_commit {
+            (theme::accent(), ColorU::new(255, 255, 255, 255))
+        } else {
+            (theme::surface(), theme::pane_dim())
+        };
+        let commit_inner = Container::new(
+            Text::new(btn_label, self.ui_font, 12.5).with_color(btn_fg).finish(),
         )
+        .with_background_color(btn_bg)
         .with_padding_left(10.0)
         .with_padding_right(10.0)
-        .with_padding_top(8.0)
-        .finish()
+        .with_padding_top(7.0)
+        .with_padding_bottom(7.0)
+        .finish();
+        let commit_btn = EventHandler::new(commit_inner)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                if can_commit {
+                    ctx.dispatch_typed_action(CraneShellAction::CommitStaged);
+                }
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+
+        let mut column = Flex::column()
+            .with_child(field)
+            .with_child(Self::spacer(6.0))
+            .with_child(commit_btn);
+
+        // Status pill: in-flight op / last success / failure, else legacy error.
+        let pill: Option<(String, ColorU)> = match &op.state {
+            crate::warpui::git::OpState::Idle => self
+                .commit_error
+                .as_ref()
+                .map(|e| (e.clone(), theme::error())),
+            crate::warpui::git::OpState::Running => op
+                .kind
+                .map(|k| (format!("{}…", k.label()), theme::text_muted())),
+            crate::warpui::git::OpState::Done(msg) => op
+                .kind
+                .map(|k| (format!("{}: {}", k.label(), msg), theme::success())),
+            crate::warpui::git::OpState::Failed(err) => op.kind.map(|k| {
+                let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or(err);
+                (format!("{} failed: {}", k.label(), first.trim()), theme::error())
+            }),
+        };
+        if let Some((msg, col)) = pill {
+            column = column.with_child(Self::spacer(6.0)).with_child(
+                Text::new(msg, self.ui_font, 11.0).with_color(col).finish(),
+            );
+        }
+
+        Container::new(column.finish())
+            .with_padding_left(10.0)
+            .with_padding_right(10.0)
+            .with_padding_top(8.0)
+            .with_padding_bottom(8.0)
+            .finish()
+    }
+
+    /// The inline new-file / new-folder editor row in the Files tree. Text is
+    /// the live `pending_new_entry.name` with a caret; keys route here via
+    /// `SendKeys`. Enter commits, Escape cancels (handled in `edit_new_entry`).
+    fn pending_entry_row(&self, p: &PendingNewEntry) -> Box<dyn Element> {
+        let glyph = if p.is_folder { icons::FOLDER } else { icons::FILE };
+        let hint = if p.is_folder { "folder-name" } else { "filename.ext" };
+        let shown = if p.name.is_empty() {
+            hint.to_string()
+        } else {
+            format!("{}|", p.name)
+        };
+        let text_color = if p.name.is_empty() { theme::text_muted() } else { theme::text() };
+        let row = Flex::row()
+            .with_child(
+                Container::new(self.icon(glyph, 12.0, theme::text_muted()))
+                    .with_padding_left(22.0)
+                    .with_padding_right(5.0)
+                    .with_padding_top(3.0)
+                    .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Text::new(shown, self.ui_font, 12.0).with_color(text_color).finish(),
+                )
+                .with_padding_top(3.0)
+                .finish(),
+            )
+            .finish();
+        let mut col = Flex::column().with_child(
+            Container::new(row)
+                .with_background_color(theme::row_active())
+                .with_padding_top(1.0)
+                .with_padding_bottom(1.0)
+                .finish(),
+        );
+        if let Some(err) = &p.error {
+            col = col.with_child(
+                Container::new(
+                    Text::new(err.clone(), self.ui_font, 10.5).with_color(theme::error()).finish(),
+                )
+                .with_padding_left(40.0)
+                .finish(),
+            );
+        }
+        col.finish()
     }
 
     /// Unified full-width top bar that doubles as the macOS titlebar: the
@@ -2360,17 +3250,96 @@ impl CraneShellView {
         }
     }
 
-    /// Commit staged changes with the current message, then clear + refresh.
+    /// Commit staged changes with the current message on a background thread
+    /// (so the op pill animates like Push/Pull), then clear the message.
     fn commit_now(&mut self) {
         let msg = self.commit_msg.trim().to_string();
-        if msg.is_empty() {
+        let staged = self.changes.iter().filter(|c| c.staged).count();
+        if msg.is_empty() || staged == 0 {
+            return;
+        }
+        if self.git_op.lock().is_running() {
             return;
         }
         if let Some(root) = self.active_cwd.clone() {
-            if crate::warpui::git::commit(&root, &msg).is_ok() {
-                self.commit_msg.clear();
-                self.commit_focused = false;
+            self.commit_error = None;
+            let status = self.git_op.clone();
+            let wake = self.git_wake.clone();
+            crate::warpui::git::spawn_git_commit(root, msg, status, move || wake());
+            self.commit_msg.clear();
+            self.commit_focused = false;
+        }
+    }
+
+    /// Dispatch an async network git op (Push / Pull / Fetch) on the active repo.
+    fn spawn_op(&mut self, kind: crate::warpui::git::OpKind) {
+        if let Some(root) = self.active_cwd.clone() {
+            let status = self.git_op.clone();
+            let wake = self.git_wake.clone();
+            crate::warpui::git::spawn_git_op(kind, root, status, move || wake());
+        }
+    }
+
+    /// Apply a keystroke to the pending new-file/new-folder editor. Enter
+    /// commits, Escape cancels, Backspace deletes, printable chars append.
+    fn edit_new_entry(&mut self, ks: &warpui::keymap::Keystroke) {
+        match ks.key.as_str() {
+            "enter" | "return" | "numpadenter" => self.commit_pending_entry(),
+            "escape" => self.pending_new_entry = None,
+            "backspace" => {
+                if let Some(p) = self.pending_new_entry.as_mut() {
+                    p.name.pop();
+                }
+            }
+            k if k.chars().count() == 1 => {
+                if let Some(p) = self.pending_new_entry.as_mut() {
+                    p.name.push_str(k);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Create the pending new file/folder on disk; on success refresh + clear,
+    /// on failure keep the row open with an inline error (port of old
+    /// `try_commit_pending`).
+    fn commit_pending_entry(&mut self) {
+        let Some(p) = self.pending_new_entry.as_ref() else { return };
+        let name = p.name.trim().to_string();
+        if name.is_empty() {
+            self.pending_new_entry = None;
+            return;
+        }
+        if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+            if let Some(p) = self.pending_new_entry.as_mut() {
+                p.error = Some("Name can't contain / \\ . or ..".into());
+            }
+            return;
+        }
+        let target = p.parent.join(&name);
+        let parent = p.parent.clone();
+        let is_folder = p.is_folder;
+        if target.exists() {
+            if let Some(p) = self.pending_new_entry.as_mut() {
+                p.error = Some(format!("`{name}` already exists"));
+            }
+            return;
+        }
+        let result = if is_folder {
+            std::fs::create_dir(&target)
+        } else {
+            std::fs::File::create(&target).map(|_| ())
+        };
+        match result {
+            Ok(()) => {
+                self.expanded_dirs.insert(parent);
+                self.pending_new_entry = None;
                 self.refresh_panel();
+            }
+            Err(e) => {
+                if let Some(p) = self.pending_new_entry.as_mut() {
+                    p.error = Some(format!("Couldn't create: {e}"));
+                }
             }
         }
     }
@@ -2396,7 +3365,7 @@ impl CraneShellView {
     /// intentionally EXCLUDED here — otherwise panel-toggle shortcuts could
     /// never fire (the shell always has a focused pane).
     fn any_text_input_focused(&self) -> bool {
-        if self.commit_focused {
+        if self.commit_focused || self.pending_new_entry.is_some() {
             return true;
         }
         self.active_input_pane()
@@ -2608,6 +3577,15 @@ impl View for CraneShellView {
         if let Some(pm) = &self.context_menu {
             root_stack = root_stack.with_child(self.project_context_menu(pm));
         }
+        if let Some(rm) = &self.row_menu {
+            root_stack = root_stack.with_child(self.row_menu_overlay(rm));
+        }
+        if let Some((x, y)) = self.branch_picker {
+            root_stack = root_stack.with_child(self.branch_picker_overlay(x, y));
+        }
+        if let Some(p) = &self.pending_delete {
+            root_stack = root_stack.with_child(self.delete_confirm_overlay(p));
+        }
 
         let root = root_stack.finish();
 
@@ -2781,8 +3759,37 @@ pub enum CraneShellAction {
     FileTabClose(usize),
     /// Cmd+A select-all in the focused editor.
     SelectAllFocused,
-    /// Toggle stage/unstage for a changed file (click in the Changes tab).
-    StageToggle { path: String, staged: bool },
+    /// Bulk-stage the given paths (folder-row / context-menu Stage).
+    StagePaths(Vec<String>),
+    /// Bulk-unstage the given paths (folder-row / context-menu Unstage).
+    UnstagePaths(Vec<String>),
+    /// Toggle collapse of a directory group in the Changes tree.
+    ToggleChangeDir(String),
+    /// Async network git ops on the active repo.
+    GitPush,
+    GitPull,
+    GitFetch,
+    /// Open the Changes-row right-click menu.
+    ShowChangeMenu { path: String, staged: bool, x: f32, y: f32 },
+    /// Open the Files-row right-click menu.
+    ShowFileMenu { path: PathBuf, is_dir: bool, x: f32, y: f32 },
+    /// Open an absolute path in the editor/Files pane (context-menu Open).
+    OpenFileAt(PathBuf),
+    /// Copy an arbitrary path string to the clipboard.
+    CopyPathStr(String),
+    /// Reveal an absolute path in the system file manager (`open -R`).
+    RevealPathInFinder(PathBuf),
+    /// Start the inline new-file / new-folder editor under `parent`.
+    NewEntry { parent: PathBuf, is_folder: bool },
+    /// Request delete of a path — opens the confirm overlay.
+    RequestDelete(PathBuf),
+    /// Confirm / cancel the pending delete.
+    ConfirmDelete,
+    CancelDelete,
+    /// Open the branch picker overlay at (x, y).
+    ShowBranchPicker { x: f32, y: f32 },
+    /// Check out a branch, then refresh.
+    CheckoutBranch(String),
     /// Give the commit message box keyboard focus.
     FocusCommit,
     /// Commit staged changes with the current message.
@@ -2839,6 +3846,11 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::Select { sel, path } => {
                 self.selected = *sel;
                 self.active_cwd = Some(path.clone());
+                // Loose (non-git) projects have no Changes tab — force Files so
+                // the user never lands on a permanently empty Changes pane.
+                if self.is_loose_active() {
+                    self.files_tab = true;
+                }
                 // Open this tab's layout once (single terminal leaf); thereafter
                 // just show it (its PTY + scrollback ran the whole time).
                 if !self.layouts.contains_key(sel) {
@@ -2891,7 +3903,9 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::SendKeys(ks) => {
-                if self.commit_focused {
+                if self.pending_new_entry.is_some() {
+                    self.edit_new_entry(ks);
+                } else if self.commit_focused {
                     self.edit_commit(ks);
                 } else if let Some(id) = self.active_input_pane() {
                     if let Some(h) = self.terminal_at(id) {
@@ -3062,14 +4076,122 @@ impl TypedActionView for CraneShellView {
                     }
                 }
             }
-            CraneShellAction::StageToggle { path, staged } => {
+            CraneShellAction::StagePaths(paths) => {
                 if let Some(root) = self.active_cwd.clone() {
-                    let _ = if *staged {
-                        crate::warpui::git::unstage(&root, path)
-                    } else {
-                        crate::warpui::git::stage(&root, path)
-                    };
+                    self.commit_error = None;
+                    for p in paths {
+                        if let Err(e) = crate::warpui::git::stage(&root, p) {
+                            self.commit_error = Some(e);
+                            break;
+                        }
+                    }
                     self.refresh_panel();
+                }
+            }
+            CraneShellAction::UnstagePaths(paths) => {
+                if let Some(root) = self.active_cwd.clone() {
+                    self.commit_error = None;
+                    for p in paths {
+                        if let Err(e) = crate::warpui::git::unstage(&root, p) {
+                            self.commit_error = Some(e);
+                            break;
+                        }
+                    }
+                    self.refresh_panel();
+                }
+            }
+            CraneShellAction::ToggleChangeDir(key) => {
+                if !self.collapsed_change_dirs.remove(key) {
+                    self.collapsed_change_dirs.insert(key.clone());
+                }
+            }
+            CraneShellAction::GitPush => self.spawn_op(crate::warpui::git::OpKind::Push),
+            CraneShellAction::GitPull => self.spawn_op(crate::warpui::git::OpKind::Pull),
+            CraneShellAction::GitFetch => self.spawn_op(crate::warpui::git::OpKind::Fetch),
+            CraneShellAction::ShowChangeMenu { path, staged, x, y } => {
+                self.row_menu = Some(RowMenu::Change {
+                    path: path.clone(),
+                    staged: *staged,
+                    x: *x,
+                    y: *y,
+                });
+            }
+            CraneShellAction::ShowFileMenu { path, is_dir, x, y } => {
+                self.row_menu = Some(RowMenu::File {
+                    path: path.clone(),
+                    is_dir: *is_dir,
+                    x: *x,
+                    y: *y,
+                });
+            }
+            CraneShellAction::OpenFileAt(path) => {
+                self.row_menu = None;
+                self.selected_file = Some(path.clone());
+                self.open_file(path.clone(), ctx);
+            }
+            CraneShellAction::CopyPathStr(s) => {
+                self.row_menu = None;
+                ctx.clipboard()
+                    .write(warpui::clipboard::ClipboardContent::plain_text(s.clone()));
+            }
+            CraneShellAction::RevealPathInFinder(path) => {
+                self.row_menu = None;
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+                #[cfg(target_os = "linux")]
+                {
+                    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("/"));
+                    let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+                }
+            }
+            CraneShellAction::NewEntry { parent, is_folder } => {
+                self.row_menu = None;
+                self.expanded_dirs.insert(parent.clone());
+                self.pending_new_entry = Some(PendingNewEntry {
+                    parent: parent.clone(),
+                    is_folder: *is_folder,
+                    name: String::new(),
+                    error: None,
+                });
+                self.refresh_panel();
+            }
+            CraneShellAction::RequestDelete(path) => {
+                self.row_menu = None;
+                self.pending_delete = Some(path.clone());
+            }
+            CraneShellAction::ConfirmDelete => {
+                if let Some(path) = self.pending_delete.take() {
+                    let _ = if path.is_dir() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    if self.selected_file.as_deref() == Some(path.as_path()) {
+                        self.selected_file = None;
+                    }
+                    self.refresh_panel();
+                }
+            }
+            CraneShellAction::CancelDelete => {
+                self.pending_delete = None;
+            }
+            CraneShellAction::ShowBranchPicker { x, y } => {
+                if let Some(root) = self.active_cwd.clone() {
+                    let mut list = crate::warpui::git::list_local_branches(&root);
+                    for r in crate::warpui::git::list_remote_branches(&root) {
+                        list.push(r);
+                    }
+                    self.branch_list = list;
+                    self.branch_picker = Some((*x, *y));
+                }
+            }
+            CraneShellAction::CheckoutBranch(branch) => {
+                self.branch_picker = None;
+                if let Some(root) = self.active_cwd.clone() {
+                    match crate::warpui::git::checkout_branch(&root, branch) {
+                        Ok(()) => self.refresh_panel(),
+                        Err(e) => self.commit_error = Some(e),
+                    }
                 }
             }
             CraneShellAction::FocusPrevPane | CraneShellAction::FocusNextPane => {
@@ -3239,6 +4361,8 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::CloseContextMenu => {
                 self.context_menu = None;
+                self.row_menu = None;
+                self.branch_picker = None;
             }
             CraneShellAction::RevealProjectInFinder(i) => {
                 self.context_menu = None;

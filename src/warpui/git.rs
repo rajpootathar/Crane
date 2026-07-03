@@ -2,8 +2,11 @@
 //! worktree, parsed into status + path. Matches Crane's rule of shelling out
 //! to the `git` binary (never libgit2).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 pub struct Change {
     /// Porcelain XY status, trimmed (e.g. "M", "A", "D", "??", "R").
@@ -134,6 +137,55 @@ pub fn is_dirty(root: &Path) -> bool {
     out.status.success() && !out.stdout.is_empty()
 }
 
+/// Local branch names in `root` (`git branch --format=%(refname:short)`),
+/// or empty on any error. Port of old Crane `git.rs::list_local_branches`.
+pub fn list_local_branches(root: &Path) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["branch", "--format=%(refname:short)"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Remote-tracking branch names in `root` (`git branch -r
+/// --format=%(refname:short)`), excluding symbolic HEAD refs. Empty on error.
+pub fn list_remote_branches(root: &Path) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["branch", "-r", "--format=%(refname:short)"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains("->"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `git checkout <branch>` in `root`. Port of old Crane `git.rs::checkout_branch`.
+pub fn checkout_branch(root: &Path, branch: &str) -> Result<(), String> {
+    run(root, &["checkout", branch])
+}
+
 /// `git init` in `dir` — turns a loose folder into a git repository.
 /// On success the folder gains a `.git` directory; reload the project list
 /// afterwards so the `is_loose` flag reflects the new state.
@@ -202,4 +254,277 @@ pub fn changes(root: &Path) -> Vec<Change> {
             })
         })
         .collect()
+}
+
+/// Working-tree changes as a flat `(path, staged, status_char)` tuple list,
+/// sorted by path so the Right Panel can group them into a directory tree
+/// trivially. Thin projection over [`changes`] — the shell groups by the
+/// leading path components and paints the status glyph from `status_char`.
+/// `status_char` is the single normalized porcelain letter ('M', 'A', 'D',
+/// 'R', 'C', 'U', or '?'); ' ' when the status string is empty.
+pub fn changes_flat(root: &Path) -> Vec<(String, bool, char)> {
+    let mut rows: Vec<(String, bool, char)> = changes(root)
+        .into_iter()
+        .map(|c| {
+            let ch = c.status.chars().next().unwrap_or(' ');
+            (c.path, c.staged, ch)
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// `git pull --ff-only` (1:1 old Crane `git.rs::pull`). Network op — call
+/// off-thread (see [`spawn_git_op`]). Runs non-interactively so an HTTPS
+/// remote that wants credentials fails fast instead of blocking on a tty.
+/// Returns the first non-empty summary line ("Already up to date.",
+/// "Updating abc..def", …) on success, git's stderr verbatim on failure.
+pub fn pull(repo: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["pull", "--ff-only"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        return Err(if stderr.is_empty() { stdout } else { stderr });
+    }
+    let summary = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Pulled".to_string());
+    Ok(summary)
+}
+
+/// `git fetch --prune` (1:1 old Crane `git.rs::fetch`). Network op — call
+/// off-thread. git fetch reports to stderr; we surface the single "<from>
+/// -> <to>" ref-update line, "No new refs" when nothing changed, or a
+/// "Fetched N refs" count when several updated.
+pub fn fetch(repo: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "--prune"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        return Err(if stderr.is_empty() { stdout } else { stderr });
+    }
+    let combined = if stderr.is_empty() { stdout } else { stderr };
+    let updates: Vec<&str> = combined
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("->"))
+        .collect();
+    let summary = if updates.is_empty() {
+        "No new refs".to_string()
+    } else if updates.len() == 1 {
+        updates[0].to_string()
+    } else {
+        format!("Fetched {} refs", updates.len())
+    };
+    Ok(summary)
+}
+
+/// Commits `(ahead, behind)` the upstream branch, or `None` when no
+/// upstream is configured (fresh branch before first push) or the
+/// `git rev-list` call fails. Port of old Crane `git.rs::ahead_behind`,
+/// returning a plain tuple instead of the `AheadBehind` struct.
+///
+/// `git rev-list --left-right --count @{u}...HEAD` prints "<behind>
+/// <ahead>" — left side (`@{u}`) is commits we're missing (behind),
+/// right side (`HEAD`) is commits we have that upstream lacks (ahead).
+pub fn ahead_behind(repo: &Path) -> Option<(usize, usize)> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-list", "--left-right", "--count", "@{u}...HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let behind = parts[0].parse::<usize>().ok()?;
+    let ahead = parts[1].parse::<usize>().ok()?;
+    Some((ahead, behind))
+}
+
+// ── Async git-op model ────────────────────────────────────────────────
+// Mirrors old Crane's `GitOpKind` / `GitOpStatus` / `dispatch_git_op`
+// (src/state/state.rs). Crane bans async runtimes — the op runs on a
+// `std::thread`, flips a shared `OpStatus`, and calls `wake()` (egui
+// `request_repaint`) so the Right Panel redraws with the result pill.
+
+/// Which git operation a background thread is running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpKind {
+    Push,
+    Pull,
+    Fetch,
+    Commit,
+}
+
+impl OpKind {
+    /// Human label for the in-progress / result pill.
+    pub fn label(self) -> &'static str {
+        match self {
+            OpKind::Push => "Push",
+            OpKind::Pull => "Pull",
+            OpKind::Fetch => "Fetch",
+            OpKind::Commit => "Commit",
+        }
+    }
+}
+
+/// Lifecycle of the most recent git op. `Done`/`Failed` carry the
+/// summary / error string for the result pill.
+#[derive(Clone, Debug)]
+pub enum OpState {
+    Idle,
+    Running,
+    Done(String),
+    Failed(String),
+}
+
+/// Shared status the Right Panel polls each frame. `kind` is `None`
+/// while `Idle`; `Some(kind)` for the op that is Running / last
+/// finished. Wrap in `Arc<Mutex<_>>` and hand a clone to
+/// [`spawn_git_op`].
+#[derive(Clone, Debug)]
+pub struct OpStatus {
+    pub kind: Option<OpKind>,
+    pub state: OpState,
+}
+
+impl Default for OpStatus {
+    fn default() -> Self {
+        OpStatus {
+            kind: None,
+            state: OpState::Idle,
+        }
+    }
+}
+
+impl OpStatus {
+    /// True while a background op is in flight — the shell disables the
+    /// Push/Pull/Fetch buttons and shows a spinner to avoid double-dispatch.
+    pub fn is_running(&self) -> bool {
+        matches!(self.state, OpState::Running)
+    }
+}
+
+/// Run a network git op (`Push` / `Pull` / `Fetch`) on a `std::thread`,
+/// flipping `status` to `Running`, then `Done`/`Failed`, waking the UI
+/// after each transition. Mirrors old Crane `dispatch_git_op`, including
+/// the cheap `ahead_behind` short-circuit so Push/Pull answer instantly
+/// when there's nothing to do instead of stalling on the network.
+///
+/// If an op is already `Running`, this is a no-op (guards against
+/// double-dispatch). `Commit` needs a message and is rejected here —
+/// use [`spawn_git_commit`] for that.
+pub fn spawn_git_op(
+    kind: OpKind,
+    dir: PathBuf,
+    status: Arc<Mutex<OpStatus>>,
+    wake: impl Fn() + Send + 'static,
+) {
+    {
+        let mut guard = status.lock();
+        if guard.is_running() {
+            return;
+        }
+        guard.kind = Some(kind);
+        guard.state = OpState::Running;
+    }
+
+    // Cheap pre-checks (single `git rev-list`): tell the user upfront
+    // when Push/Pull have nothing to do rather than after a network wait.
+    if matches!(kind, OpKind::Push | OpKind::Pull) {
+        if let Some((ahead, behind)) = ahead_behind(&dir) {
+            let mut guard = status.lock();
+            if kind == OpKind::Push && ahead == 0 {
+                guard.state = OpState::Done(if behind > 0 {
+                    format!("Nothing to push (behind {behind} — pull first)")
+                } else {
+                    "Nothing to push (up to date)".into()
+                });
+                drop(guard);
+                wake();
+                return;
+            }
+            if kind == OpKind::Pull && behind == 0 {
+                guard.state = OpState::Done("Already up to date".into());
+                drop(guard);
+                wake();
+                return;
+            }
+        }
+    }
+
+    std::thread::spawn(move || {
+        let result: Result<String, String> = match kind {
+            OpKind::Push => push(&dir).map(|()| "Pushed".to_string()),
+            OpKind::Pull => pull(&dir),
+            OpKind::Fetch => fetch(&dir),
+            OpKind::Commit => Err("Commit requires a message — use spawn_git_commit".into()),
+        };
+        let mut guard = status.lock();
+        guard.state = match result {
+            Ok(message) => OpState::Done(message),
+            Err(error) => OpState::Failed(error),
+        };
+        drop(guard);
+        wake();
+    });
+}
+
+/// Async commit on a `std::thread` — the message-carrying companion to
+/// [`spawn_git_op`] (whose fixed signature can't take a message). Flips
+/// `status` to `Running` → `Done`/`Failed`, waking the UI. Refuses an
+/// empty / whitespace message so the pill reports a clear error instead
+/// of git's "aborting commit due to empty message".
+pub fn spawn_git_commit(
+    dir: PathBuf,
+    message: String,
+    status: Arc<Mutex<OpStatus>>,
+    wake: impl Fn() + Send + 'static,
+) {
+    {
+        let mut guard = status.lock();
+        if guard.is_running() {
+            return;
+        }
+        guard.kind = Some(OpKind::Commit);
+        guard.state = OpState::Running;
+    }
+    std::thread::spawn(move || {
+        let result = if message.trim().is_empty() {
+            Err("No commit message".to_string())
+        } else {
+            commit(&dir, &message).map(|()| "Committed".to_string())
+        };
+        let mut guard = status.lock();
+        guard.state = match result {
+            Ok(message) => OpState::Done(message),
+            Err(error) => OpState::Failed(error),
+        };
+        drop(guard);
+        wake();
+    });
 }
