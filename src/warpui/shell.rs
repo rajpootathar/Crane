@@ -321,6 +321,41 @@ pub struct CraneShellView {
     tab_switcher: Option<TabSwitcherState>,
     /// Scroll state for the tab-switcher list.
     switcher_scroll: ClippedScrollStateHandle,
+
+    // ── LSP wiring ───────────────────────────────────────────────────────────
+    /// The language-server client. Diagnostics + goto-definition for the active
+    /// editor. No-ops gracefully when no matching server is installed.
+    lsp: crate::lsp::LspManager,
+    /// A standalone egui context handed to `LspManager` (its API takes one to
+    /// call `request_repaint` when async results land). warpui does NOT drive
+    /// this context's frame loop — repaints are driven by `_lsp_tick` instead —
+    /// so it is only a required-argument sink here.
+    lsp_ctx: egui::Context,
+    /// Per-language behavior toggles. Default set (matches the egui app's
+    /// startup `LanguageConfigs::default()`); not yet surfaced in warpui
+    /// Settings, so it never diverges from the per-server defaults.
+    lsp_configs: crate::lsp::LanguageConfigs,
+    /// Last `buffer_version` sent to the server per open editor path — drives
+    /// `did_change` change detection (send only on an actual content edit).
+    lsp_versions: HashMap<PathBuf, u64>,
+    /// Last diagnostics fingerprint pushed to each editor. Avoids re-pushing
+    /// (and re-rendering) identical diagnostics every poll tick.
+    lsp_diag_sig: HashMap<PathBuf, Vec<(u32, u32, u32, u8)>>,
+    /// In-flight goto-definition requests, polled each tick until they resolve
+    /// (or a 5s watchdog prunes them). Port of the egui app's `pending_gotos`.
+    pending_gotos: Vec<PendingGoto>,
+    /// 300ms poll timer: ticks `LspManager`, syncs the active editor's
+    /// `did_change` + diagnostics, and drains goto results. Kept alive for the
+    /// view's lifetime.
+    _lsp_tick: warpui::r#async::SpawnedLocalStream,
+}
+
+/// An in-flight goto-definition request token (server + JSON-RPC id) plus the
+/// time it was dispatched, so a watchdog can prune requests that never resolve.
+struct PendingGoto {
+    server: crate::lsp::ServerKey,
+    request_id: i64,
+    dispatched_at: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -561,10 +596,12 @@ impl CraneShellView {
                             for p in &saved_paths {
                                 let content = std::fs::read_to_string(p).unwrap_or_default();
                                 let pc = p.clone();
+                                let goto = Self::lsp_goto_cb(p.clone());
                                 let h = ctx.add_typed_action_view(move |ctx| {
                                     crate::warpui::editor_view::WarpEditorView::new(
                                         ctx, content, mono, pc,
                                     )
+                                    .with_goto(goto)
                                 });
                                 restored_editor_views.insert(p.clone(), h);
                             }
@@ -669,6 +706,22 @@ impl CraneShellView {
             },
             |_this, _vctx| {},
         );
+        // LSP poll timer. warpui has no per-frame hook we can mutate the view
+        // from, and the egui repaint callback is a one-shot on a frame-less
+        // context, so a 300ms interval stream drives the LSP: it ticks the
+        // manager, sends `did_change` when the active editor's buffer version
+        // moved, pushes fresh diagnostics, and drains goto-definition results.
+        // Cheap when idle (a couple hashmap lookups + lock reads; no repaint
+        // unless something actually changed).
+        let lsp_ticker =
+            warpui::r#async::Timer::interval(std::time::Duration::from_millis(300));
+        let lsp_tick = ctx.spawn_stream_local(
+            lsp_ticker,
+            |this: &mut Self, _instant, vctx| {
+                this.poll_lsp(vctx);
+            },
+            |_this, _vctx| {},
+        );
         Self {
             ui_font,
             icon_font,
@@ -752,6 +805,13 @@ impl CraneShellView {
             find_scroll: ClippedScrollStateHandle::new(),
             tab_switcher: None,
             switcher_scroll: ClippedScrollStateHandle::new(),
+            lsp: crate::lsp::LspManager::new(),
+            lsp_ctx: egui::Context::default(),
+            lsp_configs: crate::lsp::LanguageConfigs::default(),
+            lsp_versions: HashMap::new(),
+            lsp_diag_sig: HashMap::new(),
+            pending_gotos: Vec::new(),
+            _lsp_tick: lsp_tick,
         }
     }
 
@@ -4618,12 +4678,24 @@ impl CraneShellView {
                 cache.load_system_font("Menlo").expect("load Menlo")
             });
             let p = path.clone();
+            let goto = Self::lsp_goto_cb(path.clone());
             let h = ctx.add_typed_action_view(move |ctx| {
                 crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, p)
+                    .with_goto(goto)
             });
             self.editor_views.insert(path.clone(), h.clone());
             h
         };
+        // Notify the LSP that this file is open (spawns the matching server on
+        // first sight; a no-op when none is installed). Seed the sent-version so
+        // the poll loop doesn't fire a redundant did_change on the first tick.
+        if !self.lsp.is_tracked(&path) {
+            let content = handle.read(ctx, |v, app| v.buffer_text(app));
+            self.lsp
+                .did_open(&self.lsp_ctx, &path, &content, &self.lsp_configs);
+            let v0 = handle.read(ctx, |v, app| v.buffer_version(app));
+            self.lsp_versions.insert(path.clone(), v0);
+        }
         // Existing editor pane still alive? Swap its content to the active file.
         if let Some(fp) = self.files_pane {
             if matches!(
@@ -4674,6 +4746,141 @@ impl CraneShellView {
                 .get(path)
                 .map(|h| PaneContent::Editor(h.clone()))
         }
+    }
+
+    // ── LSP ──────────────────────────────────────────────────────────────────
+
+    /// Build the goto-definition callback for an editor bound to `path`. On a
+    /// Cmd+LeftClick the editor invokes this with the 0-based `(line, char)`
+    /// under the cursor; we dispatch a shell action (deferred, so it runs after
+    /// the editor's own update settles) that starts the LSP request.
+    fn lsp_goto_cb(
+        path: PathBuf,
+    ) -> Rc<dyn Fn(u32, u32, &mut ViewContext<crate::warpui::editor_view::WarpEditorView>)> {
+        Rc::new(move |line, character, ctx| {
+            ctx.dispatch_typed_action_deferred(CraneShellAction::LspGoto {
+                path: path.clone(),
+                line,
+                character,
+            });
+        })
+    }
+
+    /// The path of the editor currently shown in the File pane (the active file
+    /// tab), if that tab is a real editor (not a Markdown preview).
+    fn active_editor_path(&self) -> Option<PathBuf> {
+        let path = self.file_pane_paths.get(self.file_pane_active)?.clone();
+        self.editor_views.contains_key(&path).then_some(path)
+    }
+
+    /// 300ms poll: drain server state transitions, sync the active editor's
+    /// content + diagnostics with the LSP, and pick up any resolved goto
+    /// results. Runs off the `_lsp_tick` timer stream (and is cheap / silent
+    /// when nothing changed).
+    fn poll_lsp(&mut self, ctx: &mut ViewContext<Self>) {
+        self.lsp.tick(&self.lsp_ctx);
+        if let Some(path) = self.active_editor_path() {
+            if let Some(h) = self.editor_views.get(&path).cloned() {
+                let (ver, text) =
+                    h.read(ctx, |v, app| (v.buffer_version(app), v.buffer_text(app)));
+                if !self.lsp.is_tracked(&path) {
+                    self.lsp
+                        .did_open(&self.lsp_ctx, &path, &text, &self.lsp_configs);
+                    self.lsp_versions.insert(path.clone(), ver);
+                } else if self.lsp_versions.get(&path) != Some(&ver) {
+                    self.lsp.did_change(&path, &text);
+                    self.lsp_versions.insert(path.clone(), ver);
+                }
+                // Push diagnostics only when they changed — avoids re-rendering
+                // (set_diagnostics notifies) on every idle tick.
+                let diags = self.lsp.diagnostics(&path);
+                let sig: Vec<(u32, u32, u32, u8)> = diags
+                    .iter()
+                    .map(|d| (d.line, d.col_start, d.col_end, d.severity))
+                    .collect();
+                if self.lsp_diag_sig.get(&path) != Some(&sig) {
+                    self.lsp_diag_sig.insert(path.clone(), sig);
+                    h.update(ctx, |v, c| v.set_diagnostics(diags, c));
+                }
+            }
+        }
+        self.drain_gotos(ctx);
+    }
+
+    /// Fire a goto-definition request for `path` at the 0-based `(line, char)`.
+    /// Non-blocking: results are polled in `drain_gotos`. Ensures the file is
+    /// opened on the server first (goto_dispatch only routes to tracked files).
+    fn lsp_start_goto(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !self.lsp.is_tracked(&path) {
+            if let Some(h) = self.editor_views.get(&path).cloned() {
+                let (ver, text) =
+                    h.read(ctx, |v, app| (v.buffer_version(app), v.buffer_text(app)));
+                self.lsp
+                    .did_open(&self.lsp_ctx, &path, &text, &self.lsp_configs);
+                self.lsp_versions.insert(path.clone(), ver);
+            }
+        }
+        let now = std::time::Instant::now();
+        for (server, request_id) in self.lsp.goto_dispatch(&path, line, character) {
+            self.pending_gotos.push(PendingGoto {
+                server,
+                request_id,
+                dispatched_at: now,
+            });
+        }
+        // Try once immediately in case the server already had the answer.
+        self.drain_gotos(ctx);
+    }
+
+    /// Poll every in-flight goto request. Jump to the first location that
+    /// resolves (dropping its siblings — multiple servers per file); a 5s
+    /// watchdog prunes requests that never answer. Port of the egui app's
+    /// goto-result drain.
+    fn drain_gotos(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.pending_gotos.is_empty() {
+            return;
+        }
+        let mut landed = false;
+        let mut target: Option<crate::lsp::Location> = None;
+        let mut pending = std::mem::take(&mut self.pending_gotos);
+        pending.retain(|p| {
+            if landed {
+                return false;
+            }
+            if p.dispatched_at.elapsed() > std::time::Duration::from_secs(5) {
+                return false;
+            }
+            match self.lsp.take_goto_result(p.server, p.request_id) {
+                Some(Some(loc)) => {
+                    target = Some(loc);
+                    landed = true;
+                    false
+                }
+                Some(None) => false,
+                None => true,
+            }
+        });
+        self.pending_gotos = pending;
+        if let Some(loc) = target {
+            self.goto_location(loc, ctx);
+        }
+    }
+
+    /// Open the goto-definition target file at its line. `Location::line` is
+    /// 0-based; `goto_line` takes a 1-based line.
+    fn goto_location(&mut self, loc: crate::lsp::Location, ctx: &mut ViewContext<Self>) {
+        let path = loc.path.clone();
+        self.open_file(path.clone(), ctx);
+        if let Some(h) = self.editor_views.get(&path).cloned() {
+            h.update(ctx, |v, c| v.goto_line((loc.line as usize) + 1, c));
+        }
+        ctx.notify();
     }
 
     /// Toggle the Git Log bottom dock for the active worktree.
@@ -5456,6 +5663,11 @@ impl View for CraneShellView {
                     ctx.dispatch_typed_action(CraneShellAction::ToggleWordWrap);
                     return DispatchEventResult::StopPropagation;
                 }
+                // F12: LSP goto-definition at the caret in the focused editor.
+                if !ks.cmd && !ks.ctrl && !ks.alt && ks.key.to_ascii_lowercase() == "f12" {
+                    ctx.dispatch_typed_action(CraneShellAction::LspGotoAtCursor);
+                    return DispatchEventResult::StopPropagation;
+                }
                 // Regular keys: route to the FOCUSED pane's terminal. Shell-driven
                 // input avoids warpui per-view focus being out of sync.
                 // TODO(parity): IME / composed multi-codepoint text (CJK, emoji,
@@ -5671,6 +5883,15 @@ pub enum CraneShellAction {
         key: (usize, usize, usize),
         path: PathBuf,
     },
+    /// LSP goto-definition at a 0-based `(line, character)` in `path` — raised by
+    /// the editor's Cmd+LeftClick callback.
+    LspGoto {
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
+    /// F12: LSP goto-definition at the caret in the focused editor pane.
+    LspGotoAtCursor,
     Noop,
 }
 
@@ -5792,6 +6013,18 @@ impl TypedActionView for CraneShellView {
                     h.update(ctx, |view, vctx| {
                         view.save(vctx);
                     });
+                    // Notify the LSP of the on-disk save (rust-analyzer runs
+                    // cargo check on didSave for full error coverage). Reads the
+                    // just-saved buffer back so the server sees the same bytes.
+                    // NOTE: format-on-save is deferred — `LspManager` exposes no
+                    // textDocument/formatting request yet (the `format_on_save`
+                    // config flag is a Phase-2 placeholder), so there is nothing
+                    // to apply before the write.
+                    let (path, text) =
+                        h.read(ctx, |v, app| (v.file_path().to_path_buf(), v.buffer_text(app)));
+                    if !path.as_os_str().is_empty() {
+                        self.lsp.did_save(&path, &text, &self.lsp_configs);
+                    }
                 }
             }
             CraneShellAction::FindFocused => {
@@ -6752,6 +6985,21 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::ActivateSwitcherTab { key, path } => {
                 self.activate_switcher_tab(*key, path.clone(), ctx);
+            }
+            CraneShellAction::LspGoto {
+                path,
+                line,
+                character,
+            } => {
+                self.lsp_start_goto(path.clone(), *line, *character, ctx);
+            }
+            CraneShellAction::LspGotoAtCursor => {
+                if let Some(path) = self.active_editor_path() {
+                    if let Some(h) = self.editor_views.get(&path).cloned() {
+                        let (line, character) = h.read(ctx, |v, app| v.cursor_line_char(app));
+                        self.lsp_start_goto(path, line, character, ctx);
+                    }
+                }
             }
             CraneShellAction::Noop => {}
         }

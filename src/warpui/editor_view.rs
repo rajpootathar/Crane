@@ -95,6 +95,17 @@ fn solid(c: ColorU) -> Fill {
     Fill::Solid(c)
 }
 
+/// Underline color for an LSP diagnostic by severity: 1 = error, 2 = warning,
+/// 3 = info, 4 = hint. Info/hint use the muted text color; warning uses the
+/// theme's warning color.
+fn diag_color(severity: u8) -> ColorU {
+    match severity {
+        1 => theme::error(),
+        2 => theme::warning(),
+        _ => theme::text_muted(),
+    }
+}
+
 /// Build a RichTextStyles for plain-code editing from our mono font + theme.
 fn styles(font: FamilyId) -> RichTextStyles {
     let para = |tab: Option<u8>| ParagraphStyles {
@@ -173,6 +184,9 @@ fn offset_of(location: &Location) -> CharOffset {
 #[derive(Debug, Clone)]
 pub enum EditAction {
     CursorPlace { offset: CharOffset },
+    /// Cmd+LeftClick — place the caret AND fire the goto-definition callback with
+    /// the `(line, character)` at the click. Non-mutating.
+    GotoDefinitionAt { offset: CharOffset },
     SelectionExtend { offset: CharOffset },
     /// Left mouse released — ends an in-editor selection drag.
     EndSelect,
@@ -252,13 +266,20 @@ impl<V> RichTextAction<V> for EditAction {
     }
     fn left_mouse_down(
         l: Location,
-        _m: ModifiersState,
+        m: ModifiersState,
         _cc: u32,
         _fm: bool,
         _v: &WeakViewHandle<V>,
         _x: &AppContext,
     ) -> Option<Self> {
-        Some(EditAction::CursorPlace { offset: offset_of(&l) })
+        let offset = offset_of(&l);
+        // Cmd+Click triggers goto-definition (and still places the caret);
+        // a plain click just places the caret.
+        if m.cmd {
+            Some(EditAction::GotoDefinitionAt { offset })
+        } else {
+            Some(EditAction::CursorPlace { offset })
+        }
     }
     fn left_mouse_dragged(
         l: Location,
@@ -477,6 +498,17 @@ pub struct WarpEditorView {
     /// Gutter git-diff marker cache (recomputed on save / external git op, NOT
     /// per frame — see `DiffCache`). The gutter reads this each paint.
     diff: std::cell::RefCell<DiffCache>,
+    /// LSP diagnostics for this file, pushed by the shell (which owns the
+    /// `LspManager`). Rendered as dashed severity-colored underlines that coexist
+    /// with the syntax color layer and the find-match highlights. The shell
+    /// re-pushes fresh diagnostics whenever the buffer changes, so offsets don't
+    /// drift; `refresh_decorations` re-maps line/col → CharOffset on each push.
+    diagnostics: Vec<crate::lsp::Diagnostic>,
+    /// Cmd+Click goto-definition callback. The shell wires this to dispatch an
+    /// LSP goto action; the editor computes the 0-based `(line, character)` under
+    /// the click and invokes it. `None` = goto disabled for this editor.
+    #[allow(clippy::type_complexity)]
+    goto_cb: Option<std::rc::Rc<dyn Fn(u32, u32, &mut ViewContext<WarpEditorView>)>>,
 }
 
 /// The on-disk modification time of `path`, or `None` if it can't be stat'd.
@@ -692,6 +724,10 @@ impl WarpEditorView {
         self.diff.borrow_mut().dirty = true;
         if self.find.is_some() {
             self.recompute_matches(ctx);
+        } else {
+            // Re-map any diagnostic underlines onto the reloaded content (the
+            // shell will also push a fresh set shortly).
+            self.refresh_decorations(ctx);
         }
         ctx.notify();
     }
@@ -748,6 +784,66 @@ impl WarpEditorView {
         let chars = sel.chars().count();
         let lines = sel.matches('\n').count() + 1;
         Some((chars, lines))
+    }
+
+    // ── LSP surface (the shell owns the LspManager and drives it) ────────────
+
+    /// This editor's file path (empty when the buffer is unsaved). The shell uses
+    /// it as the LSP document key for `did_open` / `did_change` / `did_save` /
+    /// `diagnostics` / `goto_dispatch`.
+    pub fn file_path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// A monotonically-increasing version that bumps on every USER content edit
+    /// (type / paste / undo / redo / cut / replace / indent / …). The shell polls
+    /// this and only sends `did_change` when it changes — cheap change detection
+    /// without diffing text. Caret motion / scrolling / selection do NOT bump it.
+    pub fn buffer_version(&self, app: &AppContext) -> u64 {
+        self.model.as_ref(app).buffer.as_ref(app).version().as_u64()
+    }
+
+    /// The caret's 0-based `(line, character)` — the position form LSP wants for
+    /// `goto_dispatch` / `hover`. (`cursor_line_col` returns the 1-based form for
+    /// the status row; this is the LSP-shaped peer.)
+    pub fn cursor_line_char(&self, app: &AppContext) -> (u32, u32) {
+        let text = self.buffer_text(app);
+        let off = self.cursor_text_offset(app);
+        Self::line_char_at_offset(&text, off)
+    }
+
+    /// Store fresh LSP diagnostics and re-render their underline decorations.
+    /// Coexists with syntax colors (a separate `text_decorations` layer) and find
+    /// highlights. The shell pushes a fresh set whenever the buffer changes, so
+    /// offsets track edits.
+    pub fn set_diagnostics(
+        &mut self,
+        diags: Vec<crate::lsp::Diagnostic>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.diagnostics = diags;
+        self.refresh_decorations(ctx);
+        ctx.notify();
+    }
+
+    /// The 0-based `(line, character)` of char offset `offset` into `text`.
+    /// `character` counts chars from the line start. Shared by `cursor_line_char`
+    /// and the Cmd+Click goto path.
+    fn line_char_at_offset(text: &str, offset: usize) -> (u32, u32) {
+        let mut line = 0u32;
+        let mut col = 0u32;
+        for (i, ch) in text.chars().enumerate() {
+            if i >= offset {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
     }
 
     // ── Preview / read-only ──────────────────────────────────────────────────
@@ -835,10 +931,9 @@ impl WarpEditorView {
             let sel = m.selection.clone();
             sel.update(mctx, |s, sctx| s.set_cursor(c, sctx));
         });
-        // Re-push any active find highlights (the fresh render state cleared them).
-        if self.find.is_some() {
-            self.apply_match_decorations(ctx);
-        }
+        // Re-push decorations (find highlights + diagnostics) — the fresh render
+        // state cleared them.
+        self.refresh_decorations(ctx);
         ctx.notify();
     }
 
@@ -1154,7 +1249,30 @@ impl WarpEditorView {
             read_only: false,
             loaded_mtime,
             diff,
+            diagnostics: Vec::new(),
+            goto_cb: None,
         }
+    }
+
+    /// Builder: install the Cmd+Click goto-definition callback. Chains onto
+    /// `new(...)` inside the view-construction closure.
+    #[allow(clippy::type_complexity)]
+    pub fn with_goto(
+        mut self,
+        cb: std::rc::Rc<dyn Fn(u32, u32, &mut ViewContext<WarpEditorView>)>,
+    ) -> Self {
+        self.goto_cb = Some(cb);
+        self
+    }
+
+    /// Setter form of `with_goto`, for wiring the callback after construction
+    /// (e.g. `handle.update(ctx, |v, _| v.set_goto(cb))`).
+    #[allow(clippy::type_complexity)]
+    pub fn set_goto(
+        &mut self,
+        cb: std::rc::Rc<dyn Fn(u32, u32, &mut ViewContext<WarpEditorView>)>,
+    ) {
+        self.goto_cb = Some(cb);
     }
 }
 
@@ -1223,8 +1341,10 @@ impl WarpEditorView {
         ctx.notify();
     }
 
-    /// The whole buffer as an owned `String`.
-    fn buffer_text(&self, ctx: &impl warpui::ModelAsRef) -> String {
+    /// The whole buffer as an owned `String`. Public so the shell can feed it to
+    /// the LSP (`did_open` / `did_change` / `did_save`). `AppContext` satisfies
+    /// `ModelAsRef`, so the shell calls `editor.buffer_text(app)`.
+    pub fn buffer_text(&self, ctx: &impl warpui::ModelAsRef) -> String {
         self.model.as_ref(ctx).buffer.as_ref(ctx).text().to_string()
     }
 
@@ -1325,26 +1445,80 @@ impl WarpEditorView {
         self.apply_match_decorations(ctx);
     }
 
-    /// Push the match ranges into the render state as background decorations
-    /// (brighter for the current match). Reuses warp's search highlight fills.
-    fn apply_match_decorations(&mut self, ctx: &mut ViewContext<Self>) {
-        let decs: Vec<Decoration> = match self.find.as_ref() {
-            Some(f) => f
-                .matches
-                .iter()
-                .enumerate()
-                .map(|(idx, (s, e))| {
-                    let fill = if Some(idx) == f.current {
-                        *warp_editor::search::SELECTED_MATCH_FILL
-                    } else {
-                        *warp_editor::search::MATCH_FILL
-                    };
+    /// Map the stored LSP diagnostics to render-state underline decorations.
+    /// Each diagnostic is single-line (`line`, `col_start`, `col_end`); columns
+    /// are treated as char offsets into the line and clamped to the line length
+    /// (mirroring the old egui overlay). Offsets are 0-based char indices into
+    /// the buffer text — the same space the find-match decorations use — so they
+    /// coexist correctly. Recomputed against the CURRENT buffer text on every
+    /// call, so ranges track edits (the shell re-pushes on change).
+    fn diag_decorations(&self, ctx: &impl warpui::ModelAsRef) -> Vec<Decoration> {
+        if self.diagnostics.is_empty() {
+            return Vec::new();
+        }
+        let text = self.buffer_text(ctx);
+        // Char offset of each line start, precomputed once.
+        let mut line_starts: Vec<usize> = vec![0];
+        let mut idx = 0usize;
+        for ch in text.chars() {
+            idx += 1;
+            if ch == '\n' {
+                line_starts.push(idx);
+            }
+        }
+        let total = idx;
+        let mut out = Vec::new();
+        for d in &self.diagnostics {
+            let Some(&base) = line_starts.get(d.line as usize) else {
+                continue;
+            };
+            let next = line_starts
+                .get(d.line as usize + 1)
+                .copied()
+                .unwrap_or(total);
+            let line_len = next.saturating_sub(base).saturating_sub(1);
+            let cs = (d.col_start as usize).min(line_len);
+            let ce = (d.col_end as usize).min(line_len).max(cs);
+            let (mut s, mut e) = (base + cs, base + ce);
+            // Zero-width diagnostic (col_start == col_end): underline one char so
+            // it's still visible.
+            if e <= s {
+                e = (s + 1).min(total);
+                if e <= s {
+                    // At EOF with nothing to underline — nudge start back one.
+                    s = s.saturating_sub(1);
+                }
+                if e <= s {
+                    continue;
+                }
+            }
+            out.push(
+                Decoration::new(CharOffset::from(s), CharOffset::from(e))
+                    .with_dashed_underline(diag_color(d.severity)),
+            );
+        }
+        out
+    }
+
+    /// Rebuild the render-state decoration set from BOTH coexisting layers:
+    /// diagnostic underlines (from the LSP) and find-match backgrounds (when the
+    /// find bar is open). `set_text_decorations` REPLACES the whole vec, so the
+    /// two layers must be pushed together or one clobbers the other.
+    fn refresh_decorations(&self, ctx: &mut ViewContext<Self>) {
+        let mut decs = self.diag_decorations(ctx);
+        if let Some(f) = self.find.as_ref() {
+            for (idx, (s, e)) in f.matches.iter().enumerate() {
+                let fill = if Some(idx) == f.current {
+                    *warp_editor::search::SELECTED_MATCH_FILL
+                } else {
+                    *warp_editor::search::MATCH_FILL
+                };
+                decs.push(
                     Decoration::new(CharOffset::from(*s), CharOffset::from(*e))
-                        .with_background(fill)
-                })
-                .collect(),
-            None => Vec::new(),
-        };
+                        .with_background(fill),
+                );
+            }
+        }
         let model = self.model.clone();
         model.update(ctx, |m: &mut CodeModel, mctx| {
             let rs = m.render_state.clone();
@@ -1352,12 +1526,17 @@ impl WarpEditorView {
         });
     }
 
+    /// Push the current find-match ranges (plus diagnostics) into the render
+    /// state. Kept as a thin alias over `refresh_decorations` so the find code
+    /// reads naturally.
+    fn apply_match_decorations(&mut self, ctx: &mut ViewContext<Self>) {
+        self.refresh_decorations(ctx);
+    }
+
+    /// Clear find-match highlights (Escape / close). Diagnostics are preserved —
+    /// `refresh_decorations` re-pushes them since `find` is now `None`.
     fn clear_match_decorations(&mut self, ctx: &mut ViewContext<Self>) {
-        let model = self.model.clone();
-        model.update(ctx, |m: &mut CodeModel, mctx| {
-            let rs = m.render_state.clone();
-            rs.update(mctx, |r, rctx| r.set_text_decorations(Vec::new(), rctx));
-        });
+        self.refresh_decorations(ctx);
     }
 
     /// Select match `idx` (as a selection range) and scroll it into view.
@@ -1577,6 +1756,25 @@ impl WarpEditorView {
                     let sel = m.selection.clone();
                     sel.update(mctx, |s, sctx| s.set_cursor(off, sctx));
                 });
+            }
+            EditAction::GotoDefinitionAt { offset } => {
+                // Place the caret at the click, exactly like CursorPlace …
+                self.selecting.set(false);
+                let boff = offset.add_signed(1);
+                model.update(ctx, |m: &mut CodeModel, mctx| {
+                    let sel = m.selection.clone();
+                    sel.update(mctx, |s, sctx| s.set_cursor(boff, sctx));
+                });
+                // … then fire the goto callback with the 0-based (line, char) at
+                // the click (LSP positions are 0-based). Clone the Rc so the
+                // borrow of `self.goto_cb` ends before we hand `ctx` to it.
+                if let Some(cb) = self.goto_cb.clone() {
+                    let text = self.buffer_text(ctx);
+                    let (line, ch) = Self::line_char_at_offset(&text, offset.as_usize());
+                    cb(line, ch, ctx);
+                }
+                ctx.notify();
+                return;
             }
             EditAction::SelectionExtend { offset } => {
                 // Only extend if the drag STARTED inside the editor. A pane
