@@ -82,8 +82,10 @@ pub struct GridElement {
     /// convert viewport rows to terminal line numbers.
     selection: Option<SelectionRange>,
     display_offset: i32,
-    /// Mouse selection callback: `(phase, viewport_row, col, side)`.
-    mouse_sel_cb: Option<Rc<dyn Fn(MouseSelPhase, usize, usize, Side)>>,
+    /// Mouse selection callback: `(phase, viewport_row, col, side, shift)`.
+    /// `shift` is the Shift-modifier state at a Down event (used to extend an
+    /// existing selection); it is always `false` for Drag/Up.
+    mouse_sel_cb: Option<Rc<dyn Fn(MouseSelPhase, usize, usize, Side, bool)>>,
     /// Shared drag state (persisted by the owning View across per-frame rebuilds).
     mouse_dragging: Rc<StdCell<bool>>,
     /// URL spans detected in the visible grid rows (built by the View each frame).
@@ -162,7 +164,7 @@ impl GridElement {
     pub fn on_mouse_select(
         mut self,
         dragging: Rc<StdCell<bool>>,
-        cb: Rc<dyn Fn(MouseSelPhase, usize, usize, Side)>,
+        cb: Rc<dyn Fn(MouseSelPhase, usize, usize, Side, bool)>,
     ) -> Self {
         self.mouse_dragging = dragging;
         self.mouse_sel_cb = Some(cb);
@@ -226,6 +228,9 @@ impl Element for GridElement {
         let descent = fc.descent(font, self.font_size); // negative
         let text_height = ascent - descent;
         let baseline = ((self.cell_h - text_height) * 0.5) + ascent;
+        // Underline sits part-way into the descent region (font underline
+        // metric); clamp so tiny/large fonts still get a sensible offset.
+        let underline_off = ((-descent) * 0.5).clamp(1.0, 3.0);
         let (cw, ch) = (self.cell_w, self.cell_h);
 
         // 1) Whole-grid background + the single hit rect.
@@ -268,20 +273,7 @@ impl Element for GridElement {
             }
         }
 
-        // 4) Block cursor (two columns wide over a double-width glyph).
-        if let Some((cr, cc)) = self.cursor {
-            if cr < self.rows && cc < self.cols {
-                let wide = self.cells[cr * self.cols + cc].is_wide;
-                let w = if wide { cw * 2.0 } else { cw };
-                let x = origin.x() + cc as f32 * cw;
-                let y = origin.y() + cr as f32 * ch;
-                ctx.scene
-                    .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(w, ch)))
-                    .with_background(Fill::Solid(self.cursor_color));
-            }
-        }
-
-        // 5) Glyphs + decorations (underline, strikethrough).
+        // 4) Glyphs + decorations (underline, strikethrough).
         for r in 0..self.rows {
             for c in 0..self.cols {
                 let cell = self.cells[r * self.cols + c];
@@ -291,11 +283,10 @@ impl Element for GridElement {
                     continue;
                 }
 
-                let is_cursor = matches!(self.cursor, Some((cr, cc)) if cr == r && cc == c);
-
-                // Resolve fg color: invert under cursor, dim otherwise.
-                let mut fg = if is_cursor { self.default_bg } else { cell.fg };
-                if cell.dim && !is_cursor {
+                // Resolve fg color: the glyph keeps its own fg (the cursor is a
+                // translucent overlay painted *after* this pass — no inversion).
+                let mut fg = cell.fg;
+                if cell.dim {
                     fg = ColorU::new(fg.r, fg.g, fg.b, fg.a / 2);
                 }
 
@@ -323,10 +314,12 @@ impl Element for GridElement {
                     }
                 }
 
-                // Underline: 1px line just below the baseline.
+                // Underline: 1px line at the font's underline metric (part-way
+                // into the descent region), matching egui's built-in underline
+                // position in the old renderer rather than a fixed +2px offset.
                 if cell.underline {
                     let x = origin.x() + c as f32 * cw;
-                    let y = origin.y() + r as f32 * ch + baseline + 2.0;
+                    let y = origin.y() + r as f32 * ch + baseline + underline_off;
                     ctx.scene
                         .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(cw, 1.0)))
                         .with_background(Fill::Solid(fg));
@@ -340,6 +333,22 @@ impl Element for GridElement {
                         .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(cw, 1.0)))
                         .with_background(Fill::Solid(fg));
                 }
+            }
+        }
+
+        // 5) Block cursor — a translucent overlay in terminal_fg (alpha 130)
+        // painted *after* the glyphs so the character stays readable and is
+        // merely tinted (matches old `view.rs:1282`). DECTCEM hides it (cursor
+        // is None); doubled width over a wide (CJK/emoji) cell.
+        if let Some((cr, cc)) = self.cursor {
+            if cr < self.rows && cc < self.cols {
+                let wide = self.cells[cr * self.cols + cc].is_wide;
+                let w = if wide { cw * 2.0 } else { cw };
+                let x = origin.x() + cc as f32 * cw;
+                let y = origin.y() + cr as f32 * ch;
+                ctx.scene
+                    .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(w, ch)))
+                    .with_background(Fill::Solid(self.cursor_color));
             }
         }
 
@@ -433,25 +442,25 @@ impl Element for GridElement {
         // Mouse selection + URL click — only when a selection callback is registered.
         if let Some(cb) = self.mouse_sel_cb.clone() {
             match event.raw_event() {
-                Event::LeftMouseDown { position, .. } if in_bounds(position) => {
+                Event::LeftMouseDown { position, modifiers, .. } if in_bounds(position) => {
                     // Record URL under the press (if any) and reset drag flag.
                     let (row, col, side) = pos_to_cell(position);
                     let pressed_url = url_hit_at(row, col).map(|sp| sp.url.clone());
                     *self.url_pressed.borrow_mut() = pressed_url;
                     self.url_did_drag.set(false);
                     self.mouse_dragging.set(true);
-                    cb(MouseSelPhase::Down, row, col, side);
+                    cb(MouseSelPhase::Down, row, col, side, modifiers.shift);
                     return true;
                 }
                 Event::LeftMouseDragged { position, .. } if self.mouse_dragging.get() => {
                     self.url_did_drag.set(true);
                     let (row, col, side) = pos_to_cell(position);
-                    cb(MouseSelPhase::Drag, row, col, side);
+                    cb(MouseSelPhase::Drag, row, col, side, false);
                     return true;
                 }
                 Event::LeftMouseUp { position, .. } if self.mouse_dragging.get() => {
                     self.mouse_dragging.set(false);
-                    cb(MouseSelPhase::Up, 0, 0, Side::Left);
+                    cb(MouseSelPhase::Up, 0, 0, Side::Left, false);
                     // URL click: only when no drag happened and the release is on
                     // the same URL that was pressed. This keeps text selection
                     // (drag) completely unaffected.

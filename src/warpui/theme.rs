@@ -26,9 +26,19 @@ pub fn success() -> ColorU       { rgb(crate::theme::current().success) }
 pub fn warning() -> ColorU       { rgb(crate::theme::current().warning) }
 
 /// Text selection highlight background.
+///
+/// Prefer the theme's dedicated `selection` field, rendered opaque. Custom
+/// themes may omit it (serde default = Rgb(0,0,0)) — in that case fall back
+/// to the historical accent-at-~28%-alpha derivation so old theme files keep
+/// working without modification.
 pub fn selection() -> ColorU {
-    let c = crate::theme::current().selection;
-    ColorU { r: c.r, g: c.g, b: c.b, a: 180 }
+    let s = crate::theme::current().selection;
+    if s.r == 0 && s.g == 0 && s.b == 0 {
+        let a = crate::theme::current().accent;
+        ColorU { r: a.r, g: a.g, b: a.b, a: 72 }
+    } else {
+        ColorU { r: s.r, g: s.g, b: s.b, a: 255 }
+    }
 }
 
 /// Translucent accent for drag drop-zone overlays.

@@ -13,6 +13,10 @@ pub struct WorktreeNode {
     /// Cached `git diff --numstat HEAD` totals: (added_lines, deleted_lines).
     /// Computed once at load/reload time — never per frame.
     pub diff_stat: (u32, u32),
+    /// Whether the working tree has ANY uncommitted change (incl. untracked).
+    /// Lets the branch row paint a "dirty dot" when `diff_stat` is (0, 0) but
+    /// the tree is still dirty (e.g. only untracked files). Computed at load.
+    pub dirty: bool,
 }
 
 pub struct ProjectNode {
@@ -77,16 +81,21 @@ pub fn load_projects() -> Vec<ProjectNode> {
                             );
                         }
                     }
-                    let diff_stat = if !wpath.is_empty() {
-                        crate::warpui::git::diff_numstat(std::path::Path::new(&wpath))
+                    let (diff_stat, dirty) = if !wpath.is_empty() {
+                        let p = std::path::Path::new(&wpath);
+                        (
+                            crate::warpui::git::diff_numstat(p),
+                            crate::warpui::git::is_dirty(p),
+                        )
                     } else {
-                        (0, 0)
+                        ((0, 0), false)
                     };
                     worktrees.push(WorktreeNode {
                         name: wname,
                         path: wpath,
                         tabs,
                         diff_stat,
+                        dirty,
                     });
                 }
             }

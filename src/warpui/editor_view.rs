@@ -365,6 +365,52 @@ pub struct WarpEditorView {
     scrollbar_drag: std::rc::Rc<std::cell::Cell<bool>>,
     /// Find / Replace / Goto-line bar state; `None` = closed.
     find: Option<FindState>,
+    /// One indent level's worth of whitespace, discovered per-file from the
+    /// nearest `.prettierrc` / `package.json` "prettier" field (tabs / 2-space /
+    /// 4-space). Used by Tab-indent and Enter auto-indent — mirrors old egui.
+    indent_unit: String,
+    /// When set, trailing whitespace is stripped before writing on save
+    /// (old `prefs.trim_on_save`). Defaults to `false` to match the old egui
+    /// default; wire to a real warpui pref when settings plumbing lands.
+    trim_on_save: bool,
+}
+
+/// Strip one indent level off the front of `s`: up to `max_spaces` leading
+/// spaces, or a single leading tab. Mirrors the old egui `remove_one_indent`.
+fn remove_one_indent(s: &str, max_spaces: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && i < max_spaces && chars[i] == ' ' {
+        i += 1;
+    }
+    if i == 0 && chars.first() == Some(&'\t') {
+        i = 1;
+    }
+    chars[i..].iter().collect()
+}
+
+/// `(line_start, line_end)` as 0-based char offsets into `text` for the line
+/// containing char offset `char_idx`. `line_end` is the index *after* the
+/// trailing `\n` (or the char count at EOF). Used for whole-line copy/cut.
+fn line_char_range(text: &str, char_idx: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let idx = char_idx.min(n);
+    let mut ls = 0;
+    for i in (0..idx).rev() {
+        if chars[i] == '\n' {
+            ls = i + 1;
+            break;
+        }
+    }
+    let mut le = n;
+    for (offset, ch) in chars[idx..].iter().enumerate() {
+        if *ch == '\n' {
+            le = idx + offset + 1;
+            break;
+        }
+    }
+    (ls, le)
 }
 
 impl WarpEditorView {
@@ -386,20 +432,77 @@ impl WarpEditorView {
         let m = self.model.clone();
         m.update(ctx, |m: &mut CodeModel, mctx| m.user_insert(&text, mctx));
     }
-    /// Copy the current selection to the clipboard (Cmd+C).
+    /// Copy the current selection to the clipboard (Cmd+C). On an EMPTY
+    /// selection, copies the whole current line (trailing newline included),
+    /// matching old egui's empty-selection Cmd+C.
     pub fn copy(&self, ctx: &mut ViewContext<Self>) {
         let m = self.model.clone();
         m.update(ctx, |m: &mut CodeModel, mctx| {
-            let content = m.read_selected_text_as_clipboard_content(mctx);
-            mctx.clipboard().write(content);
+            let (start, end) = {
+                let sel = m.selection.as_ref(mctx);
+                (
+                    sel.selection_start(mctx).as_usize(),
+                    sel.selection_end(mctx).as_usize(),
+                )
+            };
+            if end > start {
+                let content = m.read_selected_text_as_clipboard_content(mctx);
+                mctx.clipboard().write(content);
+                return;
+            }
+            // Empty selection → whole-line copy (incl. trailing newline).
+            let text = m.buffer.as_ref(mctx).text().into_string();
+            let cursor_off = m.selection.as_ref(mctx).cursors(mctx).last().as_usize();
+            let char_idx = cursor_off.saturating_sub(1);
+            let (ls, le) = line_char_range(&text, char_idx);
+            let line: String = text.chars().skip(ls).take(le - ls).collect();
+            if !line.is_empty() {
+                mctx.clipboard()
+                    .write(warpui::clipboard::ClipboardContent::plain_text(line));
+            }
         });
     }
-    /// Cut the current selection to the clipboard (Cmd+X): writes to clipboard
-    /// and deletes the selection.
+    /// Cut the current selection to the clipboard (Cmd+X). On an EMPTY
+    /// selection, cuts the whole current line (trailing newline included) as one
+    /// undo step — matching old egui's empty-selection Cmd+X. Falls back to a
+    /// normal selection cut when a selection exists.
     pub fn cut(&self, ctx: &mut ViewContext<Self>) {
         let m = self.model.clone();
         m.update(ctx, |m: &mut CodeModel, mctx| {
-            m.delete(TextDirection::Backwards, TextUnit::Character, true, mctx);
+            let (start, end) = {
+                let sel = m.selection.as_ref(mctx);
+                (
+                    sel.selection_start(mctx).as_usize(),
+                    sel.selection_end(mctx).as_usize(),
+                )
+            };
+            if end > start {
+                m.delete(TextDirection::Backwards, TextUnit::Character, true, mctx);
+                return;
+            }
+            // Empty selection → whole-line cut (incl. trailing newline).
+            let text = m.buffer.as_ref(mctx).text().into_string();
+            let cursor_off = m.selection.as_ref(mctx).cursors(mctx).last().as_usize();
+            let char_idx = cursor_off.saturating_sub(1);
+            let (ls, le) = line_char_range(&text, char_idx);
+            if le <= ls {
+                return;
+            }
+            let cut: String = text.chars().skip(ls).take(le - ls).collect();
+            if cut.is_empty() {
+                return;
+            }
+            mctx.clipboard()
+                .write(warpui::clipboard::ClipboardContent::plain_text(cut));
+            // Select the whole line range, then delete it in one edit.
+            let sel_start = CharOffset::from(ls).add_signed(1);
+            let sel_end = CharOffset::from(le).add_signed(1);
+            let sel = m.selection.clone();
+            sel.update(mctx, |s, sctx| {
+                s.set_cursor(sel_start, sctx);
+                s.set_last_head(sel_end, sctx);
+            });
+            m.backspace(mctx);
         });
     }
 
@@ -410,7 +513,12 @@ impl WarpEditorView {
             return false;
         }
         let buffer = self.model.as_ref(app).buffer.clone();
-        let text = buffer.as_ref(app).text().to_string();
+        let mut text = buffer.as_ref(app).text().to_string();
+        // Old `save_tab` honored `prefs.trim_on_save`: strip trailing
+        // whitespace before writing when the pref is set.
+        if self.trim_on_save {
+            text = crate::views::file_util::trim_trailing_whitespace(&text);
+        }
         if std::fs::write(&self.path, &text).is_ok() {
             self.saved_text = text;
             true
@@ -431,8 +539,18 @@ impl WarpEditorView {
         font: FamilyId,
         path: std::path::PathBuf,
     ) -> Self {
-        let buffer = ctx.add_model(|_| {
-            Buffer::new(Box::new(|_, _| IndentBehavior::TabIndent(IndentUnit::Space(4))))
+        // Per-file indent unit discovered from the nearest .prettierrc /
+        // package.json "prettier" field (tabs / 2-space / 4-space), matching the
+        // old egui Files pane — instead of a hardcoded 4-space unit.
+        let style = crate::format::discover(&path);
+        let indent_unit_str = style.indent_unit();
+        let iu = if style.use_tabs {
+            IndentUnit::Tab
+        } else {
+            IndentUnit::Space(style.tab_width)
+        };
+        let buffer = ctx.add_model(move |_| {
+            Buffer::new(Box::new(move |_, _| IndentBehavior::TabIndent(iu)))
         });
         let buffer_sel = ctx.add_model(|_| BufferSelectionModel::new(buffer.clone()));
         let bsel2 = buffer_sel.clone();
@@ -440,7 +558,7 @@ impl WarpEditorView {
             *buf = Buffer::from_plain_text(
                 &content,
                 None,
-                Box::new(|_, _| IndentBehavior::TabIndent(IndentUnit::Space(4))),
+                Box::new(move |_, _| IndentBehavior::TabIndent(iu)),
                 bsel2,
                 mctx,
             );
@@ -521,6 +639,8 @@ impl WarpEditorView {
             selecting: std::cell::Cell::new(false),
             scrollbar_drag: std::rc::Rc::new(std::cell::Cell::new(false)),
             find: None,
+            indent_unit: indent_unit_str,
+            trim_on_save: false,
         }
     }
 }
@@ -601,14 +721,15 @@ impl WarpEditorView {
         Some(chars[start..end.min(chars.len())].iter().collect())
     }
 
-    /// Case-insensitive (ASCII) non-overlapping substring search. Returns
-    /// `(start, end)` char offsets (end exclusive) into `text`.
+    /// Case-SENSITIVE non-overlapping substring search (matches old egui's
+    /// `content.matches(query)` / `str::find`). Returns `(start, end)` char
+    /// offsets (end exclusive) into `text`.
     fn find_all(text: &str, query: &str) -> Vec<(usize, usize)> {
         if query.is_empty() {
             return Vec::new();
         }
-        let hay: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
-        let needle: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let hay: Vec<char> = text.chars().collect();
+        let needle: Vec<char> = query.chars().collect();
         let (n, m) = (hay.len(), needle.len());
         let mut out = Vec::new();
         if m == 0 || m > n {
@@ -947,45 +1068,104 @@ impl WarpEditorView {
                     "[" => Some("]"),
                     _ => None,
                 };
-                model.update(ctx, |m: &mut CodeModel, mctx| match close {
-                    Some(c) => {
-                        let pair = format!("{chars}{c}");
-                        m.user_insert(&pair, mctx);
-                        let sel = m.selection.clone();
-                        sel.update(mctx, |s, sctx| {
-                            let end = s.selection_end(sctx);
-                            s.set_cursor(end.add_signed(-1), sctx);
-                        });
+                // Skip-over: typing a closer when the next char is already that
+                // same closer advances the caret past it (no doubled `))`).
+                let is_closer = matches!(chars.as_str(), "}" | ")" | "]");
+                model.update(ctx, |m: &mut CodeModel, mctx| {
+                    if is_closer {
+                        let (start, end) = {
+                            let sel = m.selection.as_ref(mctx);
+                            (
+                                sel.selection_start(mctx).as_usize(),
+                                sel.selection_end(mctx).as_usize(),
+                            )
+                        };
+                        // Only skip over on an empty selection (single cursor).
+                        if end == start {
+                            let text = m.buffer.as_ref(mctx).text().into_string();
+                            let char_idx = end.saturating_sub(1);
+                            let next_char = text.chars().nth(char_idx);
+                            if next_char.map(|c| c.to_string()).as_deref() == Some(chars.as_str())
+                            {
+                                let sel = m.selection.clone();
+                                sel.update(mctx, |s, sctx| {
+                                    let cur = s.selection_end(sctx);
+                                    s.set_cursor(cur.add_signed(1), sctx);
+                                });
+                                return;
+                            }
+                        }
                     }
-                    None => m.user_insert(&chars, mctx),
+                    match close {
+                        Some(c) => {
+                            let pair = format!("{chars}{c}");
+                            m.user_insert(&pair, mctx);
+                            let sel = m.selection.clone();
+                            sel.update(mctx, |s, sctx| {
+                                let end = s.selection_end(sctx);
+                                s.set_cursor(end.add_signed(-1), sctx);
+                            });
+                        }
+                        None => m.user_insert(&chars, mctx),
+                    }
                 });
             }
             EditAction::Backspace => {
                 model.update(ctx, |m: &mut CodeModel, mctx| m.backspace(mctx));
             }
             EditAction::Enter => {
+                // Port of old egui `auto_indent_context`: copy the current
+                // line's indent, bump one level after an opening bracket, and
+                // when the caret sits directly before a closer drop that closer
+                // onto its own line at the parent indent. Also dedents after a
+                // closing bracket.
+                let indent = self.indent_unit.clone();
                 model.update(ctx, |m: &mut CodeModel, mctx| {
-                    // Capture the leading whitespace of the current line so Enter
-                    // auto-indents to match the previous line's indentation.
-                    let leading_ws: String = {
-                        let cursor_off =
-                            m.selection.as_ref(mctx).cursors(mctx).last().as_usize();
-                        // Buffer offset 0 is a sentinel; text characters start at index
-                        // cursor_off - 1 within the string returned by text().
-                        let text = m.buffer.as_ref(mctx).text().into_string();
-                        let text_idx = cursor_off.saturating_sub(1).min(text.len());
-                        let line_start = text[..text_idx]
-                            .rfind('\n')
-                            .map(|p| p + 1)
-                            .unwrap_or(0);
-                        text[line_start..text_idx]
-                            .chars()
-                            .take_while(|c| *c == ' ' || *c == '\t')
-                            .collect()
+                    let text = m.buffer.as_ref(mctx).text().into_string();
+                    // Buffer offset 0 is a sentinel; text char index = off - 1.
+                    let cursor_off = m.selection.as_ref(mctx).cursors(mctx).last().as_usize();
+                    let char_idx = cursor_off.saturating_sub(1);
+                    let byte = crate::format::char_idx_to_byte(&text, char_idx);
+                    let (prev_indent, bump, dedent) =
+                        crate::format::auto_indent_context(&text, byte);
+                    let next_is_close = text
+                        .as_bytes()
+                        .get(byte)
+                        .map(|c| matches!(c, b'}' | b')' | b']'))
+                        .unwrap_or(false);
+                    let dedented_indent = remove_one_indent(&prev_indent, indent.chars().count());
+                    let body_indent = if bump {
+                        format!("{prev_indent}{indent}")
+                    } else if dedent && next_is_close {
+                        // e.g. caret between `}` and `)` — keep at brace level.
+                        prev_indent.clone()
+                    } else if dedent {
+                        dedented_indent
+                    } else {
+                        prev_indent.clone()
                     };
+                    // First newline + the body-line indent.
                     m.enter(mctx);
-                    if !leading_ws.is_empty() {
-                        m.user_insert(&leading_ws, mctx);
+                    if !body_indent.is_empty() {
+                        m.user_insert(&body_indent, mctx);
+                    }
+                    // Caret sits directly before a closer after a bump/dedent:
+                    // push that closer onto its own line at the parent indent.
+                    if next_is_close && (bump || dedent) {
+                        let tail = format!("\n{prev_indent}");
+                        m.user_insert(&tail, mctx);
+                        if bump {
+                            // Old advance = 1 + body_indent chars: land the caret
+                            // on the (indented) body line, above the closer.
+                            let back = 1 + prev_indent.chars().count();
+                            let sel = m.selection.clone();
+                            sel.update(mctx, |s, sctx| {
+                                let end = s.selection_end(sctx);
+                                s.set_cursor(end.add_signed(-(back as isize)), sctx);
+                            });
+                        }
+                        // dedent && next_is_close: old leaves the caret at the end
+                        // (after the trailing indent) — no move needed.
                     }
                 });
             }

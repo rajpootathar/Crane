@@ -17,8 +17,9 @@ use crate::warpui::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
 use crate::warpui::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
-    Border, ChildView, ConstrainedBox, Container, Dismiss, DispatchEventResult, Draggable,
-    DraggableState, EventHandler, Expanded, Flex, ParentElement, Rect, Stack, Text,
+    Border, ChildView, ConstrainedBox, Container, CornerRadius, Dismiss, DispatchEventResult,
+    Draggable, DraggableState, EventHandler, Expanded, Flex, ParentElement, Radius, Rect, Stack,
+    Text,
 };
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::vec2f;
@@ -589,7 +590,26 @@ impl CraneShellView {
                 return ColorU::new(r, g, b, 255);
             }
         }
-        project_tint(idx)
+        // Untinted projects use the single theme accent for the leading icon —
+        // matching old egui `projects.rs` (`tint_color.unwrap_or_else(accent)`),
+        // NOT a per-index rainbow.
+        theme::accent()
+    }
+
+    /// A 2px-wide accent vertical bar pinned to the left edge of a row, inset
+    /// ~3px vertically. Layered ON TOP of the `row_active()` bg for the active /
+    /// selected branch of a nav row — mirrors old egui `draw_row`'s `active_bar`
+    /// (`Rect x+4, y+3, w=2, h=row_h-6`, accent).
+    fn active_bar(&self, row_h: f32) -> Box<dyn Element> {
+        Container::new(
+            ConstrainedBox::new(Rect::new().with_background_color(theme::accent()).finish())
+                .with_width(2.0)
+                .with_height((row_h - 6.0).max(0.0))
+                .finish(),
+        )
+        .with_padding_left(4.0)
+        .with_padding_top(3.0)
+        .finish()
     }
 
     /// A single row inside the context menu (icon + label). Dispatches
@@ -879,11 +899,11 @@ impl CraneShellView {
         let hit_layer = ConstrainedBox::new(Rect::new().finish())
             .with_height(row_h)
             .finish();
-        let row = Stack::new()
-            .with_child(bg_layer)
-            .with_child(label)
-            .with_child(hit_layer)
-            .finish();
+        let mut row = Stack::new().with_child(bg_layer);
+        if selected {
+            row = row.with_child(self.active_bar(row_h));
+        }
+        let row = row.with_child(label).with_child(hit_layer).finish();
 
         EventHandler::new(row)
             .on_left_mouse_down(move |ctx, _app, _pos| {
@@ -904,6 +924,7 @@ impl CraneShellView {
         label_color: ColorU,
         selected: bool,
         diff_stat: (u32, u32),
+        dirty: bool,
         action: CraneShellAction,
     ) -> Box<dyn Element> {
         let size = 12.0_f32;
@@ -942,6 +963,27 @@ impl CraneShellView {
 
         // +N / -M badges appended at right when there are line changes.
         let (added, deleted) = diff_stat;
+        // Dirty-dot fallback: the tree is dirty but `diff --numstat HEAD` shows
+        // no line changes (e.g. only untracked files). Old egui paints a small
+        // 3px filled add-colour dot so the branch still signals uncommitted
+        // content. Rendered as a 6x6 fully-rounded (→ circular) success Rect.
+        if added == 0 && deleted == 0 && dirty {
+            row_inner = row_inner.with_child(
+                Container::new(
+                    ConstrainedBox::new(
+                        Rect::new()
+                            .with_background_color(theme::success())
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                            .finish(),
+                    )
+                    .with_width(6.0)
+                    .with_height(6.0)
+                    .finish(),
+                )
+                .with_padding_right(6.0)
+                .finish(),
+            );
+        }
         if added > 0 {
             row_inner = row_inner.with_child(
                 Container::new(
@@ -972,11 +1014,11 @@ impl CraneShellView {
         let hit_layer = ConstrainedBox::new(Rect::new().finish())
             .with_height(row_h)
             .finish();
-        let stack = Stack::new()
-            .with_child(bg_layer)
-            .with_child(label)
-            .with_child(hit_layer)
-            .finish();
+        let mut stack = Stack::new().with_child(bg_layer);
+        if selected {
+            stack = stack.with_child(self.active_bar(row_h));
+        }
+        let stack = stack.with_child(label).with_child(hit_layer).finish();
         EventHandler::new(stack)
             .on_left_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(action.clone());
@@ -1040,10 +1082,11 @@ impl CraneShellView {
             .with_child(Expanded::new(1.0, label).finish())
             .with_child(close_btn)
             .finish();
-        let stack = Stack::new()
-            .with_child(bg_layer)
-            .with_child(row_content)
-            .finish();
+        let mut stack = Stack::new().with_child(bg_layer);
+        if selected {
+            stack = stack.with_child(self.active_bar(row_h));
+        }
+        let stack = stack.with_child(row_content).finish();
         EventHandler::new(stack)
             .on_left_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(select_action.clone());
@@ -1191,6 +1234,7 @@ impl CraneShellView {
                     wcol,
                     wsel,
                     w.diff_stat,
+                    w.dirty,
                     CraneShellAction::ToggleWorktree(pi, wi),
                 ));
                 if !w_expanded {
@@ -2249,6 +2293,26 @@ impl CraneShellView {
         }
     }
 
+    /// Whether a real text-input widget currently holds keyboard focus — the
+    /// commit box, or a focused Editor / Files pane (warp's text editors).
+    /// Mirrors old egui's `!any_focus` guard (`ctx.memory(|m| m.focused())`):
+    /// the terminal grid never registers as an egui-focused widget, so it is
+    /// intentionally EXCLUDED here — otherwise panel-toggle shortcuts could
+    /// never fire (the shell always has a focused pane).
+    fn any_text_input_focused(&self) -> bool {
+        if self.commit_focused {
+            return true;
+        }
+        self.active_input_pane()
+            .map(|id| {
+                matches!(
+                    self.panes.get(&id),
+                    Some(PaneContent::Editor(_)) | Some(PaneContent::File(_))
+                )
+            })
+            .unwrap_or(false)
+    }
+
     /// Add a new tab to worktree (pi, wi) and make it active.
     fn add_tab(&mut self, pi: usize, wi: usize, ctx: &mut ViewContext<Self>) {
         let id = self.next_tab_id;
@@ -2496,6 +2560,9 @@ impl View for CraneShellView {
             .on_keydown(|ctx, _app, ks| {
                 if ks.cmd && !ks.ctrl && !ks.alt {
                     // Shift uppercases the key ("D"), so normalize the case.
+                    // TODO(parity): Cmd+= / Cmd+- / Cmd+0 font zoom (+1 max 40 /
+                    // -1 min 8 / reset 14.0) — deferred until warpui carries a
+                    // shell-level font-size setting to drive.
                     let key = ks.key.to_ascii_lowercase();
                     let act = match key.as_str() {
                         "b" => Some(CraneShellAction::ToggleLeft),
@@ -2519,14 +2586,22 @@ impl View for CraneShellView {
                         "x" => Some(CraneShellAction::CutFocused),
                         // Editor find / replace / goto-line (open the bar; keys then
                         // route through the editor's own input_key).
+                        // TODO(parity): Cmd+Shift+F should open the cross-file
+                        // Find-in-Files modal (needs the modal framework, not yet
+                        // ported). For now Shift falls through to the in-file bar.
                         "f" => Some(CraneShellAction::FindFocused),
                         "h" => Some(CraneShellAction::ReplaceFocused),
                         "g" => Some(CraneShellAction::GotoLineFocused),
+                        // Cmd+Shift+O adds a project (folder picker); Cmd+O opens
+                        // an external file (file picker). Matches old shortcuts.rs.
+                        "o" if ks.shift => Some(CraneShellAction::AddProject),
+                        "o" => Some(CraneShellAction::OpenExternalFile),
                         // Cmd+[ / Cmd+] cycle focus across panes in the active tab.
                         "[" => Some(CraneShellAction::FocusPrevPane),
                         "]" => Some(CraneShellAction::FocusNextPane),
-                        // Cmd+9 toggles the Git log panel.
-                        "9" => Some(CraneShellAction::OpenGitLog),
+                        // Cmd+9 toggles the Git log panel (bare Cmd+9 only —
+                        // Cmd+Shift+9 must NOT open it, matching old shortcuts.rs).
+                        "9" if !ks.shift => Some(CraneShellAction::OpenGitLog),
                         // Cmd+Shift+N opens the Welcome / landing pane beside the
                         // focused pane (default new-tab stays a terminal).
                         "n" if ks.shift => Some(CraneShellAction::OpenWelcome),
@@ -2540,27 +2615,15 @@ impl View for CraneShellView {
                 }
                 // Regular keys: route to the FOCUSED pane's terminal. Shell-driven
                 // input avoids warpui per-view focus being out of sync.
+                // TODO(parity): IME / composed multi-codepoint text (CJK, emoji,
+                // dead keys) should arrive via a Text/insert-text route and be
+                // written verbatim to the PTY — deferred until warpui surfaces a
+                // composed-text event (only the single Keystroke.key is sent now).
                 ctx.dispatch_typed_action(CraneShellAction::SendKeys(ks.clone()));
                 DispatchEventResult::StopPropagation
             })
             .finish()
     }
-}
-
-/// Distinct per-project icon tint (stand-in until session.json tints are read).
-fn project_tint(idx: usize) -> ColorU {
-    const P: [(u8, u8, u8); 8] = [
-        (232, 146, 42),
-        (68, 170, 153),
-        (170, 102, 204),
-        (90, 135, 220),
-        (204, 119, 221),
-        (119, 204, 204),
-        (232, 108, 108),
-        (120, 200, 120),
-    ];
-    let (r, g, b) = P[idx % 8];
-    ColorU::new(r, g, b, 255)
 }
 
 #[derive(Debug, Clone)]
@@ -2650,6 +2713,8 @@ pub enum CraneShellAction {
     SetTheme(String),
     /// Open a native folder picker and add the chosen directory as a new project.
     AddProject,
+    /// Open a native file picker and open the chosen file into the Files pane.
+    OpenExternalFile,
     /// Remove the project at index `i` from the project list and persist.
     RemoveProject(usize),
     /// Show the project context menu anchored at the given window position.
@@ -2689,6 +2754,10 @@ impl TypedActionView for CraneShellView {
                 self.refresh_panel();
             }
             CraneShellAction::SplitFocused(dir) => self.split_focused(*dir, ctx),
+            // TODO(parity): Cmd+W should close the active File Tab first when a
+            // Files/Editor pane has >1 tabs, and stage a running-process confirm
+            // modal for terminals with a live foreground process. Both need the
+            // (unported) confirm-modal framework; for now it tears the pane down.
             CraneShellAction::CloseFocused => self.close_focused(),
             CraneShellAction::FocusPane(id) => {
                 self.focused = Some(*id);
@@ -2767,6 +2836,9 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::UndoFocused => {
+                // TODO(parity): with NO editor focus, Cmd+Z should undo the last
+                // Files-pane move/trash op (old `undo_last_file_op`). Deferred
+                // until a Files-pane file-op undo stack is ported to warpui.
                 if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
                     h.update(ctx, |view, vctx| {
                         view.undo();
@@ -2871,8 +2943,14 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::SelectAllFocused => {
-                if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
-                    h.update(ctx, |view, vctx| view.select_all(vctx));
+                // Terminal panes select the whole grid (old terminal/view.rs
+                // Cmd+A); editor panes select all buffer text.
+                if let Some(id) = self.active_input_pane() {
+                    if let Some(h) = self.terminal_at(id) {
+                        h.update(ctx, |view, _| view.select_all());
+                    } else if let Some(h) = self.editor_at(id) {
+                        h.update(ctx, |view, vctx| view.select_all(vctx));
+                    }
                 }
             }
             CraneShellAction::ClearFocused => {
@@ -2959,8 +3037,19 @@ impl TypedActionView for CraneShellView {
                     }
                 }
             }
-            CraneShellAction::ToggleLeft => self.show_left = !self.show_left,
-            CraneShellAction::ToggleRight => self.show_right = !self.show_right,
+            // Cmd+B / Cmd+/ toggle the side panels only when no text-input widget
+            // holds focus — don't toggle while typing in an editor / commit box.
+            // Mirrors old shortcuts.rs `if toggle_left && !any_focus`.
+            CraneShellAction::ToggleLeft => {
+                if !self.any_text_input_focused() {
+                    self.show_left = !self.show_left;
+                }
+            }
+            CraneShellAction::ToggleRight => {
+                if !self.any_text_input_focused() {
+                    self.show_right = !self.show_right;
+                }
+            }
             CraneShellAction::SetTab { files } => {
                 self.files_tab = *files;
                 self.refresh_panel();
@@ -3013,6 +3102,17 @@ impl TypedActionView for CraneShellView {
                         self.removed_project_paths.retain(|r| r != &path_str);
                         self.reload_projects();
                     }
+                }
+            }
+            CraneShellAction::OpenExternalFile => {
+                // Blocking native file picker; open the chosen file into the
+                // Files pane. Matches old shortcuts.rs Cmd+O → open_external_file.
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Open file")
+                    .pick_file()
+                {
+                    self.selected_file = Some(path.clone());
+                    self.open_file(path, ctx);
                 }
             }
             CraneShellAction::RemoveProject(i) => {

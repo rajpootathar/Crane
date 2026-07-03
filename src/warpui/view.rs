@@ -90,6 +90,33 @@ use crate::warpui::input::keystroke_to_pty_bytes;
 
 const FONT_SIZE: f32 = 14.0;
 
+/// True when `col` looks like a TUI vertical divider: a box-drawing vertical
+/// bar occupies it on ≥60% of the visible rows. Ported verbatim from old
+/// `src/terminal/view.rs:271-287`.
+fn is_separator_column(term: &crane_term::Term, col: usize, rows: usize) -> bool {
+    if rows == 0 {
+        return false;
+    }
+    let mut hits = 0usize;
+    for r in 0..rows {
+        let c = term.grid.cell_at(r, col).map(|c| c.ch).unwrap_or(' ');
+        if matches!(c, '│' | '┃' | '║' | '╎' | '╏' | '╽' | '╿') {
+            hits += 1;
+        }
+    }
+    hits * 5 >= rows * 3
+}
+
+/// True when the start cell sits between a vertical separator on its left and
+/// one on its right (i.e. inside a bordered TUI column). Ported verbatim from
+/// old `src/terminal/view.rs:289-294`.
+fn is_inside_vertical_separators(term: &crane_term::Term, start_col: usize, rows: usize) -> bool {
+    let total_cols = term.grid.columns;
+    let has_left = (0..start_col).any(|c| is_separator_column(term, c, rows));
+    let has_right = (start_col + 1..total_cols).any(|c| is_separator_column(term, c, rows));
+    has_left && has_right
+}
+
 pub struct TerminalView {
     font_family: FamilyId,
     controller: Rc<RefCell<TerminalController>>,
@@ -210,6 +237,26 @@ impl TerminalView {
     /// there is no selection or it covers no characters.
     pub fn copy_selection(&self) -> Option<String> {
         self.controller.borrow().term.lock().selection_to_string()
+    }
+
+    /// Select the entire grid: a Simple selection from (Line 0, Col 0) to
+    /// (Line rows-1, Col cols-1). Mirrors old `src/terminal/view.rs:1453-1461`
+    /// (Cmd+A). Called by the shell for the focused terminal pane.
+    pub fn select_all(&self) {
+        let ctrl = self.controller.borrow();
+        let mut t = ctrl.term.lock();
+        let rows = t.grid.visible_rows;
+        let cols = t.grid.columns;
+        let start = TermPoint::new(TermLine(0), TermColumn(0));
+        let end = TermPoint::new(
+            TermLine(rows.saturating_sub(1) as i32),
+            TermColumn(cols.saturating_sub(1)),
+        );
+        let mut sel = Selection::new(SelectionType::Simple, start, Side::Left);
+        sel.update(end, Side::Right);
+        t.selection = Some(sel);
+        drop(t);
+        (self.wake)();
     }
 }
 
@@ -351,11 +398,12 @@ impl View for TerminalView {
         let click_count = self.click_count.clone();
         let grid_cols = cols;
         let grid_rows = rows;
-        let mouse_sel_cb: Rc<dyn Fn(MouseSelPhase, usize, usize, Side)> =
-            Rc::new(move |phase, vrow, vcol, side| {
+        let mouse_sel_cb: Rc<dyn Fn(MouseSelPhase, usize, usize, Side, bool)> =
+            Rc::new(move |phase, vrow, vcol, side, shift| {
                 match phase {
                     MouseSelPhase::Down => {
                         // Consecutive-click detection (double = word, triple = line).
+                        // 500ms window matches old `view.rs:918`.
                         let now = std::time::Instant::now();
                         let count = {
                             let mut last = last_click.borrow_mut();
@@ -363,7 +411,7 @@ impl View for TerminalView {
                             let new_count = match *last {
                                 Some((t, pr, pc))
                                     if now.duration_since(t)
-                                        < std::time::Duration::from_millis(350)
+                                        < std::time::Duration::from_millis(500)
                                         && pr == vrow
                                         && pc == vcol =>
                                 {
@@ -382,6 +430,17 @@ impl View for TerminalView {
                         let term_line = vrow as i32 - disp;
                         let pt =
                             TermPoint::new(TermLine(term_line), TermColumn(vcol.min(grid_cols.saturating_sub(1))));
+
+                        // Shift+click extends an existing selection to the click
+                        // point instead of starting a fresh one (old `view.rs:927`).
+                        if shift && t.selection.is_some() {
+                            if let Some(sel) = t.selection.as_mut() {
+                                sel.update(pt, side);
+                            }
+                            drop(t);
+                            (sel_wake)();
+                            return;
+                        }
 
                         let sel = if count >= 3 {
                             // Triple click: select the whole line.
@@ -421,8 +480,21 @@ impl View for TerminalView {
                                 },
                             }
                         } else {
-                            // Single click: start a simple drag selection.
-                            Selection::new(SelectionType::Simple, pt, side)
+                            // Single click: start a drag selection. If the start
+                            // cell sits between two TUI vertical separators
+                            // (lazygit/k9s column divider), promote to Block so
+                            // dragging one column stays rectangular
+                            // (old `view.rs:886-895`).
+                            let kind = if is_inside_vertical_separators(
+                                &t,
+                                pt.column.0,
+                                grid_rows,
+                            ) {
+                                SelectionType::Block
+                            } else {
+                                SelectionType::Simple
+                            };
+                            Selection::new(kind, pt, side)
                         };
                         t.selection = Some(sel);
                         drop(t);

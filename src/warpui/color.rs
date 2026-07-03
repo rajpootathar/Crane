@@ -61,9 +61,12 @@ pub fn default_bg() -> ColorU {
     theme_rgb(crate::theme::current().terminal_bg)
 }
 
-/// Cursor color — the active theme's accent.
+/// Cursor color — a translucent block in the active theme's `terminal_fg`
+/// (alpha 130), painted *over* the glyph so the character stays readable and
+/// merely tinted. Mirrors old `src/terminal/view.rs:1278-1281`.
 pub fn cursor_color() -> ColorU {
-    theme_rgb(crate::theme::current().accent)
+    let c = crate::theme::current().terminal_fg;
+    ColorU::new(c.r, c.g, c.b, 130)
 }
 
 /// Port of `view.rs::color_to_egui`.

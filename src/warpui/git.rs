@@ -117,6 +117,23 @@ pub fn diff_numstat(root: &Path) -> (u32, u32) {
     (added, deleted)
 }
 
+/// Whether the working tree at `root` has ANY uncommitted change (staged,
+/// unstaged, or untracked) — `git status --porcelain` returning a non-empty
+/// listing. Used to paint the "dirty dot" on a branch whose `diff --numstat`
+/// totals are (0, 0) (e.g. only untracked files), mirroring old egui Crane.
+pub fn is_dirty(root: &Path) -> bool {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && !out.stdout.is_empty()
+}
+
 /// `git init` in `dir` — turns a loose folder into a git repository.
 /// On success the folder gains a `.git` directory; reload the project list
 /// afterwards so the `is_loose` flag reflects the new state.
