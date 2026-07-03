@@ -4348,39 +4348,47 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::AddProject => {
-                // Blocking native folder picker; the OS modal takes over until
-                // the user confirms or cancels.
-                if let Some(folder) = rfd::FileDialog::new()
+                // Run the native folder picker as an ASYNC future so it does NOT
+                // re-enter warpui's borrowed event dispatch (a blocking sync modal
+                // here panics with "RefCell already borrowed"). The callback runs
+                // on the main thread once the user confirms/cancels.
+                let fut = rfd::AsyncFileDialog::new()
                     .set_title("Choose project folder")
-                    .pick_folder()
-                {
-                    let path_str = folder.to_string_lossy().to_string();
-                    let name = folder
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path_str.clone());
-                    if !self.projects.iter().any(|p| p.path == path_str) {
-                        let ap = crate::warpui::persist::AddedProject {
-                            name,
-                            path: path_str.clone(),
-                        };
-                        self.added_projects.push(ap);
-                        // Re-add in case the user had previously removed it.
-                        self.removed_project_paths.retain(|r| r != &path_str);
-                        self.reload_projects();
+                    .pick_folder();
+                ctx.spawn(fut, |this, res: Option<rfd::FileHandle>, _vctx| {
+                    if let Some(folder) = res {
+                        let p = folder.path().to_path_buf();
+                        let path_str = p.to_string_lossy().to_string();
+                        let name = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path_str.clone());
+                        if !this.projects.iter().any(|p| p.path == path_str) {
+                            this.added_projects.push(crate::warpui::persist::AddedProject {
+                                name,
+                                path: path_str.clone(),
+                            });
+                            // Re-add in case the user had previously removed it.
+                            this.removed_project_paths.retain(|r| r != &path_str);
+                            this.reload_projects();
+                        }
                     }
-                }
+                });
             }
             CraneShellAction::OpenExternalFile => {
-                // Blocking native file picker; open the chosen file into the
-                // Files pane. Matches old shortcuts.rs Cmd+O → open_external_file.
-                if let Some(path) = rfd::FileDialog::new()
+                // Async native file picker (see AddProject) — a sync modal here
+                // re-enters warpui's borrowed dispatch and panics. Open the chosen
+                // file into the Files pane on the main-thread callback.
+                let fut = rfd::AsyncFileDialog::new()
                     .set_title("Open file")
-                    .pick_file()
-                {
-                    self.selected_file = Some(path.clone());
-                    self.open_file(path, ctx);
-                }
+                    .pick_file();
+                ctx.spawn(fut, |this, res: Option<rfd::FileHandle>, vctx| {
+                    if let Some(f) = res {
+                        let path = f.path().to_path_buf();
+                        this.selected_file = Some(path.clone());
+                        this.open_file(path, vctx);
+                    }
+                });
             }
             CraneShellAction::RemoveProject(i) => {
                 self.context_menu = None;
