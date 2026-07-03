@@ -33,6 +33,7 @@ pub mod rect_probe;
 pub mod shell;
 pub mod split;
 pub mod theme;
+pub mod update;
 pub mod view;
 pub mod welcome_view;
 

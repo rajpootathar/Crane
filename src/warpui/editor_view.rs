@@ -1175,6 +1175,23 @@ impl WarpEditorView {
         self.find = Some(FindState::new(FindMode::Goto));
         ctx.notify();
     }
+    /// Move the caret to the start of 1-based line `n` and autoscroll it into
+    /// view. Used by Find-in-Files to jump to a clicked match. Peer of the
+    /// internal `do_goto_line` but takes an explicit line number.
+    pub fn goto_line(&mut self, n: usize, ctx: &mut ViewContext<Self>) {
+        let n = n.max(1);
+        let text = self.buffer_text(ctx);
+        let offset = Self::line_start_offset(&text, n);
+        let buf_off = CharOffset::from(offset).add_signed(1);
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let sel = m.selection.clone();
+            sel.update(mctx, |sm, sctx| sm.set_cursor(buf_off, sctx));
+            let rs = m.render_state.clone();
+            rs.update(mctx, |r, _rctx| r.request_autoscroll());
+        });
+        ctx.notify();
+    }
     /// Close the bar and clear match highlights (Escape).
     pub fn close_find(&mut self, ctx: &mut ViewContext<Self>) {
         if self.find.take().is_some() {

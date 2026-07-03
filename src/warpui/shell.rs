@@ -51,6 +51,13 @@ enum Modal {
     Settings,
     /// Keyboard shortcuts cheat-sheet.
     Help,
+    /// Cmd+Shift+F project-wide text search. Query + result state lives in
+    /// `CraneShellView::find_in_files`; this variant only marks the modal open
+    /// so the backdrop/scaffold/key-gating reuse the shared framework.
+    FindInFiles,
+    /// Cmd+` tab switcher. Entry list + highlight lives in
+    /// `CraneShellView::tab_switcher`; this variant only marks it open.
+    TabSwitcher,
 }
 
 /// Visual style of a modal button (`modal_button`).
@@ -304,6 +311,16 @@ pub struct CraneShellView {
     confirmed_quit: bool,
     /// Scroll state for the Help / Settings modal body (tall content).
     modal_scroll: ClippedScrollStateHandle,
+    /// Cmd+Shift+F Find-in-Files modal state, or None when closed. `self.modal`
+    /// mirrors this as `Modal::FindInFiles` while it is open.
+    find_in_files: Option<FindInFilesState>,
+    /// Scroll state for the Find-in-Files result list.
+    find_scroll: ClippedScrollStateHandle,
+    /// Cmd+` tab-switcher overlay state, or None when closed. `self.modal`
+    /// mirrors this as `Modal::TabSwitcher` while it is open.
+    tab_switcher: Option<TabSwitcherState>,
+    /// Scroll state for the tab-switcher list.
+    switcher_scroll: ClippedScrollStateHandle,
 }
 
 #[derive(Clone)]
@@ -311,6 +328,45 @@ pub struct TabMeta {
     pub id: usize,
     pub name: String,
 }
+
+/// A single match row in the Find-in-Files modal.
+pub struct FifMatch {
+    /// Absolute path of the file the match lives in.
+    pub path: PathBuf,
+    /// Root-relative display path (e.g. "src/warpui/shell.rs").
+    pub display: String,
+    /// 1-based line number of the match.
+    pub line: u32,
+    /// The matched line's text (trimmed of trailing newline), trimmed of
+    /// leading whitespace for compact display.
+    pub text: String,
+}
+
+/// State for the Cmd+Shift+F Find-in-Files modal. Keys route to `query` via the
+/// same keystroke path as the commit box (`edit_find_in_files`); each edit
+/// re-runs a synchronous recursive substring search over the active project.
+pub struct FindInFilesState {
+    pub query: String,
+    pub results: Vec<FifMatch>,
+    /// True when the result set was capped at `FIF_MAX_RESULTS`.
+    pub truncated: bool,
+    /// Highlighted result row (Enter opens it).
+    pub selected: usize,
+}
+
+/// State for the Cmd+` tab switcher overlay. `entries` is the list of
+/// `(project_idx, worktree_idx, tab_id)` in the active workspace; `highlight`
+/// is the row that Enter / Cmd-` release activates.
+pub struct TabSwitcherState {
+    pub entries: Vec<(usize, usize, usize)>,
+    pub highlight: usize,
+}
+
+/// Hard cap on Find-in-Files matches so a broad query in a huge tree can't wedge
+/// the UI (the search runs synchronously on the UI thread per keystroke).
+const FIF_MAX_RESULTS: usize = 500;
+/// Skip files larger than this (bytes) — almost always minified/vendored blobs.
+const FIF_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// In-flight inline rename of a worktree/branch row or a Tab row. `buffer` is
 /// the live edit text; typed keys route here (see `edit_rename`) while it is
@@ -357,6 +413,10 @@ fn edge_dir_before(edge: DockEdge) -> Option<(Dir, bool)> {
 
 impl CraneShellView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
+        // Kick off the background GitHub-releases update check once at startup.
+        // Idempotent + non-blocking; the Settings > About section polls
+        // `update::latest_available()` to show an "update available" line.
+        crate::warpui::update::spawn_check();
         let ui_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
             cache
                 .load_system_font("Helvetica Neue")
@@ -688,6 +748,10 @@ impl CraneShellView {
             modal: None,
             confirmed_quit: false,
             modal_scroll: ClippedScrollStateHandle::new(),
+            find_in_files: None,
+            find_scroll: ClippedScrollStateHandle::new(),
+            tab_switcher: None,
+            switcher_scroll: ClippedScrollStateHandle::new(),
         }
     }
 
@@ -1585,6 +1649,8 @@ impl CraneShellView {
             Modal::ConfirmClosePane(id) => self.confirm_close_pane_card(*id, app),
             Modal::Settings => self.settings_card(),
             Modal::Help => self.help_card(),
+            Modal::FindInFiles => self.find_in_files_card(),
+            Modal::TabSwitcher => self.tab_switcher_card(),
         };
         self.modal_scaffold(card)
     }
@@ -1904,8 +1970,494 @@ impl CraneShellView {
                 .with_color(theme::text_muted())
                 .finish(),
             )
+            .with_child(Self::spacer(6.0))
+            .with_child(match crate::warpui::update::latest_available() {
+                Some(v) => Flex::column()
+                    .with_child(
+                        Text::new(
+                            format!("Update available: {v}"),
+                            self.ui_font,
+                            12.0,
+                        )
+                        .with_color(theme::accent())
+                        .finish(),
+                    )
+                    .with_child(Self::spacer(2.0))
+                    .with_child(
+                        Text::new(
+                            "https://github.com/rajpootathar/Crane/releases/latest".to_string(),
+                            self.ui_font,
+                            10.5,
+                        )
+                        .with_color(theme::text_muted())
+                        .finish(),
+                    )
+                    .finish(),
+                None => Text::new("Up to date".to_string(), self.ui_font, 11.0)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            })
             .finish();
         self.modal_card(420.0, col)
+    }
+
+    /// Find-in-Files card — Cmd+Shift+F. A read-only query field (keys route in
+    /// via `edit_find_in_files`, like the commit box), a status line, and a
+    /// scrollable list of matches grouped by file. Clicking a match opens the
+    /// file at that line. Port of the old egui `src/modals/find_in_files.rs`
+    /// (simplified: synchronous substring search, no regex/case/scope options).
+    fn find_in_files_card(&self) -> Box<dyn Element> {
+        let Some(st) = self.find_in_files.as_ref() else {
+            return self.modal_card(640.0, Flex::column().finish());
+        };
+        // Query field — mirrors the commit box's editable-looking Text field.
+        let (qtext, qcolor) = if st.query.is_empty() {
+            ("Search files in the active project…".to_string(), theme::text_muted())
+        } else {
+            (format!("{}|", st.query), theme::text())
+        };
+        let query_field = Container::new(
+            Flex::row()
+                .with_child(self.icon(icons::MAGNIFYING_GLASS, 13.0, theme::text_muted()))
+                .with_child(Self::spacer(8.0))
+                .with_child(Text::new(qtext, self.ui_font, 13.0).with_color(qcolor).finish())
+                .finish(),
+        )
+        .with_background_color(theme::row_active())
+        .with_border(Border::all(1.0).with_border_color(theme::border()))
+        .with_padding_left(8.0)
+        .with_padding_right(8.0)
+        .with_padding_top(7.0)
+        .with_padding_bottom(7.0)
+        .finish();
+
+        // Status line: match count / cap notice / empty-query hint.
+        let status = if st.query.trim().is_empty() {
+            "Type to search across the active project".to_string()
+        } else if st.results.is_empty() {
+            "No matches".to_string()
+        } else if st.truncated {
+            format!("{}+ matches (capped at {})", st.results.len(), FIF_MAX_RESULTS)
+        } else {
+            format!("{} matches", st.results.len())
+        };
+
+        // Result list — grouped by file. A non-clickable file header precedes
+        // each file's clickable match rows; the selected row is highlighted.
+        let mut list = Flex::column();
+        let mut last_display: Option<&str> = None;
+        for (i, m) in st.results.iter().enumerate() {
+            if last_display != Some(m.display.as_str()) {
+                last_display = Some(m.display.as_str());
+                list = list.with_child(
+                    Container::new(
+                        Text::new(m.display.clone(), self.ui_font, 11.5)
+                            .with_color(theme::accent())
+                            .finish(),
+                    )
+                    .with_padding_left(4.0)
+                    .with_padding_top(6.0)
+                    .with_padding_bottom(2.0)
+                    .finish(),
+                );
+            }
+            let is_sel = i == st.selected;
+            let path = m.path.clone();
+            let line = m.line;
+            let row_text = format!("{}:  {}", m.line, m.text);
+            let mut bg = Rect::new();
+            if is_sel {
+                bg = bg.with_background_color(theme::row_active());
+            }
+            let bg_layer = ConstrainedBox::new(bg.finish()).with_height(20.0).finish();
+            let label = Container::new(
+                Text::new(row_text, self.ui_font, 12.0)
+                    .with_color(if is_sel { theme::text() } else { theme::text_muted() })
+                    .finish(),
+            )
+            .with_padding_left(18.0)
+            .with_padding_top(3.0)
+            .finish();
+            let row = EventHandler::new(
+                Stack::new().with_child(bg_layer).with_child(label).finish(),
+            )
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::OpenFifMatch {
+                    path: path.clone(),
+                    line,
+                });
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            list = list.with_child(row);
+        }
+        let scrolled = ConstrainedBox::new(
+            ClippedScrollable::vertical(
+                self.find_scroll.clone(),
+                list.finish(),
+                ScrollbarWidth::Auto,
+                Fill::Solid(theme::border()),
+                Fill::Solid(theme::text_muted()),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_height(360.0)
+        .finish();
+
+        let col = Flex::column()
+            .with_child(self.modal_header("Find in Files"))
+            .with_child(Self::spacer(8.0))
+            .with_child(query_field)
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                Text::new(status, self.ui_font, 11.0)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            )
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                    .with_height(1.0)
+                    .finish(),
+            )
+            .with_child(Self::spacer(4.0))
+            .with_child(scrolled)
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                Text::new(
+                    "Enter opens · Up/Down to move · Esc closes".to_string(),
+                    self.ui_font,
+                    10.5,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
+            )
+            .finish();
+        self.modal_card(640.0, col)
+    }
+
+    /// Tab-switcher card — Cmd+`. Lists every tab in the active workspace and
+    /// highlights the row that Enter (or another Cmd+`) will activate. Escape
+    /// cancels. NOTE(simplification): the old egui build committed on Cmd
+    /// *release* (alt-tab muscle memory); warpui does not surface a reliable
+    /// modifier-release event to the shell, so this uses an explicit
+    /// Enter-to-commit list instead (Cmd+` / Up / Down move the highlight).
+    fn tab_switcher_card(&self) -> Box<dyn Element> {
+        let Some(st) = self.tab_switcher.as_ref() else {
+            return self.modal_card(460.0, Flex::column().finish());
+        };
+        let mut list = Flex::column();
+        for (i, (pi, wi, tid)) in st.entries.iter().enumerate() {
+            let is_hl = i == st.highlight;
+            let label = self.switcher_label(*pi, *wi, *tid);
+            let key = (*pi, *wi, *tid);
+            let path = self
+                .projects
+                .get(*pi)
+                .and_then(|p| p.worktrees.get(*wi))
+                .map(|w| PathBuf::from(&w.path))
+                .unwrap_or_default();
+            let mut bg = Rect::new();
+            if is_hl {
+                bg = bg.with_background_color(theme::row_active());
+            }
+            let bg_layer = ConstrainedBox::new(bg.finish()).with_height(24.0).finish();
+            let inner = Container::new(
+                Text::new(label, self.ui_font, 12.5)
+                    .with_color(if is_hl { theme::text() } else { theme::text_muted() })
+                    .finish(),
+            )
+            .with_padding_left(8.0)
+            .with_padding_top(5.0)
+            .finish();
+            let row = EventHandler::new(
+                Stack::new().with_child(bg_layer).with_child(inner).finish(),
+            )
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::ActivateSwitcherTab {
+                    key,
+                    path: path.clone(),
+                });
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            list = list.with_child(row);
+        }
+        let scrolled = ConstrainedBox::new(
+            ClippedScrollable::vertical(
+                self.switcher_scroll.clone(),
+                list.finish(),
+                ScrollbarWidth::Auto,
+                Fill::Solid(theme::border()),
+                Fill::Solid(theme::text_muted()),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_height(320.0)
+        .finish();
+        let col = Flex::column()
+            .with_child(self.modal_header("Switch Tab"))
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                    .with_height(1.0)
+                    .finish(),
+            )
+            .with_child(Self::spacer(6.0))
+            .with_child(scrolled)
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                Text::new(
+                    "Cmd+` next · Cmd+Shift+` prev · Enter activates · Esc cancels".to_string(),
+                    self.ui_font,
+                    10.5,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
+            )
+            .finish();
+        self.modal_card(460.0, col)
+    }
+
+    /// "project / workspace / tab" label for a tab-switcher entry.
+    fn switcher_label(&self, pi: usize, wi: usize, tid: usize) -> String {
+        let project = self.projects.get(pi).map(|p| p.name.clone()).unwrap_or_default();
+        let ws = self
+            .projects
+            .get(pi)
+            .and_then(|p| p.worktrees.get(wi))
+            .map(|w| {
+                self.worktree_names
+                    .get(&w.path)
+                    .cloned()
+                    .unwrap_or_else(|| w.name.clone())
+            })
+            .unwrap_or_default();
+        let tab = self
+            .worktree_tabs
+            .get(&(pi, wi))
+            .and_then(|tabs| tabs.iter().find(|t| t.id == tid))
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        format!("{project} / {ws} / {tab}")
+    }
+
+    /// Run a synchronous, recursive, case-insensitive substring search over the
+    /// active project's files and store the results. Called on every query edit.
+    /// Skips `.git` / `target` / `node_modules`, oversized files, and non-UTF-8
+    /// (binary) files. Capped at `FIF_MAX_RESULTS`.
+    fn run_find_in_files(&mut self) {
+        let Some(st) = self.find_in_files.as_mut() else { return };
+        st.results.clear();
+        st.truncated = false;
+        st.selected = 0;
+        let needle = st.query.trim().to_lowercase();
+        if needle.is_empty() {
+            return;
+        }
+        let Some(root) = self.active_cwd.clone() else { return };
+        let mut results: Vec<FifMatch> = Vec::new();
+        let mut truncated = false;
+        let mut stack: Vec<PathBuf> = vec![root.clone()];
+        'walk: while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let mut children: Vec<PathBuf> = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir {
+                    if matches!(name.as_ref(), ".git" | "target" | "node_modules" | ".svn" | ".hg") {
+                        continue;
+                    }
+                    stack.push(path);
+                } else {
+                    children.push(path);
+                }
+            }
+            children.sort();
+            for path in children {
+                // Skip oversized / unreadable files.
+                if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > FIF_MAX_FILE_BYTES {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else { continue };
+                let display = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                for (idx, line) in content.lines().enumerate() {
+                    if line.to_lowercase().contains(&needle) {
+                        if results.len() >= FIF_MAX_RESULTS {
+                            truncated = true;
+                            break 'walk;
+                        }
+                        let text = line.trim_start();
+                        let text: String = text.chars().take(200).collect();
+                        results.push(FifMatch {
+                            path: path.clone(),
+                            display: display.clone(),
+                            line: (idx + 1) as u32,
+                            text,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(st) = self.find_in_files.as_mut() {
+            st.results = results;
+            st.truncated = truncated;
+        }
+    }
+
+    /// Apply a keystroke to the Find-in-Files query buffer (modal focused).
+    /// Enter opens the highlighted match; Up/Down move; printable chars / Backspace
+    /// edit the query and re-run the search. Escape is handled by the modal gate.
+    fn edit_find_in_files(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
+        match ks.key.as_str() {
+            "up" => {
+                if let Some(st) = self.find_in_files.as_mut() {
+                    st.selected = st.selected.saturating_sub(1);
+                }
+            }
+            "down" => {
+                if let Some(st) = self.find_in_files.as_mut() {
+                    let len = st.results.len();
+                    if len > 0 {
+                        st.selected = (st.selected + 1).min(len - 1);
+                    }
+                }
+            }
+            "enter" | "return" | "numpadenter" => {
+                let target = self.find_in_files.as_ref().and_then(|st| {
+                    st.results.get(st.selected).map(|m| (m.path.clone(), m.line))
+                });
+                if let Some((path, line)) = target {
+                    self.open_fif_match(path, line, ctx);
+                }
+            }
+            "backspace" => {
+                if let Some(st) = self.find_in_files.as_mut() {
+                    st.query.pop();
+                }
+                self.run_find_in_files();
+            }
+            k if k.chars().count() == 1 && !ks.cmd && !ks.ctrl => {
+                if let Some(st) = self.find_in_files.as_mut() {
+                    st.query.push_str(k);
+                }
+                self.run_find_in_files();
+            }
+            _ => {}
+        }
+    }
+
+    /// Open a Find-in-Files match: open the file in the editor, scroll to the
+    /// matched line, and close the modal.
+    fn open_fif_match(&mut self, path: PathBuf, line: u32, ctx: &mut ViewContext<Self>) {
+        self.modal = None;
+        self.find_in_files = None;
+        self.selected_file = Some(path.clone());
+        self.open_file(path.clone(), ctx);
+        // Scroll the (now-active) editor to the matched line.
+        if let Some(h) = self.editor_views.get(&path) {
+            let h = h.clone();
+            h.update(ctx, |view, vctx| view.goto_line(line as usize, vctx));
+        }
+    }
+
+    /// Advance the tab-switcher highlight, opening it on the first press. Returns
+    /// nothing; the overlay commits on Enter / click (see `edit_tab_switcher`).
+    fn advance_tab_switcher(&mut self, backward: bool) {
+        // Build the entry list for the active workspace (worktree_tabs of the
+        // active project/worktree), current tab first.
+        let Some((api, awi, atid)) = self.active_tab else { return };
+        let mut entries: Vec<(usize, usize, usize)> = self
+            .worktree_tabs
+            .get(&(api, awi))
+            .map(|tabs| tabs.iter().map(|t| (api, awi, t.id)).collect())
+            .unwrap_or_default();
+        if entries.len() < 2 {
+            return;
+        }
+        match self.tab_switcher.as_mut() {
+            None => {
+                // Order so the current tab is first; open highlighting the next
+                // (or previous) so a single extra press lands on the neighbour.
+                if let Some(cur) = entries.iter().position(|&(_, _, t)| t == atid) {
+                    entries.rotate_left(cur);
+                }
+                let len = entries.len();
+                let highlight = if backward { len - 1 } else { 1 };
+                self.modal = Some(Modal::TabSwitcher);
+                self.tab_switcher = Some(TabSwitcherState { entries, highlight });
+            }
+            Some(state) => {
+                let len = state.entries.len();
+                state.highlight = if backward {
+                    (state.highlight + len - 1) % len
+                } else {
+                    (state.highlight + 1) % len
+                };
+            }
+        }
+    }
+
+    /// Apply a keystroke to the open tab switcher (modal focused). Enter / `
+    /// activate the highlight; Up/Down move it; Escape is handled by the gate.
+    fn edit_tab_switcher(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
+        match ks.key.as_str() {
+            "up" => {
+                if let Some(st) = self.tab_switcher.as_mut() {
+                    let len = st.entries.len();
+                    if len > 0 {
+                        st.highlight = (st.highlight + len - 1) % len;
+                    }
+                }
+            }
+            "down" => {
+                if let Some(st) = self.tab_switcher.as_mut() {
+                    let len = st.entries.len();
+                    if len > 0 {
+                        st.highlight = (st.highlight + 1) % len;
+                    }
+                }
+            }
+            "enter" | "return" | "numpadenter" => {
+                let target = self.tab_switcher.as_ref().and_then(|st| {
+                    st.entries.get(st.highlight).copied().map(|(pi, wi, tid)| {
+                        let path = self
+                            .projects
+                            .get(pi)
+                            .and_then(|p| p.worktrees.get(wi))
+                            .map(|w| PathBuf::from(&w.path))
+                            .unwrap_or_default();
+                        ((pi, wi, tid), path)
+                    })
+                });
+                if let Some((key, path)) = target {
+                    self.activate_switcher_tab(key, path, ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Commit the tab switcher: activate the chosen tab and close the overlay.
+    fn activate_switcher_tab(
+        &mut self,
+        key: (usize, usize, usize),
+        path: PathBuf,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.modal = None;
+        self.tab_switcher = None;
+        let a = CraneShellAction::Select { sel: key, path };
+        self.handle_action(&a, ctx);
     }
 
     /// Reload the project list from session.json + the current overlay
@@ -4768,6 +5320,10 @@ impl View for CraneShellView {
         // Whether a blocking modal is open — captured into the keydown closure so
         // Escape closes it and other keys are swallowed.
         let modal_open = self.modal.is_some();
+        // Which typing-capable modal is open (if any): its keys route to the
+        // query field / switcher instead of being swallowed.
+        let modal_is_fif = matches!(self.modal, Some(Modal::FindInFiles));
+        let modal_is_switcher = matches!(self.modal, Some(Modal::TabSwitcher));
         // App-level keyboard shortcuts. The terminal pane propagates Cmd combos
         // up to here (its own on_keydown returns PropagateToParent for cmd).
         EventHandler::new(root)
@@ -4805,6 +5361,27 @@ impl View for CraneShellView {
                         && !ks.alt
                     {
                         ctx.dispatch_typed_action(CraneShellAction::CloseModal);
+                        return DispatchEventResult::StopPropagation;
+                    }
+                    // Cmd+` while the switcher is open advances the highlight
+                    // (next / prev on Shift) instead of typing into it.
+                    if modal_is_switcher
+                        && ks.cmd
+                        && !ks.ctrl
+                        && !ks.alt
+                        && (ks.key == "`" || ks.key == "~")
+                    {
+                        ctx.dispatch_typed_action(CraneShellAction::AdvanceTabSwitcher(
+                            ks.shift || ks.key == "~",
+                        ));
+                        return DispatchEventResult::StopPropagation;
+                    }
+                    // Route typing / nav into the Find-in-Files query field or
+                    // the tab switcher; every other modal swallows all keys.
+                    if modal_is_fif {
+                        ctx.dispatch_typed_action(CraneShellAction::FindInFilesKey(ks.clone()));
+                    } else if modal_is_switcher {
+                        ctx.dispatch_typed_action(CraneShellAction::TabSwitcherKey(ks.clone()));
                     }
                     return DispatchEventResult::StopPropagation;
                 }
@@ -4834,10 +5411,10 @@ impl View for CraneShellView {
                         "c" => Some(CraneShellAction::CopyFocused),
                         "x" => Some(CraneShellAction::CutFocused),
                         // Editor find / replace / goto-line (open the bar; keys then
-                        // route through the editor's own input_key).
-                        // TODO(parity): Cmd+Shift+F should open the cross-file
-                        // Find-in-Files modal (needs the modal framework, not yet
-                        // ported). For now Shift falls through to the in-file bar.
+                        // route through the editor's own input_key). Cmd+Shift+F
+                        // opens the project-wide Find-in-Files modal instead — it
+                        // MUST precede the plain "f" arm.
+                        "f" if ks.shift => Some(CraneShellAction::OpenFindInFiles),
                         "f" => Some(CraneShellAction::FindFocused),
                         "h" => Some(CraneShellAction::ReplaceFocused),
                         "g" => Some(CraneShellAction::GotoLineFocused),
@@ -4848,6 +5425,10 @@ impl View for CraneShellView {
                         // Cmd+[ / Cmd+] cycle focus across panes in the active tab.
                         "[" => Some(CraneShellAction::FocusPrevPane),
                         "]" => Some(CraneShellAction::FocusNextPane),
+                        // Cmd+` opens / advances the tab switcher (Cmd+Shift+` =
+                        // "~" on macOS → previous). Committed via Enter / click.
+                        "`" => Some(CraneShellAction::AdvanceTabSwitcher(false)),
+                        "~" => Some(CraneShellAction::AdvanceTabSwitcher(true)),
                         // Cmd+9 toggles the Git log panel (bare Cmd+9 only —
                         // Cmd+Shift+9 must NOT open it, matching old shortcuts.rs).
                         "9" if !ks.shift => Some(CraneShellAction::OpenGitLog),
@@ -5075,6 +5656,21 @@ pub enum CraneShellAction {
     QuitConfirmed,
     /// User confirmed closing a terminal pane that had a running process.
     ConfirmClosePane(PaneId),
+    /// Cmd+Shift+F: open the project-wide Find-in-Files modal.
+    OpenFindInFiles,
+    /// A keystroke routed to the open Find-in-Files query field.
+    FindInFilesKey(warpui::keymap::Keystroke),
+    /// Open a Find-in-Files match: open its file at the given 1-based line.
+    OpenFifMatch { path: PathBuf, line: u32 },
+    /// Cmd+` / Cmd+Shift+`: open or advance the tab switcher (`true` = backward).
+    AdvanceTabSwitcher(bool),
+    /// A keystroke routed to the open tab switcher.
+    TabSwitcherKey(warpui::keymap::Keystroke),
+    /// Activate the given tab from the switcher (click / Enter) and close it.
+    ActivateSwitcherTab {
+        key: (usize, usize, usize),
+        path: PathBuf,
+    },
     Noop,
 }
 
@@ -6107,6 +6703,8 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::CloseModal => {
                 self.modal = None;
+                self.find_in_files = None;
+                self.tab_switcher = None;
             }
             CraneShellAction::OpenHelp => {
                 self.modal = Some(Modal::Help);
@@ -6130,6 +6728,30 @@ impl TypedActionView for CraneShellView {
                     self.maximized = None;
                 }
                 self.close_focused();
+            }
+            CraneShellAction::OpenFindInFiles => {
+                self.find_in_files = Some(FindInFilesState {
+                    query: String::new(),
+                    results: Vec::new(),
+                    truncated: false,
+                    selected: 0,
+                });
+                self.modal = Some(Modal::FindInFiles);
+            }
+            CraneShellAction::FindInFilesKey(ks) => {
+                self.edit_find_in_files(ks, ctx);
+            }
+            CraneShellAction::OpenFifMatch { path, line } => {
+                self.open_fif_match(path.clone(), *line, ctx);
+            }
+            CraneShellAction::AdvanceTabSwitcher(backward) => {
+                self.advance_tab_switcher(*backward);
+            }
+            CraneShellAction::TabSwitcherKey(ks) => {
+                self.edit_tab_switcher(ks, ctx);
+            }
+            CraneShellAction::ActivateSwitcherTab { key, path } => {
+                self.activate_switcher_tab(*key, path.clone(), ctx);
             }
             CraneShellAction::Noop => {}
         }
