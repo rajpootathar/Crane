@@ -1612,10 +1612,14 @@ impl CraneShellView {
         // emitted exactly once per contiguous run of same-group projects.
         let mut last_group: Option<String> = None;
         for (pi, p) in self.projects.iter().enumerate() {
-            // Folder groups: when 2+ projects share a parent directory, emit a
-            // collapsible FOLDER header once, then nest the member projects one
-            // indent deeper. Ungrouped projects render flush-left exactly as
-            // before (group_offset == 0).
+            // Container folder groups: when the user opens a NON-git folder whose
+            // immediate children are git repos, each child carries the container
+            // folder's own path in `group_path`. Emit a collapsible FOLDER header
+            // (label = container basename) once per contiguous run of children,
+            // then nest the child projects one indent deeper. Projects the user
+            // opened directly (git repo / loose folder) have `group_path == None`
+            // and render flush-left exactly as before (group_offset == 0). We
+            // NEVER group two separately-opened projects by a shared parent dir.
             let in_group = p.group_path.is_some();
             let group_collapsed = p
                 .group_path

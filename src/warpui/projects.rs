@@ -5,6 +5,7 @@
 //! full session schema.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 pub struct WorktreeNode {
     pub name: String,
@@ -29,46 +30,148 @@ pub struct ProjectNode {
     /// Computed once at load time. A loose project shows a FOLDER icon, hides
     /// branch/worktree rows, and offers "Initialize Git" in its context menu.
     pub is_loose: bool,
-    /// Shared-parent folder group. `Some(parent_dir)` when 2+ loaded projects
-    /// live directly under the same parent directory — those projects nest
-    /// under a collapsible FOLDER header named by the parent's basename.
-    /// `None` for projects with no shared-parent sibling (rendered top-level).
-    /// Derived at load time by `assign_groups`.
+    /// Set ONLY on a git project that was discovered INSIDE a container folder
+    /// the user opened — i.e. the user opened a non-git folder whose immediate
+    /// child directories are themselves git repos (e.g. opening `qck-platform`
+    /// surfaces `qck-cloud` / `qck-py-sdk` / `qck-js-sdk`). The value is the
+    /// CONTAINER folder's OWN path. The sidebar renders a collapsible FOLDER
+    /// header (label = the container's basename, collapse keyed by this path via
+    /// `ToggleGroup`/`collapsed_groups`) once per contiguous run of children and
+    /// nests each child project one indent below it.
+    ///
+    /// `None` for a folder the user opened directly (a git project or a loose
+    /// folder) — those render top-level. Grouping is INTRINSIC to a single
+    /// opened container folder; it is NEVER inferred from a shared parent
+    /// directory of separately-opened projects.
     pub group_path: Option<String>,
 }
 
-/// Group projects that share an immediate parent directory. When 2+ projects
-/// in the list live directly under the same parent, each of those projects gets
-/// `group_path = Some(parent)` so the sidebar renders them under a collapsible
-/// FOLDER header. Projects with no shared-parent sibling stay ungrouped.
-///
-/// Simplification vs. old egui: the original derived groups from a live repo
-/// discovery walk (`git::discover_repos`); here we group purely by the loaded
-/// projects' immediate parent directory path, which is deterministic and needs
-/// no filesystem scan.
-fn assign_groups(projects: &mut [ProjectNode]) {
-    let parent_of = |path: &str| -> Option<String> {
-        std::path::Path::new(path)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
+/// One folder the user explicitly opened (from session.json or "Add Project"),
+/// before container-expansion. Carries any worktrees session.json recorded for
+/// it (used verbatim when the folder is itself a git repo / loose folder).
+struct OpenedFolder {
+    name: String,
+    path: String,
+    worktrees: Vec<WorktreeNode>,
+}
+
+/// Names of child directories that are never scanned when detecting whether a
+/// non-git container folder holds git repos (build output / dependency dirs).
+fn skip_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules" | "target" | "dist" | "build" | ".next" | "vendor"
+            | ".venv" | "venv" | ".cache" | ".turbo" | ".cargo"
+    )
+}
+
+/// Immediate child directories of `dir` that are themselves git repos (contain
+/// a `.git` entry). Only the FIRST level is scanned — grouping is intrinsic to
+/// the one opened container folder, so we never recurse into a parent the user
+/// didn't open. Sorted for stable ordering across reloads.
+fn immediate_child_repos(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
     };
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for p in projects.iter() {
-        if let Some(parent) = parent_of(&p.path) {
-            *counts.entry(parent).or_insert(0) += 1;
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() || ft.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(n) = name.to_str() else { continue };
+        if n.starts_with('.') || skip_dir(n) {
+            continue;
+        }
+        let path = entry.path();
+        if path.join(".git").exists() {
+            out.push(path);
         }
     }
-    for p in projects.iter_mut() {
-        if let Some(parent) = parent_of(&p.path) {
-            if counts.get(&parent).copied().unwrap_or(0) >= 2 {
-                p.group_path = Some(parent);
-            }
-        }
+    out.sort();
+    out
+}
+
+/// Basename of a path as a `String`, falling back to `fallback`.
+fn basename(path: &Path, fallback: &str) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// Build a git-project `ProjectNode` for a discovered CHILD repo (a git repo
+/// found directly inside an opened container folder). It gets a single
+/// synthesized worktree = its own checkout (current branch), so the sidebar
+/// renders a real branch row + tabs + diff badges under it.
+fn child_project_node(child: &Path, container_path: &str) -> ProjectNode {
+    let cpath = child.to_string_lossy().to_string();
+    let cname = basename(child, "(repo)");
+    let branch = crate::warpui::git::current_branch(child);
+    let wname = if branch.is_empty() { cname.clone() } else { branch };
+    let diff_stat = crate::warpui::git::diff_numstat(child);
+    let dirty = crate::warpui::git::is_dirty(child);
+    ProjectNode {
+        name: cname,
+        path: cpath.clone(),
+        worktrees: vec![WorktreeNode {
+            name: wname,
+            path: cpath,
+            tabs: Vec::new(),
+            diff_stat,
+            dirty,
+        }],
+        tint: None,
+        is_loose: false,
+        group_path: Some(container_path.to_string()),
     }
 }
 
-/// Load the project tree from the live Crane session, or empty if missing.
-pub fn load_projects() -> Vec<ProjectNode> {
+/// Expand ONE opened folder into the flat `ProjectNode`s it contributes:
+/// - git repo            → itself, top-level (`group_path = None`).
+/// - non-git CONTAINER   → one child ProjectNode per immediate git-repo child,
+///                         each carrying `group_path = Some(container path)`.
+/// - non-git loose folder → itself as a loose folder (`is_loose = true`).
+fn expand_folder(opened: OpenedFolder, out: &mut Vec<ProjectNode>) {
+    let path = Path::new(&opened.path);
+    let is_git = path.join(".git").exists();
+    if is_git {
+        out.push(ProjectNode {
+            name: opened.name,
+            path: opened.path,
+            worktrees: opened.worktrees,
+            tint: None,
+            is_loose: false,
+            group_path: None,
+        });
+        return;
+    }
+    // Non-git folder: is it a CONTAINER (immediate children are git repos)?
+    let children = if opened.path.is_empty() {
+        Vec::new()
+    } else {
+        immediate_child_repos(path)
+    };
+    if !children.is_empty() {
+        for child in &children {
+            out.push(child_project_node(child, &opened.path));
+        }
+        return;
+    }
+    // Loose folder (non-git, no git children): tabs render directly under it.
+    out.push(ProjectNode {
+        name: opened.name,
+        path: opened.path,
+        worktrees: opened.worktrees,
+        tint: None,
+        is_loose: true,
+        group_path: None,
+    });
+}
+
+/// Parse the opened folders recorded in `~/.crane/session.json` (unexpanded).
+fn session_folders() -> Vec<OpenedFolder> {
     let home = std::env::var("HOME").unwrap_or_default();
     let path = format!("{home}/.crane/session.json");
     let Ok(data) = std::fs::read_to_string(&path) else {
@@ -118,7 +221,7 @@ pub fn load_projects() -> Vec<ProjectNode> {
                         }
                     }
                     let (diff_stat, dirty) = if !wpath.is_empty() {
-                        let p = std::path::Path::new(&wpath);
+                        let p = Path::new(&wpath);
                         (
                             crate::warpui::git::diff_numstat(p),
                             crate::warpui::git::is_dirty(p),
@@ -135,14 +238,10 @@ pub fn load_projects() -> Vec<ProjectNode> {
                     });
                 }
             }
-            let is_loose = !std::path::Path::new(&path).join(".git").exists();
-            out.push(ProjectNode {
+            out.push(OpenedFolder {
                 name,
                 path,
                 worktrees,
-                tint: None,
-                is_loose,
-                group_path: None,
             });
         }
     }
@@ -151,33 +250,40 @@ pub fn load_projects() -> Vec<ProjectNode> {
 
 /// Load projects with overlay data from warpui-state.json:
 /// - `added`: extra projects appended by the user via "Add Project"
-/// - `removed`: paths of session.json projects to exclude
+/// - `removed`: paths of opened folders to exclude
 /// - `tints`: per-path tint overrides
+///
+/// The overlay is applied to the OPENED-folder list (keyed by the folder path
+/// the user actually opened) BEFORE container-expansion, so removing a
+/// container folder drops all of its discovered child repos atomically and
+/// re-adding one via "Add Project" is deduped by the opened path.
 pub fn load_projects_extended(
     added: &[crate::warpui::persist::AddedProject],
     removed: &[String],
     tints: &HashMap<String, [u8; 3]>,
 ) -> Vec<ProjectNode> {
-    let mut projects = load_projects();
-    projects.retain(|p| !removed.contains(&p.path));
-    for p in &mut projects {
-        p.tint = tints.get(&p.path).copied();
-    }
+    // 1. Gather opened folders (session + user-added), minus removed, deduped
+    //    by the opened path.
+    let mut folders: Vec<OpenedFolder> = session_folders();
+    folders.retain(|f| !removed.contains(&f.path));
     for ap in added {
-        if !projects.iter().any(|p| p.path == ap.path) {
-            let is_loose = !std::path::Path::new(&ap.path).join(".git").exists();
-            projects.push(ProjectNode {
+        if !folders.iter().any(|f| f.path == ap.path) {
+            folders.push(OpenedFolder {
                 name: ap.name.clone(),
                 path: ap.path.clone(),
                 worktrees: Vec::new(),
-                tint: tints.get(&ap.path).copied(),
-                is_loose,
-                group_path: None,
             });
         }
     }
-    // Derive folder groups on the FINAL list (session + added projects) so a
-    // newly added project can join an existing parent-folder group.
-    assign_groups(&mut projects);
+    // 2. Expand each opened folder into its flat ProjectNode(s).
+    let mut projects = Vec::new();
+    for folder in folders {
+        expand_folder(folder, &mut projects);
+    }
+    // 3. Apply per-path tint overrides (git/loose keyed by opened path, child
+    //    repos keyed by their own path).
+    for p in &mut projects {
+        p.tint = tints.get(&p.path).copied();
+    }
     projects
 }
