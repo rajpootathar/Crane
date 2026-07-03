@@ -202,6 +202,92 @@ pub fn remove_worktree(main: &Path, wt_path: &Path) -> Result<(), String> {
     run(main, &["worktree", "remove", "--force", &p])
 }
 
+/// `git -C <main_repo> worktree add [-b <branch>] <path> <branch-or-startpoint>`.
+/// Port of old Crane `git.rs::workspace_add`. When `create_branch` is true, uses
+/// `-b <branch>` so git creates the branch at the current HEAD and checks it out
+/// into the new worktree. When false, checks the *existing* `branch` out into the
+/// new worktree (`worktree add -- <path> <branch>`). Returns git's stderr verbatim
+/// on failure. Pure shell-out; never panics.
+pub fn add_worktree(
+    main_repo: &Path,
+    branch: &str,
+    path: &Path,
+    create_branch: bool,
+) -> Result<(), String> {
+    let path_str = path.to_string_lossy();
+    // With `-b`, git wants `-b <new-branch> <path>` with no `--` separator
+    // (a `--` there would be read as a commit-ish). The non-`-b` form takes
+    // `<path> <commit-ish>` and benefits from `--` so a leading-dash path is
+    // not mistaken for a flag.
+    let mut args: Vec<&str> = vec!["worktree", "add"];
+    if create_branch {
+        args.push("-b");
+        args.push(branch);
+        args.push(&path_str);
+    } else {
+        args.push("--");
+        args.push(&path_str);
+        args.push(branch);
+    }
+    run(main_repo, &args)
+}
+
+/// Parse `git -C <main_repo> worktree list --porcelain` into
+/// `(worktree_path, branch_name)` pairs. `branch_name` is the short ref from the
+/// `branch refs/heads/<name>` line, or `"(detached)"` for a detached HEAD /
+/// bare entry. Used for live worktree auto-detection (#3). Empty vec on any
+/// error / non-repo; never panics.
+pub fn list_worktrees(main_repo: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(main_repo)
+        .args(["worktree", "list", "--porcelain"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut result: Vec<(PathBuf, String)> = Vec::new();
+    let mut cur_path: Option<PathBuf> = None;
+    let mut cur_branch: Option<String> = None;
+    let flush =
+        |result: &mut Vec<(PathBuf, String)>, p: Option<PathBuf>, b: Option<String>| {
+            if let Some(path) = p {
+                result.push((path, b.unwrap_or_else(|| "(detached)".to_string())));
+            }
+        };
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            // New record — flush the previous one first.
+            flush(&mut result, cur_path.take(), cur_branch.take());
+            cur_path = Some(PathBuf::from(rest));
+            cur_branch = None;
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            cur_branch = Some(rest.trim_start_matches("refs/heads/").to_string());
+        } else if line == "detached" || line == "bare" {
+            cur_branch = Some("(detached)".to_string());
+        }
+    }
+    flush(&mut result, cur_path.take(), cur_branch.take());
+    result
+}
+
+/// Create a branch `name` in `repo`. When `checkout` is true, runs
+/// `git checkout -b <name>` (create + switch); otherwise `git branch <name>`
+/// (create without switching). Returns git's stderr on failure. Pure
+/// shell-out; never panics.
+pub fn create_branch(repo: &Path, name: &str, checkout: bool) -> Result<(), String> {
+    if checkout {
+        run(repo, &["checkout", "-b", name])
+    } else {
+        run(repo, &["branch", name])
+    }
+}
+
 /// Working-tree changes in `root`, or empty on any error / non-repo.
 pub fn changes(root: &Path) -> Vec<Change> {
     let Ok(out) = Command::new("git")

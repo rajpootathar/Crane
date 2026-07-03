@@ -101,6 +101,12 @@ fn basename(path: &Path, fallback: &str) -> String {
         .to_string()
 }
 
+/// Public basename helper for callers outside this module (e.g. the shell's
+/// worktree-poll tick naming a detached worktree by its directory).
+pub fn basename_of(path: &Path) -> String {
+    basename(path, "(worktree)")
+}
+
 /// Build a git-project `ProjectNode` for a discovered CHILD repo (a git repo
 /// found directly inside an opened container folder). It gets a single
 /// synthesized worktree = its own checkout (current branch), so the sidebar

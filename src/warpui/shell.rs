@@ -21,9 +21,11 @@ use crate::warpui::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
     Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
-    CornerRadius, Dismiss, DispatchEventResult, Draggable, DraggableState, EventHandler, Expanded,
-    Fill, Flex, ParentElement, Radius, Rect, ScrollbarWidth, Stack, Text,
+    CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, Draggable, DraggableState,
+    EventHandler, Expanded, Fill, Flex, Hoverable, MouseStateHandle, ParentElement, Radius, Rect,
+    ScrollbarWidth, Stack, Text,
 };
+use warpui::platform::Cursor;
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::vec2f;
 use warpui::fonts::FamilyId;
@@ -58,6 +60,13 @@ enum Modal {
     /// Cmd+` tab switcher. Entry list + highlight lives in
     /// `CraneShellView::tab_switcher`; this variant only marks it open.
     TabSwitcher,
+    /// "Switch Branch" — a searchable local+remote branch list. Query + list
+    /// live in `CraneShellView::switch_branch`; this variant marks it open so the
+    /// modal scaffold + key-gating reuse the shared framework.
+    SwitchBranch,
+    /// "New Workspace" — create a git worktree for a branch. State lives in
+    /// `CraneShellView::new_workspace`.
+    NewWorkspace,
 }
 
 /// Visual style of a modal button (`modal_button`).
@@ -67,6 +76,8 @@ enum ModalBtn {
     Danger,
     /// Plain surface pill — Cancel / secondary.
     Plain,
+    /// Filled accent — the primary / affirmative action (Create, Confirm).
+    Primary,
 }
 
 /// State for an open project right-click context menu.
@@ -242,6 +253,12 @@ pub struct CraneShellView {
     removed_project_paths: Vec<String>,
     /// Per-project tint overrides keyed by project path.
     project_tints: HashMap<String, [u8; 3]>,
+    /// Pool of persistent per-row hover states for context-menu / modal rows,
+    /// keyed by a stable string. Menu rows are rebuilt every render, but a
+    /// `Hoverable`'s hover must survive the mouse-in → repaint gap, so the
+    /// `MouseStateHandle` (an `Arc<Mutex<..>>`) has to persist on the view.
+    /// `RefCell` because `render` is `&self` and lazily get-or-inserts handles.
+    menu_hover: RefCell<HashMap<String, MouseStateHandle>>,
     /// Active project context menu, or None when no menu is open.
     context_menu: Option<ProjectContextMenu>,
     /// Collapsed folder groups, keyed by `ProjectNode::group_path`. Absent →
@@ -321,6 +338,19 @@ pub struct CraneShellView {
     tab_switcher: Option<TabSwitcherState>,
     /// Scroll state for the tab-switcher list.
     switcher_scroll: ClippedScrollStateHandle,
+    /// "Switch Branch" modal state, or None when closed. Mirrored by
+    /// `Modal::SwitchBranch`.
+    switch_branch: Option<SwitchBranchState>,
+    /// Scroll state for the Switch-Branch list.
+    switch_branch_scroll: ClippedScrollStateHandle,
+    /// "New Workspace" modal state, or None when closed. Mirrored by
+    /// `Modal::NewWorkspace`.
+    new_workspace: Option<NewWorkspaceState>,
+    /// Per-project cache of the last `git worktree list` signature, used by the
+    /// background worktree-poll tick to skip re-computing when nothing changed.
+    worktree_poll_sig: HashMap<String, String>,
+    /// Keeps the worktree-detection poll stream alive for the view's lifetime.
+    _worktree_tick: warpui::r#async::SpawnedLocalStream,
 
     // ── LSP wiring ───────────────────────────────────────────────────────────
     /// The language-server client. Diagnostics + goto-definition for the active
@@ -395,6 +425,35 @@ pub struct FindInFilesState {
 pub struct TabSwitcherState {
     pub entries: Vec<(usize, usize, usize)>,
     pub highlight: usize,
+}
+
+/// State for the "Switch Branch" modal. Keys route to `query` (via
+/// `edit_switch_branch`), which filters `all` (local + deduped remote short
+/// names) into the rendered list. Picking a branch checks it out in the active
+/// workspace; each row also offers "+ worktree" (open New Workspace pre-filled).
+pub struct SwitchBranchState {
+    pub query: String,
+    /// The active project index (for "+ worktree" / new-branch worktree flows).
+    pub project_idx: usize,
+    /// Every candidate branch name (locals first, then deduped remote shorts).
+    pub all: Vec<String>,
+    /// Local branch names (subset of `all`) — used only to tag remote-only rows.
+    pub locals: std::collections::HashSet<String>,
+    /// Highlighted row (Enter checks it out).
+    pub selected: usize,
+}
+
+/// State for the "New Workspace" modal — create a `git worktree` for a branch.
+pub struct NewWorkspaceState {
+    /// The project the worktree is created under.
+    pub project_idx: usize,
+    /// The branch name being typed / chosen.
+    pub branch: String,
+    /// When true, create a brand-new branch (`worktree add -b`); else check out
+    /// an existing branch into the new worktree.
+    pub new_branch: bool,
+    /// Error surfaced under the field on a failed `git worktree add`.
+    pub error: Option<String>,
 }
 
 /// Hard cap on Find-in-Files matches so a broad query in a huge tree can't wedge
@@ -722,6 +781,21 @@ impl CraneShellView {
             },
             |_this, _vctx| {},
         );
+        // Worktree auto-detection poll. Every ~1.5s it reconciles each git
+        // project's in-memory worktrees against `git worktree list` (add ones
+        // created outside the app, flip a loose folder to git when `.git`
+        // appears, drop ones removed on disk). Cheap when idle: a per-project
+        // `git worktree list` whose output is signature-cached, and heavier
+        // per-worktree git (branch/diff/dirty) only for worktrees that changed.
+        let wt_ticker =
+            warpui::r#async::Timer::interval(std::time::Duration::from_millis(1500));
+        let worktree_tick = ctx.spawn_stream_local(
+            wt_ticker,
+            |this: &mut Self, _instant, vctx| {
+                this.poll_worktrees(vctx);
+            },
+            |_this, _vctx| {},
+        );
         Self {
             ui_font,
             icon_font,
@@ -773,6 +847,7 @@ impl CraneShellView {
             added_projects: init_added,
             removed_project_paths: init_removed,
             project_tints: init_tints,
+            menu_hover: RefCell::new(HashMap::new()),
             context_menu: None,
             collapsed_groups: HashSet::new(),
             collapsed_change_dirs: HashSet::new(),
@@ -805,6 +880,11 @@ impl CraneShellView {
             find_scroll: ClippedScrollStateHandle::new(),
             tab_switcher: None,
             switcher_scroll: ClippedScrollStateHandle::new(),
+            switch_branch: None,
+            switch_branch_scroll: ClippedScrollStateHandle::new(),
+            new_workspace: None,
+            worktree_poll_sig: HashMap::new(),
+            _worktree_tick: worktree_tick,
             lsp: crate::lsp::LspManager::new(),
             lsp_ctx: egui::Context::default(),
             lsp_configs: crate::lsp::LanguageConfigs::default(),
@@ -1024,32 +1104,63 @@ impl CraneShellView {
 
     /// A single row inside the context menu (icon + label). Dispatches
     /// CloseContextMenu then the real `action` when clicked.
+    /// Get-or-create the persistent hover state for a menu/modal row keyed by a
+    /// stable string. The `MouseStateHandle` must outlive a single render so the
+    /// `Hoverable` sees a stable is_hovered across the mouse-in → repaint gap.
+    fn hover_handle(&self, key: &str) -> MouseStateHandle {
+        let mut map = self.menu_hover.borrow_mut();
+        if let Some(h) = map.get(key) {
+            return h.clone();
+        }
+        let h = MouseStateHandle::default();
+        map.insert(key.to_string(), h.clone());
+        h
+    }
+
     fn menu_item(&self, glyph: &str, label: &str, action: CraneShellAction) -> Box<dyn Element> {
-        let row = Flex::row()
-            .with_child(
-                Container::new(self.icon(glyph, 12.0, theme::text_muted()))
+        // Key the hover state by the row label. Only one context menu is open at
+        // a time and labels are unique within a menu, so this is a stable key.
+        let state = self.hover_handle(&format!("mi:{label}"));
+        let glyph = glyph.to_string();
+        let label = label.to_string();
+        let ui_font = self.ui_font;
+        let icon_font = self.icon_font;
+        Hoverable::new(state, move |ms| {
+            let bg = if ms.is_hovered() {
+                theme::row_hover()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            let row = Flex::row()
+                .with_child(
+                    Container::new(
+                        Text::new(glyph.clone(), icon_font, 12.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    )
                     .with_padding_right(8.0)
                     .finish(),
-            )
-            .with_child(
-                Text::new(label.to_string(), self.ui_font, 12.0)
-                    .with_color(theme::text())
-                    .finish(),
-            )
-            .finish();
-        let content = Container::new(row)
-            .with_padding_left(10.0)
-            .with_padding_right(20.0)
-            .with_padding_top(6.0)
-            .with_padding_bottom(6.0)
-            .finish();
-        EventHandler::new(content)
-            .on_left_mouse_down(move |ctx, _, _| {
-                ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
-                ctx.dispatch_typed_action(action.clone());
-                DispatchEventResult::StopPropagation
-            })
-            .finish()
+                )
+                .with_child(
+                    Text::new(label.clone(), ui_font, 12.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .finish();
+            Container::new(row)
+                .with_background_color(bg)
+                .with_padding_left(10.0)
+                .with_padding_right(20.0)
+                .with_padding_top(6.0)
+                .with_padding_bottom(6.0)
+                .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(move |ctx, _, _| {
+            ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+            ctx.dispatch_typed_action(action.clone());
+        })
+        .finish()
     }
 
     /// A thin horizontal divider for use inside the context menu.
@@ -1087,19 +1198,27 @@ impl CraneShellView {
         for rgb in PALETTE {
             let color = ColorU::new(rgb[0], rgb[1], rgb[2], 255);
             let action = on_pick(rgb);
-            let swatch = EventHandler::new(
+            let state = self.hover_handle(&format!("sw:{}:{}:{}", rgb[0], rgb[1], rgb[2]));
+            let swatch = Hoverable::new(state, move |ms| {
+                let bg = if ms.is_hovered() {
+                    theme::row_hover()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                };
                 Container::new(
                     Text::new(icons::CUBE.to_string(), icon_font, 14.0)
                         .with_color(color)
                         .finish(),
                 )
+                .with_background_color(bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
                 .with_uniform_padding(4.0)
-                .finish(),
-            )
-            .on_left_mouse_down(move |ctx, _, _| {
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _, _| {
                 ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
                 ctx.dispatch_typed_action(action.clone());
-                DispatchEventResult::StopPropagation
             })
             .finish();
             swatches = swatches.with_child(swatch);
@@ -1116,7 +1235,7 @@ impl CraneShellView {
     fn project_context_menu(&self, pm: &ProjectContextMenu) -> Box<dyn Element> {
         let pi = pm.project_idx;
         let is_loose = self.projects.get(pi).map(|p| p.is_loose).unwrap_or(false);
-        let mut items = Flex::column();
+        let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
         items = items.with_child(self.menu_item(
             icons::FOLDER_OPEN,
@@ -1157,19 +1276,27 @@ impl CraneShellView {
         for (_name, rgb) in &PALETTE {
             let color = ColorU::new(rgb[0], rgb[1], rgb[2], 255);
             let rgb_copy = *rgb;
-            let swatch = EventHandler::new(
+            let state = self.hover_handle(&format!("sw:{}:{}:{}", rgb[0], rgb[1], rgb[2]));
+            let swatch = Hoverable::new(state, move |ms| {
+                let bg = if ms.is_hovered() {
+                    theme::row_hover()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                };
                 Container::new(
                     Text::new(icons::CUBE.to_string(), icon_font, 14.0)
                         .with_color(color)
                         .finish(),
                 )
+                .with_background_color(bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
                 .with_uniform_padding(4.0)
-                .finish(),
-            )
-            .on_left_mouse_down(move |ctx, _, _| {
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _, _| {
                 ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
                 ctx.dispatch_typed_action(CraneShellAction::SetProjectTint(pi, Some(rgb_copy)));
-                DispatchEventResult::StopPropagation
             })
             .finish();
             swatches = swatches.with_child(swatch);
@@ -1253,7 +1380,7 @@ impl CraneShellView {
     fn row_menu_overlay(&self, menu: &RowMenu) -> Box<dyn Element> {
         match menu {
             RowMenu::Change { path, staged, x, y } => {
-                let mut items = Flex::column();
+                let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
                 if !*staged {
                     items = items.with_child(self.menu_item(
                         icons::PLUS,
@@ -1293,7 +1420,7 @@ impl CraneShellView {
                 self.menu_popover(items.finish(), *x, *y)
             }
             RowMenu::File { path, is_dir, x, y } => {
-                let mut items = Flex::column();
+                let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
                 if !*is_dir {
                     items = items.with_child(self.menu_item(
                         icons::FILE,
@@ -1342,7 +1469,7 @@ impl CraneShellView {
     /// The branch-picker overlay: a scrollable list of local + remote branches;
     /// clicking one checks it out. (Simple list — no fuzzy filter input yet.)
     fn branch_picker_overlay(&self, x: f32, y: f32) -> Box<dyn Element> {
-        let mut items = Flex::column();
+        let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         if self.branch_list.is_empty() {
             items = items.with_child(
                 Container::new(
@@ -1359,28 +1486,42 @@ impl CraneShellView {
             let glyph = if is_current { icons::CHECK } else { icons::GIT_BRANCH };
             let color = if is_current { theme::accent() } else { theme::text() };
             let branch = b.clone();
-            let row = Flex::row()
-                .with_child(
-                    Container::new(self.icon(glyph, 12.0, color))
+            let label = b.clone();
+            let ui_font = self.ui_font;
+            let icon_font = self.icon_font;
+            let state = self.hover_handle(&format!("bp:{b}"));
+            let item = Hoverable::new(state, move |ms| {
+                let bg = if ms.is_hovered() {
+                    theme::row_hover()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                };
+                let row = Flex::row()
+                    .with_child(
+                        Container::new(
+                            Text::new(glyph.to_string(), icon_font, 12.0)
+                                .with_color(color)
+                                .finish(),
+                        )
                         .with_padding_right(8.0)
                         .finish(),
-                )
-                .with_child(
-                    Text::new(b.clone(), self.ui_font, 12.0).with_color(color).finish(),
-                )
-                .finish();
-            let item = EventHandler::new(
+                    )
+                    .with_child(
+                        Text::new(label.clone(), ui_font, 12.0).with_color(color).finish(),
+                    )
+                    .finish();
                 Container::new(row)
+                    .with_background_color(bg)
                     .with_padding_left(10.0)
                     .with_padding_right(10.0)
                     .with_padding_top(5.0)
                     .with_padding_bottom(5.0)
-                    .finish(),
-            )
-            .on_left_mouse_down(move |ctx, _app, _pos| {
+                    .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
                 ctx.dispatch_typed_action(CraneShellAction::CheckoutBranch(branch.clone()));
-                DispatchEventResult::StopPropagation
             })
             .finish();
             items = items.with_child(item);
@@ -1447,7 +1588,7 @@ impl CraneShellView {
             .map(|w| w.path.clone())
             .unwrap_or_default();
         let path = PathBuf::from(&wt_path);
-        let mut items = Flex::column();
+        let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         items = items.with_child(self.menu_item(
             icons::FOLDER_OPEN,
             "Reveal in Finder",
@@ -1498,7 +1639,7 @@ impl CraneShellView {
         x: f32,
         y: f32,
     ) -> Box<dyn Element> {
-        let mut items = Flex::column();
+        let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         items = items.with_child(self.menu_item(
             icons::X,
             "Close Tab",
@@ -1642,6 +1783,7 @@ impl CraneShellView {
         let (bg, fg) = match style {
             ModalBtn::Danger => (theme::error(), ColorU::new(255, 255, 255, 255)),
             ModalBtn::Plain => (theme::surface(), theme::text()),
+            ModalBtn::Primary => (theme::accent(), ColorU::new(255, 255, 255, 255)),
         };
         EventHandler::new(
             Container::new(
@@ -1711,6 +1853,8 @@ impl CraneShellView {
             Modal::Help => self.help_card(),
             Modal::FindInFiles => self.find_in_files_card(),
             Modal::TabSwitcher => self.tab_switcher_card(),
+            Modal::SwitchBranch => self.switch_branch_card(),
+            Modal::NewWorkspace => self.new_workspace_card(),
         };
         self.modal_scaffold(card)
     }
@@ -2281,6 +2425,386 @@ impl CraneShellView {
         self.modal_card(460.0, col)
     }
 
+    /// "Switch Branch" card — a search field over local + remote branches. Each
+    /// row checks the branch out in the active workspace; a trailing "+ worktree"
+    /// button opens the New-Workspace modal pre-filled with that branch. A typed
+    /// query that matches no branch surfaces a "Create new branch …" row.
+    fn switch_branch_card(&self) -> Box<dyn Element> {
+        let Some(st) = self.switch_branch.as_ref() else {
+            return self.modal_card(520.0, Flex::column().finish());
+        };
+        let q = st.query.trim().to_lowercase();
+        let filtered: Vec<String> = st
+            .all
+            .iter()
+            .filter(|b| q.is_empty() || b.to_lowercase().contains(&q))
+            .cloned()
+            .collect();
+        let exact = st.all.iter().any(|b| b.to_lowercase() == q);
+
+        // Search field (mirrors Find-in-Files).
+        let (qtext, qcolor) = if st.query.is_empty() {
+            ("Search branches…".to_string(), theme::text_muted())
+        } else {
+            (format!("{}|", st.query), theme::text())
+        };
+        let query_field = Container::new(
+            Flex::row()
+                .with_child(self.icon(icons::MAGNIFYING_GLASS, 13.0, theme::text_muted()))
+                .with_child(Self::spacer(8.0))
+                .with_child(Text::new(qtext, self.ui_font, 13.0).with_color(qcolor).finish())
+                .finish(),
+        )
+        .with_background_color(theme::row_active())
+        .with_border(Border::all(1.0).with_border_color(theme::border()))
+        .with_padding_left(8.0)
+        .with_padding_right(8.0)
+        .with_padding_top(7.0)
+        .with_padding_bottom(7.0)
+        .finish();
+
+        let pi = st.project_idx;
+        let mut list = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        for (i, b) in filtered.iter().enumerate() {
+            let is_current = *b == self.branch;
+            let is_sel = i == st.selected;
+            let is_local = st.locals.contains(b);
+            let glyph = if is_current { icons::CHECK } else { icons::GIT_BRANCH };
+            let color = if is_current { theme::accent() } else { theme::text() };
+            let branch = b.clone();
+            let label = b.clone();
+            let ui_font = self.ui_font;
+            let icon_font = self.icon_font;
+            let state = self.hover_handle(&format!("sb:{b}"));
+            // Left region: icon + name (+ a muted "remote" tag) — click = checkout.
+            let name_region = Hoverable::new(state, move |ms| {
+                let bg = if ms.is_hovered() || is_sel {
+                    theme::row_hover()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                };
+                let mut r = Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Container::new(
+                            Text::new(glyph.to_string(), icon_font, 12.0)
+                                .with_color(color)
+                                .finish(),
+                        )
+                        .with_padding_right(8.0)
+                        .finish(),
+                    )
+                    .with_child(
+                        Text::new(label.clone(), ui_font, 12.5).with_color(color).finish(),
+                    );
+                if !is_local {
+                    r = r.with_child(Self::spacer(8.0)).with_child(
+                        Text::new("remote".to_string(), ui_font, 10.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    );
+                }
+                Container::new(r.finish())
+                    .with_background_color(bg)
+                    .with_padding_left(10.0)
+                    .with_padding_top(6.0)
+                    .with_padding_bottom(6.0)
+                    .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::CloseModal);
+                ctx.dispatch_typed_action(CraneShellAction::CheckoutBranch(branch.clone()));
+            })
+            .finish();
+            // Right region: "+ worktree".
+            let wt_branch = b.clone();
+            let wt_state = self.hover_handle(&format!("sbw:{b}"));
+            let wt_btn = Hoverable::new(wt_state, move |ms| {
+                let bg = if ms.is_hovered() {
+                    theme::row_hover()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                };
+                Container::new(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Text::new(icons::PLUS.to_string(), icon_font, 11.0)
+                                .with_color(theme::text_muted())
+                                .finish(),
+                        )
+                        .with_child(Self::spacer(3.0))
+                        .with_child(
+                            Text::new("worktree".to_string(), ui_font, 10.5)
+                                .with_color(theme::text_muted())
+                                .finish(),
+                        )
+                        .finish(),
+                )
+                .with_background_color(bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_padding_left(6.0)
+                .with_padding_right(8.0)
+                .with_padding_top(4.0)
+                .with_padding_bottom(4.0)
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::OpenNewWorkspace {
+                    pi,
+                    branch: Some(wt_branch.clone()),
+                });
+            })
+            .finish();
+            let row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(Expanded::new(1.0, name_region).finish())
+                .with_child(wt_btn)
+                .with_child(Self::spacer(6.0))
+                .finish();
+            list = list.with_child(row);
+        }
+        // "Create new branch" row when the query names no existing branch.
+        if !q.is_empty() && !exact {
+            let new_name = st.query.trim().to_string();
+            list = list.with_child(self.create_branch_row(new_name));
+        }
+        if filtered.is_empty() && q.is_empty() {
+            list = list.with_child(
+                Container::new(
+                    Text::new("(no branches)".to_string(), self.ui_font, 12.0)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .with_uniform_padding(8.0)
+                .finish(),
+            );
+        }
+        let scrolled = ConstrainedBox::new(
+            ClippedScrollable::vertical(
+                self.switch_branch_scroll.clone(),
+                list.finish(),
+                ScrollbarWidth::Auto,
+                Fill::Solid(theme::border()),
+                Fill::Solid(theme::text_muted()),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_height(320.0)
+        .finish();
+        let col = Flex::column()
+            .with_child(self.modal_header("Switch Branch"))
+            .with_child(Self::spacer(8.0))
+            .with_child(query_field)
+            .with_child(Self::spacer(8.0))
+            .with_child(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                    .with_height(1.0)
+                    .finish(),
+            )
+            .with_child(Self::spacer(4.0))
+            .with_child(scrolled)
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                Text::new(
+                    "Enter checks out · + worktree creates a workspace · Esc closes".to_string(),
+                    self.ui_font,
+                    10.5,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
+            )
+            .finish();
+        self.modal_card(520.0, col)
+    }
+
+    /// The "Create new branch '<name>'" row shown in the Switch-Branch modal.
+    fn create_branch_row(&self, name: String) -> Box<dyn Element> {
+        let ui_font = self.ui_font;
+        let icon_font = self.icon_font;
+        let label = format!("Create new branch \"{name}\"");
+        let state = self.hover_handle("sb:__create__");
+        Hoverable::new(state, move |ms| {
+            let bg = if ms.is_hovered() {
+                theme::row_hover()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Container::new(
+                            Text::new(icons::PLUS.to_string(), icon_font, 12.0)
+                                .with_color(theme::accent())
+                                .finish(),
+                        )
+                        .with_padding_right(8.0)
+                        .finish(),
+                    )
+                    .with_child(
+                        Text::new(label.clone(), ui_font, 12.5)
+                            .with_color(theme::accent())
+                            .finish(),
+                    )
+                    .finish(),
+            )
+            .with_background_color(bg)
+            .with_padding_left(10.0)
+            .with_padding_top(6.0)
+            .with_padding_bottom(6.0)
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::CreateBranchCheckout(name.clone()));
+        })
+        .finish()
+    }
+
+    /// "New Workspace" card — create a git worktree for a branch. A branch field,
+    /// a "create new branch" toggle, the computed worktree path, and Create /
+    /// Cancel buttons. Port of old egui `src/modals/new_workspace.rs`.
+    fn new_workspace_card(&self) -> Box<dyn Element> {
+        let Some(st) = self.new_workspace.as_ref() else {
+            return self.modal_card(460.0, Flex::column().finish());
+        };
+        let project = self.projects.get(st.project_idx);
+        let pname = project.map(|p| p.name.clone()).unwrap_or_default();
+
+        let (btext, bcolor) = if st.branch.is_empty() {
+            ("branch name…".to_string(), theme::text_muted())
+        } else {
+            (format!("{}|", st.branch), theme::text())
+        };
+        let branch_field = Container::new(
+            Flex::row()
+                .with_child(self.icon(icons::GIT_BRANCH, 13.0, theme::text_muted()))
+                .with_child(Self::spacer(8.0))
+                .with_child(Text::new(btext, self.ui_font, 13.0).with_color(bcolor).finish())
+                .finish(),
+        )
+        .with_background_color(theme::row_active())
+        .with_border(Border::all(1.0).with_border_color(theme::border()))
+        .with_padding_left(8.0)
+        .with_padding_right(8.0)
+        .with_padding_top(7.0)
+        .with_padding_bottom(7.0)
+        .finish();
+
+        // "Create new branch" toggle row (a small checkbox box + label). Built
+        // from a bordered square (filled accent + CHECK when on) rather than a
+        // dedicated glyph so it never depends on an unbundled phosphor codepoint.
+        let checkbox = {
+            let inner: Box<dyn Element> = if st.new_branch {
+                self.icon(icons::CHECK, 11.0, ColorU::new(255, 255, 255, 255))
+            } else {
+                Rect::new().finish()
+            };
+            let bg = if st.new_branch {
+                theme::accent()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            ConstrainedBox::new(
+                Container::new(inner)
+                    .with_background_color(bg)
+                    .with_border(Border::all(1.0).with_border_color(theme::border()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                    .finish(),
+            )
+            .with_width(16.0)
+            .with_height(16.0)
+            .finish()
+        };
+        let toggle = EventHandler::new(
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(checkbox)
+                    .with_child(Self::spacer(8.0))
+                    .with_child(
+                        Text::new(
+                            "Create as a new branch".to_string(),
+                            self.ui_font,
+                            12.0,
+                        )
+                        .with_color(theme::text())
+                        .finish(),
+                    )
+                    .finish(),
+            )
+            .with_padding_top(4.0)
+            .with_padding_bottom(4.0)
+            .finish(),
+        )
+        .on_left_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceToggleNewBranch);
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+
+        // Computed target path preview.
+        let path_preview = Self::default_worktree_path(&pname, &st.branch);
+        let path_text = format!("→ {}", path_preview.display());
+
+        let mut col = Flex::column()
+            .with_child(self.modal_header("New Workspace"))
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                Text::new(
+                    format!("Project: {pname}"),
+                    self.ui_font,
+                    11.5,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
+            )
+            .with_child(Self::spacer(10.0))
+            .with_child(branch_field)
+            .with_child(Self::spacer(8.0))
+            .with_child(toggle)
+            .with_child(Self::spacer(8.0))
+            .with_child(
+                Text::new(path_text, self.ui_font, 10.5)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            );
+        if let Some(err) = &st.error {
+            col = col.with_child(Self::spacer(6.0)).with_child(
+                Text::new(err.clone(), self.ui_font, 11.0)
+                    .with_color(theme::error())
+                    .finish(),
+            );
+        }
+        let buttons = Flex::row()
+            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+            .with_child(self.modal_button("Cancel", ModalBtn::Plain, CraneShellAction::CloseModal))
+            .with_child(Self::spacer(8.0))
+            .with_child(self.modal_button(
+                "Create",
+                ModalBtn::Primary,
+                CraneShellAction::NewWorkspaceConfirm,
+            ))
+            .finish();
+        col = col.with_child(Self::spacer(16.0)).with_child(buttons);
+        self.modal_card(460.0, col.finish())
+    }
+
+    /// Default worktree checkout path: `~/.crane-worktrees/<project>/<branch>`
+    /// with `/` in the branch flattened to `-` so nested refs stay one directory.
+    fn default_worktree_path(project: &str, branch: &str) -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let safe_branch = branch.replace('/', "-");
+        PathBuf::from(home)
+            .join(".crane-worktrees")
+            .join(project)
+            .join(safe_branch)
+    }
+
     /// "project / workspace / tab" label for a tab-switcher entry.
     fn switcher_label(&self, pi: usize, wi: usize, tid: usize) -> String {
         let project = self.projects.get(pi).map(|p| p.name.clone()).unwrap_or_default();
@@ -2518,6 +3042,304 @@ impl CraneShellView {
         self.tab_switcher = None;
         let a = CraneShellAction::Select { sel: key, path };
         self.handle_action(&a, ctx);
+    }
+
+    /// Build the branch candidate list for the active repo: local branches first,
+    /// then remote branches with the `<remote>/` prefix stripped and deduped
+    /// against the locals (so `git checkout <short>` DWIMs to a tracking branch).
+    /// Returns `(all_candidates, locals_set)`.
+    fn branch_candidates(root: &std::path::Path) -> (Vec<String>, HashSet<String>) {
+        let locals = crate::warpui::git::list_local_branches(root);
+        let locals_set: HashSet<String> = locals.iter().cloned().collect();
+        let mut seen = locals_set.clone();
+        let mut all = locals;
+        for r in crate::warpui::git::list_remote_branches(root) {
+            let short = r.splitn(2, '/').nth(1).unwrap_or(r.as_str()).to_string();
+            if short.is_empty() || short == "HEAD" {
+                continue;
+            }
+            if seen.insert(short.clone()) {
+                all.push(short);
+            }
+        }
+        (all, locals_set)
+    }
+
+    /// Open the "Switch Branch" modal for the active workspace.
+    fn open_switch_branch(&mut self) {
+        let Some(root) = self.active_cwd.clone() else {
+            return;
+        };
+        let pi = self.active_tab.map(|(p, _, _)| p).unwrap_or(0);
+        let (all, locals) = Self::branch_candidates(&root);
+        self.switch_branch = Some(SwitchBranchState {
+            query: String::new(),
+            project_idx: pi,
+            all,
+            locals,
+            selected: 0,
+        });
+        self.modal = Some(Modal::SwitchBranch);
+    }
+
+    /// Route a keystroke into the Switch-Branch search field. Up/Down move the
+    /// highlight over the FILTERED list; Enter checks the highlighted branch out
+    /// (or creates it when the query names no branch); typing filters.
+    fn edit_switch_branch(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
+        // Compute the currently-visible (filtered) list to bound navigation +
+        // resolve Enter's target.
+        let filtered: Vec<String> = match self.switch_branch.as_ref() {
+            Some(st) => {
+                let q = st.query.trim().to_lowercase();
+                st.all
+                    .iter()
+                    .filter(|b| q.is_empty() || b.to_lowercase().contains(&q))
+                    .cloned()
+                    .collect()
+            }
+            None => return,
+        };
+        match ks.key.as_str() {
+            "up" => {
+                if let Some(st) = self.switch_branch.as_mut() {
+                    st.selected = st.selected.saturating_sub(1);
+                }
+            }
+            "down" => {
+                if let Some(st) = self.switch_branch.as_mut() {
+                    if !filtered.is_empty() {
+                        st.selected = (st.selected + 1).min(filtered.len() - 1);
+                    }
+                }
+            }
+            "enter" | "return" | "numpadenter" => {
+                let (query, sel) = self
+                    .switch_branch
+                    .as_ref()
+                    .map(|st| (st.query.trim().to_string(), st.selected))
+                    .unwrap_or_default();
+                if let Some(branch) = filtered.get(sel).cloned() {
+                    // Close the modal first (the click path dispatches CloseModal;
+                    // CheckoutBranch itself doesn't clear the modal).
+                    self.modal = None;
+                    self.switch_branch = None;
+                    let a = CraneShellAction::CheckoutBranch(branch);
+                    self.handle_action(&a, ctx);
+                } else if !query.is_empty() {
+                    // CreateBranchCheckout's handler clears the modal itself.
+                    let a = CraneShellAction::CreateBranchCheckout(query);
+                    self.handle_action(&a, ctx);
+                }
+            }
+            "backspace" => {
+                if let Some(st) = self.switch_branch.as_mut() {
+                    st.query.pop();
+                    st.selected = 0;
+                }
+            }
+            k if k.chars().count() == 1 && !ks.cmd && !ks.ctrl => {
+                if let Some(st) = self.switch_branch.as_mut() {
+                    st.query.push_str(k);
+                    st.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Route a keystroke into the New-Workspace branch field. Enter confirms;
+    /// typing edits the branch name.
+    fn edit_new_workspace(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
+        match ks.key.as_str() {
+            "enter" | "return" | "numpadenter" => {
+                self.confirm_new_workspace(ctx);
+            }
+            "backspace" => {
+                if let Some(st) = self.new_workspace.as_mut() {
+                    st.branch.pop();
+                    st.error = None;
+                }
+            }
+            k if k.chars().count() == 1 && !ks.cmd && !ks.ctrl => {
+                if let Some(st) = self.new_workspace.as_mut() {
+                    st.branch.push_str(k);
+                    st.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Confirm the New-Workspace modal: compute the target path, run
+    /// `git worktree add`, insert the new worktree into the project in-memory,
+    /// and open it. On failure, surface the git error under the field.
+    fn confirm_new_workspace(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(st) = self.new_workspace.as_ref() else {
+            return;
+        };
+        let pi = st.project_idx;
+        let branch = st.branch.trim().to_string();
+        let create_branch = st.new_branch;
+        if branch.is_empty() {
+            if let Some(st) = self.new_workspace.as_mut() {
+                st.error = Some("Enter a branch name.".to_string());
+            }
+            return;
+        }
+        let Some(project) = self.projects.get(pi) else {
+            return;
+        };
+        let main = PathBuf::from(&project.path);
+        let path = Self::default_worktree_path(&project.name, &branch);
+        // `git worktree add` (shell-out). Never libgit2, per project rules.
+        if let Err(e) = crate::warpui::git::add_worktree(&main, &branch, &path, create_branch) {
+            if let Some(st) = self.new_workspace.as_mut() {
+                st.error = Some(e);
+            }
+            return;
+        }
+        // Success — close the modal, insert the worktree in-memory, and open it.
+        self.modal = None;
+        self.new_workspace = None;
+        let wpath = path.to_string_lossy().to_string();
+        let diff_stat = crate::warpui::git::diff_numstat(&path);
+        let dirty = crate::warpui::git::is_dirty(&path);
+        let wi = {
+            let Some(project) = self.projects.get_mut(pi) else {
+                return;
+            };
+            // Dedup: if a worktree with this path already exists, reuse it.
+            if let Some(existing) = project.worktrees.iter().position(|w| w.path == wpath) {
+                existing
+            } else {
+                project.worktrees.push(crate::warpui::projects::WorktreeNode {
+                    name: branch.clone(),
+                    path: wpath.clone(),
+                    tabs: Vec::new(),
+                    diff_stat,
+                    dirty,
+                });
+                project.worktrees.len() - 1
+            }
+        };
+        // Refresh the poll signature so the auto-detect tick doesn't see this as a
+        // brand-new external change and redo the work.
+        self.worktree_poll_sig.remove(&main.to_string_lossy().to_string());
+        // Open (expand + create a first tab in) the new worktree.
+        self.add_tab(pi, wi, ctx);
+        self.invalidate_editor_diffs(&*ctx);
+    }
+
+    /// Background worktree auto-detection tick (~1.5s). For each git project it
+    /// reconciles the in-memory worktrees against `git worktree list`: appends
+    /// worktrees created outside the app, drops one whose checkout dir vanished,
+    /// and flips a loose folder to a git project when a `.git` entry appears.
+    /// Cheap when idle — the per-project `git worktree list` output is signature-
+    /// cached, and heavier per-worktree git only runs for worktrees that changed.
+    fn poll_worktrees(&mut self, ctx: &mut ViewContext<Self>) {
+        let mut changed = false;
+        // 1) Loose → git flip: cheap `.git` existence check (fs stat, no git).
+        let loose_flips: Vec<usize> = self
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_loose && std::path::Path::new(&p.path).join(".git").exists())
+            .map(|(i, _)| i)
+            .collect();
+        for i in loose_flips {
+            if let Some(p) = self.projects.get_mut(i) {
+                p.is_loose = false;
+            }
+            changed = true;
+        }
+        // 2) Per git-project worktree reconciliation.
+        // Collect (pi, main_path) for git projects to avoid borrow conflicts.
+        let git_projects: Vec<(usize, String)> = self
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.is_loose)
+            .map(|(i, p)| (i, p.path.clone()))
+            .collect();
+        // A dead worktree to remove this tick (at most one — removal remaps many
+        // index-keyed structures, so we do one per tick and let the next tick
+        // catch the rest).
+        let mut dead_remove: Option<(usize, usize)> = None;
+        for (pi, main_path) in git_projects {
+            let main = std::path::Path::new(&main_path);
+            let listed = crate::warpui::git::list_worktrees(main);
+            // Signature = the git output; skip the heavy path when unchanged.
+            let sig: String = listed
+                .iter()
+                .map(|(p, b)| format!("{}|{}", p.display(), b))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if self.worktree_poll_sig.get(&main_path) == Some(&sig) {
+                continue;
+            }
+            self.worktree_poll_sig.insert(main_path.clone(), sig);
+            let listed_paths: HashSet<String> =
+                listed.iter().map(|(p, _)| p.to_string_lossy().to_string()).collect();
+            let existing_paths: HashSet<String> = self
+                .projects
+                .get(pi)
+                .map(|p| p.worktrees.iter().map(|w| w.path.clone()).collect())
+                .unwrap_or_default();
+            // 2a) Append worktrees that git knows about but the UI doesn't. The
+            //     project's own checkout (== main_path) is represented by the
+            //     primary worktree row, so only ADD paths distinct from existing.
+            for (wpath, wbranch) in &listed {
+                let wps = wpath.to_string_lossy().to_string();
+                if existing_paths.contains(&wps) {
+                    continue;
+                }
+                let name = if wbranch == "(detached)" || wbranch.is_empty() {
+                    crate::warpui::projects::basename_of(wpath)
+                } else {
+                    wbranch.clone()
+                };
+                let diff_stat = crate::warpui::git::diff_numstat(wpath);
+                let dirty = crate::warpui::git::is_dirty(wpath);
+                if let Some(p) = self.projects.get_mut(pi) {
+                    p.worktrees.push(crate::warpui::projects::WorktreeNode {
+                        name,
+                        path: wps,
+                        tabs: Vec::new(),
+                        diff_stat,
+                        dirty,
+                    });
+                    changed = true;
+                }
+            }
+            // 2b) Detect a worktree whose checkout dir vanished on disk AND is no
+            //     longer in git's list — remove it (never the primary checkout).
+            if dead_remove.is_none() {
+                if let Some(p) = self.projects.get(pi) {
+                    for (wi, w) in p.worktrees.iter().enumerate() {
+                        if w.path == main_path {
+                            continue; // primary working tree — never auto-remove.
+                        }
+                        if !listed_paths.contains(&w.path)
+                            && !std::path::Path::new(&w.path).exists()
+                        {
+                            dead_remove = Some((pi, wi));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Apply at most one dead-worktree removal via the full teardown path
+        // (it remaps every (pi, wi, *)-keyed structure).
+        if let Some((pi, wi)) = dead_remove {
+            let a = CraneShellAction::RemoveWorktree { pi, wi };
+            self.handle_action(&a, ctx);
+            // handle_action already notified; nothing more to do.
+            return;
+        }
+        if changed {
+            ctx.notify();
+        }
     }
 
     /// Reload the project list from session.json + the current overlay
@@ -3330,6 +4152,22 @@ impl CraneShellView {
                     42.0 + group_offset,
                     false,
                     CraneShellAction::NewTabIn(pi, wi),
+                ));
+            }
+            // "+ New workspace" affordance for a git project — opens the New
+            // Workspace modal to `git worktree add` a branch. Loose folders have
+            // no worktrees, so this only shows for real git projects.
+            if !p.is_loose {
+                col = col.with_child(self.nav_row(
+                    None,
+                    icons::PLUS,
+                    theme::accent(),
+                    "New workspace",
+                    12.0,
+                    theme::text_muted(),
+                    24.0 + group_offset,
+                    false,
+                    CraneShellAction::OpenNewWorkspace { pi, branch: None },
                 ));
             }
         }
@@ -4207,22 +5045,44 @@ impl CraneShellView {
         } else {
             format!("{}  -  ready", self.branch)
         };
-        let mut row = Flex::row().with_child(
-            Container::new(self.icon(icons::GIT_BRANCH, 11.0, theme::text_muted()))
-                .with_padding_left(10.0)
-                .with_padding_right(5.0)
-                .with_padding_top(7.0)
-                .finish(),
-        );
-        row = row.with_child(
-            Container::new(
-                Text::new(label, self.ui_font, 11.0)
-                    .with_color(theme::text_muted())
+        // The branch icon + label. When a git branch is present, the whole cluster
+        // is clickable → opens the Switch Branch modal (matches old Crane's
+        // status-bar branch click). A loose/no-repo workspace shows a plain label.
+        let branch_cluster = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                Container::new(self.icon(icons::GIT_BRANCH, 11.0, theme::text_muted()))
+                    .with_padding_left(10.0)
+                    .with_padding_right(5.0)
+                    .with_padding_top(7.0)
                     .finish(),
             )
-            .with_padding_top(7.0)
-            .finish(),
-        );
+            .with_child(
+                Container::new(
+                    Text::new(label, self.ui_font, 11.0)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .with_padding_top(7.0)
+                .with_padding_right(6.0)
+                .with_padding_bottom(2.0)
+                .finish(),
+            )
+            .finish();
+        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        if self.branch.is_empty() {
+            row = row.with_child(branch_cluster);
+        } else {
+            let state = self.hover_handle("statusbar:branch");
+            row = row.with_child(
+                Hoverable::new(state, move |_ms| branch_cluster)
+                    .with_cursor(Cursor::PointingHand)
+                    .on_mouse_down(|ctx, _app, _pos| {
+                        ctx.dispatch_typed_action(CraneShellAction::OpenSwitchBranch);
+                    })
+                    .finish(),
+            );
+        }
         // Flexible spacer pushes everything after it to the right edge (an empty
         // Flex paints nothing and records no hits).
         row = row.with_child(Expanded::new(1.0, Flex::row().finish()).finish());
@@ -5531,6 +6391,8 @@ impl View for CraneShellView {
         // query field / switcher instead of being swallowed.
         let modal_is_fif = matches!(self.modal, Some(Modal::FindInFiles));
         let modal_is_switcher = matches!(self.modal, Some(Modal::TabSwitcher));
+        let modal_is_switch_branch = matches!(self.modal, Some(Modal::SwitchBranch));
+        let modal_is_new_workspace = matches!(self.modal, Some(Modal::NewWorkspace));
         // App-level keyboard shortcuts. The terminal pane propagates Cmd combos
         // up to here (its own on_keydown returns PropagateToParent for cmd).
         EventHandler::new(root)
@@ -5589,6 +6451,10 @@ impl View for CraneShellView {
                         ctx.dispatch_typed_action(CraneShellAction::FindInFilesKey(ks.clone()));
                     } else if modal_is_switcher {
                         ctx.dispatch_typed_action(CraneShellAction::TabSwitcherKey(ks.clone()));
+                    } else if modal_is_switch_branch {
+                        ctx.dispatch_typed_action(CraneShellAction::SwitchBranchKey(ks.clone()));
+                    } else if modal_is_new_workspace {
+                        ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceKey(ks.clone()));
                     }
                     return DispatchEventResult::StopPropagation;
                 }
@@ -5596,6 +6462,9 @@ impl View for CraneShellView {
                     // Shift uppercases the key ("D"), so normalize the case.
                     let key = ks.key.to_ascii_lowercase();
                     let act = match key.as_str() {
+                        // Cmd+Shift+B opens the Switch Branch modal; Cmd+B toggles
+                        // the Left Panel (the shift arm MUST precede the plain one).
+                        "b" if ks.shift => Some(CraneShellAction::OpenSwitchBranch),
                         "b" => Some(CraneShellAction::ToggleLeft),
                         // Cmd+/ toggles the line comment when an editor pane is
                         // focused, else toggles the Right Panel (its old behavior).
@@ -5892,6 +6761,24 @@ pub enum CraneShellAction {
     },
     /// F12: LSP goto-definition at the caret in the focused editor pane.
     LspGotoAtCursor,
+    /// Open the "Switch Branch" modal (searchable local + remote branch list).
+    /// Trigger: click the status-bar branch label, or Cmd+Shift+B.
+    OpenSwitchBranch,
+    /// A keystroke routed to the open Switch-Branch search field.
+    SwitchBranchKey(warpui::keymap::Keystroke),
+    /// Create a NEW branch (checkout -b) named after the current search query in
+    /// the Switch-Branch modal, then refresh. Raised by the "Create new branch…"
+    /// row when the typed query names a branch that doesn't exist yet.
+    CreateBranchCheckout(String),
+    /// Open the "New Workspace" modal for project `pi`, optionally pre-filling the
+    /// branch field (e.g. from a Switch-Branch row's "+ worktree" affordance).
+    OpenNewWorkspace { pi: usize, branch: Option<String> },
+    /// A keystroke routed to the open New-Workspace branch field.
+    NewWorkspaceKey(warpui::keymap::Keystroke),
+    /// Toggle the New-Workspace "create new branch" checkbox.
+    NewWorkspaceToggleNewBranch,
+    /// Confirm the New-Workspace modal: `git worktree add` + insert + open.
+    NewWorkspaceConfirm,
     Noop,
 }
 
@@ -6910,8 +7797,15 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::SetProjectTint(i, tint) => {
                 self.context_menu = None;
-                if let Some(p) = self.projects.get(*i) {
+                // Update the tint IN PLACE — set both the in-memory node's `tint`
+                // field (read by the sidebar render + save_state) and the persisted
+                // `project_tints` map. NEVER call `reload_projects()` here: that
+                // re-shells git (current_branch / diff_numstat / is_dirty) for every
+                // project + worktree on the machine, which is dozens of subprocess
+                // spawns per color click. A tint change touches no git state.
+                if let Some(p) = self.projects.get_mut(*i) {
                     let path = p.path.clone();
+                    p.tint = *tint;
                     match tint {
                         Some(rgb) => {
                             self.project_tints.insert(path, *rgb);
@@ -6921,7 +7815,6 @@ impl TypedActionView for CraneShellView {
                         }
                     }
                 }
-                self.reload_projects();
             }
             CraneShellAction::InitGitProject(i) => {
                 self.context_menu = None;
@@ -6938,6 +7831,8 @@ impl TypedActionView for CraneShellView {
                 self.modal = None;
                 self.find_in_files = None;
                 self.tab_switcher = None;
+                self.switch_branch = None;
+                self.new_workspace = None;
             }
             CraneShellAction::OpenHelp => {
                 self.modal = Some(Modal::Help);
@@ -7000,6 +7895,51 @@ impl TypedActionView for CraneShellView {
                         self.lsp_start_goto(path, line, character, ctx);
                     }
                 }
+            }
+            CraneShellAction::OpenSwitchBranch => {
+                self.open_switch_branch();
+            }
+            CraneShellAction::SwitchBranchKey(ks) => {
+                self.edit_switch_branch(ks, ctx);
+            }
+            CraneShellAction::CreateBranchCheckout(name) => {
+                self.modal = None;
+                self.switch_branch = None;
+                let name = name.trim().to_string();
+                if !name.is_empty() {
+                    if let Some(root) = self.active_cwd.clone() {
+                        match crate::warpui::git::create_branch(&root, &name, true) {
+                            Ok(()) => {
+                                self.refresh_panel();
+                                self.invalidate_editor_diffs(&*ctx);
+                            }
+                            Err(e) => self.commit_error = Some(e),
+                        }
+                    }
+                }
+            }
+            CraneShellAction::OpenNewWorkspace { pi, branch } => {
+                // Close any Switch-Branch modal first (it may have opened this).
+                self.switch_branch = None;
+                let new_branch = branch.is_none();
+                self.new_workspace = Some(NewWorkspaceState {
+                    project_idx: *pi,
+                    branch: branch.clone().unwrap_or_default(),
+                    new_branch,
+                    error: None,
+                });
+                self.modal = Some(Modal::NewWorkspace);
+            }
+            CraneShellAction::NewWorkspaceKey(ks) => {
+                self.edit_new_workspace(ks, ctx);
+            }
+            CraneShellAction::NewWorkspaceToggleNewBranch => {
+                if let Some(st) = self.new_workspace.as_mut() {
+                    st.new_branch = !st.new_branch;
+                }
+            }
+            CraneShellAction::NewWorkspaceConfirm => {
+                self.confirm_new_workspace(ctx);
             }
             CraneShellAction::Noop => {}
         }
