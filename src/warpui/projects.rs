@@ -133,14 +133,40 @@ fn child_project_node(child: &Path, container_path: &str) -> ProjectNode {
 /// - non-git CONTAINER   → one child ProjectNode per immediate git-repo child,
 ///                         each carrying `group_path = Some(container path)`.
 /// - non-git loose folder → itself as a loose folder (`is_loose = true`).
+/// Build a default single worktree for a freshly-opened folder that has no
+/// session worktrees yet (e.g. one just added via the folder picker). Without
+/// this the project renders no worktree/branch row, so no tab or terminal can
+/// appear under it. For a git repo the row shows the current branch; for a loose
+/// folder the branch is empty so it falls back to the folder name.
+fn default_worktree(path: &Path, folder_name: &str) -> WorktreeNode {
+    let branch = crate::warpui::git::current_branch(path);
+    let wname = if branch.is_empty() {
+        folder_name.to_string()
+    } else {
+        branch
+    };
+    WorktreeNode {
+        name: wname,
+        path: path.to_string_lossy().to_string(),
+        tabs: Vec::new(),
+        diff_stat: crate::warpui::git::diff_numstat(path),
+        dirty: crate::warpui::git::is_dirty(path),
+    }
+}
+
 fn expand_folder(opened: OpenedFolder, out: &mut Vec<ProjectNode>) {
     let path = Path::new(&opened.path);
     let is_git = path.join(".git").exists();
     if is_git {
+        let worktrees = if opened.worktrees.is_empty() {
+            vec![default_worktree(path, &opened.name)]
+        } else {
+            opened.worktrees
+        };
         out.push(ProjectNode {
             name: opened.name,
             path: opened.path,
-            worktrees: opened.worktrees,
+            worktrees,
             tint: None,
             is_loose: false,
             group_path: None,
@@ -159,11 +185,17 @@ fn expand_folder(opened: OpenedFolder, out: &mut Vec<ProjectNode>) {
         }
         return;
     }
-    // Loose folder (non-git, no git children): tabs render directly under it.
+    // Loose folder (non-git, no git children): tabs render directly under it,
+    // but it still needs a worktree to hold those tabs.
+    let worktrees = if opened.worktrees.is_empty() {
+        vec![default_worktree(path, &opened.name)]
+    } else {
+        opened.worktrees
+    };
     out.push(ProjectNode {
         name: opened.name,
         path: opened.path,
-        worktrees: opened.worktrees,
+        worktrees,
         tint: None,
         is_loose: true,
         group_path: None,
