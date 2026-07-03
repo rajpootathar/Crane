@@ -5,9 +5,19 @@
 
 use std::cell::{Cell as StdCell, RefCell};
 use std::rc::Rc;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// Process-lifetime epoch used to drive the cursor blink phase. A single shared
+/// clock keeps every terminal's cursor blinking in unison.
+fn blink_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
 
 use crane_term::index::{Column as TermColumn, Line as TermLine, Point as TermPoint, Side};
 use crane_term::selection::SelectionRange;
+use crane_term::CursorShape;
 use warpui::color::ColorU;
 use warpui::elements::{Element, Fill, Point};
 use warpui::event::{DispatchedEvent, Event};
@@ -66,6 +76,12 @@ pub struct GridElement {
     line_height_ratio: f32,
     default_bg: ColorU,
     cursor_color: ColorU,
+    /// DECSCUSR cursor shape (Block / Underline / Beam) — controls the cursor
+    /// geometry drawn in paint().
+    cursor_shape: CursorShape,
+    /// DECSCUSR blink bit — when true, the cursor alpha oscillates on a ~1s
+    /// period (500ms on / 500ms off); when false it is steady.
+    cursor_blink: bool,
     /// Written in layout() with the cols/rows that fit the available
     /// space; the View reads this next frame to drive PTY/grid resize.
     desired: Rc<StdCell<Option<(usize, usize)>>>,
@@ -98,6 +114,11 @@ pub struct GridElement {
     /// True if LeftMouseDragged fired since the last LeftMouseDown. Shared so
     /// the View can also inspect it (e.g. suppress copy on drag-release).
     url_did_drag: Rc<StdCell<bool>>,
+    /// When Some, the terminal has a mouse-reporting mode active: a
+    /// LeftMouseDown/Up forwards an SGR mouse press/release (so ranger/mc/
+    /// vim-mouse work) INSTEAD of starting a text selection. The callback
+    /// receives `(press, col_1based, row_1based)`.
+    mouse_report_cb: Option<Rc<dyn Fn(bool, usize, usize)>>,
 }
 
 impl GridElement {
@@ -123,6 +144,8 @@ impl GridElement {
             line_height_ratio: 1.2,
             default_bg,
             cursor_color,
+            cursor_shape: CursorShape::Block,
+            cursor_blink: false,
             desired,
             size: None,
             origin: None,
@@ -138,12 +161,28 @@ impl GridElement {
             url_hover: Rc::new(StdCell::new(None)),
             url_pressed: Rc::new(RefCell::new(None)),
             url_did_drag: Rc::new(StdCell::new(false)),
+            mouse_report_cb: None,
         }
     }
 
     /// Attach a scroll-wheel handler that receives `(delta_y_points, precise)`.
     pub fn on_scroll(mut self, cb: Rc<dyn Fn(f32, bool)>) -> Self {
         self.scroll_cb = Some(cb);
+        self
+    }
+
+    /// Set the DECSCUSR cursor shape + blink used when painting the cursor.
+    pub fn with_cursor_style(mut self, shape: CursorShape, blink: bool) -> Self {
+        self.cursor_shape = shape;
+        self.cursor_blink = blink;
+        self
+    }
+
+    /// Attach an SGR mouse-report callback. When set (i.e. a mouse-reporting
+    /// mode is active), left clicks forward SGR press/release to the PTY instead
+    /// of starting a text selection. `None` keeps the default selection path.
+    pub fn on_mouse_report(mut self, cb: Option<Rc<dyn Fn(bool, usize, usize)>>) -> Self {
+        self.mouse_report_cb = cb;
         self
     }
 
@@ -336,19 +375,49 @@ impl Element for GridElement {
             }
         }
 
-        // 5) Block cursor — a translucent overlay in terminal_fg (alpha 130)
-        // painted *after* the glyphs so the character stays readable and is
-        // merely tinted (matches old `view.rs:1282`). DECTCEM hides it (cursor
-        // is None); doubled width over a wide (CJK/emoji) cell.
+        // 5) Cursor — a translucent overlay in terminal_fg (alpha 130) painted
+        // *after* the glyphs so the character stays readable and is merely tinted
+        // (matches old `view.rs:1282`). DECTCEM hides it (cursor is None). The
+        // DECSCUSR shape decides the geometry: Block fills the cell (doubled over
+        // a wide CJK/emoji cell), Beam is a ~2px bar at the left edge, Underline a
+        // ~2px bar at the cell bottom. When blink is on, the alpha toggles on a
+        // 500ms-on / 500ms-off cycle driven by a shared process clock.
         if let Some((cr, cc)) = self.cursor {
             if cr < self.rows && cc < self.cols {
-                let wide = self.cells[cr * self.cols + cc].is_wide;
-                let w = if wide { cw * 2.0 } else { cw };
-                let x = origin.x() + cc as f32 * cw;
-                let y = origin.y() + cr as f32 * ch;
-                ctx.scene
-                    .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(w, ch)))
-                    .with_background(Fill::Solid(self.cursor_color));
+                // Blink phase: default = drawn. When blinking, drop the frame
+                // during the "off" half and schedule the next toggle so the
+                // animation keeps running at idle (no PTY activity needed).
+                let mut draw = true;
+                if self.cursor_blink {
+                    const HALF_MS: u128 = 500;
+                    let ms = blink_epoch().elapsed().as_millis();
+                    let phase = ms % (HALF_MS * 2);
+                    draw = phase < HALF_MS;
+                    let remaining = (HALF_MS - (phase % HALF_MS)) as u64;
+                    ctx.repaint_after(Duration::from_millis(remaining.max(1)));
+                }
+                if draw {
+                    let wide = self.cells[cr * self.cols + cc].is_wide;
+                    let full_w = if wide { cw * 2.0 } else { cw };
+                    let x = origin.x() + cc as f32 * cw;
+                    let y = origin.y() + cr as f32 * ch;
+                    let rect = match self.cursor_shape {
+                        CursorShape::Block => RectF::new(vec2f(x, y), vec2f(full_w, ch)),
+                        CursorShape::Beam => {
+                            // ~2px vertical bar hugging the cell's left edge.
+                            let bw = 2.0_f32.min(full_w);
+                            RectF::new(vec2f(x, y), vec2f(bw, ch))
+                        }
+                        CursorShape::Underline => {
+                            // ~2px horizontal bar along the cell bottom.
+                            let bh = 2.0_f32.min(ch);
+                            RectF::new(vec2f(x, y + ch - bh), vec2f(full_w, bh))
+                        }
+                    };
+                    ctx.scene
+                        .draw_rect_without_hit_recording(rect)
+                        .with_background(Fill::Solid(self.cursor_color));
+                }
             }
         }
 
@@ -450,6 +519,26 @@ impl Element for GridElement {
                 }
             }
             _ => {}
+        }
+
+        // SGR mouse-report click forwarding — takes precedence over text
+        // selection when a mouse-reporting mode is active, so TUIs that own the
+        // mouse (ranger / mc / vim-mouse) receive press/release events instead of
+        // us starting a selection. Only left button (SGR button code 0).
+        if let Some(cb) = self.mouse_report_cb.clone() {
+            match event.raw_event() {
+                Event::LeftMouseDown { position, .. } if in_bounds(position) => {
+                    let (row, col, _) = pos_to_cell(position);
+                    cb(true, col + 1, row + 1);
+                    return true;
+                }
+                Event::LeftMouseUp { position, .. } => {
+                    let (row, col, _) = pos_to_cell(position);
+                    cb(false, col + 1, row + 1);
+                    return true;
+                }
+                _ => {}
+            }
         }
 
         // Mouse selection + URL click — only when a selection callback is registered.

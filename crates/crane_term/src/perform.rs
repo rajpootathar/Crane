@@ -201,6 +201,30 @@ impl<H: Handler> vte::ansi::Handler for Bridge<'_, H> {
         self.inner.identify_terminal(intermediate);
     }
 
+    // ---- cursor presentation ----
+
+    fn set_cursor_style(&mut self, style: Option<vte::ansi::CursorStyle>) {
+        // Map vte's shape set onto our three DECSCUSR-reachable
+        // shapes. `HollowBlock` / `Hidden` are only produced by
+        // escapes we don't surface, but collapse them onto `Block` so
+        // the mapping is total. `None` (DECSCUSR 0) is forwarded as-is
+        // and interpreted as "reset to default" by the Term.
+        let mapped = style.map(|s| {
+            let shape = match s.shape {
+                vte::ansi::CursorShape::Underline => crate::handler::CursorShape::Underline,
+                vte::ansi::CursorShape::Beam => crate::handler::CursorShape::Beam,
+                vte::ansi::CursorShape::Block
+                | vte::ansi::CursorShape::HollowBlock
+                | vte::ansi::CursorShape::Hidden => crate::handler::CursorShape::Block,
+            };
+            crate::handler::CursorStyle {
+                shape,
+                blink: s.blinking,
+            }
+        });
+        self.inner.set_cursor_style(mapped);
+    }
+
     // ---- title / bell ----
 
     fn set_title(&mut self, title: Option<String>) {

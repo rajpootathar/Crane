@@ -89,6 +89,20 @@ use crate::warpui::grid_element::{GridCell, GridElement, MouseSelPhase};
 use crate::warpui::input::keystroke_to_pty_bytes;
 
 
+/// Ring the macOS system alert sound (the classic "beep"). `NSBeep` is a free
+/// AppKit C function; AppKit is already linked via objc2-app-kit, so no new
+/// dependency is needed. No-op on non-macOS targets.
+#[cfg(target_os = "macos")]
+fn system_beep() {
+    #[link(name = "AppKit", kind = "framework")]
+    unsafe extern "C" {
+        fn NSBeep();
+    }
+    // Safe: NSBeep takes no arguments and is callable from the main thread,
+    // which is where render() runs.
+    unsafe { NSBeep() }
+}
+
 /// True when `col` looks like a TUI vertical divider: a box-drawing vertical
 /// bar occupies it on ≥60% of the visible rows. Ported verbatim from old
 /// `src/terminal/view.rs:271-287`.
@@ -232,6 +246,12 @@ impl TerminalView {
         self.controller.borrow().cwd.clone()
     }
 
+    /// The terminal's OSC-0/OSC-2 window title, if a program set one. Used by
+    /// the shell to label a terminal Tab with the running command / cwd.
+    pub fn title(&self) -> Option<String> {
+        self.controller.borrow().title()
+    }
+
     /// Copy the current terminal text selection to a string. Returns `None` when
     /// there is no selection or it covers no characters.
     pub fn copy_selection(&self) -> Option<String> {
@@ -295,11 +315,12 @@ impl View for TerminalView {
         // Snapshot the viewport (scrollback-aware) into owned cells.
         let default_fg = color::default_fg();
         let default_bg = color::default_bg();
-        let (cells, rows, cols, cursor, sel_range, disp_off) = {
+        let (cells, rows, cols, cursor, sel_range, disp_off, cursor_style) = {
             let ctrl = self.controller.borrow();
             let t = ctrl.term.lock();
             let cols = t.grid.columns;
             let rows = t.grid.visible_rows;
+            let cursor_style = t.cursor_style();
             let blank = GridCell {
                 ch: ' ',
                 fg: default_fg,
@@ -369,8 +390,16 @@ impl View for TerminalView {
             let sel_range = t.selection.as_ref().map(|s| s.to_range());
             let disp_off = t.grid.display_offset as i32;
 
-            (cells, rows, cols, cursor, sel_range, disp_off)
+            (cells, rows, cols, cursor, sel_range, disp_off, cursor_style)
         };
+
+        // Ring the system bell if a BEL arrived since the last frame. Drained
+        // unconditionally (even off-macOS) so it can't re-trigger; the audible
+        // chime is macOS-only (NSBeep).
+        if self.controller.borrow().take_bell() {
+            #[cfg(target_os = "macos")]
+            system_beep();
+        }
 
         // Scan visible rows for clickable URLs.
         let url_spans: Vec<crate::warpui::grid_element::UrlSpan> = {
@@ -527,6 +556,28 @@ impl View for TerminalView {
                 }
             });
 
+        // Mouse-reporting mode: when a TUI owns the mouse, forward SGR clicks
+        // rather than starting a text selection. Same mode set the scroll path
+        // already recognises (click / drag / motion).
+        let mouse_on = {
+            let ctrl = self.controller.borrow();
+            let t = ctrl.term.lock();
+            t.mode_contains(TermMode::MOUSE_REPORT_CLICK)
+                || t.mode_contains(TermMode::MOUSE_DRAG)
+                || t.mode_contains(TermMode::MOUSE_MOTION)
+        };
+        let mouse_report_cb: Option<Rc<dyn Fn(bool, usize, usize)>> = if mouse_on {
+            let ctrl = self.controller.clone();
+            Some(Rc::new(move |press: bool, col: usize, row: usize| {
+                // SGR: `\x1b[<0;COL;ROW M` press / `... m` release, 1-based.
+                let tail = if press { 'M' } else { 'm' };
+                let seq = format!("\x1b[<0;{col};{row}{tail}");
+                ctrl.borrow().write_input(seq.as_bytes());
+            }))
+        } else {
+            None
+        };
+
         let grid = GridElement::new(
             rows,
             cols,
@@ -539,6 +590,8 @@ impl View for TerminalView {
             self.desired.clone(),
         )
         .with_selection(sel_range, disp_off)
+        .with_cursor_style(cursor_style.shape, cursor_style.blink)
+        .on_mouse_report(mouse_report_cb)
         .on_mouse_select(self.sel_dragging.clone(), mouse_sel_cb)
         .with_url_spans(
             url_spans,

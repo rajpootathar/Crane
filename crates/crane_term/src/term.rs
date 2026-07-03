@@ -4,7 +4,7 @@
 
 use crate::cell::{Cell, Color, Flags, NamedColor};
 use crate::grid::{Cursor, Grid};
-use crate::handler::{Handler, ProcessorInput, ScrollDelta};
+use crate::handler::{CursorStyle, Handler, ProcessorInput, ScrollDelta};
 use crate::index::{Column, Line, Point};
 use crate::mode::TermMode;
 use crate::row::Row;
@@ -78,6 +78,19 @@ pub struct Term {
     /// `specs/tui-output-redraw/TECH.md` in warpdotdev/warp for the
     /// original design rationale.
     full_grid_clear_behavior: FullGridClearBehavior,
+    /// Cursor presentation last requested via DECSCUSR
+    /// (`CSI Ps SP q`). Read by the renderer through
+    /// [`Term::cursor_style`] to pick block / underline / beam and
+    /// blink. Defaults to a blinking block.
+    cursor_style: CursorStyle,
+    /// Window / icon title last set via OSC 0 / OSC 2. `None` until
+    /// the PTY sets one. Exposed through [`Term::window_title`] so the
+    /// pane header can show the running program's title.
+    window_title: Option<String>,
+    /// Latched by `bell()` when the PTY emits BEL (`0x07`). Drained by
+    /// [`Term::take_bell`] once per frame so the UI can flash / chime
+    /// exactly once per bell burst.
+    bell_pending: bool,
 }
 
 /// Resize / full-clear policy for the primary screen. See the
@@ -120,7 +133,30 @@ impl Term {
             pty_replies: Vec::new(),
             notifications: Vec::new(),
             full_grid_clear_behavior: FullGridClearBehavior::default(),
+            cursor_style: CursorStyle::default(),
+            window_title: None,
+            bell_pending: false,
         }
+    }
+
+    /// Cursor presentation last requested by the PTY via DECSCUSR
+    /// (`CSI Ps SP q`). Defaults to a blinking block until the program
+    /// sets otherwise.
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.cursor_style
+    }
+
+    /// Window / icon title last set via OSC 0 / OSC 2, or `None` if
+    /// the PTY has not set one.
+    pub fn window_title(&self) -> Option<&str> {
+        self.window_title.as_deref()
+    }
+
+    /// Return whether a BEL (`0x07`) has arrived since the last call
+    /// and clear the pending flag. Coalesces a burst of bells into a
+    /// single `true`.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::replace(&mut self.bell_pending, false)
     }
 
     /// Drain queued desktop notifications. Called by Crane's render
@@ -1311,6 +1347,23 @@ impl Handler for Term {
         self.in_sync_frame = active;
     }
 
+    fn set_cursor_style(&mut self, style: Option<CursorStyle>) {
+        // `None` is DECSCUSR 0 (reset to the terminal default).
+        self.cursor_style = style.unwrap_or_default();
+    }
+
+    fn set_title(&mut self, title: Option<String>) {
+        // OSC 0 / OSC 2. Programs clear the title with an empty
+        // payload; keep the empty string as `Some("")` if that's what
+        // arrives, and `None` only when the parser reports no title.
+        self.window_title = title;
+    }
+
+    fn bell(&mut self) {
+        // BEL (0x07). Latch until the UI drains it via `take_bell`.
+        self.bell_pending = true;
+    }
+
     fn on_finish_byte_processing(&mut self, _input: &ProcessorInput) {
         // Frame boundary marker. Renderer hookup lives in Crane's
         // pane_view, not here — `Term` just exposes the grid +
@@ -1336,6 +1389,7 @@ impl Handler for Term {
 mod tests {
     use super::*;
     use crate::cell::{Color, NamedColor};
+    use crate::handler::CursorShape;
     use crate::index::{Column, Line, Point, Side};
     use crate::selection::{Selection, SelectionType};
     use vte::ansi::{Attr, ClearMode, LineClearMode};
@@ -1944,6 +1998,95 @@ mod tests {
         let mut t = Term::new(5, 10);
         t.identify_terminal(None);
         assert_eq!(t.take_pty_replies(), b"\x1b[?6c");
+    }
+
+    #[test]
+    fn cursor_style_defaults_to_blinking_block() {
+        let t = Term::new(5, 10);
+        assert_eq!(
+            t.cursor_style(),
+            CursorStyle {
+                shape: CursorShape::Block,
+                blink: true
+            }
+        );
+    }
+
+    #[test]
+    fn decscusr_sets_cursor_shape_and_blink() {
+        // (DECSCUSR param, expected shape, expected blink)
+        let cases = [
+            (1u8, CursorShape::Block, true),
+            (2, CursorShape::Block, false),
+            (3, CursorShape::Underline, true),
+            (4, CursorShape::Underline, false),
+            (5, CursorShape::Beam, true),
+            (6, CursorShape::Beam, false),
+        ];
+        for (param, shape, blink) in cases {
+            let mut t = Term::new(5, 10);
+            let mut p = crate::Processor::new();
+            let seq = format!("\x1b[{} q", param);
+            p.parse_bytes(&mut t, seq.as_bytes());
+            assert_eq!(
+                t.cursor_style(),
+                CursorStyle { shape, blink },
+                "DECSCUSR {param}"
+            );
+        }
+    }
+
+    #[test]
+    fn decscusr_zero_resets_to_default() {
+        let mut t = Term::new(5, 10);
+        let mut p = crate::Processor::new();
+        // Move away from default (steady beam)...
+        p.parse_bytes(&mut t, b"\x1b[6 q");
+        assert_eq!(t.cursor_style().shape, CursorShape::Beam);
+        // ...then DECSCUSR 0 resets to the blinking-block default.
+        p.parse_bytes(&mut t, b"\x1b[0 q");
+        assert_eq!(t.cursor_style(), CursorStyle::default());
+    }
+
+    #[test]
+    fn osc2_sets_window_title() {
+        let mut t = Term::new(5, 10);
+        let mut p = crate::Processor::new();
+        p.parse_bytes(&mut t, b"\x1b]2;my-project \xe2\x80\x94 zsh\x07");
+        assert_eq!(t.window_title(), Some("my-project \u{2014} zsh"));
+    }
+
+    #[test]
+    fn osc0_sets_window_title_st_terminated() {
+        let mut t = Term::new(5, 10);
+        let mut p = crate::Processor::new();
+        p.parse_bytes(&mut t, b"\x1b]0;build running\x1b\\");
+        assert_eq!(t.window_title(), Some("build running"));
+    }
+
+    #[test]
+    fn window_title_none_until_set() {
+        let t = Term::new(5, 10);
+        assert_eq!(t.window_title(), None);
+    }
+
+    #[test]
+    fn bel_latches_and_take_bell_clears() {
+        let mut t = Term::new(5, 10);
+        let mut p = crate::Processor::new();
+        assert!(!t.take_bell(), "no bell before any BEL");
+        p.parse_bytes(&mut t, b"ding\x07");
+        assert!(t.take_bell(), "BEL must latch");
+        assert!(!t.take_bell(), "take_bell must clear the latch");
+    }
+
+    #[test]
+    fn bel_burst_coalesces_to_single_take() {
+        let mut t = Term::new(5, 10);
+        let mut p = crate::Processor::new();
+        p.parse_bytes(&mut t, b"\x07\x07\x07");
+        assert!(t.take_bell());
+        assert!(!t.take_bell());
     }
 
     /// Real-world reproduction: a Claude-Code-style status line

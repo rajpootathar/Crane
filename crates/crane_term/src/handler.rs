@@ -32,6 +32,44 @@ impl ScrollDelta {
     }
 }
 
+/// Shape of the text cursor, set by DECSCUSR (`CSI Ps SP q`).
+///
+/// Only the three shapes DECSCUSR can select are modeled — vte's
+/// `HollowBlock` / `Hidden` (reachable only via other escapes we do
+/// not surface) collapse onto `Block` in the [`crate::perform`]
+/// bridge. The renderer reads [`crate::term::Term::cursor_style`] to
+/// pick how to paint the cursor cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum CursorShape {
+    /// Filled block covering the cell (default).
+    #[default]
+    Block,
+    /// Underscore along the cell's baseline.
+    Underline,
+    /// Vertical bar at the cell's left edge ("I-beam").
+    Beam,
+}
+
+/// Cursor presentation set by DECSCUSR (`CSI Ps SP q`).
+///
+/// `blink` mirrors the odd/even DECSCUSR parameter: `1/3/5` blink,
+/// `2/4/6` are steady. The default (matching a fresh terminal and the
+/// DECSCUSR `0` "reset" parameter) is a blinking block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CursorStyle {
+    pub shape: CursorShape,
+    pub blink: bool,
+}
+
+impl Default for CursorStyle {
+    fn default() -> Self {
+        CursorStyle {
+            shape: CursorShape::Block,
+            blink: true,
+        }
+    }
+}
+
 /// Boundary marker passed to `on_finish_byte_processing`. Lets the
 /// caller distinguish "frame from a `?2026` flush" from "frame from
 /// streaming output", e.g. to defer a render pass.
@@ -113,6 +151,13 @@ pub trait Handler {
     // ---- attribute ----
 
     fn terminal_attribute(&mut self, attr: vte::ansi::Attr) {}
+
+    // ---- cursor presentation ----
+
+    /// DECSCUSR (`CSI Ps SP q`). `None` is the DECSCUSR `0` "reset to
+    /// default" parameter; implementations should treat it as
+    /// [`CursorStyle::default`].
+    fn set_cursor_style(&mut self, style: Option<CursorStyle>) {}
 
     // ---- title / bell ----
 

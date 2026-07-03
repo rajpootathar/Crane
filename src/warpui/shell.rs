@@ -1769,6 +1769,32 @@ impl CraneShellView {
 
     /// A tab row with a trailing close button. The close button's EventHandler returns
     /// `StopPropagation` so the outer select handler never fires when close is clicked.
+    /// OSC-2 title of a terminal Tab, if one of its terminal panes set one.
+    /// Prefers the focused pane (when it is a leaf of this tab), else the first
+    /// leaf. Returns `None` for non-terminal tabs or when no title has arrived,
+    /// so the caller falls back to the tab's own name ("Terminal N").
+    fn terminal_tab_title(
+        &self,
+        key: (usize, usize, usize),
+        app: &AppContext,
+    ) -> Option<String> {
+        let node = self.layouts.get(&key)?;
+        let mut leaves = Vec::new();
+        node.leaves(&mut leaves);
+        let pid = self
+            .focused
+            .filter(|p| leaves.contains(p))
+            .or_else(|| leaves.first().copied())?;
+        if let Some(PaneContent::Terminal(h)) = self.panes.get(&pid) {
+            let title = h.as_ref(app).title()?;
+            let title = title.trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+        None
+    }
+
     fn tab_closeable_row(
         &self,
         icon_color: ColorU,
@@ -1894,7 +1920,7 @@ impl CraneShellView {
             .finish()
     }
 
-    fn left_sidebar(&self) -> Box<dyn Element> {
+    fn left_sidebar(&self, app: &AppContext) -> Box<dyn Element> {
         // Header row: just the "PROJECTS" label. The Add Project affordance is a
         // prominent accent pill pinned at the bottom of the panel (below).
         let header_row = Container::new(
@@ -2148,6 +2174,15 @@ impl CraneShellView {
                             theme::text_muted()
                         };
                         let rbuf = self.tab_rename_buf(tkey);
+                        // Prefer the terminal's live OSC-2 title over the stored
+                        // tab name — but never while this row is being renamed
+                        // (the rename buffer owns the label then).
+                        let display_name = if rbuf.is_some() {
+                            t.name.clone()
+                        } else {
+                            self.terminal_tab_title(tkey, app)
+                                .unwrap_or_else(|| t.name.clone())
+                        };
                         // Double-click → rename; single click → select. Noop while
                         // this row is the one being renamed.
                         let select = if rbuf.is_some() {
@@ -2163,7 +2198,7 @@ impl CraneShellView {
                         // clicking it does not also trigger the row's select action.
                         let tab_base = self.tab_closeable_row(
                             tcol,
-                            &t.name,
+                            &display_name,
                             tsel,
                             42.0 + group_offset,
                             rbuf,
@@ -4087,7 +4122,7 @@ impl View for CraneShellView {
                 .finish();
                 SplitBox::new(
                     Dir::Horizontal,
-                    self.left_sidebar(),
+                    self.left_sidebar(app),
                     inner,
                     self.left_ratio.clone(),
                     self.left_drag.clone(),
@@ -4097,7 +4132,7 @@ impl View for CraneShellView {
             }
             (true, false) => SplitBox::new(
                 Dir::Horizontal,
-                self.left_sidebar(),
+                self.left_sidebar(app),
                 center_region,
                 self.left_ratio.clone(),
                 self.left_drag.clone(),

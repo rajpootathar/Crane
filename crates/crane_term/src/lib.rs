@@ -47,7 +47,7 @@ pub mod index;
 pub mod selection;
 
 pub use cell::{Cell, CellExtra, Color, Flags, NamedColor};
-pub use handler::{Handler, ProcessorInput, ScrollDelta};
+pub use handler::{CursorShape, CursorStyle, Handler, ProcessorInput, ScrollDelta};
 pub use index::{Column, Line, Point, Side};
 pub use mode::TermMode;
 pub use processor::Processor;

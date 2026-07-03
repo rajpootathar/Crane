@@ -28,6 +28,10 @@ pub struct TerminalController {
     pub cols: usize,
     pub rows: usize,
     alive: Arc<AtomicBool>,
+    /// Latched BEL (0x07): the reader thread drains `Term::take_bell()` into
+    /// this atomic (which also guarantees a UI wake even for a bare bell that
+    /// doesn't otherwise dirty the grid) and the UI drains it via `take_bell`.
+    bell: Arc<AtomicBool>,
     /// The directory the shell was spawned in — persisted so a restored
     /// session reopens the terminal in the same place (old Crane parity).
     pub cwd: std::path::PathBuf,
@@ -85,6 +89,7 @@ impl TerminalController {
         let term = Arc::new(Mutex::new(Term::new(rows, cols)));
         let parser = Arc::new(Mutex::new(Processor::new()));
         let alive = Arc::new(AtomicBool::new(true));
+        let bell = Arc::new(AtomicBool::new(false));
 
         // Reader thread: PTY -> crane_term, write back replies, wake the UI.
         // Lock order is ALWAYS parser-then-term (deadlock-critical).
@@ -93,6 +98,7 @@ impl TerminalController {
             let parser = parser.clone();
             let writer = writer.clone();
             let alive = alive.clone();
+            let bell = bell.clone();
             Some(thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -102,7 +108,7 @@ impl TerminalController {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            let (replies, epoch, cursor);
+                            let (replies, epoch, cursor, rang);
                             {
                                 let mut p = parser.lock();
                                 let mut t = term.lock();
@@ -110,6 +116,10 @@ impl TerminalController {
                                 replies = t.take_pty_replies();
                                 epoch = t.dirty_epoch;
                                 cursor = (t.grid.cursor.row, t.grid.cursor.col);
+                                // Drain the BEL latch here so a bare bell (which
+                                // doesn't dirty the grid) still forces a wake and
+                                // reaches the UI via the atomic below.
+                                rang = t.take_bell();
                             }
                             // Write replies BEFORE the next read (P10k workaround).
                             if !replies.is_empty() {
@@ -117,7 +127,10 @@ impl TerminalController {
                                 let _ = w.write_all(&replies);
                                 let _ = w.flush();
                             }
-                            if epoch != last_epoch || cursor != last_cursor {
+                            if rang {
+                                bell.store(true, Ordering::Relaxed);
+                            }
+                            if epoch != last_epoch || cursor != last_cursor || rang {
                                 last_epoch = epoch;
                                 last_cursor = cursor;
                                 wake();
@@ -144,8 +157,22 @@ impl TerminalController {
             cols,
             rows,
             alive,
+            bell,
             cwd,
         })
+    }
+
+    /// The terminal's window title (OSC 0 / OSC 2), if the shell or a program
+    /// set one; `None` until the first title escape arrives.
+    pub fn title(&self) -> Option<String> {
+        self.term.lock().window_title().map(|s| s.to_string())
+    }
+
+    /// Read-and-clear the BEL latch: `true` when a bell rang since the last
+    /// call. Drained by the reader thread into an atomic so it always survives
+    /// to the UI even when the bell didn't otherwise dirty the grid.
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::Relaxed)
     }
 
     /// Render the current grid + scrollback to an ANSI snapshot (for session
