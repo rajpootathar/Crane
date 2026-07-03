@@ -23,8 +23,8 @@ use warp_editor::selection::{SelectionModel, TextDirection, TextUnit};
 use warpui::text::word_boundaries::WordBoundariesPolicy;
 use warpui::color::ColorU;
 use warpui::elements::{
-    Axis, Border, DispatchEventResult, Element, EventHandler, Expanded, Fill, Flex, ParentElement,
-    ZIndex,
+    Axis, Border, Container, DispatchEventResult, Element, EventHandler, Expanded, Fill, Flex,
+    ParentElement, Text, ZIndex,
 };
 use warpui::platform::Cursor;
 use warpui::event::ModifiersState;
@@ -37,6 +37,7 @@ use warpui::{
 use rangemap::RangeMap;
 
 use crate::warpui::find_bar_element::{BarMode, FindBarElement};
+use crate::warpui::gutter_element::DiffKind;
 use crate::warpui::theme;
 
 const BASELINE: f32 = 0.78;
@@ -204,6 +205,39 @@ pub enum EditAction {
     FindReplaceAll,
     /// Focus the find field (`true`) or the replace field (`false`) for typing.
     FindFocusField { find_field: bool },
+    /// Toggle a line comment on the current line(s) / selection using the
+    /// language's line-comment prefix (keyed off the file extension).
+    ToggleComment,
+    /// Move the current line (or the selected lines) up (`down = false`) or
+    /// down (`down = true`) — Alt+Up / Alt+Down.
+    MoveLine { down: bool },
+    /// Duplicate the current line below the caret — Alt+Shift+Down.
+    DuplicateLine,
+    /// Re-read the file from disk (the reload banner's "Reload" button).
+    ReloadFromDisk,
+    /// Dismiss the external-change reload banner (its "Keep" button): reset the
+    /// mtime baseline so the banner closes and keeps the in-buffer edits.
+    DismissDiskBanner,
+}
+
+impl EditAction {
+    /// True for actions that change the buffer text — gated by read-only mode
+    /// and used to promote a preview tab on first edit. Caret motion, scrolling,
+    /// selection, and find-navigation are NOT mutating.
+    fn is_mutating(&self) -> bool {
+        matches!(
+            self,
+            EditAction::InsertChars(_)
+                | EditAction::Backspace
+                | EditAction::Enter
+                | EditAction::Indent { .. }
+                | EditAction::ToggleComment
+                | EditAction::MoveLine { .. }
+                | EditAction::DuplicateLine
+                | EditAction::FindReplaceCurrent
+                | EditAction::FindReplaceAll
+        )
+    }
 }
 
 impl<V> RichTextAction<V> for EditAction {
@@ -356,6 +390,44 @@ struct ColorCache {
     theme: String,
 }
 
+/// Cache for the gutter git-diff markers. The `git diff` shell-out is expensive
+/// (a subprocess), and the working-tree diff only changes on SAVE (unsaved
+/// in-buffer edits aren't on disk yet) or an external git op — never per
+/// keystroke — so `dirty` gates recomputation to those moments instead of every
+/// paint. Keyed by 0-based render line, ready to hand straight to `GutterElement`.
+struct DiffCache {
+    map: RangeMap<u32, DiffKind>,
+    dirty: bool,
+}
+
+/// Compute the per-line git-diff markers for `path`, keyed by **0-based** render
+/// line (what `GutterElement`/`cursor_line` use). Uses the file's PARENT dir as
+/// the `git -C` root: git walks up to discover the enclosing repo, and the
+/// absolute `path` pathspec resolves regardless — so no shell `active_cwd` is
+/// needed. NOTE(simplification): markers are keyed by BUFFER line; with soft
+/// word-wrap ON these can drift from render (wrapped) lines. Word-wrap defaults
+/// OFF (`InfiniteWidth`, 1 buffer line = 1 render line), so the common path is exact.
+fn compute_diff(path: &std::path::Path) -> RangeMap<u32, DiffKind> {
+    let mut map = RangeMap::new();
+    if path.as_os_str().is_empty() {
+        return map;
+    }
+    let Some(repo) = path.parent() else {
+        return map;
+    };
+    for (line, kind) in crate::warpui::git::file_line_diff(repo, path) {
+        let dk = match kind {
+            'A' => DiffKind::Added,
+            'M' => DiffKind::Modified,
+            _ => DiffKind::Deleted,
+        };
+        // git returns 1-based NEW-file line numbers; the gutter keys 0-based.
+        let idx = line.saturating_sub(1);
+        map.insert(idx..idx + 1, dk);
+    }
+    map
+}
+
 pub struct WarpEditorView {
     model: ModelHandle<CodeModel>,
     self_handle: WeakViewHandle<Self>,
@@ -384,6 +456,58 @@ pub struct WarpEditorView {
     /// (old `prefs.trim_on_save`). Defaults to `false` to match the old egui
     /// default; wire to a real warpui pref when settings plumbing lands.
     trim_on_save: bool,
+    /// When `true`, text soft-wraps to the viewport width
+    /// (`WidthSetting::FitViewport`); when `false` (the default, matching warp's
+    /// own code editor) lines never wrap (`WidthSetting::InfiniteWidth`).
+    /// Toggled by `set_word_wrap`, which rebuilds the RenderState — the vendored
+    /// `RenderState` has no public width-setting mutator, only the consuming
+    /// `with_width_setting` builder, so a fresh state is the only in-crate lever.
+    word_wrap: bool,
+    /// Preview-tab flag: the shell opens single-clicked files in a shared
+    /// "preview" tab styled differently, and promotes it to a permanent tab on
+    /// the first edit. Cleared by `note_edit` when a mutating action lands.
+    preview: bool,
+    /// Read-only mode: text-mutating actions (insert / backspace / enter /
+    /// indent / comment / move / duplicate) become no-ops.
+    read_only: bool,
+    /// The file's on-disk modification time captured at load / save. `disk_changed`
+    /// re-stats the path and compares, so the shell can show a reload banner when
+    /// the file is edited by another process.
+    loaded_mtime: Option<std::time::SystemTime>,
+    /// Gutter git-diff marker cache (recomputed on save / external git op, NOT
+    /// per frame — see `DiffCache`). The gutter reads this each paint.
+    diff: std::cell::RefCell<DiffCache>,
+}
+
+/// The on-disk modification time of `path`, or `None` if it can't be stat'd.
+fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// The minimal `(start_char, old_end_char, replacement)` edit that turns `old`
+/// into `new`, found by trimming the common prefix and suffix. `start_char` and
+/// `old_end_char` are 0-based char offsets into `old` (end exclusive);
+/// `replacement` is the run of new chars that fills that gap. `None` when the
+/// strings are identical. Lets whole-buffer string transforms (comment toggle,
+/// line move) apply as ONE small model edit — one undo step, no color re-smear.
+fn minimal_char_diff(old: &str, new: &str) -> Option<(usize, usize, String)> {
+    if old == new {
+        return None;
+    }
+    let o: Vec<char> = old.chars().collect();
+    let n: Vec<char> = new.chars().collect();
+    let mut pre = 0usize;
+    while pre < o.len() && pre < n.len() && o[pre] == n[pre] {
+        pre += 1;
+    }
+    let mut suf = 0usize;
+    while suf < o.len() - pre && suf < n.len() - pre && o[o.len() - 1 - suf] == n[n.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    let old_end = o.len() - suf;
+    let replacement: String = n[pre..n.len() - suf].iter().collect();
+    Some((pre, old_end, replacement))
 }
 
 /// Strip one indent level off the front of `s`: up to `max_spaces` leading
@@ -532,10 +656,370 @@ impl WarpEditorView {
         }
         if std::fs::write(&self.path, &text).is_ok() {
             self.saved_text = text;
+            // Refresh the external-change baseline so saving our own edits
+            // doesn't trip `disk_changed`.
+            self.loaded_mtime = file_mtime(&self.path);
+            // Working tree changed → the gutter diff is now stale.
+            self.diff.borrow_mut().dirty = true;
             true
         } else {
             false
         }
+    }
+
+    /// Invalidate the cached gutter git-diff so the next paint recomputes it.
+    /// The shell calls this after a git op (stage / commit / checkout) that can
+    /// change the working-tree-vs-HEAD diff without an edit to this buffer.
+    pub fn mark_diff_dirty(&self) {
+        self.diff.borrow_mut().dirty = true;
+    }
+
+    /// Re-read the file from disk into the buffer (the reload banner's "Reload").
+    /// Replaces the whole buffer as one edit (select-all + insert), refreshes the
+    /// saved snapshot + external-change baseline, and invalidates the gutter diff.
+    pub fn reload_from_disk(&mut self, ctx: &mut ViewContext<Self>) {
+        let Ok(content) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
+        let model = self.model.clone();
+        let text = content.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            m.select_all(mctx);
+            m.user_insert(&text, mctx);
+        });
+        self.saved_text = content;
+        self.loaded_mtime = file_mtime(&self.path);
+        self.diff.borrow_mut().dirty = true;
+        if self.find.is_some() {
+            self.recompute_matches(ctx);
+        }
+        ctx.notify();
+    }
+
+    /// True when the file on disk has been modified since we last loaded / saved
+    /// it (an external edit) — lets the shell show a reload banner. Also true if
+    /// the file has since been removed. `false` for unsaved (empty-path) buffers.
+    pub fn disk_changed(&self) -> bool {
+        if self.path.as_os_str().is_empty() {
+            return false;
+        }
+        match (self.loaded_mtime, file_mtime(&self.path)) {
+            (Some(loaded), Some(current)) => current != loaded,
+            // File vanished after we had a baseline → treat as changed.
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    /// Reset the external-change baseline to the current on-disk mtime — the
+    /// shell calls this after the user dismisses / reloads to clear the banner.
+    pub fn refresh_disk_mtime(&mut self) {
+        self.loaded_mtime = file_mtime(&self.path);
+    }
+
+    // ── Ln/Col + selection status (shell renders a status row) ───────────────
+
+    /// The caret's 1-based `(line, column)` in the buffer text. Column counts
+    /// characters from the line start (1 = start of line).
+    pub fn cursor_line_col(&self, app: &AppContext) -> (usize, usize) {
+        let text = self.buffer_text(app);
+        let off = self.cursor_text_offset(app);
+        let mut line = 1usize;
+        let mut col = 1usize;
+        for ch in text.chars().take(off) {
+            if ch == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    /// When a non-empty selection exists, its `(char_count, line_count)` — where
+    /// `line_count` is the number of lines the selection spans (1 for a
+    /// single-line selection). `None` for an empty selection.
+    pub fn selection_info(&self, app: &AppContext) -> Option<(usize, usize)> {
+        let sel = self.selected_text(app)?;
+        if sel.is_empty() {
+            return None;
+        }
+        let chars = sel.chars().count();
+        let lines = sel.matches('\n').count() + 1;
+        Some((chars, lines))
+    }
+
+    // ── Preview / read-only ──────────────────────────────────────────────────
+
+    /// True while this editor is a preview tab (see `preview` field).
+    pub fn is_preview(&self) -> bool {
+        self.preview
+    }
+    /// Mark / unmark this editor as a preview tab.
+    pub fn set_preview(&mut self, preview: bool, ctx: &mut ViewContext<Self>) {
+        self.preview = preview;
+        ctx.notify();
+    }
+    /// Promote a preview tab to permanent (clears the preview flag). Returns
+    /// `true` if it was a preview tab (the shell can then re-style the tab).
+    pub fn clear_preview(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let was = self.preview;
+        if was {
+            self.preview = false;
+            ctx.notify();
+        }
+        was
+    }
+    /// True when the editor is read-only (mutating actions are no-ops).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+    /// Enable / disable read-only mode.
+    pub fn set_read_only(&mut self, read_only: bool, ctx: &mut ViewContext<Self>) {
+        self.read_only = read_only;
+        ctx.notify();
+    }
+
+    // ── Word wrap ────────────────────────────────────────────────────────────
+
+    /// True when soft word-wrap is on.
+    pub fn word_wrap(&self) -> bool {
+        self.word_wrap
+    }
+    /// Flip word-wrap and re-apply it.
+    pub fn toggle_word_wrap(&mut self, ctx: &mut ViewContext<Self>) {
+        self.set_word_wrap(!self.word_wrap, ctx);
+    }
+    /// Switch soft word-wrap on/off. `on` wraps to the viewport width
+    /// (`WidthSetting::FitViewport`, which the RichTextElement re-measures each
+    /// paint via `set_viewport_size`); `off` restores infinite width.
+    ///
+    /// The vendored `RenderState` exposes no public width-setting mutator (only
+    /// the consuming `with_width_setting` builder), so we rebuild the RenderState
+    /// and its dependent SelectionModel in place — the shared `Buffer` (content +
+    /// undo history) is preserved, and the caret offset is restored after the
+    /// relayout. Only runs on an explicit toggle, so the rebuild cost is fine.
+    pub fn set_word_wrap(&mut self, on: bool, ctx: &mut ViewContext<Self>) {
+        if self.word_wrap == on {
+            return;
+        }
+        self.word_wrap = on;
+        let setting = if on {
+            WidthSetting::FitViewport
+        } else {
+            WidthSetting::InfiniteWidth
+        };
+        // Preserve the caret so the toggle doesn't jump the view.
+        let cursor_char = self.cursor_text_offset(ctx);
+        let (buffer, buffer_sel) = {
+            let m = self.model.as_ref(ctx);
+            (m.buffer.clone(), m.buffer_sel.clone())
+        };
+        let st = styles(self.gutter_font);
+        let new_rs = ctx.add_model(|mctx| {
+            RenderState::new(st, false, None, mctx).with_width_setting(setting)
+        });
+        let new_sel = {
+            let (b, r, bs) = (buffer.clone(), new_rs.clone(), buffer_sel.clone());
+            ctx.add_model(|mctx| SelectionModel::new(b, r, bs, None, mctx))
+        };
+        // Swap the handles into the model (the buffer→render forwarding
+        // subscription reads `me.render_state` fresh, so it now targets the new
+        // state), then re-lay-out the buffer content into the fresh render state.
+        self.model.update(ctx, |m: &mut CodeModel, mctx| {
+            m.render_state = new_rs;
+            m.selection = new_sel;
+            m.rebuild_layout(mctx);
+            let c = CharOffset::from(cursor_char).add_signed(1);
+            let sel = m.selection.clone();
+            sel.update(mctx, |s, sctx| s.set_cursor(c, sctx));
+        });
+        // Re-push any active find highlights (the fresh render state cleared them).
+        if self.find.is_some() {
+            self.apply_match_decorations(ctx);
+        }
+        ctx.notify();
+    }
+
+    // ── Comment toggle / move / duplicate line ───────────────────────────────
+
+    /// Toggle a line comment on the current line(s) or selection, using the
+    /// language's line-comment prefix (from the file extension). Reuses the old
+    /// egui `file_util::{comment_prefix, toggle_line_comments}` so behavior is
+    /// identical; the whole-buffer transform is applied as one minimal model edit.
+    pub fn toggle_comment(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.read_only {
+            return;
+        }
+        let text = self.buffer_text(ctx);
+        let (start, end) = self.selection_char_range(ctx);
+        let prefix =
+            crate::views::file_util::comment_prefix(&self.path.to_string_lossy());
+        let mut modified = text.clone();
+        crate::views::file_util::toggle_line_comments(&mut modified, start, end, prefix);
+        let Some((s, old_end, replacement)) = minimal_char_diff(&text, &modified) else {
+            return;
+        };
+        self.note_edit();
+        let new_end = s + replacement.chars().count();
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let cs = CharOffset::from(s).add_signed(1);
+            let ce = CharOffset::from(old_end).add_signed(1);
+            let sel = m.selection.clone();
+            sel.update(mctx, |sm, sctx| {
+                sm.set_cursor(cs, sctx);
+                sm.set_last_head(ce, sctx);
+            });
+            m.user_insert(&replacement, mctx);
+            // Re-select the toggled block so repeated toggles keep working.
+            let a = CharOffset::from(s).add_signed(1);
+            let b = CharOffset::from(new_end).add_signed(1);
+            sel.update(mctx, |sm, sctx| {
+                sm.set_cursor(a, sctx);
+                sm.set_last_head(b, sctx);
+            });
+        });
+        if self.find.is_some() {
+            self.recompute_matches(ctx);
+        }
+        ctx.notify();
+    }
+
+    /// Move the current line (or the lines the selection spans) up or down.
+    /// Ports old egui `file_view` Alt+Up / Alt+Down, translated to char space
+    /// and applied as one model edit. Collapses to a single caret (as old did).
+    fn move_line(&mut self, down: bool, ctx: &mut ViewContext<Self>) {
+        if self.read_only {
+            return;
+        }
+        let text = self.buffer_text(ctx);
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let (sel_start, sel_end) = self.selection_char_range(ctx);
+        // Line block containing the selection: [line_start, line_end), where
+        // line_end is one PAST the newline that ends the last selected line.
+        let line_start = chars[..sel_start.min(n)]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let line_end = chars[sel_end.min(n)..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|i| sel_end.min(n) + i + 1)
+            .unwrap_or(n);
+        let (region_start, region_end, replacement, new_cursor) = if down {
+            if line_end >= n {
+                return; // already the last line
+            }
+            let next_end = chars[line_end..]
+                .iter()
+                .position(|c| *c == '\n')
+                .map(|i| line_end + i + 1)
+                .unwrap_or(n);
+            let next: String = chars[line_end..next_end].iter().collect();
+            let cur: String = chars[line_start..line_end].iter().collect();
+            let cursor = sel_start + (next_end - line_end);
+            (line_start, next_end, format!("{next}{cur}"), cursor)
+        } else {
+            if line_start == 0 {
+                return; // already the first line
+            }
+            let prev_start = chars[..line_start - 1]
+                .iter()
+                .rposition(|c| *c == '\n')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let prev_len = line_start - prev_start;
+            let cur: String = chars[line_start..line_end].iter().collect();
+            let prev: String = chars[prev_start..line_start].iter().collect();
+            let cursor = sel_start.saturating_sub(prev_len);
+            (prev_start, line_end, format!("{cur}{prev}"), cursor)
+        };
+        self.note_edit();
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let cs = CharOffset::from(region_start).add_signed(1);
+            let ce = CharOffset::from(region_end).add_signed(1);
+            let sel = m.selection.clone();
+            sel.update(mctx, |sm, sctx| {
+                sm.set_cursor(cs, sctx);
+                sm.set_last_head(ce, sctx);
+            });
+            m.user_insert(&replacement, mctx);
+            let c = CharOffset::from(new_cursor).add_signed(1);
+            sel.update(mctx, |sm, sctx| sm.set_cursor(c, sctx));
+        });
+        if self.find.is_some() {
+            self.recompute_matches(ctx);
+        }
+        ctx.notify();
+    }
+
+    /// Duplicate the current line below the caret (Alt+Shift+Down). Inserts a
+    /// clean copy on its own line — no blank line — and drops the caret onto the
+    /// duplicate at the same column. (Old egui inserted the trailing newline into
+    /// the copy, which left a blank line on interior lines; this is the intended
+    /// clean behavior.)
+    fn duplicate_line(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.read_only {
+            return;
+        }
+        let text = self.buffer_text(ctx);
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let cursor = self.cursor_text_offset(ctx).min(n);
+        let line_start = chars[..cursor]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        // End of the line's CONTENT (before the terminating '\n', or EOF).
+        let line_end = chars[cursor..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|i| cursor + i)
+            .unwrap_or(n);
+        let line: String = chars[line_start..line_end].iter().collect();
+        self.note_edit();
+        let inserted = format!("\n{line}");
+        let new_cursor = cursor + line.chars().count() + 1;
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let at = CharOffset::from(line_end).add_signed(1);
+            let sel = m.selection.clone();
+            sel.update(mctx, |sm, sctx| sm.set_cursor(at, sctx));
+            m.user_insert(&inserted, mctx);
+            let c = CharOffset::from(new_cursor).add_signed(1);
+            sel.update(mctx, |sm, sctx| sm.set_cursor(c, sctx));
+        });
+        if self.find.is_some() {
+            self.recompute_matches(ctx);
+        }
+        ctx.notify();
+    }
+
+    /// The current selection as a 0-based `(start, end)` char range in the buffer
+    /// text (end exclusive). Collapses to `(caret, caret)` when there's no
+    /// selection. Shared by comment/move/duplicate.
+    fn selection_char_range(&self, ctx: &impl warpui::ModelAsRef) -> (usize, usize) {
+        let m = self.model.as_ref(ctx);
+        let sel = m.selection.as_ref(ctx);
+        let start = sel.selection_start(ctx).as_usize().saturating_sub(1);
+        let end = sel.selection_end(ctx).as_usize().saturating_sub(1);
+        if end < start {
+            (end, start)
+        } else {
+            (start, end)
+        }
+    }
+
+    /// Called at the start of any mutating action: promotes a preview tab to a
+    /// permanent one on first edit. (The shell reads `is_preview()` for styling.)
+    fn note_edit(&mut self) {
+        self.preview = false;
     }
 
     /// True when the buffer differs from the last on-disk snapshot (unsaved edits).
@@ -645,6 +1129,13 @@ impl WarpEditorView {
             version: None,
             theme: crate::theme::current().syntax_theme.clone(),
         });
+        let loaded_mtime = file_mtime(&path);
+        // Compute the gutter diff once at open (the "compute at open" trigger);
+        // thereafter it's refreshed only on save / external git op / reload.
+        let diff = std::cell::RefCell::new(DiffCache {
+            map: compute_diff(&path),
+            dirty: false,
+        });
         WarpEditorView {
             model,
             self_handle: ctx.handle(),
@@ -658,6 +1149,11 @@ impl WarpEditorView {
             find: None,
             indent_unit: indent_unit_str,
             trim_on_save: false,
+            word_wrap: false,
+            preview: false,
+            read_only: false,
+            loaded_mtime,
+            diff,
         }
     }
 }
@@ -1043,6 +1539,14 @@ impl WarpEditorView {
     /// receives actions dispatched by the `RichTextElement` for mouse/typed
     /// input — and by `input_key`, the shell's keyboard-routing entry point).
     pub fn apply(&mut self, action: &EditAction, ctx: &mut ViewContext<Self>) {
+        // Read-only editors swallow every text-mutating action.
+        if self.read_only && action.is_mutating() {
+            return;
+        }
+        // First edit promotes a preview tab to a permanent one.
+        if action.is_mutating() {
+            self.note_edit();
+        }
         let model = self.model.clone();
         match action {
             EditAction::CursorPlace { offset } => {
@@ -1257,6 +1761,29 @@ impl WarpEditorView {
                     });
                 });
             }
+            // ── Comment / move / duplicate line ────────────────────────────
+            EditAction::ToggleComment => {
+                self.toggle_comment(ctx);
+                return;
+            }
+            EditAction::MoveLine { down } => {
+                self.move_line(*down, ctx);
+                return;
+            }
+            EditAction::DuplicateLine => {
+                self.duplicate_line(ctx);
+                return;
+            }
+            EditAction::ReloadFromDisk => {
+                self.reload_from_disk(ctx);
+                return;
+            }
+            EditAction::DismissDiskBanner => {
+                // Keep the in-buffer edits; just re-baseline so the banner closes.
+                self.refresh_disk_mtime();
+                ctx.notify();
+                return;
+            }
             // ── Find / Replace / Goto ──────────────────────────────────────
             EditAction::FindNext { forward } => {
                 self.find_step(*forward, ctx);
@@ -1355,6 +1882,11 @@ impl WarpEditorView {
                 TextDirection::Forwards,
                 if ks.alt { word() } else { TextUnit::Character },
             ),
+            // Alt+Up / Alt+Down move the current line; Alt+Shift+Down duplicates
+            // it. These must precede the plain up/down caret-motion arms.
+            "up" if ks.alt => EditAction::MoveLine { down: false },
+            "down" if ks.alt && ks.shift => EditAction::DuplicateLine,
+            "down" if ks.alt => EditAction::MoveLine { down: true },
             "up" => mv(TextDirection::Backwards, TextUnit::Line),
             "down" => mv(TextDirection::Forwards, TextUnit::Line),
             "home" => mv(TextDirection::Backwards, TextUnit::LineBoundary),
@@ -1383,6 +1915,16 @@ impl View for WarpEditorView {
             let off = *cur.last();
             Some(m.render_state.as_ref(app).offset_to_softwrap_point(off).row())
         };
+        // Gutter git-diff markers: recompute only when the cache is dirty (set on
+        // save / external git op / reload) — never per paint.
+        let diff_map = {
+            let mut d = self.diff.borrow_mut();
+            if d.dirty {
+                d.map = compute_diff(&self.path);
+                d.dirty = false;
+            }
+            d.map.clone()
+        };
         let gutter = crate::warpui::gutter_element::GutterElement::new(
             render_state.clone(),
             self.gutter_font,
@@ -1393,6 +1935,7 @@ impl View for WarpEditorView {
             theme::text(),
             theme::surface(),
         )
+        .with_diff(diff_map)
         .finish();
         // Show the caret only when THIS editor pane holds keyboard focus (the
         // shell `ctx.focus()`es the active pane). Also gates the RichTextElement's
@@ -1467,39 +2010,112 @@ impl View for WarpEditorView {
             .with_child(Expanded::new(1.0, editor).finish())
             .with_child(scrollbar)
             .finish();
-        // Find / Replace / Goto bar above the editor body when open.
-        let Some(find) = self.find.as_ref() else {
-            return body;
+        // Optional bars stacked above the editor body: the external-change reload
+        // banner (highest), then the Find / Replace / Goto bar when open.
+        let banner = if self.disk_changed() {
+            Some(self.reload_banner())
+        } else {
+            None
         };
-        // Each button dispatches an `EditAction` that routes back to
+        // Each find-bar button dispatches an `EditAction` that routes back to
         // `handle_action` → `apply` (same mechanism as the scroll wheel).
-        type Cb = std::rc::Rc<dyn Fn(&mut warpui::elements::EventContext)>;
-        let mk = |action: EditAction| -> Cb {
-            std::rc::Rc::new(move |ctx: &mut warpui::elements::EventContext| {
-                ctx.dispatch_typed_action(action.clone());
-            })
-        };
-        let find_bar = FindBarElement::new(
-            find.bar_mode(),
-            find.query.clone(),
-            find.replace.clone(),
-            find.matches.len(),
-            find.current,
-            find.find_field_active,
-            self.gutter_font,
-            mk(EditAction::FindNext { forward: false }),
-            mk(EditAction::FindNext { forward: true }),
-            mk(EditAction::FindClose),
-            mk(EditAction::FindReplaceCurrent),
-            mk(EditAction::FindReplaceAll),
-            mk(EditAction::FindFocusField { find_field: true }),
-            mk(EditAction::FindFocusField { find_field: false }),
-        )
-        .finish();
-        Flex::column()
-            .with_child(find_bar)
-            .with_child(Expanded::new(1.0, body).finish())
+        let find_bar = self.find.as_ref().map(|find| {
+            type Cb = std::rc::Rc<dyn Fn(&mut warpui::elements::EventContext)>;
+            let mk = |action: EditAction| -> Cb {
+                std::rc::Rc::new(move |ctx: &mut warpui::elements::EventContext| {
+                    ctx.dispatch_typed_action(action.clone());
+                })
+            };
+            FindBarElement::new(
+                find.bar_mode(),
+                find.query.clone(),
+                find.replace.clone(),
+                find.matches.len(),
+                find.current,
+                find.find_field_active,
+                self.gutter_font,
+                mk(EditAction::FindNext { forward: false }),
+                mk(EditAction::FindNext { forward: true }),
+                mk(EditAction::FindClose),
+                mk(EditAction::FindReplaceCurrent),
+                mk(EditAction::FindReplaceAll),
+                mk(EditAction::FindFocusField { find_field: true }),
+                mk(EditAction::FindFocusField { find_field: false }),
+            )
             .finish()
+        });
+        if banner.is_none() && find_bar.is_none() {
+            return body;
+        }
+        let mut col = Flex::column();
+        if let Some(b) = banner {
+            col = col.with_child(b);
+        }
+        if let Some(fb) = find_bar {
+            col = col.with_child(fb);
+        }
+        col.with_child(Expanded::new(1.0, body).finish()).finish()
+    }
+}
+
+impl WarpEditorView {
+    /// The external-change reload banner shown at the top of the editor pane when
+    /// the file changed on disk (`disk_changed`). "Reload" re-reads the file;
+    /// "Keep" dismisses (keeps the in-buffer edits, re-baselines the mtime).
+    /// NOTE: `disk_changed()` re-stats the path each paint — cheap (an OS-cached
+    /// stat), acceptable for a single editor pane.
+    fn reload_banner(&self) -> Box<dyn Element> {
+        let msg = Container::new(
+            Text::new(
+                "File changed on disk".to_string(),
+                self.gutter_font,
+                crate::warpui::fontsize::editor(),
+            )
+            .with_color(theme::warning())
+            .finish(),
+        )
+        .with_padding_left(10.0)
+        .with_padding_right(12.0)
+        .with_padding_top(5.0)
+        .with_padding_bottom(5.0)
+        .finish();
+        let reload = self.banner_button("Reload", theme::accent(), EditAction::ReloadFromDisk);
+        let keep = self.banner_button("Keep", theme::surface(), EditAction::DismissDiskBanner);
+        let row = Flex::row()
+            .with_child(Expanded::new(1.0, msg).finish())
+            .with_child(reload)
+            .with_child(keep)
+            .finish();
+        Container::new(row)
+            .with_background_color(theme::surface())
+            .with_border(Border::bottom(1.0).with_border_color(theme::border()))
+            .finish()
+    }
+
+    /// A small padded, clickable label used by the reload banner.
+    fn banner_button(&self, label: &str, bg: ColorU, action: EditAction) -> Box<dyn Element> {
+        EventHandler::new(
+            Container::new(
+                Text::new(
+                    label.to_string(),
+                    self.gutter_font,
+                    crate::warpui::fontsize::editor(),
+                )
+                .with_color(theme::text())
+                .finish(),
+            )
+            .with_background_color(bg)
+            .with_padding_left(10.0)
+            .with_padding_right(10.0)
+            .with_padding_top(4.0)
+            .with_padding_bottom(4.0)
+            .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
     }
 }
 

@@ -569,6 +569,7 @@ impl CraneShellView {
             git_rx,
             |this: &mut Self, _item, vctx| {
                 this.refresh_panel();
+                this.invalidate_editor_diffs(&*vctx);
                 vctx.notify();
             },
             |_this, _vctx| {},
@@ -3090,7 +3091,7 @@ impl CraneShellView {
             .finish()
     }
 
-    fn status_bar(&self) -> Box<dyn Element> {
+    fn status_bar(&self, app: &AppContext) -> Box<dyn Element> {
         let label = if self.branch.is_empty() {
             "ready".to_string()
         } else {
@@ -3112,6 +3113,40 @@ impl CraneShellView {
             .with_padding_top(7.0)
             .finish(),
         );
+        // Editor Ln/Col + selection info, right-aligned, when the active input
+        // pane is a warp editor (ports old egui `file_status.rs`).
+        if let Some((ln, col, sel)) = self
+            .active_input_pane()
+            .and_then(|id| self.editor_at(id))
+            .map(|h| {
+                h.read(app, |v, a| {
+                    let (l, c) = v.cursor_line_col(a);
+                    (l, c, v.selection_info(a))
+                })
+            })
+        {
+            let mut text = format!("Ln {ln}, Col {col}");
+            if let Some((chars, lines)) = sel {
+                if lines > 1 {
+                    text.push_str(&format!("   ({chars} chars, {lines} lines)"));
+                } else {
+                    text.push_str(&format!("   ({chars} chars)"));
+                }
+            }
+            // Flexible spacer pushes the Ln/Col readout to the right edge (an
+            // empty Flex paints nothing and records no hits).
+            row = row.with_child(Expanded::new(1.0, Flex::row().finish()).finish());
+            row = row.with_child(
+                Container::new(
+                    Text::new(text, self.ui_font, 11.0)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .with_padding_right(12.0)
+                .with_padding_top(7.0)
+                .finish(),
+            );
+        }
         let content = row.finish();
         ConstrainedBox::new(self.panel(theme::topbar_bg(), content))
             .with_height(theme::STATUS_H)
@@ -3560,6 +3595,16 @@ impl CraneShellView {
         match self.panes.get(&id) {
             Some(PaneContent::Editor(h)) => Some(h.clone()),
             _ => None,
+        }
+    }
+
+    /// Mark every open editor's gutter git-diff cache stale so it recomputes on
+    /// the next paint. Called after a git op that can change the working-tree
+    /// diff (stage / unstage / checkout / network op) — the "changes refresh"
+    /// trigger, peer of the save-time invalidation the editor does itself.
+    fn invalidate_editor_diffs(&self, app: &AppContext) {
+        for h in self.editor_views.values() {
+            h.read(app, |v, _| v.mark_diff_dirty());
         }
     }
 
@@ -4154,7 +4199,7 @@ impl View for CraneShellView {
         let column = Flex::column()
             .with_child(self.top_bar())
             .with_child(Expanded::new(1.0, body).finish())
-            .with_child(self.status_bar())
+            .with_child(self.status_bar(app))
             .finish();
 
         let mut root_stack = Stack::new()
@@ -4244,7 +4289,9 @@ impl View for CraneShellView {
                     let key = ks.key.to_ascii_lowercase();
                     let act = match key.as_str() {
                         "b" => Some(CraneShellAction::ToggleLeft),
-                        "/" => Some(CraneShellAction::ToggleRight),
+                        // Cmd+/ toggles the line comment when an editor pane is
+                        // focused, else toggles the Right Panel (its old behavior).
+                        "/" => Some(CraneShellAction::CommentOrToggleRight),
                         // Cmd+D split side-by-side, Cmd+Shift+D stacked.
                         "d" if ks.shift => Some(CraneShellAction::SplitFocused(Dir::Vertical)),
                         "d" => Some(CraneShellAction::SplitFocused(Dir::Horizontal)),
@@ -4296,6 +4343,14 @@ impl View for CraneShellView {
                     }
                     return DispatchEventResult::PropagateToParent;
                 }
+                // Cmd+Opt+W toggles soft word-wrap in the focused editor pane.
+                // NOTE(choice): Cmd+Opt+W was picked as a free chord (Cmd+W closes
+                // the pane, Cmd+Shift+W the tab); the old egui build had a wrap
+                // pref rather than a shortcut.
+                if ks.cmd && ks.alt && !ks.ctrl && ks.key.to_ascii_lowercase() == "w" {
+                    ctx.dispatch_typed_action(CraneShellAction::ToggleWordWrap);
+                    return DispatchEventResult::StopPropagation;
+                }
                 // Regular keys: route to the FOCUSED pane's terminal. Shell-driven
                 // input avoids warpui per-view focus being out of sync.
                 // TODO(parity): IME / composed multi-codepoint text (CJK, emoji,
@@ -4317,6 +4372,11 @@ pub enum CraneShellAction {
     },
     ToggleLeft,
     ToggleRight,
+    /// Cmd+/: toggle the line comment in the focused editor pane, or fall back to
+    /// toggling the Right Panel when no editor pane is focused.
+    CommentOrToggleRight,
+    /// Cmd+Opt+W: toggle soft word-wrap in the focused editor pane.
+    ToggleWordWrap,
     SetTab { files: bool },
     ToggleDir(PathBuf),
     SelectFile(PathBuf),
@@ -4746,6 +4806,7 @@ impl TypedActionView for CraneShellView {
                         }
                     }
                     self.refresh_panel();
+                    self.invalidate_editor_diffs(&*ctx);
                 }
             }
             CraneShellAction::UnstagePaths(paths) => {
@@ -4758,6 +4819,7 @@ impl TypedActionView for CraneShellView {
                         }
                     }
                     self.refresh_panel();
+                    self.invalidate_editor_diffs(&*ctx);
                 }
             }
             CraneShellAction::ToggleChangeDir(key) => {
@@ -4861,7 +4923,10 @@ impl TypedActionView for CraneShellView {
                 self.branch_picker = None;
                 if let Some(root) = self.active_cwd.clone() {
                     match crate::warpui::git::checkout_branch(&root, branch) {
-                        Ok(()) => self.refresh_panel(),
+                        Ok(()) => {
+                            self.refresh_panel();
+                            self.invalidate_editor_diffs(&*ctx);
+                        }
                         Err(e) => self.commit_error = Some(e),
                     }
                 }
@@ -4958,6 +5023,22 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::ToggleRight => {
                 if !self.any_text_input_focused(&*ctx) {
                     self.show_right = !self.show_right;
+                }
+            }
+            CraneShellAction::CommentOrToggleRight => {
+                // Editor pane focused → toggle the line comment; otherwise fall
+                // back to the Right Panel toggle (Cmd+/'s legacy behavior).
+                if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |v, vctx| {
+                        v.apply(&crate::warpui::editor_view::EditAction::ToggleComment, vctx)
+                    });
+                } else {
+                    self.handle_action(&CraneShellAction::ToggleRight, ctx);
+                }
+            }
+            CraneShellAction::ToggleWordWrap => {
+                if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    h.update(ctx, |v, vctx| v.toggle_word_wrap(vctx));
                 }
             }
             CraneShellAction::SetTab { files } => {

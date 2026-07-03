@@ -4,6 +4,7 @@
 //! Rows are a uniform grid: with warp's text block spacing at zero vertical
 //! margin, each line occupies exactly `row_pitch` px (the paragraph height).
 
+use rangemap::RangeMap;
 use warp_editor::render::model::RenderState;
 use warpui::color::ColorU;
 use warpui::elements::{Element, Fill, Point};
@@ -16,6 +17,17 @@ use warpui::{
     SizeConstraint,
 };
 
+/// The kind of change on a gutter line, mapped from git's line-level diff.
+/// Keyed the same way as `cursor_line` — by **0-based render line index**.
+/// `Deleted` marks a boundary: line(s) were removed *above* the keyed line,
+/// so it has no row of its own and is painted as a wedge at the top edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
 pub struct GutterElement {
     render_state: ModelHandle<RenderState>,
     font_family: FamilyId,
@@ -27,6 +39,8 @@ pub struct GutterElement {
     fg: ColorU,
     fg_active: ColorU,
     bg: ColorU,
+    /// Per-line git-diff markers, keyed by 0-based render line (same as `cursor_line`).
+    diff: Option<RangeMap<u32, DiffKind>>,
     size: Option<Vector2F>,
     origin: Option<Point>,
     digit_w: f32,
@@ -53,14 +67,47 @@ impl GutterElement {
             fg,
             fg_active,
             bg,
+            diff: None,
             size: None,
             origin: None,
             digit_w: font_size * 0.6,
         }
     }
 
+    /// Attach git-diff line markers. The map is keyed by 0-based render line
+    /// (matching `cursor_line`): `Added`/`Modified` paint a bar on that line;
+    /// `Deleted` paints a wedge at that line's top boundary.
+    pub fn with_diff(mut self, map: RangeMap<u32, DiffKind>) -> Self {
+        self.diff = Some(map);
+        self
+    }
+
     fn line_count(&self, app: &AppContext) -> u32 {
         self.render_state.as_ref(app).max_line().as_u32()
+    }
+
+    /// Draw a small right-pointing triangle wedge whose vertical base sits on
+    /// the left gutter edge, centred vertically on `y_boundary`. The scene has
+    /// no polygon primitive, so approximate it with a staircase of thin rects.
+    fn draw_deleted_wedge(ctx: &mut PaintContext, x: f32, y_boundary: f32, color: ColorU) {
+        const H: f32 = 8.0; // wedge height
+        const W: f32 = 5.0; // wedge depth (base width)
+        const SLICES: usize = 8;
+        let slice_h = H / SLICES as f32;
+        for s in 0..SLICES {
+            // t: 0 at top, 1 at bottom of the wedge.
+            let t = (s as f32 + 0.5) / SLICES as f32;
+            let dy = (t - 0.5) * H; // -H/2 .. H/2 relative to the boundary
+            // Widest at the vertical centre, tapering to a point top and bottom.
+            let w = (W * (1.0 - (dy.abs() / (H * 0.5)))).max(0.5);
+            let sy = y_boundary + dy - slice_h * 0.5;
+            ctx.scene
+                .draw_rect_without_hit_recording(RectF::new(
+                    vec2f(x, sy),
+                    vec2f(w, slice_h + 0.5),
+                ))
+                .with_background(Fill::Solid(color));
+        }
     }
 }
 
@@ -113,6 +160,29 @@ impl Element for GutterElement {
             let y = origin.y() + i as f32 * self.row_pitch - scroll_top;
             if y + self.row_pitch < origin.y() || y > origin.y() + size.y() {
                 continue;
+            }
+            // Git-diff marker at the left edge (drawn under the digits).
+            if let Some(kind) = self.diff.as_ref().and_then(|m| m.get(&i)).copied() {
+                match kind {
+                    DiffKind::Added | DiffKind::Modified => {
+                        let color = if kind == DiffKind::Added {
+                            crate::warpui::theme::success()
+                        } else {
+                            crate::warpui::theme::accent()
+                        };
+                        ctx.scene
+                            .draw_rect_without_hit_recording(RectF::new(
+                                vec2f(origin.x(), y),
+                                vec2f(3.0, self.row_pitch),
+                            ))
+                            .with_background(Fill::Solid(color));
+                    }
+                    DiffKind::Deleted => {
+                        // Deleted lines have no row of their own — paint a small
+                        // right-pointing wedge centred on this line's top boundary.
+                        Self::draw_deleted_wedge(ctx, origin.x(), y, crate::warpui::theme::error());
+                    }
+                }
             }
             let label = (i + 1).to_string();
             let color = if Some(i) == self.cursor_line {

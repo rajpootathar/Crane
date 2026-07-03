@@ -374,6 +374,118 @@ pub fn ahead_behind(repo: &Path) -> Option<(usize, usize)> {
     Some((ahead, behind))
 }
 
+// ── Per-file line diff (editor gutter markers) ────────────────────────
+// Feeds the warp editor's gutter change-bar: which NEW-file lines were
+// Added / Modified since HEAD, plus a Deleted boundary where lines were
+// removed with nothing added in their place. Pure `git diff` shell-out —
+// parses only the `@@ … @@` hunk headers, so it never has to diff text
+// itself.
+
+/// One gutter marker: a 1-based NEW-file line number paired with a change
+/// kind encoded as a `char`:
+///
+/// - `'A'` — **Added**: the hunk added lines with no removals at that spot
+///   (pure insertion). Every added line in the hunk gets its own `'A'`.
+/// - `'M'` — **Modified**: the hunk both removed and added lines at that
+///   spot (a replacement). Every added line in the hunk gets its own `'M'`.
+/// - `'D'` — **Deleted**: the hunk removed lines with nothing added
+///   (pure deletion). Emitted **once** per deletion, anchored to the
+///   surviving NEW-file line the removal sits *after* (git's `+c` with
+///   count 0); clamped to line 1 when the deletion is at the top of file.
+///
+/// The editor agent maps `'A' → DiffKind::Added`, `'M' → DiffKind::Modified`,
+/// `'D' → DiffKind::Deleted` for `gutter_element`.
+pub type LineDiff = (u32, char);
+
+/// Per-file line diff for the editor gutter. Runs
+/// `git diff --no-color --no-ext-diff -U0 -- <file>` in `repo` (unified
+/// context of 0 so hunk headers hug the exact changed lines) and parses
+/// the `@@ -a,b +c,d @@` headers into [`LineDiff`] markers over the NEW
+/// file.
+///
+/// Header math (with `-U0`): `b` is the count of removed OLD lines, `d`
+/// the count of added NEW lines starting at NEW line `c`. Then:
+/// - `d > 0, b == 0` → lines `c .. c+d` are `'A'` (pure insertion).
+/// - `d > 0, b > 0`  → lines `c .. c+d` are `'M'` (removal + insertion).
+/// - `d == 0, b > 0` → one `'D'` at `c.max(1)` (pure deletion boundary).
+///
+/// Compares the working tree against the index+HEAD (unstaged *and* staged
+/// edits both show, matching what the user sees in the buffer). Returns an
+/// empty vec on any error, a non-repo path, or a clean file — never
+/// panics, never errors out.
+pub fn file_line_diff(repo: &Path, file: &Path) -> Vec<LineDiff> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--no-color", "--no-ext-diff", "-U0", "HEAD", "--"])
+        .arg(file)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut marks: Vec<LineDiff> = Vec::new();
+    for line in text.lines() {
+        // Only hunk headers carry the line-number ranges we need.
+        if !line.starts_with("@@") {
+            continue;
+        }
+        let Some((old_count, new_start, new_count)) = parse_hunk_header(line) else {
+            continue;
+        };
+        if new_count == 0 {
+            // Pure deletion — anchor a single boundary at the surviving
+            // NEW line the removal follows (clamp to 1 at top of file).
+            if old_count > 0 {
+                marks.push((new_start.max(1), 'D'));
+            }
+        } else {
+            let kind = if old_count > 0 { 'M' } else { 'A' };
+            for i in 0..new_count {
+                marks.push((new_start + i, kind));
+            }
+        }
+    }
+    marks
+}
+
+/// Parse a `@@ -a,b +c,d @@` unified-diff hunk header into
+/// `(old_count b, new_start c, new_count d)`. The `,b` / `,d` counts are
+/// optional in the format and default to 1 when omitted. Returns `None`
+/// on any malformed header.
+fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32)> {
+    // header looks like: "@@ -a,b +c,d @@ optional section heading"
+    let body = header.strip_prefix("@@ ")?;
+    let ranges = body.split(" @@").next()?; // "-a,b +c,d"
+    let mut parts = ranges.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    let old_count = count_of(old)?;
+    let (new_start, new_count) = start_and_count(new)?;
+    Some((old_count, new_start, new_count))
+}
+
+/// `"a,b"` → count `b`; bare `"a"` → count 1 (unified-diff default).
+fn count_of(spec: &str) -> Option<u32> {
+    match spec.split_once(',') {
+        Some((_, c)) => c.parse().ok(),
+        None => Some(1),
+    }
+}
+
+/// `"c,d"` → `(c, d)`; bare `"c"` → `(c, 1)` (unified-diff default).
+fn start_and_count(spec: &str) -> Option<(u32, u32)> {
+    match spec.split_once(',') {
+        Some((s, c)) => Some((s.parse().ok()?, c.parse().ok()?)),
+        None => Some((spec.parse().ok()?, 1)),
+    }
+}
+
 // ── Async git-op model ────────────────────────────────────────────────
 // Mirrors old Crane's `GitOpKind` / `GitOpStatus` / `dispatch_git_op`
 // (src/state/state.rs). Crane bans async runtimes — the op runs on a
