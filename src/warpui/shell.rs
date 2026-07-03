@@ -30,6 +30,7 @@ use warpui::{
 
 use crate::warpui::theme;
 use crate::warpui::view::TerminalView;
+use crate::warpui::welcome_view::{WarpWelcomeView, WelcomeAction, WelcomeCallback};
 
 /// State for an open project right-click context menu.
 struct ProjectContextMenu {
@@ -61,6 +62,10 @@ pub struct CraneShellView {
     /// each tab preserves its own cursor / scroll / unsaved edits. The Editor
     /// pane shows the one for `file_pane_paths[file_pane_active]`.
     editor_views: HashMap<PathBuf, ViewHandle<crate::warpui::editor_view::WarpEditorView>>,
+    /// Live markdown views per open `.md` path — kept alive across tab switches
+    /// so each rendered doc preserves its own scroll offset (peer of
+    /// `editor_views`; a Markdown pane shows the one for the active file tab).
+    markdown_views: HashMap<PathBuf, ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>>,
     /// Cached terminal snapshots (cwd + ANSI scrollback) for persistence.
     /// Refreshed on every action but time-debounced so per-keystroke cost stays
     /// low while still capturing recent command output.
@@ -143,12 +148,18 @@ pub struct TabMeta {
 }
 
 /// What a leaf pane holds (warpui port of old Crane's `PaneContent`). More
-/// variants (Browser, GitLog, Markdown) follow.
+/// variants (Browser, GitLog) follow.
 pub enum PaneContent {
     Terminal(ViewHandle<TerminalView>),
     File(ViewHandle<FileView>),
     /// Warp's real text editor (warp_editor) — warp-quality file editing.
     Editor(ViewHandle<crate::warpui::editor_view::WarpEditorView>),
+    /// Landing / new-tab surface (wordmark + action cards + cheat-sheet).
+    Welcome(ViewHandle<WarpWelcomeView>),
+    /// Read-only rendered Markdown document (`.md` / `.markdown`).
+    Markdown(ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>),
+    /// Read-only unified diff (HEAD vs working copy) for a changed file.
+    Diff(ViewHandle<crate::warpui::diff_view::WarpDiffView>),
 }
 
 /// Map a dock edge to (split direction, dragged-goes-first?). Center → None
@@ -397,6 +408,7 @@ impl CraneShellView {
             file_pane_paths: restored_file_paths,
             file_pane_active: restored_active,
             editor_views: restored_editor_views,
+            markdown_views: HashMap::new(),
             term_cache: RefCell::new(restored_term_cache),
             last_term_snapshot: std::cell::Cell::new(None),
             term_cleared: RefCell::new(HashSet::new()),
@@ -1413,7 +1425,9 @@ impl CraneShellView {
             .as_ref()
             .map(|c| c.join(&ch.path))
             .unwrap_or_else(|| PathBuf::from(&ch.path));
-        let open_action = CraneShellAction::SelectFile(abs);
+        // Clicking a Changes row opens the file's read-only Diff pane (HEAD vs
+        // working copy), not the editor.
+        let open_action = CraneShellAction::OpenDiff(abs);
         let label_btn = EventHandler::new(
             Container::new(label_inner)
                 .with_background_color(theme::sidebar_bg())
@@ -1680,6 +1694,9 @@ impl CraneShellView {
             Some(PaneContent::Terminal(h)) => ChildView::new(h).finish(),
             Some(PaneContent::File(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Editor(h)) => ChildView::new(h).finish(),
+            Some(PaneContent::Welcome(h)) => ChildView::new(h).finish(),
+            Some(PaneContent::Markdown(h)) => ChildView::new(h).finish(),
+            Some(PaneContent::Diff(h)) => ChildView::new(h).finish(),
             None => Rect::new().with_background_color(theme::bg()).finish(),
         };
         // Click anywhere inside the pane body focuses it. `with_always_handle` so
@@ -1887,16 +1904,28 @@ impl CraneShellView {
             }
             strip.finish()
         } else {
+            // Title + icon reflect the pane's content (Terminal is the default;
+            // Welcome / Markdown / Diff panes name themselves).
+            let (glyph, label): (&'static str, String) = match self.panes.get(&id) {
+                Some(PaneContent::Welcome(_)) => (icons::CUBE, "Welcome".to_string()),
+                Some(PaneContent::Markdown(h)) => {
+                    (icons::FILE_TEXT, h.as_ref(app).title().to_string())
+                }
+                Some(PaneContent::Diff(h)) => {
+                    (icons::GIT_DIFF, format!("Diff: {}", h.as_ref(app).title()))
+                }
+                _ => (icons::TERMINAL_WINDOW, "Terminal".to_string()),
+            };
             EventHandler::new(
                 Container::new(
                     Flex::row()
                         .with_child(
-                            Container::new(self.icon(icons::TERMINAL_WINDOW, 12.0, fg))
+                            Container::new(self.icon(glyph, 12.0, fg))
                                 .with_padding_right(5.0)
                                 .finish(),
                         )
                         .with_child(
-                            Text::new("Terminal".to_string(), self.ui_font, 11.0)
+                            Text::new(label, self.ui_font, 11.0)
                                 .with_color(fg)
                                 .finish(),
                         )
@@ -1980,6 +2009,42 @@ impl CraneShellView {
             self.file_pane_paths.push(path.clone());
             self.file_pane_active = self.file_pane_paths.len() - 1;
         }
+        // Markdown files render read-only in a Markdown pane instead of the
+        // editor (peer of the editor path below, same placement / reuse logic).
+        let is_md = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+            .unwrap_or(false);
+        if is_md {
+            let handle = if let Some(h) = self.markdown_views.get(&path) {
+                h.clone()
+            } else {
+                let p = path.clone();
+                let h = ctx.add_typed_action_view(move |ctx| {
+                    crate::warpui::markdown_view::WarpMarkdownView::new(ctx, p)
+                });
+                self.markdown_views.insert(path.clone(), h.clone());
+                h
+            };
+            // Reuse the live files_pane (swap content) if it still holds a
+            // document pane; else split a fresh pane on the RIGHT at 0.35.
+            if let Some(fp) = self.files_pane {
+                if matches!(
+                    self.panes.get(&fp),
+                    Some(PaneContent::Editor(_))
+                        | Some(PaneContent::File(_))
+                        | Some(PaneContent::Markdown(_))
+                ) {
+                    self.panes.insert(fp, PaneContent::Markdown(handle));
+                    self.focused = Some(fp);
+                    return;
+                }
+                self.files_pane = None; // pane was closed
+            }
+            self.files_pane = self.split_with_at(PaneContent::Markdown(handle), false, 0.35);
+            return;
+        }
         // Build the editor for this file once; reuse it on later opens/switches
         // so each tab keeps its own cursor / scroll / unsaved edits.
         let handle = if let Some(h) = self.editor_views.get(&path) {
@@ -2000,7 +2065,9 @@ impl CraneShellView {
         if let Some(fp) = self.files_pane {
             if matches!(
                 self.panes.get(&fp),
-                Some(PaneContent::Editor(_)) | Some(PaneContent::File(_))
+                Some(PaneContent::Editor(_))
+                    | Some(PaneContent::File(_))
+                    | Some(PaneContent::Markdown(_))
             ) {
                 self.panes.insert(fp, PaneContent::Editor(handle));
                 self.focused = Some(fp);
@@ -2021,6 +2088,18 @@ impl CraneShellView {
         match self.panes.get(&id) {
             Some(PaneContent::Editor(h)) => Some(h.clone()),
             _ => None,
+        }
+    }
+
+    /// The pane content to show for an open file-tab `path`: a Markdown pane for
+    /// `.md` docs (tracked in `markdown_views`), else the live Editor pane.
+    fn file_tab_pane(&self, path: &PathBuf) -> Option<PaneContent> {
+        if let Some(h) = self.markdown_views.get(path) {
+            Some(PaneContent::Markdown(h.clone()))
+        } else {
+            self.editor_views
+                .get(path)
+                .map(|h| PaneContent::Editor(h.clone()))
         }
     }
 
@@ -2097,6 +2176,36 @@ impl CraneShellView {
         let handle =
             ctx.add_view(move |ctx| FileView::from_text(ctx, "Browser".to_string(), lines));
         self.split_with(PaneContent::File(handle));
+    }
+
+    /// Open a read-only unified Diff pane (HEAD vs working copy) for `path` in a
+    /// fresh pane beside the focused one (same placement as `open_browser`).
+    fn open_diff(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        let repo_root = self.active_cwd.clone();
+        let handle = ctx.add_typed_action_view(move |ctx| {
+            crate::warpui::diff_view::WarpDiffView::new(ctx, repo_root, path)
+        });
+        self.split_with(PaneContent::Diff(handle));
+    }
+
+    /// Open the Welcome / landing pane beside the focused pane. Its action cards
+    /// dispatch a `WelcomeAction` that this closure maps to the matching shell
+    /// action (mirrors the top-bar pills). Created with `add_typed_action_view`
+    /// so the shell is recorded as the pane's responder-chain parent — without
+    /// that, the card's `CraneShellAction` would never bubble up to the shell.
+    fn open_welcome(&mut self, ctx: &mut ViewContext<Self>) {
+        let on_action: WelcomeCallback = Rc::new(|action, ectx| match action {
+            WelcomeAction::Terminal => {
+                ectx.dispatch_typed_action(CraneShellAction::SplitFocused(Dir::Horizontal))
+            }
+            WelcomeAction::Files => ectx.dispatch_typed_action(CraneShellAction::ToggleRight),
+            WelcomeAction::Browser => ectx.dispatch_typed_action(CraneShellAction::OpenBrowser),
+        });
+        let (ui_font, icon_font) = (self.ui_font, self.icon_font);
+        let handle = ctx.add_typed_action_view(move |vc| {
+            WarpWelcomeView::new(vc, ui_font, icon_font, Some(on_action))
+        });
+        self.split_with(PaneContent::Welcome(handle));
     }
 
     /// Edit the commit message buffer from a keystroke (commit box focused).
@@ -2418,6 +2527,9 @@ impl View for CraneShellView {
                         "]" => Some(CraneShellAction::FocusNextPane),
                         // Cmd+9 toggles the Git log panel.
                         "9" => Some(CraneShellAction::OpenGitLog),
+                        // Cmd+Shift+N opens the Welcome / landing pane beside the
+                        // focused pane (default new-tab stays a terminal).
+                        "n" if ks.shift => Some(CraneShellAction::OpenWelcome),
                         _ => None,
                     };
                     if let Some(act) = act {
@@ -2523,6 +2635,11 @@ pub enum CraneShellAction {
     OpenGitLog,
     /// Open a Browser pane (placeholder).
     OpenBrowser,
+    /// Open a read-only unified Diff pane (HEAD vs working copy) for the file at
+    /// the given absolute path (dispatched by a Changes-row click).
+    OpenDiff(PathBuf),
+    /// Open the Welcome / landing pane beside the focused pane.
+    OpenWelcome,
     /// Add a new tab to the active workspace.
     NewTab,
     /// Add a new tab to a specific worktree (left-panel + button).
@@ -2703,9 +2820,9 @@ impl TypedActionView for CraneShellView {
                     self.focused = Some(fp);
                     if let Some(path) = self.file_pane_paths.get(*i).cloned() {
                         self.file_pane_active = *i;
-                        // Swap the Editor pane to show this file's live editor.
-                        if let Some(h) = self.editor_views.get(&path).cloned() {
-                            self.panes.insert(fp, PaneContent::Editor(h));
+                        // Swap the document pane to show this file (Markdown or Editor).
+                        if let Some(pc) = self.file_tab_pane(&path) {
+                            self.panes.insert(fp, pc);
                         }
                     }
                 }
@@ -2715,6 +2832,7 @@ impl TypedActionView for CraneShellView {
                     if *i < self.file_pane_paths.len() {
                         let removed = self.file_pane_paths.remove(*i);
                         self.editor_views.remove(&removed);
+                        self.markdown_views.remove(&removed);
                         if self.file_pane_paths.is_empty() {
                             // Last tab closed — close the whole editor pane.
                             self.files_pane = None;
@@ -2728,8 +2846,8 @@ impl TypedActionView for CraneShellView {
                                 self.file_pane_active -= 1;
                             }
                             let path = self.file_pane_paths[self.file_pane_active].clone();
-                            if let Some(h) = self.editor_views.get(&path).cloned() {
-                                self.panes.insert(fp, PaneContent::Editor(h));
+                            if let Some(pc) = self.file_tab_pane(&path) {
+                                self.panes.insert(fp, pc);
                             }
                         }
                     }
@@ -2804,6 +2922,8 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::OpenGitLog => self.toggle_gitlog(),
             CraneShellAction::OpenBrowser => self.open_browser(ctx),
+            CraneShellAction::OpenDiff(p) => self.open_diff(p.clone(), ctx),
+            CraneShellAction::OpenWelcome => self.open_welcome(ctx),
             CraneShellAction::NewTab => {
                 if let Some((pi, wi, _)) = self.active_tab {
                     self.add_tab(pi, wi, ctx);

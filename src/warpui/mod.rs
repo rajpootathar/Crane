@@ -13,11 +13,13 @@ use warpui::{platform, AddWindowOptions, AssetProvider};
 
 pub mod color;
 pub mod controller;
+pub mod diff_view;
 pub mod editor_view;
 pub mod file_pane;
 pub mod find_bar_element;
 pub mod file_tree;
 pub mod git;
+pub mod markdown_view;
 pub mod grid_element;
 pub mod gutter_element;
 pub mod scrollbar_element;
@@ -31,6 +33,7 @@ pub mod shell;
 pub mod split;
 pub mod theme;
 pub mod view;
+pub mod welcome_view;
 
 use shell::CraneShellView;
 
