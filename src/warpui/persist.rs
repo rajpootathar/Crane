@@ -166,14 +166,29 @@ fn state_file() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".crane").join("warpui-state.json"))
 }
 
-/// Load persisted warpui state, or None if absent/corrupt.
-pub fn load() -> Option<WarpuiState> {
-    let path = state_file()?;
-    let bytes = std::fs::read(&path).ok()?;
+/// Try to parse a state file at `path`, returning None if missing or corrupt.
+fn load_from(path: &std::path::Path) -> Option<WarpuiState> {
+    let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Load persisted warpui state, or None if absent/corrupt. Falls back to the
+/// `.bak` safety copy (written by `save()` before each atomic replace) when the
+/// primary file is missing or fails to parse, so a crash mid-write can't lose
+/// the whole session.
+pub fn load() -> Option<WarpuiState> {
+    let path = state_file()?;
+    if let Some(state) = load_from(&path) {
+        return Some(state);
+    }
+    // Primary missing/corrupt — try the pre-write backup.
+    let bak = path.with_extension("json.bak");
+    load_from(&bak)
+}
+
 /// Write state atomically (tmp → rename) so a crash mid-write can't truncate it.
+/// Before the rename, the previous good file (if any) is copied to `<path>.bak`
+/// as a best-effort safety net that `load()` can fall back to.
 pub fn save(state: &WarpuiState) {
     let Some(path) = state_file() else { return };
     let Ok(bytes) = serde_json::to_vec_pretty(state) else {
@@ -184,6 +199,12 @@ pub fn save(state: &WarpuiState) {
     }
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, &bytes).is_ok() {
+        // Best-effort backup of the current good state before we replace it, so a
+        // crash between here and the rename still leaves a recoverable copy.
+        if path.exists() {
+            let bak = path.with_extension("json.bak");
+            let _ = std::fs::copy(&path, &bak);
+        }
         let _ = std::fs::rename(&tmp, &path);
     }
 }

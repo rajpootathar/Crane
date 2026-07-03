@@ -246,6 +246,13 @@ impl TerminalView {
         self.controller.borrow().cwd.clone()
     }
 
+    /// True when a foreground program (alt-screen TUI: vim, htop, less, …) owns
+    /// the viewport — a proxy for "a process is running" used by the quit /
+    /// close-pane confirmation modals. See `TerminalController::has_foreground_process`.
+    pub fn has_foreground_process(&self) -> bool {
+        self.controller.borrow().has_foreground_process()
+    }
+
     /// The terminal's OSC-0/OSC-2 window title, if a program set one. Used by
     /// the shell to label a terminal Tab with the running command / cwd.
     pub fn title(&self) -> Option<String> {

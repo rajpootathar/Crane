@@ -78,8 +78,46 @@ fn set_app_icon() {}
 
 /// Run the warpui frontend (owns its own NSApplication/event loop).
 pub fn run() {
-    let app_builder =
-        platform::AppBuilder::new(platform::AppCallbacks::default(), Box::new(ASSETS), None);
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use warpui::platform::app::ApproveTerminateResult;
+    use warpui::{AppContext, ViewHandle, WindowId};
+
+    // Shared slot the init closure fills once the root view exists; the OS
+    // terminate / close-window guards read it to reach the CraneShellView so a
+    // quit with a running terminal pops the ConfirmQuit modal instead of tearing
+    // everything down. Everything runs on the main thread — Rc<RefCell> is safe.
+    type ShellSlot = Rc<RefCell<Option<(WindowId, ViewHandle<CraneShellView>)>>>;
+    let shell: ShellSlot = Rc::new(RefCell::new(None));
+
+    // The guard: cancel the quit and raise ConfirmQuit if a terminal is running;
+    // otherwise allow it. Shared by both the app-terminate (Cmd+Q / menu Quit)
+    // and window-close (red-X) hooks — a single-window app, so both mean "quit".
+    fn approve(shell: &ShellSlot, app: &mut AppContext) -> ApproveTerminateResult {
+        let handle = shell.borrow().as_ref().map(|(_, h)| h.clone());
+        let Some(handle) = handle else {
+            return ApproveTerminateResult::Terminate;
+        };
+        handle.update(app, |view, vctx| {
+            if view.approve_terminate(vctx) {
+                ApproveTerminateResult::Terminate
+            } else {
+                ApproveTerminateResult::Cancel
+            }
+        })
+    }
+
+    let mut callbacks = platform::AppCallbacks::default();
+    let shell_term = shell.clone();
+    callbacks.on_should_terminate_app =
+        Some(Box::new(move |app: &mut AppContext| approve(&shell_term, app)));
+    let shell_close = shell.clone();
+    callbacks.on_should_close_window = Some(Box::new(
+        move |_wid: WindowId, app: &mut AppContext| approve(&shell_close, app),
+    ));
+
+    let app_builder = platform::AppBuilder::new(callbacks, Box::new(ASSETS), None);
+    let shell_init = shell.clone();
     let _ = app_builder.run(move |ctx| {
         set_app_icon();
         // Use persisted window size if available; otherwise fall back to the
@@ -90,7 +128,7 @@ pub fn run() {
             .filter(|st| st.window_w > 0.0 && st.window_h > 0.0)
             .map(|st| vec2f(st.window_w, st.window_h))
             .unwrap_or_else(|| vec2f(1480.0, 920.0));
-        ctx.add_window(
+        let (wid, handle) = ctx.add_window(
             AddWindowOptions {
                 title: Some("Crane".to_string()),
                 window_bounds: platform::WindowBounds::ExactSize(initial_size),
@@ -98,5 +136,6 @@ pub fn run() {
             },
             CraneShellView::new,
         );
+        *shell_init.borrow_mut() = Some((wid, handle));
     });
 }

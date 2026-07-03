@@ -36,6 +36,32 @@ use crate::warpui::theme;
 use crate::warpui::view::TerminalView;
 use crate::warpui::welcome_view::{WarpWelcomeView, WelcomeAction, WelcomeCallback};
 
+/// A full-screen blocking modal. Rendered as the topmost child of the root
+/// stack: a dim backdrop that absorbs clicks + a centered content card. Escape
+/// or a Cancel/close button dismisses it (see `modal_overlay`). Port of old egui
+/// `src/modals/*` (confirm_quit, confirm_close_tab, help, settings).
+enum Modal {
+    /// "A process is still running. Quit anyway?" — raised when the app is asked
+    /// to quit while a terminal has a live foreground process.
+    ConfirmQuit,
+    /// Cmd+W over a terminal pane with a live foreground process — confirm before
+    /// tearing the pane (and its PTY) down.
+    ConfirmClosePane(PaneId),
+    /// Settings: Appearance (theme picker + zoom) + About (version).
+    Settings,
+    /// Keyboard shortcuts cheat-sheet.
+    Help,
+}
+
+/// Visual style of a modal button (`modal_button`).
+#[derive(Clone, Copy)]
+enum ModalBtn {
+    /// Filled error red — a destructive confirm (Quit, Close).
+    Danger,
+    /// Plain surface pill — Cancel / secondary.
+    Plain,
+}
+
 /// State for an open project right-click context menu.
 struct ProjectContextMenu {
     project_idx: usize,
@@ -269,6 +295,15 @@ pub struct CraneShellView {
     last_wt_click: Option<((usize, usize), std::time::Instant)>,
     /// Last tab-row click ((pi, wi, tid), instant) — drives double-click → rename.
     last_tab_click: Option<((usize, usize, usize), std::time::Instant)>,
+    /// The active full-screen modal (quit confirm / close-pane confirm / Settings
+    /// / Help), or None. Rendered last (topmost) in the root stack. Transient —
+    /// never persisted.
+    modal: Option<Modal>,
+    /// Set once the user confirms Quit in the ConfirmQuit modal so the re-issued
+    /// terminate passes straight through the `on_should_terminate_app` guard.
+    confirmed_quit: bool,
+    /// Scroll state for the Help / Settings modal body (tall content).
+    modal_scroll: ClippedScrollStateHandle,
 }
 
 #[derive(Clone)]
@@ -650,7 +685,42 @@ impl CraneShellView {
             tab_tints: init_tab_tints,
             last_wt_click: None,
             last_tab_click: None,
+            modal: None,
+            confirmed_quit: false,
+            modal_scroll: ClippedScrollStateHandle::new(),
         }
+    }
+
+    /// Quit guard for the OS terminate / close-window hooks (wired in
+    /// `mod.rs::run` via `AppCallbacks::on_should_terminate_app` /
+    /// `on_should_close_window`). Returns `true` if the app may terminate now;
+    /// `false` to CANCEL termination and raise the ConfirmQuit modal because a
+    /// terminal has a live foreground process. Once the user confirms via the
+    /// modal (`QuitConfirmed`), `confirmed_quit` is set so the re-issued
+    /// terminate returns `true` immediately.
+    pub fn approve_terminate(&mut self, vctx: &mut ViewContext<Self>) -> bool {
+        if self.confirmed_quit {
+            return true;
+        }
+        if self.count_running_terminals(vctx) > 0 {
+            self.modal = Some(Modal::ConfirmQuit);
+            vctx.notify();
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Count terminal panes whose foreground program (alt-screen TUI) is live.
+    /// Drives the quit / close-pane confirmation copy. Port of old egui
+    /// `confirm_quit::count_running_terminals`.
+    fn count_running_terminals(&self, app: &AppContext) -> usize {
+        self.panes
+            .values()
+            .filter(|pc| {
+                matches!(pc, PaneContent::Terminal(h) if h.as_ref(app).has_foreground_process())
+            })
+            .count()
     }
 
     /// Spawn a new persistent terminal view rooted at `path`. Each gets its own
@@ -1427,6 +1497,417 @@ impl CraneShellView {
         )
     }
 
+    // ---- Modal framework -------------------------------------------------
+    //
+    // A modal is the same overlay idea as the context menus above, but
+    // full-screen: a dim backdrop Rect (semi-transparent black) that covers the
+    // whole window and ABSORBS clicks, with a centered content card on top.
+    // Backdrop click or Escape dispatches `CloseModal`; the card's own buttons
+    // drive confirm/cancel. Rendered as the LAST (topmost) child of the root
+    // stack. Port of old egui `src/modals/*`.
+
+    /// A pill-style modal button. `primary` renders it filled with the accent
+    /// (default action) or, when `danger`, the error colour; otherwise a plain
+    /// surface pill. Ported from the old egui modal button rows.
+    fn modal_button(
+        &self,
+        label: &str,
+        style: ModalBtn,
+        action: CraneShellAction,
+    ) -> Box<dyn Element> {
+        let (bg, fg) = match style {
+            ModalBtn::Danger => (theme::error(), ColorU::new(255, 255, 255, 255)),
+            ModalBtn::Plain => (theme::surface(), theme::text()),
+        };
+        EventHandler::new(
+            Container::new(
+                Text::new(label.to_string(), self.ui_font, 12.0)
+                    .with_color(fg)
+                    .finish(),
+            )
+            .with_background_color(bg)
+            .with_border(Border::all(1.0).with_border_color(theme::border()))
+            .with_padding_left(16.0)
+            .with_padding_right(16.0)
+            .with_padding_top(7.0)
+            .with_padding_bottom(7.0)
+            .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
+    }
+
+    /// Wrap a built card in the dim full-screen backdrop + centering scaffold.
+    /// The backdrop closes the modal on click; empty-Flex spacers around the card
+    /// record no hits so an outside click falls through to the backdrop. The card
+    /// itself swallows clicks so interacting inside never dismisses it.
+    fn modal_scaffold(&self, card: Box<dyn Element>) -> Box<dyn Element> {
+        // The card absorbs clicks (so clicking its chrome doesn't close the modal).
+        let card = EventHandler::new(card)
+            .on_left_mouse_down(|_ctx, _app, _pos| DispatchEventResult::StopPropagation)
+            .with_always_handle()
+            .finish();
+        // Centre the card with flexible empty-Flex spacers (no hit recording, so
+        // clicks in the margins reach the backdrop below).
+        let centered = Flex::column()
+            .with_child(Expanded::new(1.0, Flex::column().finish()).finish())
+            .with_child(
+                Flex::row()
+                    .with_child(Expanded::new(1.0, Flex::row().finish()).finish())
+                    .with_child(card)
+                    .with_child(Expanded::new(1.0, Flex::row().finish()).finish())
+                    .finish(),
+            )
+            .with_child(Expanded::new(1.0, Flex::column().finish()).finish())
+            .finish();
+        // Dim backdrop: semi-transparent black filling the window, click-to-close.
+        let backdrop = EventHandler::new(
+            Rect::new()
+                .with_background_color(ColorU::new(0, 0, 0, 150))
+                .finish(),
+        )
+        .on_left_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::CloseModal);
+            DispatchEventResult::StopPropagation
+        })
+        .with_always_handle()
+        .finish();
+        Box::new(Stack::new().with_child(backdrop).with_child(centered))
+    }
+
+    /// Render the active modal as the topmost root-stack child.
+    fn modal_overlay(&self, m: &Modal, app: &AppContext) -> Box<dyn Element> {
+        let card = match m {
+            Modal::ConfirmQuit => self.confirm_quit_card(app),
+            Modal::ConfirmClosePane(id) => self.confirm_close_pane_card(*id, app),
+            Modal::Settings => self.settings_card(),
+            Modal::Help => self.help_card(),
+        };
+        self.modal_scaffold(card)
+    }
+
+    /// Standard modal card chrome: surface background, border, padding, fixed width.
+    fn modal_card(&self, width: f32, body: Box<dyn Element>) -> Box<dyn Element> {
+        ConstrainedBox::new(
+            Container::new(body)
+                .with_background_color(theme::surface())
+                .with_border(Border::all(1.0).with_border_color(theme::border()))
+                .with_uniform_padding(18.0)
+                .finish(),
+        )
+        .with_width(width)
+        .finish()
+    }
+
+    /// A modal heading with a close (×) button pinned to the far right.
+    fn modal_header(&self, title: &str) -> Box<dyn Element> {
+        let close = EventHandler::new(
+            Container::new(self.icon(icons::X, 13.0, theme::text_muted()))
+                .with_uniform_padding(4.0)
+                .finish(),
+        )
+        .on_left_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::CloseModal);
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+        Flex::row()
+            .with_child(
+                Text::new(title.to_string(), self.ui_font, 15.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_child(Expanded::new(1.0, Flex::row().finish()).finish())
+            .with_child(close)
+            .finish()
+    }
+
+    /// ConfirmQuit card — "A process is still running. Quit anyway?"
+    fn confirm_quit_card(&self, app: &AppContext) -> Box<dyn Element> {
+        let running = self.count_running_terminals(app);
+        let body = if running > 0 {
+            format!(
+                "{running} running terminal process{} will be killed.",
+                if running == 1 { "" } else { "es" }
+            )
+        } else {
+            "All open panes will close.".to_string()
+        };
+        let col = Flex::column()
+            .with_child(
+                Text::new("Quit Crane?".to_string(), self.ui_font, 15.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_child(Self::spacer(8.0))
+            .with_child(
+                Text::new(body, self.ui_font, 12.0)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            )
+            .with_child(Self::spacer(16.0))
+            .with_child(
+                Flex::row()
+                    .with_child(Expanded::new(1.0, Flex::row().finish()).finish())
+                    .with_child(self.modal_button(
+                        "Cancel",
+                        ModalBtn::Plain,
+                        CraneShellAction::CloseModal,
+                    ))
+                    .with_child(Self::spacer(8.0))
+                    .with_child(self.modal_button(
+                        "Quit",
+                        ModalBtn::Danger,
+                        CraneShellAction::QuitConfirmed,
+                    ))
+                    .finish(),
+            )
+            .finish();
+        self.modal_card(360.0, col)
+    }
+
+    /// ConfirmClosePane card — Cmd+W over a terminal running a foreground program.
+    fn confirm_close_pane_card(&self, id: PaneId, _app: &AppContext) -> Box<dyn Element> {
+        let col = Flex::column()
+            .with_child(
+                Text::new("Close this pane?".to_string(), self.ui_font, 15.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_child(Self::spacer(8.0))
+            .with_child(
+                Text::new(
+                    "A process is still running in this terminal.".to_string(),
+                    self.ui_font,
+                    12.0,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
+            )
+            .with_child(Self::spacer(16.0))
+            .with_child(
+                Flex::row()
+                    .with_child(Expanded::new(1.0, Flex::row().finish()).finish())
+                    .with_child(self.modal_button(
+                        "Cancel",
+                        ModalBtn::Plain,
+                        CraneShellAction::CloseModal,
+                    ))
+                    .with_child(Self::spacer(8.0))
+                    .with_child(self.modal_button(
+                        "Close",
+                        ModalBtn::Danger,
+                        CraneShellAction::ConfirmClosePane(id),
+                    ))
+                    .finish(),
+            )
+            .finish();
+        self.modal_card(360.0, col)
+    }
+
+    /// Help / keyboard cheat-sheet card — a 2-column chord → description grid.
+    fn help_card(&self) -> Box<dyn Element> {
+        const ROWS: &[(&str, &str)] = &[
+            ("Cmd+O", "Open external file"),
+            ("Cmd+Shift+O", "Add project folder"),
+            ("Cmd+T", "Split active pane with a terminal"),
+            ("Cmd+Shift+T", "New tab in active workspace"),
+            ("Cmd+D", "Split pane side-by-side"),
+            ("Cmd+Shift+D", "Split pane stacked"),
+            ("Cmd+W", "Close focused pane / file tab"),
+            ("Cmd+Shift+W", "Close active tab"),
+            ("Cmd+[  /  Cmd+]", "Focus previous / next pane"),
+            ("Cmd+B", "Toggle Left Panel"),
+            ("Cmd+/", "Comment line / toggle Right Panel"),
+            ("Cmd+Shift+N", "Open Welcome pane"),
+            ("Cmd+9", "Toggle Git Log dock"),
+            ("Cmd+K", "Terminal: clear screen + scrollback"),
+            ("Cmd+S", "Save focused file"),
+            ("Cmd+A", "Select all"),
+            ("Cmd+Z  /  Cmd+Shift+Z", "Undo / redo"),
+            ("Cmd+C  /  Cmd+X  /  Cmd+V", "Copy / cut / paste"),
+            ("Cmd+F", "Find in file"),
+            ("Cmd+H", "Replace in file"),
+            ("Cmd+G", "Go to line"),
+            ("Cmd+=  /  Cmd+-  /  Cmd+0", "Font zoom in / out / reset"),
+            ("Cmd+Opt+W", "Toggle editor word-wrap"),
+            ("Escape", "Close this dialog"),
+        ];
+        let mut grid = Flex::column();
+        for (chord, desc) in ROWS {
+            let row = Flex::row()
+                .with_child(
+                    ConstrainedBox::new(
+                        Text::new(chord.to_string(), self.ui_font, 12.0)
+                            .with_color(theme::accent())
+                            .finish(),
+                    )
+                    .with_width(200.0)
+                    .finish(),
+                )
+                .with_child(
+                    Text::new(desc.to_string(), self.ui_font, 12.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .finish();
+            grid = grid.with_child(
+                Container::new(row)
+                    .with_padding_top(4.0)
+                    .with_padding_bottom(4.0)
+                    .finish(),
+            );
+        }
+        let scrolled = ConstrainedBox::new(
+            ClippedScrollable::vertical(
+                self.modal_scroll.clone(),
+                grid.finish(),
+                ScrollbarWidth::Auto,
+                Fill::Solid(theme::border()),
+                Fill::Solid(theme::text_muted()),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_height(420.0)
+        .finish();
+        let col = Flex::column()
+            .with_child(self.modal_header("Keyboard Shortcuts"))
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                    .with_height(1.0)
+                    .finish(),
+            )
+            .with_child(Self::spacer(8.0))
+            .with_child(scrolled)
+            .finish();
+        self.modal_card(480.0, col)
+    }
+
+    /// Settings card — Appearance (theme picker + zoom) + About (version).
+    fn settings_card(&self) -> Box<dyn Element> {
+        let current_theme = crate::theme::current().name;
+        // Theme picker: one clickable row per installed theme; the active one is
+        // highlighted and gets a check. Click applies via the existing SetTheme flow.
+        let mut theme_rows = Flex::column();
+        for t in crate::theme::load_all() {
+            let is_active = t.name == current_theme;
+            let name = t.name.clone();
+            let mut inner = Flex::row().with_child(
+                ConstrainedBox::new(if is_active {
+                    self.icon(icons::CHECK, 12.0, theme::accent())
+                } else {
+                    Flex::row().finish()
+                })
+                .with_width(18.0)
+                .finish(),
+            );
+            inner = inner.with_child(
+                Text::new(name.clone(), self.ui_font, 12.0)
+                    .with_color(if is_active { theme::text() } else { theme::text_muted() })
+                    .finish(),
+            );
+            let mut bg = Rect::new();
+            if is_active {
+                bg = bg.with_background_color(theme::row_active());
+            }
+            let bg_layer = ConstrainedBox::new(bg.finish()).with_height(24.0).finish();
+            let label = Container::new(inner.finish())
+                .with_padding_left(6.0)
+                .with_padding_top(5.0)
+                .finish();
+            let row = EventHandler::new(Stack::new().with_child(bg_layer).with_child(label).finish())
+                .on_left_mouse_down(move |ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::SetTheme(name.clone()));
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
+            theme_rows = theme_rows.with_child(row);
+        }
+        let theme_scrolled = ConstrainedBox::new(
+            ClippedScrollable::vertical(
+                self.modal_scroll.clone(),
+                theme_rows.finish(),
+                ScrollbarWidth::Auto,
+                Fill::Solid(theme::border()),
+                Fill::Solid(theme::text_muted()),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_height(200.0)
+        .finish();
+
+        let zoom_pct = (crate::warpui::fontsize::zoom_level() * 100.0).round() as i32;
+
+        let col = Flex::column()
+            .with_child(self.modal_header("Settings"))
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                    .with_height(1.0)
+                    .finish(),
+            )
+            .with_child(Self::spacer(12.0))
+            // --- Appearance ---
+            .with_child(
+                Text::new("Appearance".to_string(), self.ui_font, 12.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                Text::new("Theme".to_string(), self.ui_font, 11.0)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            )
+            .with_child(Self::spacer(4.0))
+            .with_child(theme_scrolled)
+            .with_child(Self::spacer(10.0))
+            .with_child(
+                Text::new(
+                    format!("Zoom: {zoom_pct}%   (Cmd+= / Cmd+- / Cmd+0)"),
+                    self.ui_font,
+                    11.0,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
+            )
+            .with_child(Self::spacer(14.0))
+            // --- About ---
+            .with_child(
+                Text::new("About".to_string(), self.ui_font, 12.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_child(Self::spacer(6.0))
+            .with_child(
+                Text::new(
+                    format!("Crane {}", env!("CARGO_PKG_VERSION")),
+                    self.ui_font,
+                    12.0,
+                )
+                .with_color(theme::text())
+                .finish(),
+            )
+            .with_child(Self::spacer(2.0))
+            .with_child(
+                Text::new(
+                    "Native GPU-rendered development environment.".to_string(),
+                    self.ui_font,
+                    11.0,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
+            )
+            .finish();
+        self.modal_card(420.0, col)
+    }
+
     /// Reload the project list from session.json + the current overlay
     /// (added / removed / tints). Call after mutating any of those three fields.
     fn reload_projects(&mut self) {
@@ -1526,6 +2007,23 @@ impl CraneShellView {
         let content = Container::new(self.icon(glyph, 15.0, theme::text_muted()))
             .with_background_color(theme::topbar_bg())
             .with_uniform_padding(5.0)
+            .finish();
+        EventHandler::new(content)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    /// A small status-bar icon button (muted glyph, click dispatches `action`).
+    /// Sized for the 28px status strip.
+    fn status_icon_button(&self, glyph: &str, action: CraneShellAction) -> Box<dyn Element> {
+        let content = Container::new(self.icon(glyph, 13.0, theme::text_muted()))
+            .with_padding_left(5.0)
+            .with_padding_right(5.0)
+            .with_padding_top(6.0)
+            .with_padding_bottom(6.0)
             .finish();
         EventHandler::new(content)
             .on_left_mouse_down(move |ctx, _app, _pos| {
@@ -3113,6 +3611,9 @@ impl CraneShellView {
             .with_padding_top(7.0)
             .finish(),
         );
+        // Flexible spacer pushes everything after it to the right edge (an empty
+        // Flex paints nothing and records no hits).
+        row = row.with_child(Expanded::new(1.0, Flex::row().finish()).finish());
         // Editor Ln/Col + selection info, right-aligned, when the active input
         // pane is a warp editor (ports old egui `file_status.rs`).
         if let Some((ln, col, sel)) = self
@@ -3133,9 +3634,6 @@ impl CraneShellView {
                     text.push_str(&format!("   ({chars} chars)"));
                 }
             }
-            // Flexible spacer pushes the Ln/Col readout to the right edge (an
-            // empty Flex paints nothing and records no hits).
-            row = row.with_child(Expanded::new(1.0, Flex::row().finish()).finish());
             row = row.with_child(
                 Container::new(
                     Text::new(text, self.ui_font, 11.0)
@@ -3147,6 +3645,12 @@ impl CraneShellView {
                 .finish(),
             );
         }
+        // Settings (gear) + Help (keyboard) buttons, pinned far right. Trigger the
+        // Settings / Help modals. (Chosen over a Cmd+? / F1 key so the entry point
+        // is always discoverable in the status bar.)
+        row = row.with_child(self.status_icon_button(icons::GEAR, CraneShellAction::OpenSettings));
+        row = row.with_child(self.status_icon_button(icons::KEYBOARD, CraneShellAction::OpenHelp));
+        row = row.with_child(Self::spacer(6.0));
         let content = row.finish();
         ConstrainedBox::new(self.panel(theme::topbar_bg(), content))
             .with_height(theme::STATUS_H)
@@ -4238,6 +4742,10 @@ impl View for CraneShellView {
         if let Some(p) = &self.pending_delete {
             root_stack = root_stack.with_child(self.delete_confirm_overlay(p));
         }
+        // The blocking modal renders LAST — topmost, over every other overlay.
+        if let Some(m) = &self.modal {
+            root_stack = root_stack.with_child(self.modal_overlay(m, app));
+        }
 
         let root = root_stack.finish();
 
@@ -4257,6 +4765,9 @@ impl View for CraneShellView {
                 v
             })
             .unwrap_or_default();
+        // Whether a blocking modal is open — captured into the keydown closure so
+        // Escape closes it and other keys are swallowed.
+        let modal_open = self.modal.is_some();
         // App-level keyboard shortcuts. The terminal pane propagates Cmd combos
         // up to here (its own on_keydown returns PropagateToParent for cmd).
         EventHandler::new(root)
@@ -4283,7 +4794,20 @@ impl View for CraneShellView {
                 }
                 DispatchEventResult::PropagateToParent
             })
-            .on_keydown(|ctx, _app, ks| {
+            .on_keydown(move |ctx, _app, ks| {
+                // A modal is blocking: Escape closes it (routed FIRST); every
+                // other key is swallowed so nothing leaks to the panes behind
+                // the dim backdrop.
+                if modal_open {
+                    if ks.key.to_ascii_lowercase() == "escape"
+                        && !ks.cmd
+                        && !ks.ctrl
+                        && !ks.alt
+                    {
+                        ctx.dispatch_typed_action(CraneShellAction::CloseModal);
+                    }
+                    return DispatchEventResult::StopPropagation;
+                }
                 if ks.cmd && !ks.ctrl && !ks.alt {
                     // Shift uppercases the key ("D"), so normalize the case.
                     let key = ks.key.to_ascii_lowercase();
@@ -4541,6 +5065,16 @@ pub enum CraneShellAction {
     /// Run `git init` in the project folder and reload the project list so it
     /// flips from loose (FOLDER icon) to a real git project (CUBE icon + branches).
     InitGitProject(usize),
+    /// Dismiss the active blocking modal.
+    CloseModal,
+    /// Open the keyboard shortcuts (Help) modal.
+    OpenHelp,
+    /// Open the Settings modal (Appearance + About).
+    OpenSettings,
+    /// User confirmed Quit in the ConfirmQuit modal — actually terminate the app.
+    QuitConfirmed,
+    /// User confirmed closing a terminal pane that had a running process.
+    ConfirmClosePane(PaneId),
     Noop,
 }
 
@@ -4585,7 +5119,18 @@ impl TypedActionView for CraneShellView {
                     let a = CraneShellAction::FileTabClose(self.file_pane_active);
                     self.handle_action(&a, ctx);
                 } else {
-                    self.close_focused();
+                    // Guard: if the focused pane is a terminal running a foreground
+                    // program, confirm before tearing down its PTY. Idle panes
+                    // close immediately (as before).
+                    let running = self.focused.and_then(|id| self.terminal_at(id)).map_or(
+                        false,
+                        |h| h.read(&*ctx, |v, _| v.has_foreground_process()),
+                    );
+                    if running {
+                        self.modal = Some(Modal::ConfirmClosePane(self.focused.unwrap()));
+                    } else {
+                        self.close_focused();
+                    }
                 }
             }
             CraneShellAction::FocusPane(id) => {
@@ -5559,6 +6104,32 @@ impl TypedActionView for CraneShellView {
                 // Reload so `is_loose` is recomputed and the CUBE icon / branch
                 // rows appear on the next render.
                 self.reload_projects();
+            }
+            CraneShellAction::CloseModal => {
+                self.modal = None;
+            }
+            CraneShellAction::OpenHelp => {
+                self.modal = Some(Modal::Help);
+            }
+            CraneShellAction::OpenSettings => {
+                self.modal = Some(Modal::Settings);
+            }
+            CraneShellAction::QuitConfirmed => {
+                // The user approved the quit — flag it so the re-issued terminate
+                // sails through the `on_should_terminate_app` guard, then request
+                // termination (ForceTerminate: no further confirmation dialogs).
+                self.modal = None;
+                self.confirmed_quit = true;
+                self.save_state(&*ctx);
+                ctx.terminate_app(warpui::platform::TerminationMode::ForceTerminate, None);
+            }
+            CraneShellAction::ConfirmClosePane(id) => {
+                self.modal = None;
+                self.focused = Some(*id);
+                if self.maximized == Some(*id) {
+                    self.maximized = None;
+                }
+                self.close_focused();
             }
             CraneShellAction::Noop => {}
         }
