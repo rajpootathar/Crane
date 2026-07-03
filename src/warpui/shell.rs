@@ -373,8 +373,9 @@ impl CraneShellView {
                     crate::theme::set(t);
                 }
             }
-            if st.font_size > 0.0 {
-                crate::warpui::fontsize::set(st.font_size);
+            if st.zoom_level > 0.0 {
+                crate::warpui::fontsize::set_level(st.zoom_level);
+                ctx.set_zoom_factor(st.zoom_level);
             }
             show_left = st.show_left;
             show_right = st.show_right;
@@ -711,7 +712,7 @@ impl CraneShellView {
             window_w,
             window_h,
             theme_name: crate::theme::current().name.clone(),
-            font_size: crate::warpui::fontsize::base(),
+            zoom_level: crate::warpui::fontsize::zoom_level(),
             added_projects: self.added_projects.clone(),
             removed_project_paths: self.removed_project_paths.clone(),
             project_tints: self.project_tints.iter().map(|(k, v)| (k.clone(), *v)).collect(),
@@ -4276,29 +4277,17 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::FontZoomIn
             | CraneShellAction::FontZoomOut
             | CraneShellAction::FontZoomReset => {
-                match action {
-                    CraneShellAction::FontZoomIn => {
-                        crate::warpui::fontsize::zoom(1.0);
-                    }
-                    CraneShellAction::FontZoomOut => {
-                        crate::warpui::fontsize::zoom(-1.0);
-                    }
+                let step = crate::warpui::fontsize::step();
+                let level = match action {
+                    CraneShellAction::FontZoomIn => crate::warpui::fontsize::zoom(step),
+                    CraneShellAction::FontZoomOut => crate::warpui::fontsize::zoom(-step),
                     _ => crate::warpui::fontsize::reset(),
-                }
-                // Repaint every live terminal + editor so they pick up the new
-                // size (terminals read fontsize::base() each frame and re-fit to
-                // the new cell height; editors re-read on next render). Then persist.
-                let ids: Vec<PaneId> = self.panes.keys().copied().collect();
-                for id in ids {
-                    if let Some(h) = self.terminal_at(id) {
-                        h.update(ctx, |_, vctx| vctx.notify());
-                    }
-                    if let Some(h) = self.editor_at(id) {
-                        h.update(ctx, |_, vctx| vctx.notify());
-                    }
-                }
+                };
+                // Global magnification: scales EVERY rendered element (panels,
+                // tabs, breadcrumb, status bar, menus, terminal, editor) and
+                // invalidates all views — so no manual per-pane repaint needed.
+                ctx.set_zoom_factor(level);
                 self.save_state(&*ctx);
-                ctx.notify();
             }
             CraneShellAction::NewTab => {
                 if let Some((pi, wi, _)) = self.active_tab {
