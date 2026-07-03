@@ -3413,6 +3413,42 @@ impl CraneShellView {
         self.refresh_panel();
     }
 
+    /// Open (expand + activate) project `pi`: focus its first worktree's first
+    /// tab, or create one if it has none. Used after Add Project so the picked
+    /// folder becomes the active project with a live terminal.
+    fn open_project(&mut self, pi: usize, ctx: &mut ViewContext<Self>) {
+        self.expanded_projects.insert(pi);
+        self.expanded_worktrees.insert((pi, 0));
+        let first_tab = self
+            .worktree_tabs
+            .get(&(pi, 0))
+            .and_then(|tabs| tabs.first())
+            .map(|t| t.id);
+        if let Some(tid) = first_tab {
+            let key = (pi, 0, tid);
+            let path = self
+                .projects
+                .get(pi)
+                .and_then(|p| p.worktrees.get(0))
+                .map(|w| PathBuf::from(&w.path))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            self.selected = key;
+            self.active_cwd = Some(path.clone());
+            if !self.layouts.contains_key(&key) {
+                let pane = self.new_pane(path, ctx);
+                self.layouts.insert(key, Node::Leaf(pane));
+                self.focused = Some(pane);
+            } else if let Some(node) = self.layouts.get(&key) {
+                self.focused = Some(node.first_leaf());
+            }
+            self.active_tab = Some(key);
+            self.refresh_panel();
+        } else {
+            // No tabs yet → create one (also activates + spawns a terminal).
+            self.add_tab(pi, 0, ctx);
+        }
+    }
+
     /// The terminal view handle for a pane, if it is a terminal.
     fn terminal_at(&self, id: PaneId) -> Option<ViewHandle<TerminalView>> {
         match self.panes.get(&id) {
@@ -4355,7 +4391,7 @@ impl TypedActionView for CraneShellView {
                 let fut = rfd::AsyncFileDialog::new()
                     .set_title("Choose project folder")
                     .pick_folder();
-                ctx.spawn(fut, |this, res: Option<rfd::FileHandle>, _vctx| {
+                ctx.spawn(fut, |this, res: Option<rfd::FileHandle>, vctx| {
                     if let Some(folder) = res {
                         let p = folder.path().to_path_buf();
                         let path_str = p.to_string_lossy().to_string();
@@ -4371,8 +4407,16 @@ impl TypedActionView for CraneShellView {
                             // Re-add in case the user had previously removed it.
                             this.removed_project_paths.retain(|r| r != &path_str);
                             this.reload_projects();
+                            this.save_state(&*vctx);
+                        }
+                        // Open (expand + activate) the picked project so it becomes
+                        // usable immediately. A container folder (git children) has
+                        // no single project entry — its children just appear.
+                        if let Some(pi) = this.projects.iter().position(|p| p.path == path_str) {
+                            this.open_project(pi, vctx);
                         }
                     }
+                    vctx.notify();
                 });
             }
             CraneShellAction::OpenExternalFile => {
