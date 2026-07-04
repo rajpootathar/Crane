@@ -42,6 +42,12 @@ use crate::warpui::theme;
 
 const BASELINE: f32 = 0.78;
 
+/// How often `render` is allowed to re-stat the file for the external-change
+/// reload banner. `render` runs every paint frame; hitting the filesystem that
+/// often is wasteful, so the stat result is cached and refreshed at most once
+/// per this interval.
+const DISK_STAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// The syntect theme to render with — mirrors the egui file view: honor the
 /// user's configured `syntax_theme`, else a sensible dark default. NOT the empty
 /// `fallback_theme()` (which paints near-black text that clashes with the UI).
@@ -443,7 +449,19 @@ fn compute_diff(path: &std::path::Path) -> RangeMap<u32, DiffKind> {
             _ => DiffKind::Deleted,
         };
         // git returns 1-based NEW-file line numbers; the gutter keys 0-based.
-        let idx = line.saturating_sub(1);
+        //
+        // Added / Modified own a real NEW row, so `line - 1` is that row.
+        //
+        // A pure DELETION owns no row — git reports the surviving NEW line the
+        // removal FOLLOWS (`@@ -6 +5,0 @@` → new_start = 5, the line ABOVE the
+        // gap). The gutter paints the wedge at the *top boundary* of the keyed
+        // 0-based row, so the boundary between line 5 and line 6 is the top of
+        // 0-based row 5 — i.e. the raw `line`, NOT `line - 1` (which would land
+        // the wedge one row too high, on the top of line 5).
+        let idx = match dk {
+            DiffKind::Deleted => line,
+            DiffKind::Added | DiffKind::Modified => line.saturating_sub(1),
+        };
         map.insert(idx..idx + 1, dk);
     }
     map
@@ -509,6 +527,12 @@ pub struct WarpEditorView {
     /// the click and invokes it. `None` = goto disabled for this editor.
     #[allow(clippy::type_complexity)]
     goto_cb: Option<std::rc::Rc<dyn Fn(u32, u32, &mut ViewContext<WarpEditorView>)>>,
+    /// Throttle for the reload banner's on-disk stat: `(last_stat_at, changed)`.
+    /// `render` runs each paint frame, so it re-stats via `disk_changed()` at
+    /// most once per `DISK_STAT_INTERVAL` and caches the boolean here, sparing
+    /// the filesystem a `stat` on every frame. `Instant`/`bool` are `Copy`, so a
+    /// `Cell` suffices even though `render` only has `&self`.
+    disk_stat: std::cell::Cell<(Option<std::time::Instant>, bool)>,
 }
 
 /// The on-disk modification time of `path`, or `None` if it can't be stat'd.
@@ -751,6 +775,25 @@ impl WarpEditorView {
     /// shell calls this after the user dismisses / reloads to clear the banner.
     pub fn refresh_disk_mtime(&mut self) {
         self.loaded_mtime = file_mtime(&self.path);
+        // A fresh baseline means "not changed" until the next interval elapses;
+        // seed the throttle so the banner drops immediately after Reload/Keep
+        // instead of lingering until the cached value ages out.
+        self.disk_stat.set((Some(std::time::Instant::now()), false));
+    }
+
+    /// Throttled `disk_changed` for the per-frame render path: re-stats at most
+    /// once per `DISK_STAT_INTERVAL`, otherwise returns the cached result — so
+    /// the reload banner doesn't cost a filesystem `stat` on every paint.
+    fn disk_changed_throttled(&self) -> bool {
+        let (last, cached) = self.disk_stat.get();
+        let fresh = last.is_some_and(|t| t.elapsed() < DISK_STAT_INTERVAL);
+        if fresh {
+            return cached;
+        }
+        let changed = self.disk_changed();
+        self.disk_stat
+            .set((Some(std::time::Instant::now()), changed));
+        changed
     }
 
     // ── Ln/Col + selection status (shell renders a status row) ───────────────
@@ -1251,6 +1294,7 @@ impl WarpEditorView {
             diff,
             diagnostics: Vec::new(),
             goto_cb: None,
+            disk_stat: std::cell::Cell::new((None, false)),
         }
     }
 
@@ -2227,7 +2271,7 @@ impl View for WarpEditorView {
             .finish();
         // Optional bars stacked above the editor body: the external-change reload
         // banner (highest), then the Find / Replace / Goto bar when open.
-        let banner = if self.disk_changed() {
+        let banner = if self.disk_changed_throttled() {
             Some(self.reload_banner())
         } else {
             None
@@ -2277,12 +2321,13 @@ impl WarpEditorView {
     /// The external-change reload banner shown at the top of the editor pane when
     /// the file changed on disk (`disk_changed`). "Reload" re-reads the file;
     /// "Keep" dismisses (keeps the in-buffer edits, re-baselines the mtime).
-    /// NOTE: `disk_changed()` re-stats the path each paint — cheap (an OS-cached
-    /// stat), acceptable for a single editor pane.
+    /// NOTE: the on-disk stat that decides whether to show this is throttled to
+    /// `DISK_STAT_INTERVAL` (see `disk_changed_throttled`), so the per-frame
+    /// render path doesn't hit the filesystem every paint.
     fn reload_banner(&self) -> Box<dyn Element> {
         let msg = Container::new(
             Text::new(
-                "File changed on disk".to_string(),
+                "This file changed on disk".to_string(),
                 self.gutter_font,
                 crate::warpui::fontsize::editor(),
             )

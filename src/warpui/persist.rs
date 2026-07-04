@@ -76,6 +76,10 @@ pub struct STab {
     /// the focused pane was not a leaf of this tab's layout).
     #[serde(default)]
     pub focus: Option<PaneId>,
+    /// True if the user explicitly renamed this tab (pins the name against the
+    /// terminal's live OSC title across restarts).
+    #[serde(default)]
+    pub renamed: bool,
 }
 
 /// Persisted terminal state (old-Crane parity): spawn cwd + an ANSI snapshot of

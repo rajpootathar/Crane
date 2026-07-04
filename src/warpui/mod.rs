@@ -28,6 +28,7 @@ pub mod icons;
 pub mod input;
 pub mod layout;
 pub mod persist;
+pub mod platform_menu;
 pub mod projects;
 pub mod rect_probe;
 pub mod shell;
@@ -117,7 +118,11 @@ pub fn run() {
         move |_wid: WindowId, app: &mut AppContext| approve(&shell_close, app),
     ));
 
-    let app_builder = platform::AppBuilder::new(callbacks, Box::new(ASSETS), None);
+    let mut app_builder = platform::AppBuilder::new(callbacks, Box::new(ASSETS), None);
+    // Install the native macOS menu bar (no-op off macOS). Its item callbacks
+    // reach the same shell slot the terminate/close guards use, dispatching
+    // existing CraneShellActions through CraneShellView::handle_action.
+    platform_menu::install(&mut app_builder, shell.clone());
     let shell_init = shell.clone();
     let _ = app_builder.run(move |ctx| {
         set_app_icon();

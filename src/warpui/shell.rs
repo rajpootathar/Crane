@@ -284,6 +284,13 @@ pub struct CraneShellView {
     git_wake: Arc<dyn Fn() + Send + Sync>,
     /// Keeps the git-op repaint stream alive for the view's lifetime.
     _git_repaint: warpui::r#async::SpawnedLocalStream,
+    /// Repaint waker for the shell view itself. Cloned into each terminal's PTY
+    /// wake (so OSC title changes refresh the tab label), the editor pane's
+    /// drag handler (so the Ln/Col status row tracks mouse selection), and the
+    /// startup update check (so About surfaces "Update available" promptly).
+    ui_wake: Arc<dyn Fn() + Send + Sync>,
+    /// Keeps the shell repaint stream alive for the view's lifetime.
+    _ui_repaint: warpui::r#async::SpawnedLocalStream,
     /// Active Right-Panel row context menu (Changes or Files row), or None.
     row_menu: Option<RowMenu>,
     /// Inline pending new-file/new-folder editor in the Files tree.
@@ -392,6 +399,10 @@ struct PendingGoto {
 pub struct TabMeta {
     pub id: usize,
     pub name: String,
+    /// True once the user has explicitly renamed this tab. A renamed tab pins
+    /// its chosen `name` and no longer follows the terminal's live OSC-0/2
+    /// title (which would otherwise clobber the rename on the next PTY byte).
+    pub renamed: bool,
 }
 
 /// A single match row in the Find-in-Files modal.
@@ -507,10 +518,6 @@ fn edge_dir_before(edge: DockEdge) -> Option<(Dir, bool)> {
 
 impl CraneShellView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
-        // Kick off the background GitHub-releases update check once at startup.
-        // Idempotent + non-blocking; the Settings > About section polls
-        // `update::latest_available()` to show an "update available" line.
-        crate::warpui::update::spawn_check();
         let ui_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
             cache
                 .load_system_font("Helvetica Neue")
@@ -578,6 +585,25 @@ impl CraneShellView {
         let mut layouts: HashMap<(usize, usize, usize), Node> = HashMap::new();
         let mut worktree_tabs: HashMap<(usize, usize), Vec<TabMeta>> = HashMap::new();
         let mut drag_states: HashMap<PaneId, DraggableState> = HashMap::new();
+        // Shell repaint channel. Any background/child ping — a terminal's PTY
+        // output (incl. OSC-0/2 title changes that feed the tab label), a
+        // mouse-drag selection in an editor (feeds the Ln/Col status row), and
+        // the background update check (feeds Settings > About) — sends here so the
+        // CraneShell view itself re-renders. The stream handler only marks the
+        // view dirty, so it stays cheap even under heavy terminal output (this
+        // matches the original egui build, which repainted the whole UI per frame).
+        let (ui_tx, ui_rx) = async_channel::bounded::<()>(1);
+        let ui_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = ui_tx.try_send(());
+        });
+        // Kick off the background GitHub-releases update check once at startup,
+        // handing it the shell repaint waker so an "Update available" result
+        // surfaces in Settings > About immediately (not on the next incidental
+        // repaint). Idempotent + non-blocking.
+        {
+            let wake = ui_wake.clone();
+            crate::warpui::update::spawn_check(move || wake());
+        }
         let mut active_tab = None;
         let mut focused = None;
         let mut selected = (0, 0, usize::MAX);
@@ -686,7 +712,11 @@ impl CraneShellView {
                         } else {
                             panes.insert(
                                 pid,
-                                PaneContent::Terminal(Self::spawn_terminal(ctx, wpath.clone())),
+                                PaneContent::Terminal(Self::spawn_terminal(
+                                    ctx,
+                                    wpath.clone(),
+                                    ui_wake.clone(),
+                                )),
                             );
                         }
                         drag_states.insert(pid, DraggableState::default());
@@ -695,6 +725,7 @@ impl CraneShellView {
                     metas.push(TabMeta {
                         id: stab.id,
                         name: stab.name.clone(),
+                        renamed: stab.renamed,
                     });
                 }
                 if !metas.is_empty() {
@@ -735,7 +766,7 @@ impl CraneShellView {
                 .map(|name| {
                     let id = next_tab_id;
                     next_tab_id += 1;
-                    TabMeta { id, name }
+                    TabMeta { id, name, renamed: false }
                 })
                 .collect();
             let first_id = metas[0].id;
@@ -743,7 +774,10 @@ impl CraneShellView {
             let key = (0, 0, first_id);
             let pane = next_pane_id;
             next_pane_id += 1;
-            panes.insert(pane, PaneContent::Terminal(Self::spawn_terminal(ctx, path)));
+            panes.insert(
+                pane,
+                PaneContent::Terminal(Self::spawn_terminal(ctx, path, ui_wake.clone())),
+            );
             drag_states.insert(pane, DraggableState::default());
             layouts.insert(key, Node::Leaf(pane));
             active_tab = Some(key);
@@ -761,6 +795,16 @@ impl CraneShellView {
             |this: &mut Self, _item, vctx| {
                 this.refresh_panel();
                 this.invalidate_editor_diffs(&*vctx);
+                vctx.notify();
+            },
+            |_this, _vctx| {},
+        );
+        // Lightweight shell repaint stream fed by `ui_wake` (see the channel set
+        // up near the top of `new`). It only marks the shell view dirty — no git
+        // shell-out, no panel rebuild — so terminal-output-frequency pings stay cheap.
+        let ui_repaint = ctx.spawn_stream_local(
+            ui_rx,
+            |_this: &mut Self, _item, vctx| {
                 vctx.notify();
             },
             |_this, _vctx| {},
@@ -793,6 +837,7 @@ impl CraneShellView {
             wt_ticker,
             |this: &mut Self, _instant, vctx| {
                 this.poll_worktrees(vctx);
+                this.poll_editor_disk_changes(vctx);
             },
             |_this, _vctx| {},
         );
@@ -858,6 +903,8 @@ impl CraneShellView {
             git_op: Arc::new(Mutex::new(crate::warpui::git::OpStatus::default())),
             git_wake,
             _git_repaint: git_repaint,
+            ui_wake,
+            _ui_repaint: ui_repaint,
             row_menu: None,
             pending_new_entry: None,
             pending_delete: None,
@@ -932,10 +979,15 @@ impl CraneShellView {
     fn spawn_terminal(
         ctx: &mut ViewContext<Self>,
         path: PathBuf,
+        shell_wake: Arc<dyn Fn() + Send + Sync>,
     ) -> ViewHandle<TerminalView> {
         let (tx, rx) = async_channel::bounded::<()>(1);
         let wake: crate::warpui::controller::Wake = std::sync::Arc::new(move || {
             let _ = tx.try_send(());
+            // Also repaint the shell so the tab label tracks the terminal's live
+            // OSC-0/2 title (the shell renders the label, and its own view is a
+            // separate entity from the TerminalView the PTY byte woke).
+            shell_wake();
         });
         let cwd = Rc::new(RefCell::new(Some(path)));
         ctx.add_view(move |ctx| TerminalView::new_with(ctx, cwd, wake, rx))
@@ -1019,6 +1071,7 @@ impl CraneShellView {
                             name: t.name.clone(),
                             layout: snode,
                             focus,
+                            renamed: t.renamed,
                         })
                     })
                     .collect::<Vec<_>>();
@@ -3236,6 +3289,23 @@ impl CraneShellView {
     /// and flips a loose folder to a git project when a `.git` entry appears.
     /// Cheap when idle — the per-project `git worktree list` output is signature-
     /// cached, and heavier per-worktree git only runs for worktrees that changed.
+    /// Proactively surface the editor's external-change reload banner. The editor
+    /// only re-stats its file during its own `render`, and it never re-renders on
+    /// its own — so without this an edit made in another program wouldn't show the
+    /// banner until the user next interacts with that pane. On the worktree-poll
+    /// cadence we re-stat each open editor and notify (re-render) the ones whose
+    /// file changed on disk; the notify makes the banner appear on its own. Only
+    /// fires while a change is pending, and stops once the user hits Reload/Keep
+    /// (both reset the editor's mtime baseline via `refresh_disk_mtime`).
+    fn poll_editor_disk_changes(&mut self, ctx: &mut ViewContext<Self>) {
+        let handles: Vec<_> = self.editor_views.values().cloned().collect();
+        for h in handles {
+            if h.read(ctx, |v, _app| v.disk_changed()) {
+                h.update(ctx, |_v, vctx| vctx.notify());
+            }
+        }
+    }
+
     fn poll_worktrees(&mut self, ctx: &mut ViewContext<Self>) {
         let mut changed = false;
         // 1) Loose → git flip: cheap `.git` existence check (fs stat, no git).
@@ -3350,6 +3420,27 @@ impl CraneShellView {
             &self.removed_project_paths,
             &self.project_tints,
         );
+    }
+
+    /// After a `git checkout` in `root`, refresh the matching left-panel worktree
+    /// row's branch label in place. `refresh_panel` rebuilds Changes/Files/`self.branch`
+    /// but never `self.projects`, and `poll_worktrees` skips already-known paths — so
+    /// without this the row keeps the OLD branch name until restart. Skips rows the
+    /// user has explicitly renamed (their per-path override wins over the branch name).
+    fn sync_worktree_branch_label(&mut self, root: &std::path::Path) {
+        let new_branch = crate::warpui::git::current_branch(root);
+        if new_branch.is_empty() {
+            return;
+        }
+        for p in self.projects.iter_mut() {
+            for w in p.worktrees.iter_mut() {
+                if std::path::Path::new(&w.path) == root
+                    && !self.worktree_names.contains_key(&w.path)
+                {
+                    w.name = new_branch.clone();
+                }
+            }
+        }
     }
 
     fn refresh_panel(&mut self) {
@@ -4109,8 +4200,10 @@ impl CraneShellView {
                         let rbuf = self.tab_rename_buf(tkey);
                         // Prefer the terminal's live OSC-2 title over the stored
                         // tab name — but never while this row is being renamed
-                        // (the rename buffer owns the label then).
-                        let display_name = if rbuf.is_some() {
+                        // (the rename buffer owns the label then), and never once
+                        // the user has explicitly renamed the tab (the pinned
+                        // name wins, so the OSC title can't clobber it).
+                        let display_name = if rbuf.is_some() || t.renamed {
                             t.name.clone()
                         } else {
                             self.terminal_tab_title(tkey, app)
@@ -5185,9 +5278,22 @@ impl CraneShellView {
         // Click anywhere inside the pane body focuses it. `with_always_handle` so
         // it fires even when the child (e.g. the editor) consumes the click to
         // place its caret — otherwise clicking into the file wouldn't focus it.
+        let is_editor = matches!(self.panes.get(&id), Some(PaneContent::Editor(_)));
+        let drag_wake = self.ui_wake.clone();
         let body = EventHandler::new(inner)
             .on_left_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
+                DispatchEventResult::PropagateToParent
+            })
+            // A mouse-drag selection inside an editor updates the editor's own
+            // view but not the shell — yet the shell renders the Ln/Col + "(N
+            // chars)" status row. Ping the shell repaint waker so that row tracks
+            // the drag live (as Shift+Arrow already does). Non-consuming, so the
+            // editor still processes the drag to extend its selection.
+            .on_mouse_dragged(move |_ctx, _app, _pos| {
+                if is_editor {
+                    drag_wake();
+                }
                 DispatchEventResult::PropagateToParent
             })
             .with_always_handle()
@@ -5449,7 +5555,7 @@ impl CraneShellView {
     fn new_pane(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) -> PaneId {
         let id = self.next_pane_id;
         self.next_pane_id += 1;
-        let handle = Self::spawn_terminal(ctx, path);
+        let handle = Self::spawn_terminal(ctx, path, self.ui_wake.clone());
         self.panes.insert(id, PaneContent::Terminal(handle));
         self.drag_states.insert(id, DraggableState::default());
         id
@@ -5912,6 +6018,8 @@ impl CraneShellView {
                 if let Some(tabs) = self.worktree_tabs.get_mut(&(pi, wi)) {
                     if let Some(t) = tabs.iter_mut().find(|t| t.id == tid) {
                         t.name = name;
+                        // Pin the chosen name: stop following the live OSC title.
+                        t.renamed = true;
                     }
                 }
             }
@@ -6069,7 +6177,7 @@ impl CraneShellView {
         self.worktree_tabs
             .entry((pi, wi))
             .or_default()
-            .push(TabMeta { id, name });
+            .push(TabMeta { id, name, renamed: false });
         let path = self
             .projects
             .get(pi)
@@ -6444,6 +6552,22 @@ impl View for CraneShellView {
                             ks.shift || ks.key == "~",
                         ));
                         return DispatchEventResult::StopPropagation;
+                    }
+                    // Global font-zoom chords (Cmd+= / Cmd+- / Cmd+0) stay live
+                    // even while a modal is open — Settings > Appearance advertises
+                    // them, and the live % readout only refreshes if they actually
+                    // dispatch. Carve them out before the blanket swallow below.
+                    if ks.cmd && !ks.ctrl && !ks.alt {
+                        let zoom = match ks.key.to_ascii_lowercase().as_str() {
+                            "=" | "+" => Some(CraneShellAction::FontZoomIn),
+                            "-" => Some(CraneShellAction::FontZoomOut),
+                            "0" => Some(CraneShellAction::FontZoomReset),
+                            _ => None,
+                        };
+                        if let Some(act) = zoom {
+                            ctx.dispatch_typed_action(act);
+                            return DispatchEventResult::StopPropagation;
+                        }
                     }
                     // Route typing / nav into the Find-in-Files query field or
                     // the tab switcher; every other modal swallows all keys.
@@ -7185,6 +7309,7 @@ impl TypedActionView for CraneShellView {
                 if let Some(root) = self.active_cwd.clone() {
                     match crate::warpui::git::checkout_branch(&root, branch) {
                         Ok(()) => {
+                            self.sync_worktree_branch_label(&root);
                             self.refresh_panel();
                             self.invalidate_editor_diffs(&*ctx);
                         }
@@ -7910,6 +8035,7 @@ impl TypedActionView for CraneShellView {
                     if let Some(root) = self.active_cwd.clone() {
                         match crate::warpui::git::create_branch(&root, &name, true) {
                             Ok(()) => {
+                                self.sync_worktree_branch_label(&root);
                                 self.refresh_panel();
                                 self.invalidate_editor_diffs(&*ctx);
                             }
