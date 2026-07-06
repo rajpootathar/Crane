@@ -193,24 +193,40 @@ pub fn load() -> Option<WarpuiState> {
 /// Write state atomically (tmp → rename) so a crash mid-write can't truncate it.
 /// Before the rename, the previous good file (if any) is copied to `<path>.bak`
 /// as a best-effort safety net that `load()` can fall back to.
+///
+/// The `serde_json` serialize runs on the CALLING (UI) thread — the state graph
+/// is borrowed and can't cross the thread boundary cheaply — but the three
+/// blocking filesystem ops (tmp write, `.bak` copy, rename) are handed to a
+/// short-lived `std::thread::spawn` so the UI never stalls on disk IO. This
+/// mirrors OG Crane's `maybe_save` (serialize on the render thread, spawn the
+/// atomic write). No async runtime is involved (project rule).
 pub fn save(state: &WarpuiState) {
     let Some(path) = state_file() else { return };
     let Ok(bytes) = serde_json::to_vec_pretty(state) else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &bytes).is_ok() {
-        // Best-effort backup of the current good state before we replace it, so a
-        // crash between here and the rename still leaves a recoverable copy.
-        if path.exists() {
-            let bak = path.with_extension("json.bak");
-            let _ = std::fs::copy(&path, &bak);
+    write_bytes_async(path, bytes);
+}
+
+/// Off-thread crash-safe write of already-serialized bytes. Owns its inputs so
+/// the closure is `'static` for the spawned thread.
+fn write_bytes_async(path: std::path::PathBuf, bytes: Vec<u8>) {
+    std::thread::spawn(move || {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::rename(&tmp, &path);
-    }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            // Best-effort backup of the current good state before we replace it,
+            // so a crash between here and the rename still leaves a recoverable
+            // copy.
+            if path.exists() {
+                let bak = path.with_extension("json.bak");
+                let _ = std::fs::copy(&path, &bak);
+            }
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    });
 }
 
 /// Helper to rebuild HashMap fields from the flat Vecs.

@@ -6,6 +6,106 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// Per-repo git-status cache.
+//
+// `load_projects_extended` is re-run on every AddProject / InitGitProject /
+// reload. Naively it re-shells `git rev-parse` (branch) + `git diff --numstat`
+// + `git status --porcelain` for EVERY project and worktree in the whole tree —
+// so adding one project forks git dozens of times on the UI thread (a freeze).
+//
+// The git content of the OTHER, unchanged projects does not move between two
+// reloads triggered seconds apart, so we memoize each helper's result per repo
+// path with a short TTL. A reload then re-forks git only for genuinely new
+// paths (cache miss) and reuses recent results for everything else. This never
+// forks MORE than the uncached path did on a cold start (each field is computed
+// at most once per TTL window), so first-frame startup cost is unchanged; only
+// repeat reloads get cheaper. Staleness is bounded by `GIT_CACHE_TTL` and is
+// no worse than the pre-existing behaviour, where sidebar diff/dirty badges are
+// already only refreshed on structural events (worktree add/remove) and
+// reloads — never on plain file edits.
+// ---------------------------------------------------------------------------
+
+/// Max age of a cached git result before it is recomputed on next access.
+const GIT_CACHE_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Default, Clone)]
+struct RepoGit {
+    branch: Option<(Instant, String)>,
+    diff: Option<(Instant, (u32, u32))>,
+    dirty: Option<(Instant, bool)>,
+}
+
+fn git_cache() -> &'static Mutex<HashMap<String, RepoGit>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, RepoGit>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fresh<T>(slot: &Option<(Instant, T)>) -> Option<&T> {
+    slot.as_ref()
+        .filter(|(t, _)| t.elapsed() < GIT_CACHE_TTL)
+        .map(|(_, v)| v)
+}
+
+/// Cached `git::current_branch` keyed by repo path (see module note).
+fn cached_current_branch(path: &Path) -> String {
+    let key = path.to_string_lossy().to_string();
+    if let Some(v) = git_cache()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(|e| fresh(&e.branch).cloned())
+    {
+        return v;
+    }
+    let v = crate::warpui::git::current_branch(path);
+    git_cache().lock().unwrap().entry(key).or_default().branch =
+        Some((Instant::now(), v.clone()));
+    v
+}
+
+/// Cached `git::diff_numstat` keyed by repo path (see module note).
+fn cached_diff_numstat(path: &Path) -> (u32, u32) {
+    let key = path.to_string_lossy().to_string();
+    if let Some(v) = git_cache()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(|e| fresh(&e.diff).copied())
+    {
+        return v;
+    }
+    let v = crate::warpui::git::diff_numstat(path);
+    git_cache().lock().unwrap().entry(key).or_default().diff = Some((Instant::now(), v));
+    v
+}
+
+/// Cached `git::is_dirty` keyed by repo path (see module note).
+fn cached_is_dirty(path: &Path) -> bool {
+    let key = path.to_string_lossy().to_string();
+    if let Some(v) = git_cache()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(|e| fresh(&e.dirty).copied())
+    {
+        return v;
+    }
+    let v = crate::warpui::git::is_dirty(path);
+    git_cache().lock().unwrap().entry(key).or_default().dirty = Some((Instant::now(), v));
+    v
+}
+
+/// Drop the cached git status for `path`, forcing a fresh shell-out on next
+/// access. Call after an operation that mutates a repo's working tree / HEAD
+/// (commit, checkout, stage) so the sidebar badge refreshes immediately instead
+/// of waiting out the TTL. Exposed for callers in the shell.
+pub fn invalidate_git_cache(path: &str) {
+    git_cache().lock().unwrap().remove(path);
+}
 
 pub struct WorktreeNode {
     pub name: String,
@@ -114,10 +214,10 @@ pub fn basename_of(path: &Path) -> String {
 fn child_project_node(child: &Path, container_path: &str) -> ProjectNode {
     let cpath = child.to_string_lossy().to_string();
     let cname = basename(child, "(repo)");
-    let branch = crate::warpui::git::current_branch(child);
+    let branch = cached_current_branch(child);
     let wname = if branch.is_empty() { cname.clone() } else { branch };
-    let diff_stat = crate::warpui::git::diff_numstat(child);
-    let dirty = crate::warpui::git::is_dirty(child);
+    let diff_stat = cached_diff_numstat(child);
+    let dirty = cached_is_dirty(child);
     ProjectNode {
         name: cname,
         path: cpath.clone(),
@@ -145,7 +245,7 @@ fn child_project_node(child: &Path, container_path: &str) -> ProjectNode {
 /// appear under it. For a git repo the row shows the current branch; for a loose
 /// folder the branch is empty so it falls back to the folder name.
 fn default_worktree(path: &Path, folder_name: &str) -> WorktreeNode {
-    let branch = crate::warpui::git::current_branch(path);
+    let branch = cached_current_branch(path);
     let wname = if branch.is_empty() {
         folder_name.to_string()
     } else {
@@ -155,8 +255,8 @@ fn default_worktree(path: &Path, folder_name: &str) -> WorktreeNode {
         name: wname,
         path: path.to_string_lossy().to_string(),
         tabs: Vec::new(),
-        diff_stat: crate::warpui::git::diff_numstat(path),
-        dirty: crate::warpui::git::is_dirty(path),
+        diff_stat: cached_diff_numstat(path),
+        dirty: cached_is_dirty(path),
     }
 }
 
@@ -277,10 +377,7 @@ fn session_folders() -> Vec<OpenedFolder> {
                     }
                     let (diff_stat, dirty) = if !wpath.is_empty() {
                         let p = Path::new(&wpath);
-                        (
-                            crate::warpui::git::diff_numstat(p),
-                            crate::warpui::git::is_dirty(p),
-                        )
+                        (cached_diff_numstat(p), cached_is_dirty(p))
                     } else {
                         ((0, 0), false)
                     };

@@ -3458,6 +3458,17 @@ impl CraneShellView {
         };
         // Working-tree changes + upstream ahead/behind, always (the changes feed
         // BOTH the Changes tree and the Files-tab per-row status colours).
+        //
+        // TODO(threading, audit Rank 3): these two run `git status --porcelain`
+        // + `git rev-list @{u}...HEAD` synchronously on the UI thread on every
+        // focus/checkout/stage/tab-switch. On a large working tree that stalls
+        // the frame. OG routed the equivalent through its background job system
+        // (`refresh_active_git_status`) and only ever polled the result. Porting
+        // that here needs a warpui job/poll primitive with dedup-by-repo +
+        // cancel-on-supersede semantics (no warpui equivalent yet), so it is left
+        // synchronous for now to avoid destabilising the panel refresh — this is
+        // ONLY the active repo (one repo, not the whole tree), so it is bounded,
+        // unlike the RemoveProject / reload storm fixed above.
         self.changes = crate::warpui::git::changes(&root);
         self.ahead_behind = crate::warpui::git::ahead_behind(&root);
         // rel-path → status char, plus the set of directories that contain a
@@ -5424,7 +5435,10 @@ impl CraneShellView {
         const H: f32 = 26.0;
         let focused = self.focused == Some(id);
         let bg = if focused { theme::surface() } else { theme::topbar_bg() };
-        let fg = if focused { theme::text() } else { theme::text_muted() };
+        // Selected pane's heading is painted in the accent — the same colour that
+        // marks the active tab in the left panel — so the focused pane and its tab
+        // read as one selection.
+        let fg = if focused { theme::accent() } else { theme::text_muted() };
         let is_file_pane = self.files_pane == Some(id);
 
         // For a File pane the header IS the file tab strip (shell-driven, so
@@ -7528,12 +7542,23 @@ impl TypedActionView for CraneShellView {
                 // worktree_tabs, active_tab, selected, expanded_*) is keyed by a
                 // project's POSITION in `self.projects`. Removing a non-last (or
                 // the active) project shifts later projects' indices, so we must
-                // rekey those maps to the post-reload positions and tear down the
-                // vanished project's panes/PTYs. We match by PATH (robust to any
-                // reshuffle, not just a single shift).
+                // rekey those maps to the post-removal positions and tear down the
+                // vanished project's panes/PTYs. We match by PATH (robust to the
+                // single-index shift).
+                //
+                // IMPORTANT (perf / OG parity): removal is done IN PLACE via
+                // `Vec::remove`. We deliberately do NOT call `reload_projects()`
+                // here — that would re-shell `git status`/`git diff` for EVERY
+                // project + worktree + discovered child repo in the whole tree
+                // (the reported freeze). A single-project remove must run ZERO git
+                // subprocesses. `removed_project_paths` was already updated above
+                // so any *future* reload (e.g. a later Add Project) still excludes
+                // this path.
                 let old_paths: Vec<String> =
                     self.projects.iter().map(|p| p.path.clone()).collect();
-                self.reload_projects();
+                if *i < self.projects.len() {
+                    self.projects.remove(*i);
+                }
                 let new_index: HashMap<String, usize> = self
                     .projects
                     .iter()
@@ -7610,7 +7635,15 @@ impl TypedActionView for CraneShellView {
                         self.active_cwd = None;
                     }
                 }
-                self.refresh_panel();
+                // Rebuild the right panel ONLY when the active worktree changed.
+                // Removing a *non-active* project leaves the active repo's
+                // branch/changes/files untouched, so we skip the git shell-out
+                // entirely. When the active tab itself was torn down, active_cwd
+                // is None and refresh_panel clears the panel with ZERO git. Either
+                // way a remove runs no git subprocess.
+                if self.active_tab.is_none() {
+                    self.refresh_panel();
+                }
             }
             CraneShellAction::ShowProjectMenu { project_idx, x, y } => {
                 self.context_menu = Some(ProjectContextMenu {
@@ -7946,6 +7979,12 @@ impl TypedActionView for CraneShellView {
                     let dir = std::path::PathBuf::from(&p.path);
                     // Shell out `git init` — never libgit2, per project rules.
                     let _ = crate::warpui::git::init(&dir);
+                    // The path was cached as a loose (branch-less, clean) folder;
+                    // `git init` just changed that, so drop its cached git status
+                    // before the reload re-reads it — otherwise the TTL would
+                    // serve the pre-init values and the branch row would be blank
+                    // until it expires.
+                    crate::warpui::projects::invalidate_git_cache(&p.path);
                 }
                 // Reload so `is_loose` is recomputed and the CUBE icon / branch
                 // rows appear on the next render.
