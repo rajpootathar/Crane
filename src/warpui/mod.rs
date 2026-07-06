@@ -1,8 +1,8 @@
-//! warpui frontend for Crane — the GPU-rendered UI that reuses the rest of the
-//! `crane` crate's logic (`crate::git`, `crate::state`, `crate::format`, …) and
-//! replaces only the egui rendering layer. Launched from `main()` when the
-//! `CRANE_WARP` env var is set; egui remains the default until parity, then the
-//! egui path is removed.
+//! warpui frontend for Crane — the GPU-rendered UI and Crane's sole frontend.
+//! It reuses the rest of the `crane` crate's logic (`crate::git`,
+//! `crate::lsp`, `crate::theme`, `crate::format`, `crate::syntax`, …) and owns
+//! its own NSApplication / event loop. Launched unconditionally from `main()`;
+//! the legacy egui frontend has been removed.
 
 use std::borrow::Cow;
 

@@ -5,7 +5,7 @@
 //! - Main thread writes JSON-RPC messages via `self.stdin` (Mutex).
 //! - A background reader thread parses server → client messages and writes
 //!   into `Shared` (diagnostics, hover results, init state, notification
-//!   signals). It calls `ctx.request_repaint()` so the UI redraws.
+//!   signals). It invokes the `Wake` handle so the UI redraws.
 //! - Hover is fire-and-wait: the caller records its request id and then
 //!   polls `Shared.hover_results` up to a short timeout. Since each call
 //!   budgets ~800 ms and hovers are user-triggered, this is OK.
@@ -229,11 +229,11 @@ pub struct LspServer {
     next_id: AtomicI64,
     doc_versions: Mutex<HashMap<String, i32>>,
     _child: Mutex<Option<Child>>,
-    _ctx: egui::Context,
+    _wake: crate::lsp::Wake,
 }
 
 impl LspServer {
-    pub fn spawn(ctx: egui::Context, key: ServerKey, bin: &Path, cwd: Option<&Path>) -> Self {
+    pub fn spawn(wake: crate::lsp::Wake, key: ServerKey, bin: &Path, cwd: Option<&Path>) -> Self {
         let (_cmd_name, args) = key.command();
         // JS/MJS entrypoints (tsserver, pyright) need Node to launch.
         let needs_node = bin
@@ -310,7 +310,7 @@ impl LspServer {
 
         if let Some(stdout) = stdout {
             let shared2 = shared.clone();
-            let ctx2 = ctx.clone();
+            let wake2 = wake.clone();
             thread::spawn(move || {
                 let mut r = BufReader::new(stdout);
                 loop {
@@ -318,7 +318,7 @@ impl LspServer {
                         Ok(bytes) => {
                             if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                                 handle_message(&shared2, &v);
-                                ctx2.request_repaint();
+                                (wake2)();
                             }
                         }
                         Err(_) => {
@@ -341,7 +341,7 @@ impl LspServer {
             next_id: AtomicI64::new(1),
             doc_versions: Mutex::new(HashMap::new()),
             _child: Mutex::new(child_res.ok()),
-            _ctx: ctx,
+            _wake: wake,
         }
     }
 

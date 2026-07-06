@@ -52,7 +52,7 @@ const DISK_STAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// user's configured `syntax_theme`, else a sensible dark default. NOT the empty
 /// `fallback_theme()` (which paints near-black text that clashes with the UI).
 fn render_theme() -> &'static syntect::highlighting::Theme {
-    let all = &crate::views::file_view::themes().themes;
+    let all = &crate::syntax::themes().themes;
     let requested = crate::theme::current().syntax_theme.clone();
     all.get(&requested)
         .or_else(|| all.get("OneHalfDark"))
@@ -61,7 +61,7 @@ fn render_theme() -> &'static syntect::highlighting::Theme {
         .unwrap_or_else(|| {
             all.values()
                 .next()
-                .unwrap_or_else(|| crate::views::file_view::fallback_theme())
+                .unwrap_or_else(|| crate::syntax::fallback_theme())
         })
 }
 
@@ -70,7 +70,7 @@ fn render_theme() -> &'static syntect::highlighting::Theme {
 fn highlight(content: &str, path: &std::path::Path) -> RangeMap<CharOffset, ColorU> {
     use syntect::easy::HighlightLines;
     use syntect::util::LinesWithEndings;
-    let ss = crate::views::file_view::syntaxes();
+    let ss = crate::syntax::syntaxes();
     let syntax = path
         .extension()
         .and_then(|e| e.to_str())
@@ -708,7 +708,7 @@ impl WarpEditorView {
         // Old `save_tab` honored `prefs.trim_on_save`: strip trailing
         // whitespace before writing when the pref is set.
         if self.trim_on_save {
-            text = crate::views::file_util::trim_trailing_whitespace(&text);
+            text = crate::syntax::trim_trailing_whitespace(&text);
         }
         if std::fs::write(&self.path, &text).is_ok() {
             self.saved_text = text;
@@ -993,9 +993,9 @@ impl WarpEditorView {
         let text = self.buffer_text(ctx);
         let (start, end) = self.selection_char_range(ctx);
         let prefix =
-            crate::views::file_util::comment_prefix(&self.path.to_string_lossy());
+            crate::syntax::comment_prefix(&self.path.to_string_lossy());
         let mut modified = text.clone();
-        crate::views::file_util::toggle_line_comments(&mut modified, start, end, prefix);
+        crate::syntax::toggle_line_comments(&mut modified, start, end, prefix);
         let Some((s, old_end, replacement)) = minimal_char_diff(&text, &modified) else {
             return;
         };

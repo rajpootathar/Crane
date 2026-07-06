@@ -18,6 +18,12 @@ use std::sync::Arc;
 pub use downloader::{DownloadState, Downloader};
 pub use server::{Diagnostic, Location, ServerKey};
 
+/// Wake handle invoked from background threads (the server reader thread and
+/// the downloader) to nudge the frontend into repainting when async results
+/// land. The frontend supplies a closure (warpui hands in its `ui_wake`); the
+/// type is frontend-agnostic so `lsp` carries no GUI-framework dependency.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
 /// Per-language behavior toggles. Persisted in the session so users don't
 /// have to reconfigure on every launch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,7 +167,7 @@ impl LspManager {
 
     pub fn did_open(
         &mut self,
-        ctx: &egui::Context,
+        wake: &Wake,
         path: &Path,
         text: &str,
         configs: &LanguageConfigs,
@@ -175,13 +181,13 @@ impl LspManager {
         }
         self.files.write().insert(path.to_path_buf(), keys.clone());
         for key in keys {
-            self.open_on_server(ctx, key, path, text);
+            self.open_on_server(wake, key, path, text);
         }
     }
 
     fn open_on_server(
         &mut self,
-        ctx: &egui::Context,
+        wake: &Wake,
         key: ServerKey,
         path: &Path,
         text: &str,
@@ -210,7 +216,7 @@ impl LspManager {
         if let Some(bin) = resolved {
             let root = server::LspServer::detect_project_root(path);
             let server = Arc::new(server::LspServer::spawn(
-                ctx.clone(),
+                wake.clone(),
                 key,
                 &bin,
                 Some(&root),
@@ -237,10 +243,10 @@ impl LspManager {
             self.prompt_install = Some(key);
         }
 
-        self.try_spawn_pending(ctx, key);
+        self.try_spawn_pending(wake, key);
     }
 
-    fn try_spawn_pending(&mut self, ctx: &egui::Context, key: ServerKey) {
+    fn try_spawn_pending(&mut self, wake: &Wake, key: ServerKey) {
         if self.servers.contains_key(&key) {
             return;
         }
@@ -253,7 +259,7 @@ impl LspManager {
             .get(&key)
             .and_then(|q| q.first().map(|(p, _)| server::LspServer::detect_project_root(p)));
         let server = Arc::new(server::LspServer::spawn(
-            ctx.clone(),
+            wake.clone(),
             key,
             &bin,
             cwd.as_deref(),
@@ -270,7 +276,7 @@ impl LspManager {
     /// and to offer the install prompt when a spawn-from-PATH server dies
     /// (rust-analyzer crashes on incompatible workspaces, tsserver refuses
     /// bad installs, etc.).
-    pub fn tick(&mut self, ctx: &egui::Context) {
+    pub fn tick(&mut self, wake: &Wake) {
         // Early exit: nothing to do. Avoids scanning servers and hitting
         // locks every single frame when no state transition is possible.
         if self.pending_files.read().is_empty()
@@ -309,7 +315,7 @@ impl LspManager {
 
         let keys: Vec<ServerKey> = self.pending_files.read().keys().copied().collect();
         for key in keys {
-            self.try_spawn_pending(ctx, key);
+            self.try_spawn_pending(wake, key);
         }
         if self.prompt_install.is_none() {
             for (key, server) in &self.servers {
@@ -329,9 +335,9 @@ impl LspManager {
         }
     }
 
-    pub fn accept_install(&mut self, ctx: &egui::Context) {
+    pub fn accept_install(&mut self, wake: &Wake) {
         if let Some(key) = self.prompt_install.take() {
-            self.downloader.start_download(key, ctx.clone());
+            self.downloader.start_download(key, wake.clone());
         }
     }
 

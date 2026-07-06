@@ -363,11 +363,10 @@ pub struct CraneShellView {
     /// The language-server client. Diagnostics + goto-definition for the active
     /// editor. No-ops gracefully when no matching server is installed.
     lsp: crate::lsp::LspManager,
-    /// A standalone egui context handed to `LspManager` (its API takes one to
-    /// call `request_repaint` when async results land). warpui does NOT drive
-    /// this context's frame loop — repaints are driven by `_lsp_tick` instead —
-    /// so it is only a required-argument sink here.
-    lsp_ctx: egui::Context,
+    /// Wake handle handed to `LspManager` so its background threads can nudge
+    /// the UI to repaint when async results land. Shares the shell's `ui_wake`
+    /// closure, which feeds the `_ui_repaint` stream.
+    lsp_wake: crate::lsp::Wake,
     /// Per-language behavior toggles. Default set (matches the egui app's
     /// startup `LanguageConfigs::default()`); not yet surfaced in warpui
     /// Settings, so it never diverges from the per-server defaults.
@@ -903,7 +902,7 @@ impl CraneShellView {
             git_op: Arc::new(Mutex::new(crate::warpui::git::OpStatus::default())),
             git_wake,
             _git_repaint: git_repaint,
-            ui_wake,
+            ui_wake: ui_wake.clone(),
             _ui_repaint: ui_repaint,
             row_menu: None,
             pending_new_entry: None,
@@ -933,7 +932,7 @@ impl CraneShellView {
             worktree_poll_sig: HashMap::new(),
             _worktree_tick: worktree_tick,
             lsp: crate::lsp::LspManager::new(),
-            lsp_ctx: egui::Context::default(),
+            lsp_wake: ui_wake,
             lsp_configs: crate::lsp::LanguageConfigs::default(),
             lsp_versions: HashMap::new(),
             lsp_diag_sig: HashMap::new(),
@@ -1787,7 +1786,7 @@ impl CraneShellView {
                 .with_child(Self::spacer(14.0))
                 .with_child(
                     Flex::row()
-                        .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+                        .with_child(Expanded::new(1.0, ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish()).finish())
                         .with_child(cancel)
                         .with_child(Self::spacer(8.0))
                         .with_child(del)
@@ -2834,7 +2833,7 @@ impl CraneShellView {
             );
         }
         let buttons = Flex::row()
-            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+            .with_child(Expanded::new(1.0, ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish()).finish())
             .with_child(self.modal_button("Cancel", ModalBtn::Plain, CraneShellAction::CloseModal))
             .with_child(Self::spacer(8.0))
             .with_child(self.modal_button(
@@ -5112,7 +5111,7 @@ impl CraneShellView {
             .with_child(Self::spacer(80.0)) // macOS traffic-light inset
             .with_child(self.icon_button(icons::SIDEBAR, CraneShellAction::ToggleLeft))
             .with_child(crumb)
-            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+            .with_child(Expanded::new(1.0, ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish()).finish())
             .with_child(self.pill_button(
                 icons::TERMINAL_WINDOW,
                 "Terminal",
@@ -5658,7 +5657,7 @@ impl CraneShellView {
         if !self.lsp.is_tracked(&path) {
             let content = handle.read(ctx, |v, app| v.buffer_text(app));
             self.lsp
-                .did_open(&self.lsp_ctx, &path, &content, &self.lsp_configs);
+                .did_open(&self.lsp_wake, &path, &content, &self.lsp_configs);
             let v0 = handle.read(ctx, |v, app| v.buffer_version(app));
             self.lsp_versions.insert(path.clone(), v0);
         }
@@ -5744,14 +5743,14 @@ impl CraneShellView {
     /// results. Runs off the `_lsp_tick` timer stream (and is cheap / silent
     /// when nothing changed).
     fn poll_lsp(&mut self, ctx: &mut ViewContext<Self>) {
-        self.lsp.tick(&self.lsp_ctx);
+        self.lsp.tick(&self.lsp_wake);
         if let Some(path) = self.active_editor_path() {
             if let Some(h) = self.editor_views.get(&path).cloned() {
                 let (ver, text) =
                     h.read(ctx, |v, app| (v.buffer_version(app), v.buffer_text(app)));
                 if !self.lsp.is_tracked(&path) {
                     self.lsp
-                        .did_open(&self.lsp_ctx, &path, &text, &self.lsp_configs);
+                        .did_open(&self.lsp_wake, &path, &text, &self.lsp_configs);
                     self.lsp_versions.insert(path.clone(), ver);
                 } else if self.lsp_versions.get(&path) != Some(&ver) {
                     self.lsp.did_change(&path, &text);
@@ -5788,7 +5787,7 @@ impl CraneShellView {
                 let (ver, text) =
                     h.read(ctx, |v, app| (v.buffer_version(app), v.buffer_text(app)));
                 self.lsp
-                    .did_open(&self.lsp_ctx, &path, &text, &self.lsp_configs);
+                    .did_open(&self.lsp_wake, &path, &text, &self.lsp_configs);
                 self.lsp_versions.insert(path.clone(), ver);
             }
         }
@@ -5886,7 +5885,7 @@ impl CraneShellView {
                             .with_padding_top(6.0)
                             .finish(),
                         )
-                        .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+                        .with_child(Expanded::new(1.0, ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish()).finish())
                         .with_child(self.icon_button(icons::X, CraneShellAction::OpenGitLog))
                         .finish(),
                 )

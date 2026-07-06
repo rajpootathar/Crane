@@ -93,7 +93,7 @@ impl Downloader {
         }
     }
 
-    pub fn start_download(&self, key: ServerKey, ctx: egui::Context) {
+    pub fn start_download(&self, key: ServerKey, wake: crate::lsp::Wake) {
         {
             let mut g = self.states.lock();
             if matches!(
@@ -105,10 +105,10 @@ impl Downloader {
             g.insert(key, DownloadState::Downloading { progress_bytes: 0 });
         }
         let states = self.states.clone();
-        let ctx2 = ctx.clone();
+        let wake2 = wake.clone();
         thread::spawn(move || {
             let result = match key {
-                ServerKey::RustAnalyzer => download_rust_analyzer(&states, key, &ctx2),
+                ServerKey::RustAnalyzer => download_rust_analyzer(&states, key, &wake2),
                 ServerKey::TypeScript => install_npm_server(
                     key,
                     "typescript",
@@ -131,7 +131,7 @@ impl Downloader {
                     g.insert(key, DownloadState::Failed(e.to_string()));
                 }
             }
-            ctx2.request_repaint();
+            (wake2)();
         });
     }
 
@@ -208,7 +208,7 @@ fn which_on_path(bin: &str) -> Option<PathBuf> {
 fn download_rust_analyzer(
     states: &Arc<Mutex<HashMap<ServerKey, DownloadState>>>,
     key: ServerKey,
-    ctx: &egui::Context,
+    wake: &crate::lsp::Wake,
 ) -> std::io::Result<PathBuf> {
     let triple = target_triple()
         .ok_or_else(|| std::io::Error::other("unsupported target platform for auto-install"))?;
@@ -248,7 +248,7 @@ fn download_rust_analyzer(
                 progress_bytes: read_total,
             },
         );
-        ctx.request_repaint();
+        (wake)();
         let _ = total; // could be used for percentage
     }
     drop(gz_file);

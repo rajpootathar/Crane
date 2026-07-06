@@ -6,7 +6,6 @@
 //! - Every accessor clones the current theme from a parking_lot RwLock;
 //!   reads are cheap (essentially an atomic pointer load in release).
 
-use egui::Color32;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -22,11 +21,7 @@ impl Rgb {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
-    pub fn to_color32(self) -> Color32 {
-        Color32::from_rgb(self.r, self.g, self.b)
-    }
-    /// warpui equivalent of `to_color32`. Used by the warpui frontend during
-    /// the egui -> warpui migration; both coexist until egui is removed.
+    /// warpui colour token for this RGB triple (opaque).
     pub fn to_warp(self) -> warpui::color::ColorU {
         warpui::color::ColorU::new(self.r, self.g, self.b, 255)
     }
@@ -789,33 +784,6 @@ impl Theme {
             + 0.587 * self.bg.g as f32
             + 0.114 * self.bg.b as f32;
         lum < 128.0
-    }
-
-    /// Gutter / scrollbar colour for added lines (green family).
-    pub fn diff_added(&self) -> Color32 {
-        if self.is_dark() {
-            Color32::from_rgb(80, 180, 100)
-        } else {
-            Color32::from_rgb(30, 130, 55)
-        }
-    }
-
-    /// Gutter / scrollbar colour for modified lines (blue family).
-    pub fn diff_modified(&self) -> Color32 {
-        if self.is_dark() {
-            Color32::from_rgb(80, 140, 210)
-        } else {
-            Color32::from_rgb(28, 80, 170)
-        }
-    }
-
-    /// Gutter / scrollbar colour for deleted lines (red family).
-    pub fn diff_deleted(&self) -> Color32 {
-        if self.is_dark() {
-            Color32::from_rgb(200, 80, 80)
-        } else {
-            Color32::from_rgb(175, 30, 30)
-        }
     }
 }
 
