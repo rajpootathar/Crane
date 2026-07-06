@@ -83,10 +83,15 @@ pub struct WarpDiffView {
     font: FamilyId,
     /// Display title (the diffed file's name) for the shell-drawn pane header.
     title: String,
-    /// Precomputed diff rows (computed once in `new`).
+    /// Diff rows. Empty until the off-thread `head_content` + read + `TextDiff`
+    /// compute lands (see `new`), then filled by the `ctx.spawn` callback.
     rows: Vec<Row>,
     /// First visible row (manual scroll offset, in rows).
     scroll: usize,
+    /// True while the async diff compute is in flight — render shows a
+    /// "Computing diff…" placeholder instead of "No differences" so an empty
+    /// pane isn't mistaken for a clean file mid-load.
+    loading: bool,
 }
 
 impl WarpDiffView {
@@ -123,23 +128,38 @@ impl WarpDiffView {
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
 
-        let old_text = match &repo_root {
-            Some(root) => crate::git::head_content(root, &rel),
-            None => String::new(),
-        };
-        let new_text = std::fs::read_to_string(&abs).unwrap_or_default();
-
         let title = abs
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
-        let rows = compute_rows(&old_text, &new_text);
+        // Compute the diff OFF the UI thread: `git show HEAD:<rel>` (subprocess),
+        // the working-copy read, and the whole-file `similar::TextDiff` all run in
+        // the spawned future — a large/changed file would otherwise stall the frame
+        // that opens the pane. The pane paints immediately with a "Computing diff…"
+        // placeholder; the callback fills `rows` and notifies. Read-only view, so
+        // there is nothing to guard beyond the view still being alive.
+        let repo_root_fut = repo_root.clone();
+        let fut = async move {
+            let old_text = match &repo_root_fut {
+                Some(root) => crate::git::head_content(root, &rel),
+                None => String::new(),
+            };
+            let new_text = std::fs::read_to_string(&abs).unwrap_or_default();
+            compute_rows(&old_text, &new_text)
+        };
+        ctx.spawn(fut, |this, rows, vctx| {
+            this.rows = rows;
+            this.loading = false;
+            vctx.notify();
+        });
+
         Self {
             font,
             title,
-            rows,
+            rows: Vec::new(),
             scroll: 0,
+            loading: true,
         }
     }
 
@@ -235,9 +255,10 @@ impl View for WarpDiffView {
     fn render(&self, _app: &AppContext) -> Box<dyn Element> {
         let mut body = Flex::column();
         if self.rows.is_empty() {
+            let msg = if self.loading { "Computing diff…" } else { "No differences" };
             body = body.with_child(
                 Container::new(
-                    Text::new("No differences".to_string(), self.font, 12.0)
+                    Text::new(msg.to_string(), self.font, 12.0)
                         .with_color(theme::text_muted())
                         .finish(),
                 )

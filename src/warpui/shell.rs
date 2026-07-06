@@ -356,6 +356,16 @@ pub struct CraneShellView {
     /// Per-project cache of the last `git worktree list` signature, used by the
     /// background worktree-poll tick to skip re-computing when nothing changed.
     worktree_poll_sig: HashMap<String, String>,
+    /// Per-scope generation counter for keyed async git scans (the reusable
+    /// dedup / cancel-on-supersede primitive backing `spawn_git_scan`). A scope
+    /// is an arbitrary string key — `"tree"` for a whole-tree sidebar backfill,
+    /// `"add:<path>"` for a freshly added project, `"panel:<repo>"` for the
+    /// active-repo Changes/status refresh. Each spawn bumps its scope's counter
+    /// and captures the new value; when the background result lands, the
+    /// callback drops it if a newer generation for the same scope has since
+    /// superseded it. This gives OG's job-dedup / cancel semantics without a
+    /// condvar / priority thread pool.
+    git_scan_gen: HashMap<String, u64>,
     /// Keeps the worktree-detection poll stream alive for the view's lifetime.
     _worktree_tick: warpui::r#async::SpawnedLocalStream,
 
@@ -451,6 +461,16 @@ pub struct SwitchBranchState {
     pub locals: std::collections::HashSet<String>,
     /// Highlighted row (Enter checks it out).
     pub selected: usize,
+    /// True while the off-thread `git branch` / `git branch -r` listing is in
+    /// flight. Enter is a no-op while loading so a keystroke before the list
+    /// lands can't fall through the empty `filtered` list into an accidental
+    /// CreateBranchCheckout (which would create a branch the user meant to check
+    /// out).
+    pub loading: bool,
+    /// Generation stamped when this modal opened. The async listing callback
+    /// drops its result unless this still matches (a close+reopen bumps it),
+    /// so a stale scan can't repopulate a newer modal.
+    pub load_gen: u64,
 }
 
 /// State for the "New Workspace" modal — create a `git worktree` for a branch.
@@ -558,7 +578,11 @@ impl CraneShellView {
             .as_ref()
             .map(|s| s.tab_tints.iter().cloned().collect())
             .unwrap_or_default();
-        let projects = crate::warpui::projects::load_projects_extended(
+        // SHALLOW load: build the full tree STRUCTURE with zero `git` subprocess
+        // so the first frame paints immediately even with many worktrees. Branch
+        // labels + diff/dirty badges are filled in a moment later by the async
+        // scan kicked off at the end of `new` (see `spawn_git_scan` below).
+        let projects = crate::warpui::projects::load_projects_shallow(
             &init_added, &init_removed, &init_tints,
         );
         // Default the terminal to the first project's first worktree folder.
@@ -792,7 +816,7 @@ impl CraneShellView {
         let git_repaint = ctx.spawn_stream_local(
             git_rx,
             |this: &mut Self, _item, vctx| {
-                this.refresh_panel();
+                this.refresh_panel(vctx);
                 this.invalidate_editor_diffs(&*vctx);
                 vctx.notify();
             },
@@ -840,7 +864,7 @@ impl CraneShellView {
             },
             |_this, _vctx| {},
         );
-        Self {
+        let mut view = Self {
             ui_font,
             icon_font,
             panes,
@@ -863,10 +887,10 @@ impl CraneShellView {
             next_tab_id,
             active_tab,
             projects,
-            branch: active_cwd
-                .as_deref()
-                .map(crate::warpui::git::current_branch)
-                .unwrap_or_default(),
+            // Filled by the initial async git scan (kicked off at the end of
+            // `new`) — never shelled out synchronously here, so startup paints
+            // without waiting on `git`.
+            branch: String::new(),
             commit_msg: String::new(),
             commit_focused: false,
             show_git_log: false,
@@ -930,6 +954,7 @@ impl CraneShellView {
             switch_branch_scroll: ClippedScrollStateHandle::new(),
             new_workspace: None,
             worktree_poll_sig: HashMap::new(),
+            git_scan_gen: HashMap::new(),
             _worktree_tick: worktree_tick,
             lsp: crate::lsp::LspManager::new(),
             lsp_wake: ui_wake,
@@ -938,7 +963,13 @@ impl CraneShellView {
             lsp_diag_sig: HashMap::new(),
             pending_gotos: Vec::new(),
             _lsp_tick: lsp_tick,
-        }
+        };
+        // Backfill branch labels + diff/dirty badges for the whole (shallow-
+        // loaded) tree off the UI thread. The sidebar is already visible; badges
+        // stream in as this returns. ZERO synchronous `git` ran on this path.
+        let scan_paths = crate::warpui::projects::scan_paths(&view.projects);
+        view.spawn_git_scan(ctx, "tree".to_string(), scan_paths);
+        view
     }
 
     /// Quit guard for the OS terminate / close-window hooks (wired in
@@ -3118,20 +3149,39 @@ impl CraneShellView {
     }
 
     /// Open the "Switch Branch" modal for the active workspace.
-    fn open_switch_branch(&mut self) {
+    ///
+    /// The branch listing (`git branch` + `git branch -r`) runs OFF the UI thread
+    /// so opening the modal never stalls. The modal appears immediately in a
+    /// loading state (empty list); the async result fills `all`/`locals` and
+    /// clears `loading` when it lands, guarded by `load_gen` so a close+reopen
+    /// drops the stale scan.
+    fn open_switch_branch(&mut self, ctx: &mut ViewContext<Self>) {
         let Some(root) = self.active_cwd.clone() else {
             return;
         };
         let pi = self.active_tab.map(|(p, _, _)| p).unwrap_or(0);
-        let (all, locals) = Self::branch_candidates(&root);
+        let generation = self.bump_scan_gen("switchbranch");
         self.switch_branch = Some(SwitchBranchState {
             query: String::new(),
             project_idx: pi,
-            all,
-            locals,
+            all: Vec::new(),
+            locals: HashSet::new(),
             selected: 0,
+            loading: true,
+            load_gen: generation,
         });
         self.modal = Some(Modal::SwitchBranch);
+        let fut = async move { Self::branch_candidates(&root) };
+        ctx.spawn(fut, move |this, (all, locals), vctx| {
+            if let Some(st) = this.switch_branch.as_mut() {
+                if st.load_gen == generation {
+                    st.all = all;
+                    st.locals = locals;
+                    st.loading = false;
+                    vctx.notify();
+                }
+            }
+        });
     }
 
     /// Route a keystroke into the Switch-Branch search field. Up/Down move the
@@ -3165,6 +3215,13 @@ impl CraneShellView {
                 }
             }
             "enter" | "return" | "numpadenter" => {
+                // Ignore Enter until the branch list has loaded — otherwise the
+                // empty `filtered` list would route a typed query straight to
+                // CreateBranchCheckout (creating a branch the user meant to check
+                // out from the not-yet-loaded list).
+                if self.switch_branch.as_ref().is_some_and(|st| st.loading) {
+                    return;
+                }
                 let (query, sel) = self
                     .switch_branch
                     .as_ref()
@@ -3243,6 +3300,17 @@ impl CraneShellView {
         };
         let main = PathBuf::from(&project.path);
         let path = Self::default_worktree_path(&project.name, &branch);
+        // TODO(threading, audit new-workspace #3): `add_worktree` (`git worktree
+        // add`) is a MUTATING op that can take multiple seconds on a large repo,
+        // so it blocks the UI here. Deferred deliberately, not overlooked: a naive
+        // `ctx.spawn` would be the fire-and-forget "non-blocking pill" UX the user
+        // explicitly rejected (see memory `feedback_blocking_modal_for_heavy_ops`).
+        // The correct fix is a JetBrains-style blocking progress modal (disable
+        // input, show "Creating worktree…", move the in-memory insert + `add_tab`
+        // into the completion callback, keep the modal open on error) — a modal
+        // state-machine change out of scope for this threading pass. Threading it
+        // without that spinner would look frozen and let a second Enter fire a
+        // duplicate `git worktree add`.
         // `git worktree add` (shell-out). Never libgit2, per project rules.
         if let Err(e) = crate::warpui::git::add_worktree(&main, &branch, &path, create_branch) {
             if let Some(st) = self.new_workspace.as_mut() {
@@ -3413,8 +3481,97 @@ impl CraneShellView {
 
     /// Reload the project list from session.json + the current overlay
     /// (added / removed / tints). Call after mutating any of those three fields.
+    // ── Keyed async git-scan primitive ───────────────────────────────────────
+    // The reusable dedup / cancel-on-supersede building block. `spawn_git_scan`
+    // bumps a per-scope generation, runs the (branch + diff + dirty) shell-outs
+    // for a set of paths OFF the UI thread, and on the main-thread callback drops
+    // the result if a newer scan for the same scope has since superseded it —
+    // else applies the git fields into the matching `self.projects` nodes by
+    // path. This is warpui-native (built on `ctx.spawn`), no thread pool needed.
+
+    /// Bump `scope`'s generation and return the new value. The in-flight scan
+    /// captures this; a later scan for the same scope makes it stale.
+    fn bump_scan_gen(&mut self, scope: &str) -> u64 {
+        let g = self.git_scan_gen.entry(scope.to_string()).or_insert(0);
+        *g += 1;
+        *g
+    }
+
+    /// Run the git scan for `paths` off-thread under `scope`, applying the
+    /// results back into `self.projects` by path when they land (unless a newer
+    /// scan for the same scope superseded this one). No-op for an empty set.
+    fn spawn_git_scan(&mut self, ctx: &mut ViewContext<Self>, scope: String, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let generation = self.bump_scan_gen(&scope);
+        let fut = async move {
+            paths
+                .into_iter()
+                .map(|p| {
+                    let info = crate::warpui::projects::scan_repo_git(&p);
+                    (p, info)
+                })
+                .collect::<Vec<(PathBuf, crate::warpui::projects::RepoGitInfo)>>()
+        };
+        ctx.spawn(fut, move |this, results, vctx| {
+            this.apply_git_scan(&scope, generation, results, vctx);
+        });
+    }
+
+    /// Apply an async git-scan result. Drops it if `scope`'s generation moved on
+    /// (a newer scan superseded this one). Otherwise fills each scanned path's
+    /// branch label (unless the user renamed the row) + diff/dirty badge into the
+    /// matching worktree node, and keeps the status-bar `self.branch` in sync when
+    /// a scanned path is the active repo.
+    fn apply_git_scan(
+        &mut self,
+        scope: &str,
+        generation: u64,
+        results: Vec<(PathBuf, crate::warpui::projects::RepoGitInfo)>,
+        vctx: &mut ViewContext<Self>,
+    ) {
+        if self.git_scan_gen.get(scope).copied() != Some(generation) {
+            return; // superseded — a newer scan for this scope is in flight.
+        }
+        for (path, info) in results {
+            let path_str = path.to_string_lossy().to_string();
+            for p in self.projects.iter_mut() {
+                for w in p.worktrees.iter_mut() {
+                    if w.path == path_str {
+                        // Fill the branch label only when git returned one AND the
+                        // user hasn't pinned a custom name — else keep the shallow
+                        // folder-name fallback / rename.
+                        if !info.branch.is_empty() && !self.worktree_names.contains_key(&w.path) {
+                            w.name = info.branch.clone();
+                        }
+                        w.diff_stat = info.diff_stat;
+                        w.dirty = info.dirty;
+                    }
+                }
+            }
+            if !info.branch.is_empty()
+                && self.active_cwd.as_deref() == Some(path.as_path())
+            {
+                self.branch = info.branch.clone();
+            }
+        }
+        vctx.notify();
+    }
+
+    /// Re-scan git fields for the whole current tree under the `"tree"` scope.
+    /// Called after a structural reload (which resets all badges to shallow).
+    fn rescan_all_git(&mut self, ctx: &mut ViewContext<Self>) {
+        let paths = crate::warpui::projects::scan_paths(&self.projects);
+        self.spawn_git_scan(ctx, "tree".to_string(), paths);
+    }
+
+    /// Structural reload of the project tree (SHALLOW — zero `git` on the UI
+    /// thread). Rebuilds names/paths/worktrees/grouping only; branch labels +
+    /// diff/dirty badges reset to their shallow defaults. Callers that want the
+    /// badges back must follow with `rescan_all_git`.
     fn reload_projects(&mut self) {
-        self.projects = crate::warpui::projects::load_projects_extended(
+        self.projects = crate::warpui::projects::load_projects_shallow(
             &self.added_projects,
             &self.removed_project_paths,
             &self.project_tints,
@@ -3442,45 +3599,74 @@ impl CraneShellView {
         }
     }
 
-    fn refresh_panel(&mut self) {
-        let root = self.active_cwd.clone();
-        self.branch = root
-            .as_deref()
-            .map(crate::warpui::git::current_branch)
-            .unwrap_or_default();
-        let Some(root) = root else {
+    /// Refresh the Right Panel (Changes + Files tree + branch/ahead-behind) for
+    /// the active worktree.
+    ///
+    /// The heavy git — `git rev-parse` (branch), `git status --porcelain`
+    /// (changes) and `git rev-list @{u}...HEAD` (ahead/behind) — runs OFF the UI
+    /// thread via `ctx.spawn`, keyed by the repo path so a rapid focus switch to
+    /// another repo drops this stale result (the `"panel:<repo>"` scope +
+    /// generation). The cheap synchronous part — the mtime-cached Files-tab FS
+    /// walk — runs immediately using the git status we already have, then the
+    /// async callback recolours it once fresh changes land. This is the OG
+    /// `refresh_active_git_status` background-job pattern, warpui-native.
+    fn refresh_panel(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(root) = self.active_cwd.clone() else {
             self.file_rows.clear();
             self.changes.clear();
             self.file_status.clear();
             self.dirty_dirs.clear();
             self.ahead_behind = None;
+            self.branch.clear();
             return;
         };
-        // Working-tree changes + upstream ahead/behind, always (the changes feed
-        // BOTH the Changes tree and the Files-tab per-row status colours).
-        //
-        // TODO(threading, audit Rank 3): these two run `git status --porcelain`
-        // + `git rev-list @{u}...HEAD` synchronously on the UI thread on every
-        // focus/checkout/stage/tab-switch. On a large working tree that stalls
-        // the frame. OG routed the equivalent through its background job system
-        // (`refresh_active_git_status`) and only ever polled the result. Porting
-        // that here needs a warpui job/poll primitive with dedup-by-repo +
-        // cancel-on-supersede semantics (no warpui equivalent yet), so it is left
-        // synchronous for now to avoid destabilising the panel refresh — this is
-        // ONLY the active repo (one repo, not the whole tree), so it is bounded,
-        // unlike the RemoveProject / reload storm fixed above.
-        self.changes = crate::warpui::git::changes(&root);
-        self.ahead_behind = crate::warpui::git::ahead_behind(&root);
-        // rel-path → status char, plus the set of directories that contain a
-        // changed descendant (for folder-row tinting). Port of old egui
-        // `git_status_map` in explorer.rs.
+        // Rebuild the Files-tab FS tree NOW (cheap: mtime-cached walk, zero git),
+        // coloured from whatever change set we currently hold. When the async git
+        // result lands it recolours via `apply_panel_git`. This keeps the tree on
+        // screen with no flicker while the git shell-outs run.
+        if self.files_tab {
+            self.rebuild_file_rows(&root);
+        }
+        // Fetch branch + changes + ahead/behind off-thread, keyed by repo path.
+        let scope = format!("panel:{}", root.to_string_lossy());
+        let generation = self.bump_scan_gen(&scope);
+        let root_for_fut = root.clone();
+        let fut = async move {
+            let branch = crate::warpui::git::current_branch(&root_for_fut);
+            let changes = crate::warpui::git::changes(&root_for_fut);
+            let ahead_behind = crate::warpui::git::ahead_behind(&root_for_fut);
+            (branch, changes, ahead_behind)
+        };
+        ctx.spawn(fut, move |this, (branch, changes, ahead_behind), vctx| {
+            // Drop if a newer panel refresh (this repo or a switch to another)
+            // superseded us, or the active repo changed under us.
+            if this.git_scan_gen.get(&scope).copied() != Some(generation) {
+                return;
+            }
+            if this.active_cwd.as_deref() != Some(root.as_path()) {
+                return;
+            }
+            this.branch = branch;
+            this.changes = changes;
+            this.ahead_behind = ahead_behind;
+            this.rebuild_file_status();
+            if this.files_tab {
+                this.rebuild_file_rows(&root);
+            }
+            vctx.notify();
+        });
+    }
+
+    /// Rebuild `file_status` (rel-path → status char) + `dirty_dirs` (dirs with a
+    /// changed descendant) from the current `self.changes`. Pure CPU — no git.
+    /// Port of old egui `git_status_map` in explorer.rs.
+    fn rebuild_file_status(&mut self) {
         self.file_status.clear();
         self.dirty_dirs.clear();
         for c in &self.changes {
             let rel = c.path.trim_end_matches('/').to_string();
             let ch = c.status.chars().next().unwrap_or(' ');
             self.file_status.insert(rel.clone(), ch);
-            // Mark every ancestor directory dirty.
             let mut cur = std::path::Path::new(&rel);
             while let Some(parent) = cur.parent() {
                 if parent.as_os_str().is_empty() {
@@ -3490,25 +3676,28 @@ impl CraneShellView {
                 cur = parent;
             }
         }
-        if self.files_tab {
-            let skip = self.nested_repo_skip_set(&root);
-            let mut rows = file_tree::build_rows_with_skip(&root, &self.expanded_dirs, &skip);
-            for r in &mut rows {
-                let rel = r
-                    .path
-                    .strip_prefix(&root)
-                    .ok()
-                    .map(|p| p.to_string_lossy().to_string());
-                if let Some(rel) = rel {
-                    if r.is_dir {
-                        r.git_status = if self.dirty_dirs.contains(&rel) { Some('*') } else { None };
-                    } else {
-                        r.git_status = self.file_status.get(&rel).copied();
-                    }
+    }
+
+    /// Rebuild the Files-tab tree rows for `root` (mtime-cached FS walk, no git)
+    /// and colour each row from the current `file_status` / `dirty_dirs`.
+    fn rebuild_file_rows(&mut self, root: &std::path::Path) {
+        let skip = self.nested_repo_skip_set(root);
+        let mut rows = file_tree::build_rows_with_skip(root, &self.expanded_dirs, &skip);
+        for r in &mut rows {
+            let rel = r
+                .path
+                .strip_prefix(root)
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
+            if let Some(rel) = rel {
+                if r.is_dir {
+                    r.git_status = if self.dirty_dirs.contains(&rel) { Some('*') } else { None };
+                } else {
+                    r.git_status = self.file_status.get(&rel).copied();
                 }
             }
-            self.file_rows = rows;
         }
+        self.file_rows = rows;
     }
 
     /// Directories under `root` that are surfaced as their own top-level
@@ -6083,9 +6272,9 @@ impl CraneShellView {
 
     /// Apply a keystroke to the pending new-file/new-folder editor. Enter
     /// commits, Escape cancels, Backspace deletes, printable chars append.
-    fn edit_new_entry(&mut self, ks: &warpui::keymap::Keystroke) {
+    fn edit_new_entry(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
         match ks.key.as_str() {
-            "enter" | "return" | "numpadenter" => self.commit_pending_entry(),
+            "enter" | "return" | "numpadenter" => self.commit_pending_entry(ctx),
             "escape" => self.pending_new_entry = None,
             "backspace" => {
                 if let Some(p) = self.pending_new_entry.as_mut() {
@@ -6104,7 +6293,7 @@ impl CraneShellView {
     /// Create the pending new file/folder on disk; on success refresh + clear,
     /// on failure keep the row open with an inline error (port of old
     /// `try_commit_pending`).
-    fn commit_pending_entry(&mut self) {
+    fn commit_pending_entry(&mut self, ctx: &mut ViewContext<Self>) {
         let Some(p) = self.pending_new_entry.as_ref() else { return };
         let name = p.name.trim().to_string();
         if name.is_empty() {
@@ -6135,7 +6324,7 @@ impl CraneShellView {
             Ok(()) => {
                 self.expanded_dirs.insert(parent);
                 self.pending_new_entry = None;
-                self.refresh_panel();
+                self.refresh_panel(ctx);
             }
             Err(e) => {
                 if let Some(p) = self.pending_new_entry.as_mut() {
@@ -6206,7 +6395,7 @@ impl CraneShellView {
         self.active_cwd = Some(path);
         self.expanded_projects.insert(pi);
         self.expanded_worktrees.insert((pi, wi));
-        self.refresh_panel();
+        self.refresh_panel(ctx);
     }
 
     /// Open (expand + activate) project `pi`: focus its first worktree's first
@@ -6238,7 +6427,7 @@ impl CraneShellView {
                 self.focused = Some(node.first_leaf());
             }
             self.active_tab = Some(key);
-            self.refresh_panel();
+            self.refresh_panel(ctx);
         } else {
             // No tabs yet → create one (also activates + spawns a terminal).
             self.add_tab(pi, 0, ctx);
@@ -6942,7 +7131,7 @@ impl TypedActionView for CraneShellView {
                     self.focused = Some(node.first_leaf());
                 }
                 self.active_tab = Some(*sel);
-                self.refresh_panel();
+                self.refresh_panel(ctx);
             }
             CraneShellAction::SplitFocused(dir) => self.split_focused(*dir, ctx),
             // TODO(parity): Cmd+W should close the active File Tab first when a
@@ -7010,7 +7199,7 @@ impl TypedActionView for CraneShellView {
                 if self.renaming.is_some() {
                     self.edit_rename(ks);
                 } else if self.pending_new_entry.is_some() {
-                    self.edit_new_entry(ks);
+                    self.edit_new_entry(ks, ctx);
                 } else if self.commit_focused {
                     self.edit_commit(ks);
                 } else if let Some(id) = self.active_input_pane() {
@@ -7203,7 +7392,7 @@ impl TypedActionView for CraneShellView {
                             break;
                         }
                     }
-                    self.refresh_panel();
+                    self.refresh_panel(ctx);
                     self.invalidate_editor_diffs(&*ctx);
                 }
             }
@@ -7216,7 +7405,7 @@ impl TypedActionView for CraneShellView {
                             break;
                         }
                     }
-                    self.refresh_panel();
+                    self.refresh_panel(ctx);
                     self.invalidate_editor_diffs(&*ctx);
                 }
             }
@@ -7273,7 +7462,7 @@ impl TypedActionView for CraneShellView {
                     name: String::new(),
                     error: None,
                 });
-                self.refresh_panel();
+                self.refresh_panel(ctx);
             }
             CraneShellAction::RequestDelete(path) => {
                 self.row_menu = None;
@@ -7289,7 +7478,7 @@ impl TypedActionView for CraneShellView {
                     if self.selected_file.as_deref() == Some(path.as_path()) {
                         self.selected_file = None;
                     }
-                    self.refresh_panel();
+                    self.refresh_panel(ctx);
                 }
             }
             CraneShellAction::CancelDelete => {
@@ -7297,24 +7486,24 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::ShowBranchPicker { x, y } => {
                 if let Some(root) = self.active_cwd.clone() {
-                    // Locals first, then remotes with the `<remote>/` prefix
-                    // stripped and de-duplicated against the locals. Checking out
-                    // the bare short name lets `git checkout <name>` DWIM to a
-                    // tracking branch instead of landing on a detached HEAD.
-                    let locals = crate::warpui::git::list_local_branches(&root);
-                    let mut seen: HashSet<String> = locals.iter().cloned().collect();
-                    let mut list = locals;
-                    for r in crate::warpui::git::list_remote_branches(&root) {
-                        let short = r.splitn(2, '/').nth(1).unwrap_or(r.as_str()).to_string();
-                        if short.is_empty() {
-                            continue;
-                        }
-                        if seen.insert(short.clone()) {
-                            list.push(short);
-                        }
-                    }
-                    self.branch_list = list;
+                    // Open the popover immediately and fill the branch list OFF the
+                    // UI thread (`git branch` + `git branch -r` dedup runs in
+                    // `branch_candidates`). The overlay renders "(no branches)"
+                    // until the async list lands, then repaints. Read-only, so the
+                    // only guard needed is dropping a stale scan when a newer
+                    // picker opened (generation) or the picker closed.
+                    self.branch_list.clear();
                     self.branch_picker = Some((*x, *y));
+                    let generation = self.bump_scan_gen("branchpicker");
+                    let fut = async move { Self::branch_candidates(&root).0 };
+                    ctx.spawn(fut, move |this, list, vctx| {
+                        if this.git_scan_gen.get("branchpicker").copied() == Some(generation)
+                            && this.branch_picker.is_some()
+                        {
+                            this.branch_list = list;
+                            vctx.notify();
+                        }
+                    });
                 }
             }
             CraneShellAction::CheckoutBranch(branch) => {
@@ -7323,7 +7512,7 @@ impl TypedActionView for CraneShellView {
                     match crate::warpui::git::checkout_branch(&root, branch) {
                         Ok(()) => {
                             self.sync_worktree_branch_label(&root);
-                            self.refresh_panel();
+                            self.refresh_panel(ctx);
                             self.invalidate_editor_diffs(&*ctx);
                         }
                         Err(e) => self.commit_error = Some(e),
@@ -7442,13 +7631,13 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::SetTab { files } => {
                 self.files_tab = *files;
-                self.refresh_panel();
+                self.refresh_panel(ctx);
             }
             CraneShellAction::ToggleDir(p) => {
                 if !self.expanded_dirs.remove(p) {
                     self.expanded_dirs.insert(p.clone());
                 }
-                self.refresh_panel();
+                self.refresh_panel(ctx);
             }
             CraneShellAction::SelectFile(p) => {
                 self.selected_file = Some(p.clone());
@@ -7491,14 +7680,34 @@ impl TypedActionView for CraneShellView {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| path_str.clone());
-                        if !this.projects.iter().any(|p| p.path == path_str) {
-                            this.added_projects.push(crate::warpui::persist::AddedProject {
+                        if !this.projects.iter().any(|p| p.path == path_str)
+                            && !this.added_projects.iter().any(|a| a.path == path_str)
+                        {
+                            let ap = crate::warpui::persist::AddedProject {
                                 name,
                                 path: path_str.clone(),
-                            });
+                            };
+                            this.added_projects.push(ap.clone());
                             // Re-add in case the user had previously removed it.
                             this.removed_project_paths.retain(|r| r != &path_str);
-                            this.reload_projects();
+                            // Shallow-expand ONLY the picked folder and APPEND it —
+                            // no whole-tree reload and ZERO synchronous `git` on the
+                            // UI thread. Appending (vs a full rebuild) keeps every
+                            // existing project's (pi, *)-keyed state + already-filled
+                            // badges intact. The new project appears + is usable
+                            // instantly; its branch/diff/dirty fill in via the scan
+                            // below.
+                            let start = this.projects.len();
+                            let new_nodes = crate::warpui::projects::load_one_shallow(
+                                &ap,
+                                &this.removed_project_paths,
+                                &this.project_tints,
+                            );
+                            this.projects.extend(new_nodes);
+                            let new_paths = crate::warpui::projects::scan_paths(
+                                &this.projects[start..],
+                            );
+                            this.spawn_git_scan(vctx, format!("add:{path_str}"), new_paths);
                             this.save_state(&*vctx);
                         }
                         // Open (expand + activate) the picked project so it becomes
@@ -7642,7 +7851,7 @@ impl TypedActionView for CraneShellView {
                 // is None and refresh_panel clears the panel with ZERO git. Either
                 // way a remove runs no git subprocess.
                 if self.active_tab.is_none() {
-                    self.refresh_panel();
+                    self.refresh_panel(ctx);
                 }
             }
             CraneShellAction::ShowProjectMenu { project_idx, x, y } => {
@@ -7896,7 +8105,7 @@ impl TypedActionView for CraneShellView {
                 self.worktree_names.remove(&wt_path);
                 self.worktree_tints.remove(&wt_path);
                 self.tab_tints.retain(|(pt, _), _| pt != &wt_path);
-                self.refresh_panel();
+                self.refresh_panel(ctx);
             }
             CraneShellAction::SetWorktreeTint { pi, wi, tint } => {
                 self.worktree_menu = None;
@@ -7986,9 +8195,11 @@ impl TypedActionView for CraneShellView {
                     // until it expires.
                     crate::warpui::projects::invalidate_git_cache(&p.path);
                 }
-                // Reload so `is_loose` is recomputed and the CUBE icon / branch
-                // rows appear on the next render.
+                // Reload (SHALLOW — zero git on the UI thread) so `is_loose` is
+                // recomputed and the CUBE icon / branch rows appear, then refill
+                // branch/diff/dirty badges for the whole tree off-thread.
                 self.reload_projects();
+                self.rescan_all_git(ctx);
             }
             CraneShellAction::CloseModal => {
                 self.modal = None;
@@ -8060,7 +8271,7 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::OpenSwitchBranch => {
-                self.open_switch_branch();
+                self.open_switch_branch(ctx);
             }
             CraneShellAction::SwitchBranchKey(ks) => {
                 self.edit_switch_branch(ks, ctx);
@@ -8074,7 +8285,7 @@ impl TypedActionView for CraneShellView {
                         match crate::warpui::git::create_branch(&root, &name, true) {
                             Ok(()) => {
                                 self.sync_worktree_branch_label(&root);
-                                self.refresh_panel();
+                                self.refresh_panel(ctx);
                                 self.invalidate_editor_diffs(&*ctx);
                             }
                             Err(e) => self.commit_error = Some(e),

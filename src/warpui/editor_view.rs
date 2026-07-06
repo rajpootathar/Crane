@@ -2407,6 +2407,20 @@ impl EditorView for WarpEditorView {
         // (version bumps) or the user switches syntax themes. Computing once in
         // `new()` and returning it forever smeared colors after the first edit
         // (every range drifted by the edit delta) and went stale on theme change.
+        // TODO(threading, audit editor H1): this whole-file `highlight()` runs
+        // synchronously on the PAINT thread every time the buffer version bumps
+        // (i.e. per keystroke) — the single worst stall in the editor domain on a
+        // large file. Deferred deliberately, not overlooked: `text_decorations`
+        // takes `&self` + `&AppContext` and must return a `TextDecoration`
+        // synchronously — it has no `ViewContext` to `ctx.spawn` from, and the
+        // color map is keyed by `BufferVersion`, so an off-thread result applied
+        // to a newer buffer would smear every range (exactly the bug the comment
+        // below warns about). A safe async version needs the highlight kicked off
+        // from the editor's own edit/update path into a shared last-known map that
+        // this reads — an editor render-path refactor out of scope for this pass,
+        // and explicitly fenced off ("do not destabilize the editor"). Cheap fix
+        // available meanwhile: re-highlight only the edited line range instead of
+        // the whole file.
         let theme_name = crate::theme::current().syntax_theme.clone();
         let map = {
             let mut cache = self.colors.borrow_mut();
