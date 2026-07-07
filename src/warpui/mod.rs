@@ -22,6 +22,8 @@ pub mod file_tree;
 pub mod formatter;
 pub mod fontsize;
 pub mod git;
+pub mod git_log;
+pub mod git_log_element;
 pub mod markdown_view;
 pub mod grid_element;
 pub mod gutter_element;

@@ -126,33 +126,6 @@ pub fn current_branch(root: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// `git log --oneline --graph --decorate -n 300` in `root`, as lines.
-pub fn log(root: &Path) -> Vec<String> {
-    let Ok(out) = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "log",
-            "--oneline",
-            "--graph",
-            "--decorate",
-            "--all",
-            "-n",
-            "300",
-        ])
-        .output()
-    else {
-        return vec!["<git not available>".to_string()];
-    };
-    if !out.status.success() {
-        return vec!["<not a git repository>".to_string()];
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
-
 /// Sum of added/deleted lines across all uncommitted changes (`git diff --numstat HEAD`).
 /// Returns `(added, deleted)`. Runs synchronously — call at reload/load time only, never
 /// per frame. Binary files produce `-` in the numstat output which is silently skipped.

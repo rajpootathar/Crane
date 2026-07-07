@@ -197,6 +197,8 @@ impl ChangeDir {
 pub struct CraneShellView {
     ui_font: FamilyId,
     icon_font: FamilyId,
+    /// Monospace face (Menlo) for the Git Log lane graph + commit rows.
+    mono_font: FamilyId,
     /// All panes by id. Persistent (terminals keep their PTY + scrollback).
     panes: HashMap<PaneId, PaneContent>,
     /// Per-tab split tree (the Layout). Each leaf references a pane id.
@@ -249,9 +251,34 @@ pub struct CraneShellView {
     /// Git Log bottom dock (sits below the panes, outside the pane tree,
     /// height-resizable). Old Crane renders the git log as a dock, not a pane.
     show_git_log: bool,
-    git_log_lines: Vec<String>,
     git_log_ratio: Rc<Cell<f32>>,
     git_log_drag: Rc<Cell<bool>>,
+    /// Loaded lane-graph snapshot (commits + refs + lanes). `None` until the
+    /// first off-thread [`git_log::load`] lands. Shared behind `Rc` so the
+    /// custom list element can borrow it without a data clone.
+    git_log_frame: Option<Rc<crate::warpui::git_log::GraphFrame>>,
+    /// Repo the cached frame was loaded against — detects Workspace switches.
+    git_log_repo: Option<PathBuf>,
+    /// True while an off-thread graph load is in flight (loading placeholder).
+    git_log_loading: bool,
+    /// Generation guard so a stale spawn result (from an old repo / reload)
+    /// can't clobber a newer frame.
+    git_log_gen: u64,
+    /// Debounce clock for ref-change auto-reloads.
+    git_log_last_reload: std::time::Instant,
+    /// Selected commit SHA (highlighted; drives the detail panel).
+    git_log_selected: Option<String>,
+    /// Fractional row scroll offset for the commit list (owned here so it
+    /// survives the element's per-frame rebuild).
+    git_log_scroll: Rc<Cell<f32>>,
+    /// Hovered commit-list row index (shared with the element).
+    git_log_hover: Rc<Cell<Option<usize>>>,
+    /// Loaded `git show` detail for the selected commit.
+    git_log_detail: Option<crate::warpui::git_log::CommitDetail>,
+    /// True while the selected commit's `git show` is computing.
+    git_log_detail_loading: bool,
+    /// Row scroll offset for the detail/diff panel.
+    git_log_detail_scroll: usize,
     /// Commit message buffer + whether the commit box has keyboard focus
     /// (keys route to it instead of the terminal).
     commit_msg: String,
@@ -677,6 +704,11 @@ impl CraneShellView {
                 )
                 .expect("load phosphor")
         });
+        // Monospace face for the Git Log lane graph + commit rows (fixed advance
+        // keeps the graph columns and hash/subject/meta columns aligned).
+        let mono_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
+            cache.load_system_font("Menlo").expect("load Menlo")
+        });
         // Load warpui persisted state early so we can apply the project overlay
         // (added/removed/tints) when building the initial project list.
         let saved_state = crate::warpui::persist::load();
@@ -1018,6 +1050,9 @@ impl CraneShellView {
             fast_ticker,
             |this: &mut Self, _instant, vctx| {
                 this.drain_fs_events(vctx);
+                // Reload the Git Log graph when the Workspace switched while the
+                // dock is open (fs events don't fire on a checkout to a warm repo).
+                this.git_log_tick(vctx);
                 // Refresh terminal owner-tab keys so a background bell/notification
                 // is attributed to the right tab even with no user interaction.
                 this.sync_terminal_owners(&*vctx);
@@ -1040,6 +1075,7 @@ impl CraneShellView {
         let mut view = Self {
             ui_font,
             icon_font,
+            mono_font,
             panes,
             layouts,
             focused,
@@ -1067,9 +1103,19 @@ impl CraneShellView {
             commit_msg: String::new(),
             commit_focused: false,
             show_git_log: false,
-            git_log_lines: Vec::new(),
             git_log_ratio: Rc::new(Cell::new(0.7)),
             git_log_drag: Rc::new(Cell::new(false)),
+            git_log_frame: None,
+            git_log_repo: None,
+            git_log_loading: false,
+            git_log_gen: 0,
+            git_log_last_reload: std::time::Instant::now(),
+            git_log_selected: None,
+            git_log_scroll: Rc::new(Cell::new(0.0)),
+            git_log_hover: Rc::new(Cell::new(None)),
+            git_log_detail: None,
+            git_log_detail_loading: false,
+            git_log_detail_scroll: 0,
             active_cwd,
             left_ratio: Rc::new(Cell::new(0.18)),
             left_drag: Rc::new(Cell::new(false)),
@@ -4759,16 +4805,37 @@ impl CraneShellView {
             .as_ref()
             .and_then(|p| std::fs::canonicalize(p).ok());
         let mut active_touched = false;
+        // Whether any changed path under the active repo was git-internal (a
+        // ref/HEAD/packed-refs write from a commit / fetch / branch switch) —
+        // that, and only that, needs the Git Log graph reloaded.
+        let mut git_refs_touched = false;
         while let Ok(ev) = self.fs_events.try_recv() {
             if let Some(ac) = active_canon.as_ref() {
                 if &ev.root == ac {
                     active_touched = true;
+                    if ev.paths.iter().any(|p| {
+                        let s = p.to_string_lossy();
+                        s.contains("/.git/refs/")
+                            || s.ends_with("/.git/HEAD")
+                            || s.ends_with("/.git/packed-refs")
+                    }) {
+                        git_refs_touched = true;
+                    }
                 }
             }
         }
         if active_touched {
             self.refresh_panel(ctx);
             self.invalidate_editor_diffs(&*ctx);
+        }
+        // Auto-reload the Git Log on a ref change while the dock is open,
+        // debounced (the watcher already coalesces bursts; this guards against a
+        // rapid rebase spamming reloads).
+        if git_refs_touched
+            && self.show_git_log
+            && self.git_log_last_reload.elapsed() >= std::time::Duration::from_millis(250)
+        {
+            self.reload_git_log(ctx);
         }
     }
 
@@ -7359,33 +7426,115 @@ impl CraneShellView {
         ctx.notify();
     }
 
-    /// Toggle the Git Log bottom dock for the active worktree.
-    fn toggle_gitlog(&mut self) {
+    /// Toggle the Git Log bottom dock for the active worktree. On open, kicks
+    /// an off-thread graph load (the fast tick also reloads on Workspace switch
+    /// / ref change while the dock stays open).
+    fn toggle_gitlog(&mut self, ctx: &mut ViewContext<Self>) {
         self.show_git_log = !self.show_git_log;
         if self.show_git_log {
-            self.git_log_lines = self
-                .active_cwd
-                .as_deref()
-                .map(crate::warpui::git::log)
-                .unwrap_or_else(|| vec!["<no active workspace>".to_string()]);
+            self.reload_git_log(ctx);
         }
     }
 
-    /// The Git Log dock body — a header row (title + close) over the log lines.
+    /// Load the lane graph for the active repo OFF the UI thread (`git log` +
+    /// `for-each-ref` + lane layout all run on the background executor via
+    /// `ctx.spawn`; the callback swaps in the frame on the main thread). A
+    /// generation guard drops stale results from a superseded reload. Switching
+    /// repos clears the selection + detail + scroll so the pane never shows a
+    /// commit from the previous Workspace.
+    fn reload_git_log(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(repo) = self.active_cwd.clone() else {
+            self.git_log_frame = None;
+            self.git_log_loading = false;
+            self.git_log_repo = None;
+            return;
+        };
+        if self.git_log_repo.as_deref() != Some(repo.as_path()) {
+            self.git_log_selected = None;
+            self.git_log_detail = None;
+            self.git_log_detail_loading = false;
+            self.git_log_scroll.set(0.0);
+            self.git_log_detail_scroll = 0;
+        }
+        self.git_log_repo = Some(repo.clone());
+        self.git_log_loading = true;
+        self.git_log_gen = self.git_log_gen.wrapping_add(1);
+        self.git_log_last_reload = std::time::Instant::now();
+        let load_gen = self.git_log_gen;
+        let fut = async move { crate::warpui::git_log::load(&repo) };
+        ctx.spawn(fut, move |this, frame, vctx| {
+            // Ignore a result from a superseded reload (newer gen already ran).
+            if this.git_log_gen != load_gen {
+                return;
+            }
+            this.git_log_frame = Some(Rc::new(frame));
+            this.git_log_loading = false;
+            vctx.notify();
+        });
+    }
+
+    /// Fast-tick backstop: reload the graph when the dock is open but the cached
+    /// frame belongs to a different Workspace than the active one. Cheap no-op
+    /// when the repo matches (the common case) since `reload_git_log` writes
+    /// `git_log_repo` up front.
+    fn git_log_tick(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.show_git_log {
+            return;
+        }
+        if self.git_log_repo.as_deref() != self.active_cwd.as_deref() {
+            self.reload_git_log(ctx);
+        }
+    }
+
+    /// A commit row was clicked: select it and load its `git show` detail
+    /// off-thread. The callback only lands the detail if that commit is still
+    /// the selected one (guards against a rapid re-click on another row).
+    fn select_git_log_commit(&mut self, sha: String, ctx: &mut ViewContext<Self>) {
+        self.git_log_selected = Some(sha.clone());
+        self.git_log_detail = None;
+        self.git_log_detail_loading = true;
+        self.git_log_detail_scroll = 0;
+        let Some(repo) = self.active_cwd.clone() else {
+            self.git_log_detail_loading = false;
+            return;
+        };
+        let sha_for_fut = sha.clone();
+        let fut = async move { crate::warpui::git_log::load_detail(&repo, &sha_for_fut) };
+        ctx.spawn(fut, move |this, detail, vctx| {
+            if this.git_log_selected.as_deref() != Some(sha.as_str()) {
+                return;
+            }
+            this.git_log_detail = Some(detail);
+            this.git_log_detail_loading = false;
+            vctx.notify();
+        });
+    }
+
+    /// The Git Log dock body — a header strip (branch icon + title + commit
+    /// count / loading state + close) over a horizontal split: the railroad
+    /// commit list (custom lane element) on the left, the selected commit's
+    /// message + diff on the right.
     fn git_log_dock(&self) -> Box<dyn Element> {
+        // ── Header strip ──────────────────────────────────────────────────
+        let status = if self.git_log_loading && self.git_log_frame.is_none() {
+            "loading…".to_string()
+        } else {
+            match &self.git_log_frame {
+                Some(f) => format!("{} commits", f.commits.len()),
+                None => "no commits".to_string(),
+            }
+        };
         let header = ConstrainedBox::new(
             Stack::new()
                 .with_child(Rect::new().with_background_color(theme::topbar_bg()).finish())
                 .with_child(
                     Flex::row()
                         .with_child(
-                            Container::new(
-                                self.icon(icons::GIT_BRANCH, 12.0, theme::text_muted()),
-                            )
-                            .with_padding_left(10.0)
-                            .with_padding_right(6.0)
-                            .with_padding_top(6.0)
-                            .finish(),
+                            Container::new(self.icon(icons::GIT_BRANCH, 12.0, theme::text_muted()))
+                                .with_padding_left(10.0)
+                                .with_padding_right(6.0)
+                                .with_padding_top(6.0)
+                                .finish(),
                         )
                         .with_child(
                             Container::new(
@@ -7394,9 +7543,25 @@ impl CraneShellView {
                                     .finish(),
                             )
                             .with_padding_top(6.0)
+                            .with_padding_right(8.0)
                             .finish(),
                         )
-                        .with_child(Expanded::new(1.0, ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish()).finish())
+                        .with_child(
+                            Container::new(
+                                Text::new(status, self.ui_font, 10.5)
+                                    .with_color(theme::text_muted())
+                                    .finish(),
+                            )
+                            .with_padding_top(7.0)
+                            .finish(),
+                        )
+                        .with_child(
+                            Expanded::new(
+                                1.0,
+                                ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish(),
+                            )
+                            .finish(),
+                        )
                         .with_child(self.icon_button(icons::X, CraneShellAction::OpenGitLog))
                         .finish(),
                 )
@@ -7404,22 +7569,176 @@ impl CraneShellView {
         )
         .with_height(26.0)
         .finish();
-        let mut col = Flex::column();
-        for line in self.git_log_lines.iter().take(500) {
-            col = col.with_child(
-                Container::new(
-                    Text::new(line.clone(), self.ui_font, 11.0)
-                        .with_color(theme::text_muted())
-                        .finish(),
+
+        // ── Commit list (lane graph) ──────────────────────────────────────
+        let list: Box<dyn Element> = match &self.git_log_frame {
+            Some(frame) if !frame.commits.is_empty() => {
+                Box::new(crate::warpui::git_log_element::GitLogListElement::new(
+                    frame.clone(),
+                    self.mono_font,
+                    12.0,
+                    self.git_log_scroll.clone(),
+                    self.git_log_selected.clone(),
+                    self.git_log_hover.clone(),
+                )) as Box<dyn Element>
+            }
+            _ => {
+                let msg = if self.git_log_loading {
+                    "Loading commit graph…"
+                } else {
+                    "No commits to display"
+                };
+                self.panel(
+                    theme::bg(),
+                    Container::new(
+                        Text::new(msg.to_string(), self.ui_font, 12.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    )
+                    .with_padding_left(12.0)
+                    .with_padding_top(10.0)
+                    .finish(),
                 )
-                .with_padding_left(10.0)
-                .finish(),
-            );
-        }
+            }
+        };
+
+        // ── Detail / diff panel ───────────────────────────────────────────
+        let detail = self.git_log_detail_panel();
+
+        let body = Flex::row()
+            .with_child(Expanded::new(1.4, list).finish())
+            .with_child(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                    .with_width(1.0)
+                    .finish(),
+            )
+            .with_child(Expanded::new(1.0, detail).finish())
+            .finish();
+
         Flex::column()
             .with_child(header)
-            .with_child(Expanded::new(1.0, self.panel(theme::bg(), col.finish())).finish())
+            .with_child(Expanded::new(1.0, body).finish())
             .finish()
+    }
+
+    /// The right-hand detail panel: the selected commit's message header then
+    /// its patch, add/delete-tinted, manually scrolled via `GitLogDetailScroll`.
+    fn git_log_detail_panel(&self) -> Box<dyn Element> {
+        let tint = |c: warpui::color::ColorU, a: u8| warpui::color::ColorU {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a,
+        };
+        let mut col = Flex::column();
+
+        match &self.git_log_detail {
+            _ if self.git_log_selected.is_none() => {
+                col = col.with_child(
+                    Container::new(
+                        Text::new(
+                            "Select a commit to view its changes".to_string(),
+                            self.ui_font,
+                            12.0,
+                        )
+                        .with_color(theme::text_muted())
+                        .finish(),
+                    )
+                    .with_padding_left(12.0)
+                    .with_padding_top(10.0)
+                    .finish(),
+                );
+            }
+            None => {
+                let msg = if self.git_log_detail_loading {
+                    "Loading commit…"
+                } else {
+                    "(no changes)"
+                };
+                col = col.with_child(
+                    Container::new(
+                        Text::new(msg.to_string(), self.ui_font, 12.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    )
+                    .with_padding_left(12.0)
+                    .with_padding_top(10.0)
+                    .finish(),
+                );
+            }
+            Some(detail) => {
+                // Commit message header (mono, first line emphasized).
+                for (i, line) in detail.header.iter().enumerate() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let color = if i == 0 { theme::text() } else { theme::text_muted() };
+                    col = col.with_child(
+                        Container::new(
+                            Text::new(line.clone(), self.mono_font, 11.5)
+                                .with_color(color)
+                                .finish(),
+                        )
+                        .with_padding_left(12.0)
+                        .with_padding_right(8.0)
+                        .with_padding_top(1.0)
+                        .finish(),
+                    );
+                }
+                if !detail.diff.is_empty() {
+                    col = col.with_child(
+                        ConstrainedBox::new(
+                            Rect::new().with_background_color(theme::divider()).finish(),
+                        )
+                        .with_height(1.0)
+                        .finish(),
+                    );
+                }
+                // Patch body, windowed by the detail scroll offset.
+                use crate::warpui::git_log::DiffLineKind;
+                let start = self
+                    .git_log_detail_scroll
+                    .min(detail.diff.len().saturating_sub(1));
+                for dl in detail.diff.iter().skip(start).take(1500) {
+                    let (fg, bg) = match dl.kind {
+                        DiffLineKind::Add => (theme::success(), tint(theme::success(), 38)),
+                        DiffLineKind::Del => (theme::error(), tint(theme::error(), 38)),
+                        DiffLineKind::Hunk => (theme::accent(), tint(theme::accent(), 22)),
+                        DiffLineKind::FileHeader => (theme::text_muted(), tint(theme::bg(), 0)),
+                        DiffLineKind::Context => (theme::text(), tint(theme::bg(), 0)),
+                    };
+                    col = col.with_child(
+                        Container::new(
+                            Text::new(dl.text.clone(), self.mono_font, 11.0)
+                                .with_color(fg)
+                                .finish(),
+                        )
+                        .with_background_color(bg)
+                        .with_padding_left(12.0)
+                        .with_padding_right(8.0)
+                        .finish(),
+                    );
+                }
+            }
+        }
+
+        // Scroll wheel adjusts the detail row window (same manual-scroll feel as
+        // WarpDiffView).
+        let scroll_body = EventHandler::new(Expanded::new(1.0, col.finish()).finish())
+            .on_scroll_wheel(move |ctx, _app, delta, _mods| {
+                let lines = (-delta.y() / 8.0).round() as i32;
+                if lines != 0 {
+                    ctx.dispatch_typed_action(CraneShellAction::GitLogDetailScroll(lines));
+                }
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+        self.panel(
+            theme::bg(),
+            Flex::column()
+                .with_child(Expanded::new(1.0, scroll_body).finish())
+                .finish(),
+        )
     }
 
     /// Open a placeholder Browser pane (WKWebView embed pending).
@@ -8337,6 +8656,11 @@ pub enum CraneShellAction {
     CloseActiveTab,
     /// Open a Git log pane.
     OpenGitLog,
+    /// Select a commit in the Git Log list (dispatched by the lane element on a
+    /// row click) — highlights it and loads its `git show` detail off-thread.
+    GitLogSelect(String),
+    /// Scroll the Git Log detail/diff panel by N rows (positive = down).
+    GitLogDetailScroll(i32),
     /// Open a Browser pane (placeholder).
     OpenBrowser,
     /// Open a read-only unified Diff pane (HEAD vs working copy) for the file at
@@ -9022,7 +9346,18 @@ impl TypedActionView for CraneShellView {
                     self.handle_action(&cloned, ctx);
                 }
             }
-            CraneShellAction::OpenGitLog => self.toggle_gitlog(),
+            CraneShellAction::OpenGitLog => self.toggle_gitlog(ctx),
+            CraneShellAction::GitLogSelect(sha) => self.select_git_log_commit(sha.clone(), ctx),
+            CraneShellAction::GitLogDetailScroll(delta) => {
+                let max = self
+                    .git_log_detail
+                    .as_ref()
+                    .map(|d| d.diff.len().saturating_sub(1))
+                    .unwrap_or(0);
+                let next = self.git_log_detail_scroll as i64 + *delta as i64;
+                self.git_log_detail_scroll = next.clamp(0, max as i64) as usize;
+                ctx.notify();
+            }
             CraneShellAction::OpenBrowser => self.open_browser(ctx),
             CraneShellAction::OpenDiff(p) => self.open_diff(p.clone(), ctx),
             CraneShellAction::OpenWelcome => self.open_welcome(ctx),
