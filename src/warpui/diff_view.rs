@@ -106,9 +106,8 @@ impl WarpDiffView {
     /// If the disk read fails, the new side is empty and every line renders as a
     /// delete — either way the view stays populated instead of panicking.
     pub fn new(ctx: &mut ViewContext<Self>, repo_root: Option<PathBuf>, path: PathBuf) -> Self {
-        let font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            cache.load_system_font("Menlo").expect("load Menlo")
-        });
+        let font = warpui::fonts::Cache::handle(ctx)
+            .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
 
         // Absolute path on disk (for the working-copy side).
         let abs = if path.is_absolute() {

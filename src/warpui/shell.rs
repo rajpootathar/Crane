@@ -703,12 +703,8 @@ fn edge_dir_before(edge: DockEdge) -> Option<(Dir, bool)> {
 
 impl CraneShellView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
-        let ui_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            cache
-                .load_system_font("Helvetica Neue")
-                .or_else(|_| cache.load_system_font("Menlo"))
-                .expect("load ui font")
-        });
+        let ui_font = warpui::fonts::Cache::handle(ctx)
+            .update(ctx, |cache, _| crate::warpui::bundled_fonts::ui(cache));
         let icon_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
             cache
                 .load_family_from_bytes(
@@ -719,9 +715,9 @@ impl CraneShellView {
         });
         // Monospace face for the Git Log lane graph + commit rows (fixed advance
         // keeps the graph columns and hash/subject/meta columns aligned).
-        let mono_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            cache.load_system_font("Menlo").expect("load Menlo")
-        });
+        // Bundled JetBrains Mono (graceful Menlo fallback inside).
+        let mono_font = warpui::fonts::Cache::handle(ctx)
+            .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
         // Load warpui persisted state early so we can apply the project overlay
         // (added/removed/tints) when building the initial project list.
         let saved_state = crate::warpui::persist::load();
@@ -884,9 +880,10 @@ impl CraneShellView {
                             // Rebuild the file pane with Warp's REAL editor. Build a
                             // live editor for EVERY saved path (kept in editor_views)
                             // so all tabs restore and switch; show the active one.
-                            let mono = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-                                cache.load_system_font("Menlo").expect("load Menlo")
-                            });
+                            let mono = warpui::fonts::Cache::handle(ctx).update(
+                                ctx,
+                                |cache, _| crate::warpui::bundled_fonts::mono(cache),
+                            );
                             for p in &saved_paths {
                                 let content = std::fs::read_to_string(p).unwrap_or_default();
                                 let pc = p.clone();
@@ -7463,9 +7460,8 @@ impl CraneShellView {
                     return;
                 }
             };
-            let mono = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-                cache.load_system_font("Menlo").expect("load Menlo")
-            });
+            let mono = warpui::fonts::Cache::handle(ctx)
+                .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
             let p = path.clone();
             let goto = Self::lsp_goto_cb(path.clone());
             let h = ctx.add_typed_action_view(move |ctx| {

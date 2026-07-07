@@ -119,7 +119,7 @@ impl FileView {
     fn font(ctx: &mut ViewContext<Self>) -> (FamilyId, f32, f32) {
         use warpui::fonts::Properties;
         warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            let family = cache.load_system_font("Menlo").expect("load Menlo");
+            let family = crate::warpui::bundled_fonts::mono(cache);
             let size = 12.0;
             let font = cache.select_font(family, Properties::default());
             let char_w = cache

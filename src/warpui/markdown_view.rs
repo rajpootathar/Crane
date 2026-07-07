@@ -257,11 +257,8 @@ impl WarpMarkdownView {
     /// Mirrors the shell's `ui_font` load and `FileView`'s mono load.
     fn fonts(ctx: &mut ViewContext<Self>) -> (FamilyId, FamilyId) {
         warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            let prose = cache
-                .load_system_font("Helvetica Neue")
-                .or_else(|_| cache.load_system_font("Menlo"))
-                .expect("load prose font");
-            let mono = cache.load_system_font("Menlo").expect("load Menlo");
+            let prose = crate::warpui::bundled_fonts::ui(cache);
+            let mono = crate::warpui::bundled_fonts::mono(cache);
             (prose, mono)
         })
     }

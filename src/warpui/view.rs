@@ -336,7 +336,7 @@ impl TerminalView {
         rx: async_channel::Receiver<()>,
     ) -> Self {
         let font_family = warpui::fonts::Cache::handle(ctx)
-            .update(ctx, |cache, _| cache.load_system_font("Menlo").expect("load Menlo"));
+            .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
         ctx.focus_self();
 
         // Spawn directly in the initial requested cwd (avoids the
