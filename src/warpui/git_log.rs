@@ -6,8 +6,11 @@
 //! `src/git_log/{data,graph,refs}.rs`, collapsed into one module.
 //!
 //! Everything here is a pure `git` subprocess + in-memory transform, so the
-//! shell runs [`load`] and [`load_detail`] off the UI thread via `ctx.spawn`
-//! (background executor) — nothing here blocks the frame.
+//! shell runs [`load`] / [`load_graph_for`] and [`load_detail`] off the UI
+//! thread via `ctx.spawn` (background executor) — nothing here blocks the
+//! frame. The in-memory transforms ([`filter_commits`] / [`filtered_frame`],
+//! [`ref_groups`], [`step_selection`]) are pure and cheap enough to run on
+//! the UI thread at interaction time.
 
 use std::path::Path;
 use std::process::Command;
@@ -84,13 +87,37 @@ pub fn parse_log_output(stdout: &str) -> Vec<CommitRecord> {
 /// `max_count` caps the walk (pass a large value for the initial load).
 /// Empty Vec on any error.
 pub fn load_commits(repo: &Path, max_count: usize) -> Vec<CommitRecord> {
+    load_commits_for(repo, max_count, None)
+}
+
+/// [`load_commits`] with an optional ref scope. `Some("main")` walks only the
+/// commits reachable from that ref (`git log <ref>`) — the refs-column branch
+/// / tag filter, matching old Crane's `FilterState::branch` semantics — while
+/// `None` keeps the full `--all` walk. Empty Vec on any error, including a
+/// ref name git can't resolve.
+pub fn load_commits_for(
+    repo: &Path,
+    max_count: usize,
+    ref_filter: Option<&str>,
+) -> Vec<CommitRecord> {
     let format = format!(
         "--pretty=format:%H{us}%P{us}%an{us}%aI{us}%ar{us}%s{us}%D",
         us = FIELD_SEP
     );
     let max_count_arg = format!("--max-count={max_count}");
+    let mut args: Vec<&str> = vec!["log"];
+    match ref_filter {
+        Some(r) => args.push(r),
+        None => args.push("--all"),
+    }
+    args.extend(["--date-order", &format, &max_count_arg]);
+    if ref_filter.is_some() {
+        // `--` terminates the revision list so a ref named like a path
+        // (`docs`, `src`) still reads as a revision, never a pathspec.
+        args.push("--");
+    }
     let out = match Command::new("git")
-        .args(["log", "--all", "--date-order", &format, &max_count_arg])
+        .args(&args)
         .current_dir(repo)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
@@ -171,6 +198,62 @@ pub fn load_refs(repo: &Path) -> RefSet {
         }
     }
     set
+}
+
+// ── Refs column listing (old view/refs.rs, framework-free) ─────────────────
+
+/// One display-ready row for the refs column: prefix-stripped name, tip SHA
+/// (clicking becomes the ref filter / scroll target), and a HEAD marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefItem {
+    /// Prefix-stripped display name (`main`, `origin/main`, `v1.0`).
+    pub display: String,
+    /// Tip SHA the ref points at.
+    pub sha: String,
+    /// True when this ref's tip IS the current HEAD (the asterisk row in the
+    /// old refs column).
+    pub is_head: bool,
+}
+
+/// One LOCAL / REMOTE / TAGS section of the refs column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefGroup {
+    pub title: &'static str,
+    pub items: Vec<RefItem>,
+}
+
+/// Group a [`RefSet`] into the LOCAL / REMOTE / TAGS sections the refs column
+/// renders (old `view/refs.rs::ref_section`): fully-qualified names strip to
+/// display names, rows sort case-insensitively inside each group, and empty
+/// groups drop out so the column never paints a bare header.
+pub fn ref_groups(refs: &RefSet) -> Vec<RefGroup> {
+    let section = |title: &'static str, entries: &[RefEntry], prefix: &str| -> Option<RefGroup> {
+        if entries.is_empty() {
+            return None;
+        }
+        let mut items: Vec<RefItem> = entries
+            .iter()
+            .map(|e| RefItem {
+                display: e
+                    .name
+                    .strip_prefix(prefix)
+                    .unwrap_or(e.name.as_str())
+                    .to_string(),
+                sha: e.sha.clone(),
+                is_head: refs.head.as_deref() == Some(e.sha.as_str()),
+            })
+            .collect();
+        items.sort_by(|a, b| a.display.to_lowercase().cmp(&b.display.to_lowercase()));
+        Some(RefGroup { title, items })
+    };
+    [
+        section("LOCAL", &refs.local, "refs/heads/"),
+        section("REMOTE", &refs.remote, "refs/remotes/"),
+        section("TAGS", &refs.tags, "refs/tags/"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 // ── Ref pills (old view/log.rs::parse_ref_pills, framework-free) ───────────
@@ -456,18 +539,103 @@ pub struct GraphFrame {
 }
 
 /// Cap on the initial `git log` walk — a huge repo can't blow up the model.
-pub const MAX_COMMITS: usize = 5_000;
+/// 10 000, matching old Crane's `GitLogState::reload` walk depth.
+pub const MAX_COMMITS: usize = 10_000;
 
 /// Load the full graph for `repo`. Blocking (subprocess) — call off the UI
 /// thread. Returns an empty frame on any error / non-repo.
 pub fn load(repo: &Path) -> GraphFrame {
-    let commits = load_commits(repo, MAX_COMMITS);
+    load_graph_for(repo, None)
+}
+
+/// [`load`] with an optional ref scope: `Some("main")` reloads the graph from
+/// only the commits reachable from that ref (`git log <ref>` — the refs-column
+/// branch/tag filter), `None` is the full `--all` walk. Refs always load in
+/// full so the pills and the refs column stay complete while the commit list
+/// is narrowed. Blocking — call off the UI thread.
+pub fn load_graph_for(repo: &Path, ref_filter: Option<&str>) -> GraphFrame {
+    let commits = load_commits_for(repo, MAX_COMMITS, ref_filter);
     let refs = load_refs(repo);
     let lanes = layout(&commits);
     GraphFrame {
         commits,
         refs,
         lanes,
+    }
+}
+
+// ── Text filter (old view/log.rs filter bar, framework-free) ───────────────
+
+/// Case-insensitive substring filter over subject / hash / author — the text
+/// box of the old filter bar. An empty / whitespace-only needle keeps every
+/// commit. Pure; the caller re-runs [`layout`] on the survivors (see
+/// [`filtered_frame`]) so the lane graph reflects only what's on screen.
+pub fn filter_commits(commits: &[CommitRecord], needle: &str) -> Vec<CommitRecord> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return commits.to_vec();
+    }
+    commits
+        .iter()
+        .filter(|c| {
+            let hay = format!("{} {} {}", c.subject, c.sha, c.author).to_lowercase();
+            hay.contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Apply the text filter to a loaded frame, RE-RUNNING lane layout on just
+/// the surviving commits — old behavior: lanes reflect what's visible, so
+/// filtered-out branches don't linger as passthrough rails. Refs carry over
+/// unchanged so ref pills stay categorised. Cheap for the shell to cache
+/// keyed on (needle, frame generation).
+pub fn filtered_frame(frame: &GraphFrame, needle: &str) -> GraphFrame {
+    let commits = filter_commits(&frame.commits, needle);
+    let lanes = layout(&commits);
+    GraphFrame {
+        commits,
+        refs: frame.refs.clone(),
+        lanes,
+    }
+}
+
+// ── Keyboard navigation (old view/log.rs arrow / j / k nav) ────────────────
+
+/// Step the selection one row through `commits` (display order, newest
+/// first): `down` moves toward older commits. `None` selection — or a
+/// selected SHA that fell out of the (possibly filtered) list — lands on row
+/// 0; steps clamp at both ends (old behavior). `None` only on an empty list.
+pub fn step_selection(
+    commits: &[CommitRecord],
+    selected: Option<&str>,
+    down: bool,
+) -> Option<Sha> {
+    if commits.is_empty() {
+        return None;
+    }
+    let cur = selected.and_then(|sha| commits.iter().position(|c| c.sha == sha));
+    let next = match cur {
+        Some(idx) if down => (idx + 1).min(commits.len() - 1),
+        Some(idx) => idx.saturating_sub(1),
+        None => 0,
+    };
+    Some(commits[next].sha.clone())
+}
+
+/// Scroll offset (in rows) that keeps `row` inside a viewport of
+/// `visible_rows`, moving the current offset as little as possible. The shell
+/// writes this back to the shared scroll cell after a keyboard step so the
+/// selection never walks off-screen.
+pub fn reveal_offset(scroll: f32, row: usize, visible_rows: usize) -> f32 {
+    let visible = visible_rows.max(1);
+    let row = row as f32;
+    if row < scroll.floor() {
+        row
+    } else if row >= scroll + visible as f32 {
+        row - (visible as f32 - 1.0)
+    } else {
+        scroll
     }
 }
 
@@ -672,5 +840,126 @@ mod tests {
         assert_eq!(classify("+added"), DiffLineKind::Add);
         assert_eq!(classify("-removed"), DiffLineKind::Del);
         assert_eq!(classify(" context"), DiffLineKind::Context);
+    }
+
+    fn sample_refs() -> RefSet {
+        RefSet {
+            local: vec![
+                RefEntry { name: "refs/heads/main".into(), sha: "h1".into() },
+                RefEntry { name: "refs/heads/Feat/zeta".into(), sha: "h2".into() },
+                RefEntry { name: "refs/heads/dev".into(), sha: "h3".into() },
+            ],
+            remote: vec![RefEntry {
+                name: "refs/remotes/origin/main".into(),
+                sha: "h1".into(),
+            }],
+            tags: vec![],
+            head: Some("h1".into()),
+        }
+    }
+
+    #[test]
+    fn ref_groups_strip_sort_and_mark_head() {
+        let groups = ref_groups(&sample_refs());
+        // TAGS is empty → dropped; LOCAL then REMOTE remain.
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].title, "LOCAL");
+        assert_eq!(groups[1].title, "REMOTE");
+        // Prefix-stripped + case-insensitive sort: dev, Feat/zeta, main.
+        let locals: Vec<&str> = groups[0].items.iter().map(|i| i.display.as_str()).collect();
+        assert_eq!(locals, vec!["dev", "Feat/zeta", "main"]);
+        // HEAD marker follows the head SHA — on main (local) AND origin/main.
+        assert!(groups[0].items.iter().find(|i| i.display == "main").unwrap().is_head);
+        assert!(!groups[0].items.iter().find(|i| i.display == "dev").unwrap().is_head);
+        assert!(groups[1].items[0].is_head);
+    }
+
+    #[test]
+    fn ref_groups_empty_set_yields_no_groups() {
+        assert!(ref_groups(&RefSet::default()).is_empty());
+    }
+
+    fn named(sha: &str, subject: &str, author: &str) -> CommitRecord {
+        CommitRecord {
+            author: author.to_string(),
+            subject: subject.to_string(),
+            ..cr(sha, &[])
+        }
+    }
+
+    #[test]
+    fn filter_matches_subject_hash_author_case_insensitive() {
+        let commits = vec![
+            named("abc123", "fix: lane painter", "Alice"),
+            named("def456", "feat: refs column", "Bob"),
+            named("789fed", "chore: bump deps", "alice smith"),
+        ];
+        // Subject, any case.
+        assert_eq!(filter_commits(&commits, "LANE").len(), 1);
+        // Hash prefix.
+        assert_eq!(filter_commits(&commits, "def4")[0].sha, "def456");
+        // Author, matching both Alices.
+        assert_eq!(filter_commits(&commits, "alice").len(), 2);
+        // Empty / whitespace needle keeps everything.
+        assert_eq!(filter_commits(&commits, "  ").len(), 3);
+        // No match → empty.
+        assert!(filter_commits(&commits, "zzz").is_empty());
+    }
+
+    #[test]
+    fn filtered_frame_relays_lanes_on_survivors() {
+        // Fork + merge; filtering to the trunk-only subjects must re-run the
+        // lane layout on JUST the survivors so lane rows and commits stay a
+        // 1:1 zip (the painter indexes them in lockstep).
+        let commits = vec![
+            CommitRecord { subject: "trunk m".into(), ..cr("m", &["c2", "b1"]) },
+            CommitRecord { subject: "trunk c2".into(), ..cr("c2", &["c1"]) },
+            CommitRecord { subject: "branch b1".into(), ..cr("b1", &["c1"]) },
+            CommitRecord { subject: "trunk c1".into(), ..cr("c1", &[]) },
+        ];
+        let frame = GraphFrame {
+            refs: RefSet::default(),
+            lanes: layout(&commits),
+            commits,
+        };
+        let filtered = filtered_frame(&frame, "trunk");
+        assert_eq!(filtered.commits.len(), 3);
+        assert_eq!(filtered.lanes.rows.len(), 3);
+        // Every survivor sits on the trunk lane, and each lane row matches
+        // its commit by SHA (no index drift from the removed branch commit).
+        for (r, c) in filtered.lanes.rows.iter().zip(filtered.commits.iter()) {
+            assert_eq!(r.sha, c.sha);
+            assert_eq!(r.own_lane, 0, "row {} not on lane 0", r.sha);
+        }
+    }
+
+    #[test]
+    fn step_selection_clamps_and_starts_at_top() {
+        let commits = vec![cr("a", &[]), cr("b", &[]), cr("c", &[])];
+        // No selection → row 0 regardless of direction.
+        assert_eq!(step_selection(&commits, None, true).as_deref(), Some("a"));
+        assert_eq!(step_selection(&commits, None, false).as_deref(), Some("a"));
+        // Down walks toward older commits, clamping at the end.
+        assert_eq!(step_selection(&commits, Some("a"), true).as_deref(), Some("b"));
+        assert_eq!(step_selection(&commits, Some("c"), true).as_deref(), Some("c"));
+        // Up walks toward newer commits, clamping at the top.
+        assert_eq!(step_selection(&commits, Some("b"), false).as_deref(), Some("a"));
+        assert_eq!(step_selection(&commits, Some("a"), false).as_deref(), Some("a"));
+        // A selection filtered out of the list restarts at row 0.
+        assert_eq!(step_selection(&commits, Some("gone"), true).as_deref(), Some("a"));
+        // Empty list → no selection.
+        assert_eq!(step_selection(&[], Some("a"), true), None);
+    }
+
+    #[test]
+    fn reveal_offset_scrolls_minimally() {
+        // Row already visible → offset unchanged.
+        assert_eq!(reveal_offset(10.0, 12, 5), 10.0);
+        // Row above the viewport → snap it to the top edge.
+        assert_eq!(reveal_offset(10.0, 4, 5), 4.0);
+        // Row below the viewport → bottom-align it.
+        assert_eq!(reveal_offset(10.0, 20, 5), 16.0);
+        // Degenerate viewport clamps to 1 row.
+        assert_eq!(reveal_offset(0.0, 3, 0), 3.0);
     }
 }

@@ -2,13 +2,16 @@
 //! LANE GRAPH on the left (colored lane lines + a commit-node dot per row),
 //! then REF PILLS (rounded chips for HEAD / branch / tag decorations), the
 //! short hash, the subject, and the author + relative time. Viewport-aware —
-//! only the rows that fit the pane are laid out and painted, so a 5 000-commit
-//! frame costs the same as a 20-commit one.
+//! only the rows that fit the pane are laid out and painted, so a
+//! 10 000-commit frame costs the same as a 20-commit one.
 //!
 //! Scrolling is internal (a shared fractional row offset the shell persists
 //! across per-frame rebuilds); a click on a row dispatches
 //! [`CraneShellAction::GitLogSelect`] up to the shell, which loads that
-//! commit's `git show` detail off-thread.
+//! commit's `git show` detail off-thread. A RIGHT-click on a row runs the
+//! shell-supplied [`GitLogMenuCallback`] with the row's SHA + click position
+//! so the shell can open its commit context menu (Checkout / Branch from /
+//! Cherry-pick / Revert / Copy hash — old Crane `view/log.rs` row menu).
 
 use std::cell::Cell as StdCell;
 use std::rc::Rc;
@@ -63,6 +66,15 @@ const DOT_R: f32 = 4.0;
 const GRAPH_PAD_LEFT: f32 = 10.0;
 const LANE_STROKE: f32 = 1.5;
 
+/// Callback the shell supplies for a right-click on a commit row. Runs inside
+/// the element's event dispatch with `(sha, x, y, ctx)` — the clicked commit's
+/// full SHA and the click position in window coords. The shell's closure
+/// routes it into its own typed action (a context-menu overlay anchored at
+/// `(x, y)`, like the Changes / Files row menus), keeping this element free
+/// of any menu-variant knowledge — same shape as `WelcomeCallback` /
+/// `grid_element`'s callbacks.
+pub type GitLogMenuCallback = Rc<dyn Fn(&str, f32, f32, &mut EventContext)>;
+
 pub struct GitLogListElement {
     frame: Rc<GraphFrame>,
     font_family: FamilyId,
@@ -73,6 +85,8 @@ pub struct GitLogListElement {
     selected: Option<String>,
     /// Hovered row index (shared so the highlight survives per-frame rebuilds).
     hover: Rc<StdCell<Option<usize>>>,
+    /// Right-click handler (commit context menu); `None` disables it.
+    on_context_menu: Option<GitLogMenuCallback>,
 
     // Layout/paint scratch.
     size: Option<Vector2F>,
@@ -98,12 +112,19 @@ impl GitLogListElement {
             scroll,
             selected,
             hover,
+            on_context_menu: None,
             size: None,
             origin: None,
             origin_vec: None,
             row_h: font_size * 1.7,
             cell_w: font_size * 0.6,
         }
+    }
+
+    /// Attach the right-click commit-menu callback (see [`GitLogMenuCallback`]).
+    pub fn with_context_menu(mut self, cb: GitLogMenuCallback) -> Self {
+        self.on_context_menu = Some(cb);
+        self
     }
 
     fn total_rows(&self) -> usize {
@@ -456,6 +477,13 @@ impl Element for GitLogListElement {
                     ctx.dispatch_typed_action(
                         crate::warpui::shell::CraneShellAction::GitLogSelect(sha),
                     );
+                    return true;
+                }
+            }
+            Event::RightMouseDown { position, .. } if in_bounds(position) => {
+                if let (Some(cb), Some(idx)) = (self.on_context_menu.clone(), row_at(position)) {
+                    let sha = self.frame.commits[idx].sha.clone();
+                    cb(&sha, position.x(), position.y(), ctx);
                     return true;
                 }
             }

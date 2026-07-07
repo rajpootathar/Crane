@@ -218,6 +218,55 @@ pub fn checkout_branch(root: &Path, branch: &str) -> Result<(), String> {
     run(root, &["checkout", branch])
 }
 
+// ── Git Log commit ops (old git.rs, drained from the row context menu) ──
+// One sync shell-out each, 1:1 with old Crane. All mutate the working
+// tree / history, so the shell runs them off-thread and reloads the
+// graph + Changes on completion (the .git watcher fires anyway).
+
+/// `git checkout <sha>` — detached-HEAD checkout of a commit (context-menu
+/// "Checkout this commit"). Port of old Crane `git.rs::checkout_commit`.
+pub fn checkout_commit(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["checkout", sha])
+}
+
+/// `git branch <name> <sha>` — create a new branch at `sha` without
+/// switching to it (context-menu "Create branch from here…"). Port of old
+/// Crane `git.rs::branch_from`.
+pub fn branch_from(repo: &Path, name: &str, sha: &str) -> Result<(), String> {
+    run(repo, &["branch", name, sha])
+}
+
+/// `git cherry-pick <sha>` — apply the commit on top of HEAD (context-menu
+/// "Cherry-pick onto current"). A conflict surfaces as git's stderr; the
+/// user resolves it in a Terminal Pane like any other cherry-pick.
+pub fn cherry_pick(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["cherry-pick", sha])
+}
+
+/// `git revert --no-edit <sha>` — create a revert commit on HEAD without
+/// opening an editor (context-menu "Revert").
+pub fn revert(repo: &Path, sha: &str) -> Result<(), String> {
+    run(repo, &["revert", "--no-edit", sha])
+}
+
+/// `git show <ref>:<path>` — raw content of `path` at the given ref.
+/// Empty bytes on missing (e.g. a newly-added file queried at the parent
+/// commit). Port of old Crane `git.rs::show_at`.
+pub fn show_at(repo: &Path, reference: &str, path: &Path) -> Vec<u8> {
+    let arg = format!("{reference}:{}", path.display());
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &arg])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    out.stdout
+}
+
 /// `git init` in `dir` — turns a loose folder into a git repository.
 /// On success the folder gains a `.git` directory; reload the project list
 /// afterwards so the `is_loose` flag reflects the new state.
@@ -463,6 +512,45 @@ pub fn fetch(repo: &Path) -> Result<String, String> {
         .arg("-C")
         .arg(repo)
         .args(["fetch", "--prune"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        return Err(if stderr.is_empty() { stdout } else { stderr });
+    }
+    let combined = if stderr.is_empty() { stdout } else { stderr };
+    let updates: Vec<&str> = combined
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("->"))
+        .collect();
+    let summary = if updates.is_empty() {
+        "No new refs".to_string()
+    } else if updates.len() == 1 {
+        updates[0].to_string()
+    } else {
+        format!("Fetched {} refs", updates.len())
+    };
+    Ok(summary)
+}
+
+/// `git fetch --all --prune --tags` — the Git Log dock's "Fetch all"
+/// button, hitting every configured remote (1:1 the child command old
+/// Crane's `refresh.rs::fetch_all_async` ran). Network op — BLOCKING; the
+/// shell runs it off-thread (`ctx.spawn` / `std::thread`) with an
+/// in-flight flag for the spinner, exactly like [`fetch`]. No result
+/// plumbing is needed beyond the summary: the `.git/refs` watcher picks
+/// up the fetched refs and triggers the graph reload on its own. Same
+/// summary shape as [`fetch`] ("<from> -> <to>", "No new refs", or a
+/// "Fetched N refs" count).
+pub fn fetch_all(repo: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "--all", "--prune", "--tags"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
         .output()
