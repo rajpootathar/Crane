@@ -238,6 +238,8 @@ pub enum EditAction {
     /// Dismiss the external-change reload banner (its "Keep" button): reset the
     /// mtime baseline so the banner closes and keeps the in-buffer edits.
     DismissDiskBanner,
+    /// Dismiss the red save-failure banner (buffer stays dirty; Cmd+S retries).
+    DismissSaveError,
 }
 
 impl EditAction {
@@ -479,6 +481,10 @@ pub struct WarpEditorView {
     gutter_font: FamilyId,
     /// Last on-disk content; `is_dirty` compares the live buffer against it.
     saved_text: String,
+    /// Why the last save failed (io error text), shown as a red banner until
+    /// the next successful save or an explicit dismiss. `None` = last save OK.
+    /// Never silent: the user must not believe a failed Cmd+S landed on disk.
+    save_error: Option<String>,
     /// True while a text-selection drag is active (a mouse-down landed inside
     /// the editor). Gates `SelectionExtend` so dragging the pane splitter or
     /// header — which never sends the editor a mouse-down — can't select text.
@@ -710,16 +716,21 @@ impl WarpEditorView {
         if self.trim_on_save {
             text = crate::syntax::trim_trailing_whitespace(&text);
         }
-        if std::fs::write(&self.path, &text).is_ok() {
-            self.saved_text = text;
-            // Refresh the external-change baseline so saving our own edits
-            // doesn't trip `disk_changed`.
-            self.loaded_mtime = file_mtime(&self.path);
-            // Working tree changed → the gutter diff is now stale.
-            self.diff.borrow_mut().dirty = true;
-            true
-        } else {
-            false
+        match std::fs::write(&self.path, &text) {
+            Ok(()) => {
+                self.saved_text = text;
+                self.save_error = None;
+                // Refresh the external-change baseline so saving our own edits
+                // doesn't trip `disk_changed`.
+                self.loaded_mtime = file_mtime(&self.path);
+                // Working tree changed → the gutter diff is now stale.
+                self.diff.borrow_mut().dirty = true;
+                true
+            }
+            Err(e) => {
+                self.save_error = Some(format!("Save failed: {e}"));
+                false
+            }
         }
     }
 
@@ -801,10 +812,14 @@ impl WarpEditorView {
             _ => self.buffer_text(ctx),
         };
 
-        if std::fs::write(&self.path, &to_write).is_ok() {
-            self.saved_text = to_write;
-            self.loaded_mtime = file_mtime(&self.path);
-            self.diff.borrow_mut().dirty = true;
+        match std::fs::write(&self.path, &to_write) {
+            Ok(()) => {
+                self.saved_text = to_write;
+                self.save_error = None;
+                self.loaded_mtime = file_mtime(&self.path);
+                self.diff.borrow_mut().dirty = true;
+            }
+            Err(e) => self.save_error = Some(format!("Save failed: {e}")),
         }
         ctx.notify();
     }
@@ -1412,6 +1427,7 @@ impl WarpEditorView {
             colors,
             gutter_font: font,
             saved_text: content,
+            save_error: None,
             selecting: std::cell::Cell::new(false),
             scrollbar_drag: std::rc::Rc::new(std::cell::Cell::new(false)),
             find: None,
@@ -2173,6 +2189,11 @@ impl WarpEditorView {
                 ctx.notify();
                 return;
             }
+            EditAction::DismissSaveError => {
+                self.save_error = None;
+                ctx.notify();
+                return;
+            }
             // ── Find / Replace / Goto ──────────────────────────────────────
             EditAction::FindNext { forward } => {
                 self.find_step(*forward, ctx);
@@ -2400,8 +2421,15 @@ impl View for WarpEditorView {
             .with_child(scrollbar)
             .finish();
         // Optional bars stacked above the editor body: the external-change reload
-        // banner (highest), then the Find / Replace / Goto bar when open.
-        let banner = if self.disk_changed_throttled() {
+        // banner (highest), then the Find / Replace / Goto bar when open. A
+        // failed save outranks the disk banner — data the user thinks is saved
+        // but isn't beats data someone else changed.
+        // The reload banner only shows when a reload would lose something: the
+        // buffer is dirty, or the file vanished (nothing to silently re-read).
+        // Clean buffers are silently reloaded by the shell's disk-change poll.
+        let banner = if let Some(err) = &self.save_error {
+            Some(self.save_error_banner(err))
+        } else if self.disk_changed_throttled() && (self.is_dirty(app) || !self.path.exists()) {
             Some(self.reload_banner())
         } else {
             None
@@ -2475,6 +2503,35 @@ impl WarpEditorView {
             .with_child(Expanded::new(1.0, msg).finish())
             .with_child(reload)
             .with_child(keep)
+            .finish();
+        Container::new(row)
+            .with_background_color(theme::surface())
+            .with_border(Border::bottom(1.0).with_border_color(theme::border()))
+            .finish()
+    }
+
+    /// Red banner shown while `save_error` is set — the last Cmd+S did NOT
+    /// reach disk. Dismiss hides it; the buffer stays dirty so Cmd+S retries.
+    fn save_error_banner(&self, err: &str) -> Box<dyn Element> {
+        let msg = Container::new(
+            Text::new(
+                err.to_string(),
+                self.gutter_font,
+                crate::warpui::fontsize::editor(),
+            )
+            .with_color(theme::error())
+            .finish(),
+        )
+        .with_padding_left(10.0)
+        .with_padding_right(12.0)
+        .with_padding_top(5.0)
+        .with_padding_bottom(5.0)
+        .finish();
+        let dismiss =
+            self.banner_button("Dismiss", theme::surface(), EditAction::DismissSaveError);
+        let row = Flex::row()
+            .with_child(Expanded::new(1.0, msg).finish())
+            .with_child(dismiss)
             .finish();
         Container::new(row)
             .with_background_color(theme::surface())

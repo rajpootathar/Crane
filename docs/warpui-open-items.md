@@ -9,26 +9,22 @@ push stdin+summary, clickable terminal paths, copy trim, format-on-save +
 LSP did_save, git-log lane graph/rows/pills/detail/auto-reload, FS watcher,
 staged auto-updater, OSC toasts (in-app), goto-line clamp, light syntect themes.
 
-## P0 — data-loss / correctness (small, fix first)
+## P0 — data-loss / correctness — ALL DONE (data-safety wave)
 
-- **Dirty File-Tab close has no confirm.** `FileTabClose` (shell.rs ~9030-9054)
-  drops unsaved edits silently. Top-level Tab close confirms; the file-chip X
-  does not. Add a dirty check + confirm modal.
-- **Save failure is silent.** `save()` returns bool, shell discards it
-  (shell.rs ~8924-8937); `apply_format_result` write failure ignored
-  (editor_view.rs ~804-808). Surface an error banner/toast; never let the user
-  believe a failed save succeeded.
-- **Deleting a file doesn't close its editor tabs** (shell.rs ~9280) — a stale
-  dirty buffer can re-write a deleted path. Close matching File Tabs (and any
-  under a deleted directory) after `trash::delete`.
-- **Image/binary files open as garbled text** — `open_file` does
-  `read_to_string().unwrap_or_default()` (shell.rs ~7205). At minimum detect
-  binary and open read-only placeholder; ideally an image viewer branch.
-- **Remove-worktree modal lacks the `is_main` warning** (RemoveWtInfo has
-  dirty + ahead only, shell.rs ~92-105).
-- **Silent auto-reload of clean buffers lost** — external-change banner shows
-  even when buffer is clean instead of silently reloading
-  (editor_view.rs ~2404-2408).
+- ~~Dirty File-Tab close has no confirm~~ → ConfirmCloseFileTab modal; the
+  file-chip × now confirms when the buffer is dirty.
+- ~~Save failure is silent~~ → `save_error` on the editor + red banner
+  (Cmd+S sync path and the async format-on-save write both set/clear it).
+- ~~Deleting a file doesn't close its editor tabs~~ → ConfirmDelete now closes
+  every File Tab at/under the trashed path.
+- ~~Image/binary files open as garbled text~~ → `open_file` refuses non-UTF-8
+  content (toast explains); a reflexive Cmd+S can no longer truncate a binary.
+  A real image-viewer branch remains a MEDIUM item.
+- ~~Remove-worktree `is_main` warning~~ → the handler already double-guarded
+  main; the dead "Remove Worktree" menu item is now hidden for the primary
+  checkout instead.
+- ~~Silent auto-reload of clean buffers lost~~ → disk-change poll reloads clean
+  buffers silently; the banner is reserved for dirty buffers / vanished files.
 
 ## Remaining HIGH features (each a real work item)
 

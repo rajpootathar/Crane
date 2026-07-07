@@ -76,6 +76,10 @@ enum Modal {
     /// when it holds a running terminal or an editor with unsaved edits.
     /// Carries the `(project, worktree, tab)` key.
     ConfirmCloseTab { key: (usize, usize, usize) },
+    /// "Close File Tab" confirm — raised when a file chip's × targets an editor
+    /// buffer with unsaved edits (the top-level Tab confirm doesn't cover the
+    /// per-file close path). Carries the File Tab index.
+    ConfirmCloseFileTab { index: usize },
 }
 
 /// Visual style of a modal button (`modal_button`).
@@ -2283,14 +2287,23 @@ impl CraneShellView {
             "Default color",
             CraneShellAction::SetWorktreeTint { pi, wi, tint: None },
         ));
-        items = items.with_child(self.menu_separator());
-        // Remove Worktree runs `git worktree remove --force` (unless this IS the
-        // main working tree, where the handler no-ops) then tears down its panes.
-        items = items.with_child(self.menu_item(
-            icons::TRASH,
-            "Remove Worktree",
-            CraneShellAction::RemoveWorktree { pi, wi },
-        ));
+        // Remove Worktree runs `git worktree remove --force` after a confirm.
+        // The primary working tree can't be detached (the handler would no-op),
+        // so hide the item there instead of offering a dead action — removing
+        // the project is the operation that applies to the main checkout.
+        let is_main = self
+            .projects
+            .get(pi)
+            .map(|p| p.path == wt_path)
+            .unwrap_or(true);
+        if !is_main {
+            items = items.with_child(self.menu_separator());
+            items = items.with_child(self.menu_item(
+                icons::TRASH,
+                "Remove Worktree",
+                CraneShellAction::RemoveWorktree { pi, wi },
+            ));
+        }
         self.menu_popover(items.finish(), x, y)
     }
 
@@ -2718,6 +2731,7 @@ impl CraneShellView {
                 self.confirm_remove_worktree_card(*pi, *wi)
             }
             Modal::ConfirmCloseTab { key } => self.confirm_close_tab_card(*key, app),
+            Modal::ConfirmCloseFileTab { index } => self.confirm_close_file_tab_card(*index),
         };
         self.modal_scaffold(card)
     }
@@ -2834,6 +2848,52 @@ impl CraneShellView {
                         "Close",
                         ModalBtn::Danger,
                         CraneShellAction::ConfirmClosePane(id),
+                    ))
+                    .finish(),
+            )
+            .finish();
+        self.modal_card(360.0, col)
+    }
+
+    /// ConfirmCloseFileTab card — the file chip's × over a buffer with unsaved
+    /// edits. Cancel keeps the tab; Close discards the edits.
+    fn confirm_close_file_tab_card(&self, index: usize) -> Box<dyn Element> {
+        let name = self
+            .file_pane_paths
+            .get(index)
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "this file".to_string());
+        let col = Flex::column()
+            .with_child(
+                Text::new(format!("Close “{name}”?"), self.ui_font, 15.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_child(Self::spacer(8.0))
+            .with_child(
+                Text::new(
+                    "It has unsaved changes that will be lost.".to_string(),
+                    self.ui_font,
+                    12.0,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
+            )
+            .with_child(Self::spacer(16.0))
+            .with_child(
+                Flex::row()
+                    .with_child(Expanded::new(1.0, Flex::row().finish()).finish())
+                    .with_child(self.modal_button(
+                        "Cancel",
+                        ModalBtn::Plain,
+                        CraneShellAction::CloseModal,
+                    ))
+                    .with_child(Self::spacer(8.0))
+                    .with_child(self.modal_button(
+                        "Close",
+                        ModalBtn::Danger,
+                        CraneShellAction::FileTabCloseConfirmed(index),
                     ))
                     .finish(),
             )
@@ -4542,7 +4602,16 @@ impl CraneShellView {
         let handles: Vec<_> = self.editor_views.values().cloned().collect();
         for h in handles {
             if h.read(ctx, |v, _app| v.disk_changed()) {
-                h.update(ctx, |_v, vctx| vctx.notify());
+                // Clean buffer → adopt the external edit silently (old Crane's
+                // `file_save.rs` behavior); the reload banner is reserved for
+                // buffers with in-flight edits that a reload would clobber.
+                h.update(ctx, |v, vctx| {
+                    if v.is_dirty(&*vctx) {
+                        vctx.notify();
+                    } else {
+                        v.reload_from_disk(vctx);
+                    }
+                });
             }
         }
     }
@@ -7202,7 +7271,40 @@ impl CraneShellView {
         let handle = if let Some(h) = self.editor_views.get(&path) {
             h.clone()
         } else {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            // Binary guard: `read_to_string().unwrap_or_default()` used to turn
+            // an image/binary (or unreadable file) into an EMPTY editable
+            // buffer — and a reflexive Cmd+S would then truncate the real file
+            // to zero bytes. Refuse to open non-UTF-8 content as text: undo the
+            // tab bookkeeping above and say why in a toast.
+            let content = match std::fs::read(&path).map(String::from_utf8) {
+                Ok(Ok(s)) => s,
+                _ => {
+                    self.file_pane_paths.retain(|p| p != &path);
+                    if self.file_pane_active >= self.file_pane_paths.len() {
+                        self.file_pane_active =
+                            self.file_pane_paths.len().saturating_sub(1);
+                    }
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let id = self.next_toast_id;
+                    self.next_toast_id = self.next_toast_id.wrapping_add(1);
+                    if self.toasts.len() >= TOAST_MAX {
+                        self.toasts.pop_front();
+                    }
+                    self.toasts.push_back(Toast {
+                        id,
+                        body: format!("“{name}” is not a text file — use Reveal in Finder to open it externally."),
+                        urgent: false,
+                        source: "Files".to_string(),
+                        tab_key: None,
+                        at: std::time::Instant::now(),
+                    });
+                    ctx.notify();
+                    return;
+                }
+            };
             let mono = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
                 cache.load_system_font("Menlo").expect("load Menlo")
             });
@@ -8581,6 +8683,9 @@ pub enum CraneShellAction {
     /// File pane tab strip: switch to / close file tab `i`.
     FileTabSelect(usize),
     FileTabClose(usize),
+    /// Affirmative from the ConfirmCloseFileTab modal (or a direct close when
+    /// the buffer is clean) — actually removes the File Tab.
+    FileTabCloseConfirmed(usize),
     /// Cmd+A select-all in the focused editor.
     SelectAllFocused,
     /// Bulk-stage the given paths (folder-row / context-menu Stage).
@@ -9028,6 +9133,24 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::FileTabClose(i) => {
+                // Guard: closing a File Tab whose editor buffer has unsaved
+                // edits confirms first (the top-level Tab confirm doesn't cover
+                // this per-file path). Clean buffers close immediately.
+                let dirty = self
+                    .file_pane_paths
+                    .get(*i)
+                    .and_then(|p| self.editor_views.get(p))
+                    .map(|h| h.as_ref(&*ctx).is_dirty(&*ctx))
+                    .unwrap_or(false);
+                if dirty {
+                    self.modal = Some(Modal::ConfirmCloseFileTab { index: *i });
+                } else {
+                    let a = CraneShellAction::FileTabCloseConfirmed(*i);
+                    self.handle_action(&a, ctx);
+                }
+            }
+            CraneShellAction::FileTabCloseConfirmed(i) => {
+                self.modal = None;
                 if let Some(fp) = self.files_pane {
                     if *i < self.file_pane_paths.len() {
                         let removed = self.file_pane_paths.remove(*i);
@@ -9277,8 +9400,23 @@ impl TypedActionView for CraneShellView {
                     // dropping the request.
                     if let Err(e) = trash::delete(&path) {
                         self.commit_error = Some(format!("Trash: {e}"));
-                    } else if self.selected_file.as_deref() == Some(path.as_path()) {
-                        self.selected_file = None;
+                    } else {
+                        if self.selected_file.as_deref() == Some(path.as_path()) {
+                            self.selected_file = None;
+                        }
+                        // Close any File Tab holding the deleted file (or a file
+                        // under a deleted directory) — a surviving dirty buffer
+                        // could otherwise re-write the trashed path on Cmd+S.
+                        // FileTabCloseConfirmed handles active-index fixup and
+                        // tears the pane down when the last tab goes.
+                        while let Some(idx) = self
+                            .file_pane_paths
+                            .iter()
+                            .position(|p| p.starts_with(&path))
+                        {
+                            let a = CraneShellAction::FileTabCloseConfirmed(idx);
+                            self.handle_action(&a, ctx);
+                        }
                     }
                     self.refresh_panel(ctx);
                 }
