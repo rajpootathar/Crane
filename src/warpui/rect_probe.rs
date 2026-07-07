@@ -183,6 +183,83 @@ impl<T: Clone + 'static> Element for ZoneProbe<T> {
     }
 }
 
+/// `FileDropSink` — routes OS drag-and-drop file events (Finder → Crane) to a
+/// callback when the drop lands inside this element's painted rect. warpui
+/// surfaces `Event::DragAndDropFiles { paths, location }` at window scope but
+/// no stock element consumes it; this sink gives the Files tree its old
+/// "drop OS files into the tree" behavior.
+pub struct FileDropSink {
+    child: Box<dyn Element>,
+    on_drop: Rc<dyn Fn(&[String], Vector2F, &mut EventContext)>,
+    size: Option<Vector2F>,
+    origin: Option<Point>,
+}
+
+impl FileDropSink {
+    pub fn new(
+        child: Box<dyn Element>,
+        on_drop: Rc<dyn Fn(&[String], Vector2F, &mut EventContext)>,
+    ) -> Self {
+        Self {
+            child,
+            on_drop,
+            size: None,
+            origin: None,
+        }
+    }
+}
+
+impl Element for FileDropSink {
+    fn layout(
+        &mut self,
+        constraint: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &AppContext,
+    ) -> Vector2F {
+        let s = self.child.layout(constraint, ctx, app);
+        self.size = Some(s);
+        s
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
+        self.child.after_layout(ctx, app);
+    }
+
+    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+        self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
+        self.child.paint(origin, ctx, app);
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.size
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.origin
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &warpui::event::DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &AppContext,
+    ) -> bool {
+        if let warpui::event::Event::DragAndDropFiles { paths, location } = event.raw_event() {
+            if let (Some(o), Some(s)) = (self.origin.map(|p| p.xy()), self.size) {
+                let inside = location.x() >= o.x()
+                    && location.x() <= o.x() + s.x()
+                    && location.y() >= o.y()
+                    && location.y() <= o.y() + s.y();
+                if inside {
+                    (self.on_drop)(paths, *location, ctx);
+                    return true;
+                }
+            }
+        }
+        self.child.dispatch_event(event, ctx, app)
+    }
+}
+
 /// Find the (non-source) pane under `cursor` and the dock edge there.
 pub fn pane_under(
     rects: &[(PaneId, RectF)],

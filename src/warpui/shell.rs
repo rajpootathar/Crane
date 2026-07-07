@@ -313,8 +313,24 @@ pub struct CraneShellView {
     tree_drag_pos: Rc<Cell<Option<warpui::geometry::vector::Vector2F>>>,
     /// Sidebar row rects + scopes, repopulated at paint (visual order).
     tree_zones: crate::warpui::rect_probe::ZoneList<TreeScope>,
+    /// Previous frame's zones — render-time readers (the drop-line overlay)
+    /// use this snapshot: the live list is cleared at render start and only
+    /// refills at paint, AFTER the overlay is built.
+    tree_zones_last: crate::warpui::rect_probe::ZoneList<TreeScope>,
     /// Per-row `DraggableState`s, keyed by a stable row string.
     tree_drag_states: std::cell::RefCell<HashMap<String, DraggableState>>,
+    /// In-flight Files-tree row drag: the source path (None = no drag).
+    fs_drag: Option<PathBuf>,
+    /// Window-space cursor during a Files-tree drag (drop-target highlight).
+    fs_drag_pos: Rc<Cell<Option<warpui::geometry::vector::Vector2F>>>,
+    /// Directory-row rects (+ the tree root as a whole), repopulated at paint.
+    fs_zones: crate::warpui::rect_probe::ZoneList<PathBuf>,
+    /// Previous frame's dir-row zones (render-time drop-hover highlight).
+    fs_zones_last: crate::warpui::rect_probe::ZoneList<PathBuf>,
+    /// Per-file-row `DraggableState`s.
+    fs_drag_states: std::cell::RefCell<HashMap<String, DraggableState>>,
+    /// Undo stack for Files-tree ops (Cmd+Z when no editor owns focus).
+    file_ops: Vec<FileOp>,
     /// Loaded `git show` detail for the selected commit.
     git_log_detail: Option<crate::warpui::git_log::CommitDetail>,
     /// True while the selected commit's `git show` is computing.
@@ -762,6 +778,18 @@ pub enum TreeScope {
     Worktree { project: String },
     /// Tab row of (`project`, `worktree`).
     Tab { project: String, worktree: String },
+}
+
+/// A completed (undoable) Files-tree file operation — old Crane's
+/// `undo_last_file_op` stack. Trash is not undoable programmatically (the
+/// `trash` crate has no restore), so only Move/Copy land here.
+#[derive(Clone, Debug)]
+enum FileOp {
+    /// `fs::rename(from → to)`; undo renames back.
+    Move { from: PathBuf, to: PathBuf },
+    /// A path created by a copy (internal alt-copy or an external OS drop);
+    /// undo moves it to the Trash (recoverable, never a permanent unlink).
+    Copy { created: PathBuf },
 }
 
 /// Settings dialog sections (old `modals/settings.rs::SettingsSection`).
@@ -1326,7 +1354,14 @@ impl CraneShellView {
             tree_drag: None,
             tree_drag_pos: Rc::new(Cell::new(None)),
             tree_zones: Rc::new(std::cell::RefCell::new(Vec::new())),
+            tree_zones_last: Rc::new(std::cell::RefCell::new(Vec::new())),
             tree_drag_states: std::cell::RefCell::new(HashMap::new()),
+            fs_drag: None,
+            fs_drag_pos: Rc::new(Cell::new(None)),
+            fs_zones: Rc::new(std::cell::RefCell::new(Vec::new())),
+            fs_zones_last: Rc::new(std::cell::RefCell::new(Vec::new())),
+            fs_drag_states: std::cell::RefCell::new(HashMap::new()),
+            file_ops: Vec::new(),
             git_log_hover: Rc::new(Cell::new(None)),
             git_log_detail: None,
             git_log_detail_loading: false,
@@ -2174,6 +2209,185 @@ impl CraneShellView {
         ctx.notify();
     }
 
+    /// The directory a Files-tree drop at `cursor` targets: the deepest dir
+    /// row under the cursor, else the tree root when the cursor is anywhere
+    /// over the Files list. Zones repopulate per paint; a row's rect can only
+    /// contain the cursor once, so "last containing zone" (deepest painted)
+    /// is the row, with the whole-list root zone painted first as fallback.
+    fn fs_drop_target(&self, cursor: warpui::geometry::vector::Vector2F) -> Option<PathBuf> {
+        self.fs_zones
+            .borrow()
+            .iter()
+            .filter(|(r, _)| r.contains_point(cursor))
+            .last()
+            .map(|(_, p)| p.clone())
+    }
+
+    /// `name`, or `name (2)`, `name (3)` … — the first non-colliding target in
+    /// `dir` (old explorer.rs copy de-dupe naming, applied to moves too so a
+    /// move never overwrites).
+    fn unique_target(dir: &std::path::Path, name: &std::ffi::OsStr) -> PathBuf {
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        let base = std::path::Path::new(name);
+        let stem = base
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.to_string_lossy().into_owned());
+        let ext = base.extension().map(|e| e.to_string_lossy().into_owned());
+        for n in 2.. {
+            let file = match &ext {
+                Some(e) => format!("{stem} ({n}).{e}"),
+                None => format!("{stem} ({n})"),
+            };
+            let candidate = dir.join(file);
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+        unreachable!()
+    }
+
+    /// Complete an internal Files-tree drag: move `src` into the dir under the
+    /// release cursor (never overwriting — de-dupe naming), push the op onto
+    /// the undo stack, refresh the panel. No-ops: dropping onto the source's
+    /// own parent, onto itself, or a dir into its own subtree.
+    fn apply_fs_drop(&mut self, cursor: warpui::geometry::vector::Vector2F, ctx: &mut ViewContext<Self>) {
+        let Some(src) = self.fs_drag.take() else {
+            return;
+        };
+        self.fs_drag_pos.set(None);
+        let Some(dst_dir) = self.fs_drop_target(cursor) else {
+            ctx.notify();
+            return;
+        };
+        if src.parent() == Some(dst_dir.as_path())
+            || src == dst_dir
+            || dst_dir.starts_with(&src)
+        {
+            ctx.notify();
+            return;
+        }
+        let Some(name) = src.file_name() else {
+            return;
+        };
+        let target = Self::unique_target(&dst_dir, name);
+        match std::fs::rename(&src, &target) {
+            Ok(()) => {
+                self.file_ops.push(FileOp::Move {
+                    from: src.clone(),
+                    to: target.clone(),
+                });
+                // A moved open file keeps its editor tab pointing at the old
+                // path — retarget the File Tab list entry so re-clicks work.
+                for p in self.file_pane_paths.iter_mut() {
+                    if *p == src {
+                        *p = target.clone();
+                    }
+                }
+                if self.selected_file.as_deref() == Some(src.as_path()) {
+                    self.selected_file = Some(target);
+                }
+            }
+            Err(e) => self.commit_error = Some(format!("Move: {e}")),
+        }
+        self.refresh_panel(ctx);
+        ctx.notify();
+    }
+
+    /// Copy OS-dropped files/folders (Finder → Crane) into the dir under the
+    /// drop point (or the tree root), de-dupe named, each push an undoable
+    /// Copy op. Directories copy recursively.
+    fn apply_fs_external_drop(
+        &mut self,
+        paths: Vec<String>,
+        cursor: warpui::geometry::vector::Vector2F,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(dst_dir) = self
+            .fs_drop_target(cursor)
+            .or_else(|| self.active_cwd.clone())
+        else {
+            return;
+        };
+        for p in paths {
+            let src = PathBuf::from(&p);
+            let Some(name) = src.file_name() else { continue };
+            // Dropping something already inside the tree at the same spot
+            // would just clone it next to itself — skip the degenerate case.
+            if src.parent() == Some(dst_dir.as_path()) {
+                continue;
+            }
+            let target = Self::unique_target(&dst_dir, name);
+            let res = if src.is_dir() {
+                Self::copy_dir_recursive(&src, &target)
+            } else {
+                std::fs::copy(&src, &target).map(|_| ())
+            };
+            match res {
+                Ok(()) => self.file_ops.push(FileOp::Copy {
+                    created: target.clone(),
+                }),
+                Err(e) => {
+                    self.commit_error = Some(format!("Copy: {e}"));
+                    break;
+                }
+            }
+        }
+        self.refresh_panel(ctx);
+        ctx.notify();
+    }
+
+    fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if from.is_dir() {
+                Self::copy_dir_recursive(&from, &to)?;
+            } else {
+                std::fs::copy(&from, &to)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Cmd+Z fallback when no editor owns focus: undo the last Files-tree op.
+    /// A Move renames back; a Copy sends the created path to the Trash
+    /// (recoverable — never a permanent unlink).
+    fn undo_file_op(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let Some(op) = self.file_ops.pop() else {
+            return false;
+        };
+        match op {
+            FileOp::Move { from, to } => {
+                if let Err(e) = std::fs::rename(&to, &from) {
+                    self.commit_error = Some(format!("Undo move: {e}"));
+                } else {
+                    for p in self.file_pane_paths.iter_mut() {
+                        if *p == to {
+                            *p = from.clone();
+                        }
+                    }
+                    if self.selected_file.as_deref() == Some(to.as_path()) {
+                        self.selected_file = Some(from);
+                    }
+                }
+            }
+            FileOp::Copy { created } => {
+                if let Err(e) = trash::delete(&created) {
+                    self.commit_error = Some(format!("Undo copy: {e}"));
+                }
+            }
+        }
+        self.refresh_panel(ctx);
+        ctx.notify();
+        true
+    }
+
     /// Wrap a sidebar row in a `Draggable` carrying its `TreeDrag` identity —
     /// clicks pass through (drag engages past the movement threshold); the
     /// drop dispatches `TreeDrop` with the release cursor.
@@ -2236,7 +2450,7 @@ impl CraneShellView {
     fn tree_drop_line_overlay(&self) -> Option<Box<dyn Element>> {
         let drag = self.tree_drag.as_ref()?;
         let cursor = self.tree_drag_pos.get()?;
-        let zones = self.tree_zones.borrow();
+        let zones = self.tree_zones_last.borrow();
         let candidates: Vec<&(warpui::geometry::rect::RectF, TreeScope)> = zones
             .iter()
             .filter(|(_, scope)| match (drag, scope) {
@@ -6611,8 +6825,10 @@ impl CraneShellView {
         // Real project tree loaded from ~/.crane/session.json: the user's
         // actual projects -> worktrees (branches) -> tabs.
         // Drop-zone rects repopulate as the rows paint this frame (visual
-        // order); clear last frame's list first.
-        self.tree_zones.borrow_mut().clear();
+        // order). Snapshot last frame's list for render-time readers (the
+        // drop-line overlay builds BEFORE this frame's paint refills it).
+        *self.tree_zones_last.borrow_mut() =
+            std::mem::take(&mut *self.tree_zones.borrow_mut());
         let mut col = Flex::column();
         if self.projects.is_empty() {
             col = col.with_child(self.tree_row(
@@ -7149,9 +7365,25 @@ impl CraneShellView {
             .with_padding_left(pad)
             .with_padding_top(3.0)
             .finish();
+        // Drop-target highlight: while a Files-tree drag is in flight, tint
+        // the dir row under the cursor (last frame's painted zone rect).
+        let drop_hover = r.is_dir
+            && self.fs_drag.is_some()
+            && self
+                .fs_drag_pos
+                .get()
+                .map(|c| {
+                    self.fs_zones_last
+                        .borrow()
+                        .iter()
+                        .any(|(rect, p)| p == &r.path && rect.contains_point(c))
+                })
+                .unwrap_or(false);
         let mut bg = Rect::new();
         if is_sel {
             bg = bg.with_background_color(theme::row_active());
+        } else if drop_hover {
+            bg = bg.with_background_color(theme::row_hover());
         }
         let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
         let hit_layer = ConstrainedBox::new(Rect::new().finish())
@@ -7169,7 +7401,7 @@ impl CraneShellView {
         };
         let menu_path = r.path.clone();
         let is_dir = r.is_dir;
-        EventHandler::new(
+        let clickable = EventHandler::new(
             EventHandler::new(row)
                 .on_left_mouse_down(move |ctx, _app, _pos| {
                     ctx.dispatch_typed_action(action.clone());
@@ -7186,7 +7418,59 @@ impl CraneShellView {
             });
             DispatchEventResult::StopPropagation
         })
-        .finish()
+        .finish();
+        // Every row is a drag source (move into another dir); dir rows are
+        // also drop zones (rects recorded per paint).
+        let dragged = self.fs_draggable(r.path.clone(), clickable);
+        if r.is_dir {
+            Box::new(crate::warpui::rect_probe::ZoneProbe::new(
+                dragged,
+                self.fs_zones.clone(),
+                r.path.clone(),
+            ))
+        } else {
+            dragged
+        }
+    }
+
+    /// Wrap a Files-tree row in a `Draggable` carrying its source path —
+    /// clicks pass through under the movement threshold; the release
+    /// dispatches `FsDrop` with the cursor position.
+    fn fs_draggable(&self, path: PathBuf, child: Box<dyn Element>) -> Box<dyn Element> {
+        let key = format!("f:{}", path.display());
+        let state = self
+            .fs_drag_states
+            .borrow_mut()
+            .entry(key)
+            .or_default()
+            .clone();
+        let pos_cell = self.fs_drag_pos.clone();
+        let pos_cell_drop = self.fs_drag_pos.clone();
+        let state_drag = state.clone();
+        let state_drop = state.clone();
+        Box::new(
+            Draggable::new(state, child)
+                .on_drag_start(move |ctx, _app, _rect| {
+                    ctx.dispatch_typed_action(CraneShellAction::FsDragStart(path.clone()));
+                })
+                .on_drag(move |_ctx, _app, rect, _data| {
+                    let off = state_drag
+                        .cursor_offset_within_element()
+                        .unwrap_or_else(|| vec2f(0.0, 0.0));
+                    pos_cell.set(Some(rect.origin() + off));
+                })
+                .on_drop(move |ctx, _app, rect, _data| {
+                    let off = state_drop
+                        .cursor_offset_within_element()
+                        .unwrap_or_else(|| vec2f(0.0, 0.0));
+                    let cursor = rect.origin() + off;
+                    pos_cell_drop.set(None);
+                    ctx.dispatch_typed_action(CraneShellAction::FsDrop {
+                        x: cursor.x(),
+                        y: cursor.y(),
+                    });
+                }),
+        )
     }
 
     /// True when the active Project is a loose (non-git) folder — the Changes
@@ -7246,6 +7530,10 @@ impl CraneShellView {
             );
             col = col.with_child(self.commit_box());
         } else {
+            // FS drag-drop zones repopulate at paint; snapshot last frame's
+            // list for the render-time drop-hover highlight.
+            *self.fs_zones_last.borrow_mut() =
+                std::mem::take(&mut *self.fs_zones.borrow_mut());
             let mut list = Flex::column();
             if let Some(p) = &self.pending_new_entry {
                 list = list.with_child(self.pending_entry_row(p));
@@ -7256,9 +7544,28 @@ impl CraneShellView {
             for r in &self.file_rows {
                 list = list.with_child(self.file_row(r));
             }
-            col = col.with_child(
-                Expanded::new(1.0, self.scroll_list(list.finish())).finish(),
-            );
+            let mut body = self.scroll_list(list.finish());
+            if let Some(root) = &self.active_cwd {
+                // The whole list is (a) the root drop zone for internal drags
+                // that miss every dir row and (b) the sink for OS file drops
+                // (Finder → Crane), which copy into the dir under the cursor.
+                body = Box::new(crate::warpui::rect_probe::ZoneProbe::new(
+                    body,
+                    self.fs_zones.clone(),
+                    root.clone(),
+                ));
+                body = Box::new(crate::warpui::rect_probe::FileDropSink::new(
+                    body,
+                    Rc::new(|paths: &[String], loc, ectx| {
+                        ectx.dispatch_typed_action(CraneShellAction::FsExternalDrop {
+                            paths: paths.to_vec(),
+                            x: loc.x(),
+                            y: loc.y(),
+                        });
+                    }),
+                ));
+            }
+            col = col.with_child(Expanded::new(1.0, body).finish());
         }
         // No fixed width — the enclosing SplitBox sizes it (draggable).
         self.panel(theme::sidebar_bg(), col.finish())
@@ -10440,6 +10747,12 @@ pub enum CraneShellAction {
     TreeDragStart(TreeDrag),
     /// A sidebar row drag released at window position (x, y).
     TreeDrop { x: f32, y: f32 },
+    /// A Files-tree row drag crossed the movement threshold.
+    FsDragStart(PathBuf),
+    /// A Files-tree row drag released at window position (x, y).
+    FsDrop { x: f32, y: f32 },
+    /// OS files dropped (Finder → Crane) onto the Files tree at (x, y).
+    FsExternalDrop { paths: Vec<String>, x: f32, y: f32 },
     /// Open a read-only unified Diff pane (HEAD vs working copy) for the file at
     /// the given absolute path (dispatched by a Changes-row click).
     OpenDiff(PathBuf),
@@ -10766,9 +11079,6 @@ impl TypedActionView for CraneShellView {
                 }
             }
             CraneShellAction::UndoFocused => {
-                // TODO(parity): with NO editor focus, Cmd+Z should undo the last
-                // Files-pane move/trash op (old `undo_last_file_op`). Deferred
-                // until a Files-pane file-op undo stack is ported to warpui.
                 if let Some(h) = self.active_input_pane().and_then(|id| self.file_at(id)) {
                     h.update(ctx, |view, vctx| {
                         view.undo();
@@ -10776,6 +11086,11 @@ impl TypedActionView for CraneShellView {
                     });
                 } else if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
                     h.update(ctx, |view, vctx| view.undo(vctx));
+                } else {
+                    // No text buffer owns focus → undo the last Files-tree op
+                    // (old `undo_last_file_op`): a move renames back, a copy
+                    // goes to the Trash.
+                    let _ = self.undo_file_op(ctx);
                 }
             }
             CraneShellAction::RedoFocused => {
@@ -11283,6 +11598,15 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::TreeDrop { x, y } => {
                 self.apply_tree_drop(vec2f(*x, *y), ctx);
+            }
+            CraneShellAction::FsDragStart(path) => {
+                self.fs_drag = Some(path.clone());
+            }
+            CraneShellAction::FsDrop { x, y } => {
+                self.apply_fs_drop(vec2f(*x, *y), ctx);
+            }
+            CraneShellAction::FsExternalDrop { paths, x, y } => {
+                self.apply_fs_external_drop(paths.clone(), vec2f(*x, *y), ctx);
             }
             CraneShellAction::BrowserNewTab => {
                 if let Some(h) = self.focused.and_then(|id| self.browser_at(id)) {
