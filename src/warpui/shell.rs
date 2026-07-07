@@ -698,8 +698,30 @@ pub struct NewWorkspaceState {
     /// When true, create a brand-new branch (`worktree add -b`); else check out
     /// an existing branch into the new worktree.
     pub new_branch: bool,
+    /// Opened from the branch picker with an EXISTING branch — the field is
+    /// read-only and the new-branch checkbox hides (a `worktree add -b
+    /// <existing>` would fail; old modal's `branch_locked`).
+    pub branch_locked: bool,
+    /// Where the checkout lands (old `LocationMode` selector).
+    pub mode: LocationMode,
+    /// Parent folder for `LocationMode::Custom` (via Browse… or typed).
+    pub custom_path: String,
+    /// True while the custom-path field owns typing (else the branch field).
+    pub path_focused: bool,
     /// Error surfaced under the field on a failed `git worktree add`.
     pub error: Option<String>,
+}
+
+/// Where a new Workspace's worktree checkout is created (old
+/// `state::LocationMode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocationMode {
+    /// `~/.crane-worktrees/<project>/<branch>` — the default.
+    Global,
+    /// `<project>/.crane-worktrees/<branch>` — beside the code.
+    ProjectLocal,
+    /// A user-picked parent folder.
+    Custom,
 }
 
 /// Hard cap on Find-in-Files matches so a broad query in a huge tree can't wedge
@@ -4702,8 +4724,13 @@ impl CraneShellView {
         let row = Flex::row()
             .with_child(sidebar)
             .with_child(
+                // Height-bound the divider: a bare Rect has no intrinsic size,
+                // and the modal column imposes no height constraint — an
+                // unbounded Rect here panics warpui's scene ("y is_infinite",
+                // the known modal Expanded/Rect crash).
                 ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
                     .with_width(1.0)
+                    .with_height(430.0)
                     .finish(),
             )
             .with_child(
@@ -5187,24 +5214,38 @@ impl CraneShellView {
         let project = self.projects.get(st.project_idx);
         let pname = project.map(|p| p.name.clone()).unwrap_or_default();
 
+        let branch_caret = if st.path_focused || st.branch_locked { "" } else { "|" };
         let (btext, bcolor) = if st.branch.is_empty() {
-            ("branch name…".to_string(), theme::text_muted())
+            (format!("branch name…{branch_caret}"), theme::text_muted())
         } else {
-            (format!("{}|", st.branch), theme::text())
+            (format!("{}{branch_caret}", st.branch), theme::text())
         };
-        let branch_field = Container::new(
-            Flex::row()
-                .with_child(self.icon(icons::GIT_BRANCH, 13.0, theme::text_muted()))
-                .with_child(Self::spacer(8.0))
-                .with_child(Text::new(btext, self.ui_font, 13.0).with_color(bcolor).finish())
-                .finish(),
+        let branch_field = EventHandler::new(
+            Container::new(
+                Flex::row()
+                    .with_child(self.icon(icons::GIT_BRANCH, 13.0, theme::text_muted()))
+                    .with_child(Self::spacer(8.0))
+                    .with_child(Text::new(btext, self.ui_font, 13.0).with_color(bcolor).finish())
+                    .finish(),
+            )
+            .with_background_color(theme::row_active())
+            .with_border(Border::all(1.0).with_border_color(
+                if st.path_focused || st.branch_locked {
+                    theme::border()
+                } else {
+                    theme::accent()
+                },
+            ))
+            .with_padding_left(8.0)
+            .with_padding_right(8.0)
+            .with_padding_top(7.0)
+            .with_padding_bottom(7.0)
+            .finish(),
         )
-        .with_background_color(theme::row_active())
-        .with_border(Border::all(1.0).with_border_color(theme::border()))
-        .with_padding_left(8.0)
-        .with_padding_right(8.0)
-        .with_padding_top(7.0)
-        .with_padding_bottom(7.0)
+        .on_left_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceFocusPath(false));
+            DispatchEventResult::StopPropagation
+        })
         .finish();
 
         // "Create new branch" toggle row (a small checkbox box + label). Built
@@ -5259,9 +5300,123 @@ impl CraneShellView {
         })
         .finish();
 
-        // Computed target path preview.
-        let path_preview = Self::default_worktree_path(&pname, &st.branch);
-        let path_text = format!("→ {}", path_preview.display());
+        // Location mode selector (old modal's Global / Project-local / Custom).
+        let mode_pill = |label: &'static str, mode: LocationMode, hint: &'static str| -> Box<dyn Element> {
+            let active = st.mode == mode;
+            let _ = hint; // tooltips pending a warpui tooltip primitive
+            EventHandler::new(
+                Container::new(
+                    Text::new(label.to_string(), self.ui_font, 11.5)
+                        .with_color(if active { theme::text() } else { theme::text_muted() })
+                        .finish(),
+                )
+                .with_background_color(if active {
+                    theme::row_active()
+                } else {
+                    theme::surface()
+                })
+                .with_border(Border::all(1.0).with_border_color(if active {
+                    theme::accent()
+                } else {
+                    theme::border()
+                }))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_padding_left(10.0)
+                .with_padding_right(10.0)
+                .with_padding_top(3.0)
+                .with_padding_bottom(3.0)
+                .finish(),
+            )
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceSetMode(mode));
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+        };
+        let location_row = Flex::row()
+            .with_child(mode_pill(
+                "Global",
+                LocationMode::Global,
+                "~/.crane-worktrees/<project>/<branch>",
+            ))
+            .with_child(Self::spacer(6.0))
+            .with_child(mode_pill(
+                "Project-local",
+                LocationMode::ProjectLocal,
+                "<project>/.crane-worktrees/<branch>",
+            ))
+            .with_child(Self::spacer(6.0))
+            .with_child(mode_pill("Custom", LocationMode::Custom, "Pick any folder"))
+            .finish();
+
+        // Custom mode: editable parent-path field + Browse… (OS folder picker).
+        let custom_row: Option<Box<dyn Element>> = (st.mode == LocationMode::Custom).then(|| {
+            let caret = if st.path_focused { "|" } else { "" };
+            let (ptext, pcolor) = if st.custom_path.is_empty() {
+                (format!("/path/to/parent{caret}"), theme::text_muted())
+            } else {
+                (format!("{}{caret}", st.custom_path), theme::text())
+            };
+            let field = EventHandler::new(
+                Container::new(
+                    Text::new(ptext, self.ui_font, 12.0).with_color(pcolor).finish(),
+                )
+                .with_background_color(theme::row_active())
+                .with_border(Border::all(1.0).with_border_color(if st.path_focused {
+                    theme::accent()
+                } else {
+                    theme::border()
+                }))
+                .with_padding_left(8.0)
+                .with_padding_right(8.0)
+                .with_padding_top(5.0)
+                .with_padding_bottom(5.0)
+                .finish(),
+            )
+            .on_left_mouse_down(|ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceFocusPath(true));
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            let browse = EventHandler::new(
+                Container::new(
+                    Text::new("Browse…".to_string(), self.ui_font, 11.5)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_background_color(theme::surface())
+                .with_border(Border::all(1.0).with_border_color(theme::border()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_padding_left(10.0)
+                .with_padding_right(10.0)
+                .with_padding_top(4.0)
+                .with_padding_bottom(4.0)
+                .finish(),
+            )
+            .on_left_mouse_down(|ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceBrowse);
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            Flex::row()
+                .with_child(Expanded::new(1.0, field).finish())
+                .with_child(Self::spacer(6.0))
+                .with_child(browse)
+                .finish()
+        });
+
+        // Live target preview: mode-resolved parent + the (flattened) branch.
+        let ppath = project.map(|p| p.path.clone()).unwrap_or_default();
+        let parent = Self::resolved_worktree_parent(st.mode, &st.custom_path, &ppath, &pname);
+        let shown_branch = if st.branch.is_empty() {
+            "<branch>".to_string()
+        } else {
+            st.branch.replace('/', "-")
+        };
+        let path_text = format!(
+            "→ {}/{shown_branch}",
+            parent.display().to_string().trim_end_matches('/')
+        );
 
         let mut col = Flex::column()
             .with_child(self.modal_header("New Workspace"))
@@ -5277,14 +5432,39 @@ impl CraneShellView {
             )
             .with_child(Self::spacer(10.0))
             .with_child(branch_field)
-            .with_child(Self::spacer(8.0))
-            .with_child(toggle)
-            .with_child(Self::spacer(8.0))
-            .with_child(
-                Text::new(path_text, self.ui_font, 10.5)
-                    .with_color(theme::text_muted())
-                    .finish(),
+            .with_child(Self::spacer(8.0));
+        if st.branch_locked {
+            // Existing branch from the picker: the checkbox hides — the only
+            // valid action is checking it out into a new worktree.
+            col = col.with_child(
+                Text::new(
+                    "Checking out existing branch into a new worktree".to_string(),
+                    self.ui_font,
+                    11.0,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
             );
+        } else {
+            col = col.with_child(toggle);
+        }
+        col = col
+            .with_child(Self::spacer(10.0))
+            .with_child(
+                Text::new("Location".to_string(), self.ui_font, 11.5)
+                    .with_color(theme::text())
+                    .finish(),
+            )
+            .with_child(Self::spacer(4.0))
+            .with_child(location_row);
+        if let Some(row) = custom_row {
+            col = col.with_child(Self::spacer(6.0)).with_child(row);
+        }
+        col = col.with_child(Self::spacer(8.0)).with_child(
+            Text::new(path_text, self.ui_font, 10.5)
+                .with_color(theme::text_muted())
+                .finish(),
+        );
         if let Some(err) = &st.error {
             col = col.with_child(Self::spacer(6.0)).with_child(
                 Text::new(err.clone(), self.ui_font, 11.0)
@@ -5306,16 +5486,6 @@ impl CraneShellView {
         self.modal_card(460.0, col.finish())
     }
 
-    /// Default worktree checkout path: `~/.crane-worktrees/<project>/<branch>`
-    /// with `/` in the branch flattened to `-` so nested refs stay one directory.
-    fn default_worktree_path(project: &str, branch: &str) -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let safe_branch = branch.replace('/', "-");
-        PathBuf::from(home)
-            .join(".crane-worktrees")
-            .join(project)
-            .join(safe_branch)
-    }
 
     /// "project / workspace / tab" label for a tab-switcher entry.
     fn switcher_label(&self, pi: usize, wi: usize, tid: usize) -> String {
@@ -5694,17 +5864,59 @@ impl CraneShellView {
             }
             "backspace" => {
                 if let Some(st) = self.new_workspace.as_mut() {
-                    st.branch.pop();
+                    if st.path_focused {
+                        st.custom_path.pop();
+                    } else if !st.branch_locked {
+                        st.branch.pop();
+                    }
+                    st.error = None;
+                }
+            }
+            "space" if self.new_workspace.as_ref().is_some_and(|st| st.path_focused) => {
+                if let Some(st) = self.new_workspace.as_mut() {
+                    st.custom_path.push(' ');
                     st.error = None;
                 }
             }
             k if k.chars().count() == 1 && !ks.cmd && !ks.ctrl => {
                 if let Some(st) = self.new_workspace.as_mut() {
-                    st.branch.push_str(k);
+                    if st.path_focused {
+                        st.custom_path.push_str(k);
+                    } else if !st.branch_locked {
+                        st.branch.push_str(k);
+                    }
                     st.error = None;
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Resolve the parent dir a new Workspace's checkout goes under (old
+    /// `NewWorkspaceModal::resolved_parent`): Global → `~/.crane-worktrees/
+    /// <project>`, Project-local → `<project>/.crane-worktrees`, Custom → the
+    /// picked folder (with a leading `~` expanded).
+    fn resolved_worktree_parent(
+        mode: LocationMode,
+        custom_path: &str,
+        project_path: &str,
+        project_name: &str,
+    ) -> PathBuf {
+        match mode {
+            LocationMode::Global => {
+                let home = std::env::var("HOME").unwrap_or_default();
+                PathBuf::from(home).join(".crane-worktrees").join(project_name)
+            }
+            LocationMode::ProjectLocal => PathBuf::from(project_path).join(".crane-worktrees"),
+            LocationMode::Custom => {
+                let p = custom_path.trim();
+                if let Some(rest) = p.strip_prefix("~/") {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    PathBuf::from(home).join(rest)
+                } else {
+                    PathBuf::from(p)
+                }
+            }
         }
     }
 
@@ -5724,11 +5936,23 @@ impl CraneShellView {
             }
             return;
         }
+        let mode = st.mode;
+        let custom_path = st.custom_path.clone();
         let Some(project) = self.projects.get(pi) else {
             return;
         };
+        if mode == LocationMode::Custom && custom_path.trim().is_empty() {
+            if let Some(st) = self.new_workspace.as_mut() {
+                st.error = Some("Pick a parent folder for the Custom location.".to_string());
+            }
+            return;
+        }
         let main = PathBuf::from(&project.path);
-        let path = Self::default_worktree_path(&project.name, &branch);
+        // Location-mode-resolved parent + the branch (slashes flattened so
+        // nested refs stay one directory), matching the card's preview.
+        let safe_branch = branch.replace('/', "-");
+        let path = Self::resolved_worktree_parent(mode, &custom_path, &project.path, &project.name)
+            .join(safe_branch);
         // TODO(threading, audit new-workspace #3): `add_worktree` (`git worktree
         // add`) is a MUTATING op that can take multiple seconds on a large repo,
         // so it blocks the UI here. Deferred deliberately, not overlooked: a naive
@@ -6536,6 +6760,7 @@ impl CraneShellView {
         indent: f32,
         rename_buf: Option<String>,
         action: CraneShellAction,
+        plus_action: Option<CraneShellAction>,
     ) -> Box<dyn Element> {
         let size = 12.0_f32;
         let row_h = size + 8.0;
@@ -6636,10 +6861,15 @@ impl CraneShellView {
             );
         }
 
-        let label = Container::new(row_inner.finish())
+        let mut label = Container::new(row_inner.finish())
             .with_padding_left(indent)
-            .with_padding_top(4.0)
-            .finish();
+            .with_padding_top(4.0);
+        if plus_action.is_some() {
+            // Reserve the right edge for the trailing "+" so the diff badge
+            // never slides underneath it.
+            label = label.with_padding_right(22.0);
+        }
+        let label = label.finish();
         let hit_layer = ConstrainedBox::new(Rect::new().finish())
             .with_height(row_h)
             .finish();
@@ -6647,12 +6877,47 @@ impl CraneShellView {
         if selected {
             stack = stack.with_child(self.active_bar(row_h));
         }
-        let stack = stack.with_child(label).with_child(hit_layer).finish();
+        let mut stack = stack.with_child(label).with_child(hit_layer);
+        if let Some(pa) = plus_action {
+            // Trailing "+ new tab" affordance on the row's right edge (old
+            // hover-revealed PLUS; rendered above the hit layer so it wins the
+            // click). Replaces the taller per-worktree "New tab" row item.
+            stack = stack.with_child(self.trailing_plus_overlay(row_h, pa));
+        }
+        let stack = stack.finish();
         EventHandler::new(stack)
             .on_left_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(action.clone());
                 DispatchEventResult::StopPropagation
             })
+            .finish()
+    }
+
+    /// A right-aligned "+" button layered over a tree row (topmost, so it wins
+    /// the click against the row's hit layer). The row-item "New tab" / "New
+    /// workspace" entries this replaces cost a full row of height each.
+    fn trailing_plus_overlay(&self, row_h: f32, action: CraneShellAction) -> Box<dyn Element> {
+        let plus = EventHandler::new(
+            Container::new(self.icon(icons::PLUS, 10.0, theme::text_muted()))
+                .with_padding_left(6.0)
+                .with_padding_right(8.0)
+                .with_padding_top((row_h - 10.0) / 2.0)
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(action.clone());
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+        Flex::row()
+            .with_child(
+                Expanded::new(
+                    1.0,
+                    ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish(),
+                )
+                .finish(),
+            )
+            .with_child(plus)
             .finish()
     }
 
@@ -6967,6 +7232,19 @@ impl CraneShellView {
             // Feature B: a COLLAPSED project row aggregates attention over all its
             // tabs (expanded → its own tab rows carry the pulse instead).
             let project_since = if p_expanded { None } else { self.project_attention(pi) };
+            // Trailing "+" on the project row's right edge: git projects open
+            // the New Workspace modal; loose folders add a tab directly. This
+            // replaces the old full-height "New workspace" / "New tab" row
+            // items (user feedback: reduce tree height, plus lives on the row).
+            let plus_action = if p.is_loose {
+                CraneShellAction::NewTabIn(pi, 0)
+            } else {
+                CraneShellAction::OpenNewWorkspace { pi, branch: None }
+            };
+            let project_row = Stack::new()
+                .with_child(project_row)
+                .with_child(self.trailing_plus_overlay(21.0, plus_action))
+                .finish();
             // Drag to reorder: standalone projects move among root rows;
             // grouped members move only within their folder block.
             let p_scope = match &p.group_path {
@@ -7042,17 +7320,6 @@ impl CraneShellView {
                             ));
                         }
                     }
-                    col = col.with_child(self.nav_row(
-                        None,
-                        icons::PLUS,
-                        theme::text_muted(),
-                        "New tab",
-                        11.0,
-                        theme::text_muted(),
-                        24.0 + group_offset,
-                        false,
-                        CraneShellAction::NewTabIn(pi, wi),
-                    ));
                     continue;
                 }
                 let w_expanded = self.expanded_worktrees.contains(&(pi, wi));
@@ -7101,6 +7368,7 @@ impl CraneShellView {
                     24.0 + group_offset,
                     rbuf,
                     wt_action,
+                    Some(CraneShellAction::NewTabIn(pi, wi)),
                 );
                 // Right-click opens the worktree/branch context menu (mirrors the
                 // project row) without disturbing the left-click toggle.
@@ -7200,34 +7468,6 @@ impl CraneShellView {
                         ));
                     }
                 }
-                // "+ New tab" row for this worktree.
-                col = col.with_child(self.nav_row(
-                    None,
-                    icons::PLUS,
-                    theme::text_muted(),
-                    "New tab",
-                    11.0,
-                    theme::text_muted(),
-                    42.0 + group_offset,
-                    false,
-                    CraneShellAction::NewTabIn(pi, wi),
-                ));
-            }
-            // "+ New workspace" affordance for a git project — opens the New
-            // Workspace modal to `git worktree add` a branch. Loose folders have
-            // no worktrees, so this only shows for real git projects.
-            if !p.is_loose {
-                col = col.with_child(self.nav_row(
-                    None,
-                    icons::PLUS,
-                    theme::accent(),
-                    "New workspace",
-                    12.0,
-                    theme::text_muted(),
-                    24.0 + group_offset,
-                    false,
-                    CraneShellAction::OpenNewWorkspace { pi, branch: None },
-                ));
             }
         }
         // Prominent "Add Project" pill, pinned at the bottom: accent border +
@@ -10911,6 +11151,12 @@ pub enum CraneShellAction {
     NewWorkspaceKey(warpui::keymap::Keystroke),
     /// Toggle the New-Workspace "create new branch" checkbox.
     NewWorkspaceToggleNewBranch,
+    /// Pick the New-Workspace location mode (Global / Project-local / Custom).
+    NewWorkspaceSetMode(LocationMode),
+    /// Move typing focus between the branch field and the custom-path field.
+    NewWorkspaceFocusPath(bool),
+    /// Open the OS folder picker for the Custom location's parent.
+    NewWorkspaceBrowse,
     /// Confirm the New-Workspace modal: `git worktree add` + insert + open.
     NewWorkspaceConfirm,
     Noop,
@@ -12457,12 +12703,48 @@ impl TypedActionView for CraneShellView {
                     project_idx: *pi,
                     branch: branch.clone().unwrap_or_default(),
                     new_branch,
+                    // An existing branch from the picker locks the field —
+                    // the only sensible action is checkout-into-new-worktree.
+                    branch_locked: branch.is_some(),
+                    mode: LocationMode::Global,
+                    custom_path: String::new(),
+                    path_focused: false,
                     error: None,
                 });
                 self.modal = Some(Modal::NewWorkspace);
             }
             CraneShellAction::NewWorkspaceKey(ks) => {
                 self.edit_new_workspace(ks, ctx);
+            }
+            CraneShellAction::NewWorkspaceSetMode(mode) => {
+                if let Some(st) = self.new_workspace.as_mut() {
+                    st.mode = *mode;
+                    st.path_focused = *mode == LocationMode::Custom;
+                }
+            }
+            CraneShellAction::NewWorkspaceFocusPath(on) => {
+                if let Some(st) = self.new_workspace.as_mut() {
+                    st.path_focused = *on;
+                }
+            }
+            CraneShellAction::NewWorkspaceBrowse => {
+                let start = self
+                    .new_workspace
+                    .as_ref()
+                    .map(|st| st.custom_path.clone())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
+                let fut = rfd::AsyncFileDialog::new()
+                    .set_title("Choose worktree parent folder")
+                    .set_directory(start)
+                    .pick_folder();
+                ctx.spawn(fut, |this, res: Option<rfd::FileHandle>, vctx| {
+                    if let (Some(handle), Some(st)) = (res, this.new_workspace.as_mut()) {
+                        st.custom_path = handle.path().to_string_lossy().to_string();
+                        st.mode = LocationMode::Custom;
+                    }
+                    vctx.notify();
+                });
             }
             CraneShellAction::NewWorkspaceToggleNewBranch => {
                 if let Some(st) = self.new_workspace.as_mut() {
