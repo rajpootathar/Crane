@@ -435,6 +435,12 @@ pub struct CraneShellView {
     /// `did_change` + diagnostics, and drains goto results. Kept alive for the
     /// view's lifetime.
     _lsp_tick: warpui::r#async::SpawnedLocalStream,
+    /// Editor Language Server opt-in. OFF by default: the agent CLI is the
+    /// code-intelligence layer, so no rust-analyzer (or any server) is spawned
+    /// unless the user turns this on in Settings. Every LSP side effect
+    /// (did_open on file open, the poll tick body, goto-definition) is gated on
+    /// this flag. Persisted via `WarpuiState::lsp_enabled`.
+    lsp_enabled: bool,
 }
 
 /// An in-flight goto-definition request token (server + JSON-RPC id) plus the
@@ -619,6 +625,10 @@ impl CraneShellView {
             .as_ref()
             .map(|s| s.tab_tints.iter().cloned().collect())
             .unwrap_or_default();
+        // LSP opt-in, restored from warpui-state.json (default OFF — read here
+        // before `saved_state` is consumed by the restore block below).
+        let init_lsp_enabled: bool =
+            saved_state.as_ref().map(|s| s.lsp_enabled).unwrap_or(false);
         // SHALLOW load: build the full tree STRUCTURE with zero `git` subprocess
         // so the first frame paints immediately even with many worktrees. Branch
         // labels + diff/dirty badges are filled in a moment later by the async
@@ -1005,6 +1015,7 @@ impl CraneShellView {
             lsp_diag_sig: HashMap::new(),
             pending_gotos: Vec::new(),
             _lsp_tick: lsp_tick,
+            lsp_enabled: init_lsp_enabled,
         };
         // Backfill branch labels + diff/dirty badges for the whole (shallow-
         // loaded) tree off the UI thread. The sidebar is already visible; badges
@@ -1194,6 +1205,7 @@ impl CraneShellView {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
+            lsp_enabled: self.lsp_enabled,
         });
     }
 
@@ -2412,6 +2424,95 @@ impl CraneShellView {
 
         let zoom_pct = (crate::warpui::fontsize::zoom_level() * 100.0).round() as i32;
 
+        // --- Editor: Language Server (LSP) opt-in toggle row ---
+        // A bordered checkbox (accent fill + CHECK when on) matching the
+        // New-Workspace "create new branch" style — NOT a raw glyph — wrapped in
+        // a Hoverable that dispatches ToggleLsp. OFF by default: the agent CLI
+        // handles code intelligence; enabling spawns rust-analyzer et al.
+        let lsp_on = self.lsp_enabled;
+        let ui_font = self.ui_font;
+        let icon_font = self.icon_font;
+        let lsp_state = self.hover_handle("settings:lsp_toggle");
+        let lsp_toggle = Hoverable::new(lsp_state, move |ms| {
+            let row_bg = if ms.is_hovered() {
+                theme::row_hover()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            let check_inner: Box<dyn Element> = if lsp_on {
+                Text::new(icons::CHECK.to_string(), icon_font, 11.0)
+                    .with_color(ColorU::new(255, 255, 255, 255))
+                    .finish()
+            } else {
+                Rect::new().finish()
+            };
+            let check_bg = if lsp_on {
+                theme::accent()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            let checkbox = ConstrainedBox::new(
+                Container::new(check_inner)
+                    .with_background_color(check_bg)
+                    .with_border(Border::all(1.0).with_border_color(theme::border()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                    .finish(),
+            )
+            .with_width(16.0)
+            .with_height(16.0)
+            .finish();
+            let title_row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Text::new("Language Server (LSP)".to_string(), ui_font, 12.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_child(Self::spacer(8.0))
+                .with_child(
+                    Text::new(
+                        if lsp_on { "On".to_string() } else { "Off".to_string() },
+                        ui_font,
+                        11.0,
+                    )
+                    .with_color(if lsp_on { theme::accent() } else { theme::text_muted() })
+                    .finish(),
+                )
+                .finish();
+            let text_col = Flex::column()
+                .with_child(title_row)
+                .with_child(Self::spacer(2.0))
+                .with_child(
+                    Text::new(
+                        "Off by default — the agent handles code intelligence. \
+                         Spawns rust-analyzer etc. when on."
+                            .to_string(),
+                        ui_font,
+                        10.5,
+                    )
+                    .with_color(theme::text_muted())
+                    .finish(),
+                )
+                .finish();
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(checkbox)
+                    .with_child(Self::spacer(10.0))
+                    .with_child(text_col)
+                    .finish(),
+            )
+            .with_background_color(row_bg)
+            .with_padding_top(6.0)
+            .with_padding_bottom(6.0)
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::ToggleLsp);
+        })
+        .finish();
+
         let col = Flex::column()
             .with_child(self.modal_header("Settings"))
             .with_child(Self::spacer(6.0))
@@ -2445,6 +2546,15 @@ impl CraneShellView {
                 .with_color(theme::text_muted())
                 .finish(),
             )
+            .with_child(Self::spacer(14.0))
+            // --- Editor ---
+            .with_child(
+                Text::new("Editor".to_string(), self.ui_font, 12.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_child(Self::spacer(6.0))
+            .with_child(lsp_toggle)
             .with_child(Self::spacer(14.0))
             // --- About ---
             .with_child(
@@ -6102,7 +6212,9 @@ impl CraneShellView {
         // Notify the LSP that this file is open (spawns the matching server on
         // first sight; a no-op when none is installed). Seed the sent-version so
         // the poll loop doesn't fire a redundant did_change on the first tick.
-        if !self.lsp.is_tracked(&path) {
+        // GATED: with the LSP opt-in OFF (default) we never did_open, so no
+        // language server is spawned on file open.
+        if self.lsp_enabled && !self.lsp.is_tracked(&path) {
             let content = handle.read(ctx, |v, app| v.buffer_text(app));
             self.lsp
                 .did_open(&self.lsp_wake, &path, &content, &self.lsp_configs);
@@ -6191,6 +6303,12 @@ impl CraneShellView {
     /// results. Runs off the `_lsp_tick` timer stream (and is cheap / silent
     /// when nothing changed).
     fn poll_lsp(&mut self, ctx: &mut ViewContext<Self>) {
+        // LSP opt-in OFF (default): no-op the whole tick body. The timer stream
+        // stays registered (it's cheap) but drives no server activity — no
+        // tick, no did_change, no diagnostics fetch, no goto dispatch.
+        if !self.lsp_enabled {
+            return;
+        }
         self.lsp.tick(&self.lsp_wake);
         if let Some(path) = self.active_editor_path() {
             if let Some(h) = self.editor_views.get(&path).cloned() {
@@ -6230,6 +6348,12 @@ impl CraneShellView {
         character: u32,
         ctx: &mut ViewContext<Self>,
     ) {
+        // LSP opt-in OFF (default): Cmd+click / F12 do NOT dispatch an LSP goto
+        // (and never spawn a server). This is the single choke point for both
+        // `LspGoto` and `LspGotoAtCursor`.
+        if !self.lsp_enabled {
+            return;
+        }
         if !self.lsp.is_tracked(&path) {
             if let Some(h) = self.editor_views.get(&path).cloned() {
                 let (ver, text) =
@@ -7344,6 +7468,10 @@ pub enum CraneShellAction {
     },
     /// F12: LSP goto-definition at the caret in the focused editor pane.
     LspGotoAtCursor,
+    /// Settings toggle: flip the editor Language Server opt-in. ON opens every
+    /// live editor file so servers spawn + diagnostics start; OFF tears down all
+    /// running servers and clears the squiggles from every open editor.
+    ToggleLsp,
     /// Open the "Switch Branch" modal (searchable local + remote branch list).
     /// Trigger: click the status-bar branch label, or Cmd+Shift+B.
     OpenSwitchBranch,
@@ -8592,6 +8720,41 @@ impl TypedActionView for CraneShellView {
                         self.lsp_start_goto(path, line, character, ctx);
                     }
                 }
+            }
+            CraneShellAction::ToggleLsp => {
+                self.lsp_enabled = !self.lsp_enabled;
+                if self.lsp_enabled {
+                    // Turning ON: did_open every live editor file so the matching
+                    // server spawns and diagnostics start streaming — the same
+                    // path taken at app startup / on file open when enabled.
+                    let handles: Vec<(PathBuf, _)> = self
+                        .editor_views
+                        .iter()
+                        .map(|(p, h)| (p.clone(), h.clone()))
+                        .collect();
+                    for (path, h) in handles {
+                        if !self.lsp.is_tracked(&path) {
+                            let content = h.read(ctx, |v, app| v.buffer_text(app));
+                            self.lsp
+                                .did_open(&self.lsp_wake, &path, &content, &self.lsp_configs);
+                            let v0 = h.read(ctx, |v, app| v.buffer_version(app));
+                            self.lsp_versions.insert(path.clone(), v0);
+                        }
+                    }
+                } else {
+                    // Turning OFF: shut down every running language server and
+                    // wipe the diagnostics squiggles from all open editors.
+                    self.lsp.shutdown_all();
+                    self.lsp_versions.clear();
+                    self.lsp_diag_sig.clear();
+                    self.pending_gotos.clear();
+                    let handles: Vec<_> = self.editor_views.values().cloned().collect();
+                    for h in handles {
+                        h.update(ctx, |v, c| v.set_diagnostics(Vec::new(), c));
+                    }
+                }
+                // Persisted by the unconditional `save_state` at the end of
+                // `handle_action`.
             }
             CraneShellAction::OpenSwitchBranch => {
                 self.open_switch_branch(ctx);

@@ -164,6 +164,11 @@ pub struct WarpuiState {
     /// App-wide zoom level (Cmd+= / Cmd+- / Cmd+0), 1.0 = 100%. 0.0 = unset.
     #[serde(default)]
     pub zoom_level: f32,
+    /// Editor Language Server (LSP) opt-in. OFF by default — the agent CLI is
+    /// the code-intelligence layer, so we never spawn rust-analyzer et al.
+    /// unless the user explicitly enables this in Settings.
+    #[serde(default)]
+    pub lsp_enabled: bool,
 }
 
 fn state_file() -> Option<PathBuf> {

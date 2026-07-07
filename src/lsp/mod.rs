@@ -165,6 +165,19 @@ impl LspManager {
         });
     }
 
+    /// Tear down EVERY running language server. Used when the user disables the
+    /// LSP wholesale in Settings (the opt-in toggle), as opposed to
+    /// `shutdown_disabled` which only kills servers whose language was turned
+    /// off. Dropping each `Arc<LspServer>` runs its `Drop` impl
+    /// (`graceful_shutdown`: LSP `shutdown` + `exit` + hard-kill fallback), so
+    /// the child processes and their DB writers exit cleanly. All per-file
+    /// tracking is cleared so a later re-enable starts from a clean slate.
+    pub fn shutdown_all(&mut self) {
+        self.servers.clear();
+        self.pending_files.write().clear();
+        self.files.write().clear();
+    }
+
     pub fn did_open(
         &mut self,
         wake: &Wake,
