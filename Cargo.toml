@@ -97,6 +97,11 @@ flate2 = "1"
 # Windows. Deliberately picked over a hand-rolled `mv ~/.Trash/`
 # shell-out so files keep their "Put Back" affordance in Finder.
 trash = "5"
+# Cross-platform filesystem watcher (FSEvents on macOS, inotify on Linux,
+# ReadDirectoryChangesW on Windows). One RecommendedWatcher services every
+# Project; a single debouncer thread coalesces bursts. See
+# src/warpui/file_watcher.rs. 8.x is the latest stable line.
+notify = "8"
 
 [dev-dependencies]
 tempfile = "3"

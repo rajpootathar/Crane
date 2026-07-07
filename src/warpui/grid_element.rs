@@ -35,13 +35,28 @@ pub enum MouseSelPhase {
     Up,
 }
 
-/// One clickable URL span in the visible grid. `col_end` is exclusive.
+/// What a clickable span in the terminal grid points at. A `Url` opens in the
+/// system browser; a `File` is routed to the shell (Crane's editor) at the
+/// optional `:LINE[:COL]` the CLI printed.
+#[derive(Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    Url(String),
+    File {
+        path: std::path::PathBuf,
+        line: Option<u32>,
+        col: Option<u32>,
+    },
+}
+
+/// One clickable span (URL or file path) in the visible grid. `col_end` is
+/// exclusive. Built by the View each frame; hover/click machinery is shared
+/// between the two target kinds.
 #[derive(Clone)]
-pub struct UrlSpan {
+pub struct LinkSpan {
     pub row: usize,
     pub col_start: usize,
     pub col_end: usize,
-    pub url: String,
+    pub target: LinkTarget,
 }
 
 #[derive(Clone, Copy)]
@@ -104,13 +119,14 @@ pub struct GridElement {
     mouse_sel_cb: Option<Rc<dyn Fn(MouseSelPhase, usize, usize, Side, bool)>>,
     /// Shared drag state (persisted by the owning View across per-frame rebuilds).
     mouse_dragging: Rc<StdCell<bool>>,
-    /// URL spans detected in the visible grid rows (built by the View each frame).
-    url_spans: Vec<UrlSpan>,
+    /// Clickable link spans (URLs + file paths) detected in the visible grid
+    /// rows (built by the View each frame).
+    link_spans: Vec<LinkSpan>,
     /// Which span is currently hovered: (row, col_start, col_end). Persisted
     /// across rebuilds so the underline is visible between MouseMoved events.
     url_hover: Rc<StdCell<Option<(usize, usize, usize)>>>,
-    /// URL recorded at the last LeftMouseDown (for click-without-drag detection).
-    url_pressed: Rc<RefCell<Option<String>>>,
+    /// Link target recorded at the last LeftMouseDown (click-without-drag detection).
+    link_pressed: Rc<RefCell<Option<LinkTarget>>>,
     /// True if LeftMouseDragged fired since the last LeftMouseDown. Shared so
     /// the View can also inspect it (e.g. suppress copy on drag-release).
     url_did_drag: Rc<StdCell<bool>>,
@@ -157,9 +173,9 @@ impl GridElement {
             display_offset: 0,
             mouse_sel_cb: None,
             mouse_dragging: Rc::new(StdCell::new(false)),
-            url_spans: Vec::new(),
+            link_spans: Vec::new(),
             url_hover: Rc::new(StdCell::new(None)),
-            url_pressed: Rc::new(RefCell::new(None)),
+            link_pressed: Rc::new(RefCell::new(None)),
             url_did_drag: Rc::new(StdCell::new(false)),
             mouse_report_cb: None,
         }
@@ -210,18 +226,18 @@ impl GridElement {
         self
     }
 
-    /// Attach URL spans computed by the View, plus shared hover/press/drag
-    /// state that persists across per-frame rebuilds.
-    pub fn with_url_spans(
+    /// Attach clickable link spans (URLs + file paths) computed by the View,
+    /// plus shared hover/press/drag state that persists across per-frame rebuilds.
+    pub fn with_link_spans(
         mut self,
-        spans: Vec<UrlSpan>,
+        spans: Vec<LinkSpan>,
         hover: Rc<StdCell<Option<(usize, usize, usize)>>>,
-        pressed: Rc<RefCell<Option<String>>>,
+        pressed: Rc<RefCell<Option<LinkTarget>>>,
         did_drag: Rc<StdCell<bool>>,
     ) -> Self {
-        self.url_spans = spans;
+        self.link_spans = spans;
         self.url_hover = hover;
-        self.url_pressed = pressed;
+        self.link_pressed = pressed;
         self.url_did_drag = did_drag;
         self
     }
@@ -480,9 +496,9 @@ impl Element for GridElement {
             let side = if cell_frac < 0.5 { Side::Left } else { Side::Right };
             (row, col, side)
         };
-        // Return the URL span hit at (row, col), if any.
-        let url_hit_at = |row: usize, col: usize| -> Option<&UrlSpan> {
-            self.url_spans
+        // Return the link span (URL or file path) hit at (row, col), if any.
+        let link_hit_at = |row: usize, col: usize| -> Option<&LinkSpan> {
+            self.link_spans
                 .iter()
                 .find(|sp| sp.row == row && col >= sp.col_start && col < sp.col_end)
         };
@@ -490,7 +506,7 @@ impl Element for GridElement {
         match event.raw_event() {
             Event::MouseMoved { position, .. } if in_bounds(position) => {
                 let (row, col, _) = pos_to_cell(position);
-                if let Some(sp) = url_hit_at(row, col) {
+                if let Some(sp) = link_hit_at(row, col) {
                     let next = Some((sp.row, sp.col_start, sp.col_end));
                     // Repaint immediately when the hovered span changes so the
                     // accent underline appears at idle (no unrelated repaint).
@@ -545,10 +561,10 @@ impl Element for GridElement {
         if let Some(cb) = self.mouse_sel_cb.clone() {
             match event.raw_event() {
                 Event::LeftMouseDown { position, modifiers, .. } if in_bounds(position) => {
-                    // Record URL under the press (if any) and reset drag flag.
+                    // Record the link target under the press (if any) and reset drag flag.
                     let (row, col, side) = pos_to_cell(position);
-                    let pressed_url = url_hit_at(row, col).map(|sp| sp.url.clone());
-                    *self.url_pressed.borrow_mut() = pressed_url;
+                    let pressed_link = link_hit_at(row, col).map(|sp| sp.target.clone());
+                    *self.link_pressed.borrow_mut() = pressed_link;
                     self.url_did_drag.set(false);
                     self.mouse_dragging.set(true);
                     cb(MouseSelPhase::Down, row, col, side, modifiers.shift);
@@ -563,21 +579,34 @@ impl Element for GridElement {
                 Event::LeftMouseUp { position, .. } if self.mouse_dragging.get() => {
                     self.mouse_dragging.set(false);
                     cb(MouseSelPhase::Up, 0, 0, Side::Left, false);
-                    // URL click: only when no drag happened and the release is on
-                    // the same URL that was pressed. This keeps text selection
-                    // (drag) completely unaffected.
+                    // Link click: only when no drag happened and the release is on
+                    // the same target that was pressed. This keeps text selection
+                    // (drag) completely unaffected. A URL opens in the browser; a
+                    // file path is routed to the shell (Crane's editor) at the
+                    // detected line/col.
                     if !self.url_did_drag.get() {
-                        let pressed = self.url_pressed.borrow().clone();
-                        if let Some(url) = pressed {
+                        let pressed = self.link_pressed.borrow().clone();
+                        if let Some(target) = pressed {
                             let (row, col, _) = pos_to_cell(position);
-                            if url_hit_at(row, col)
-                                .is_some_and(|sp| sp.url == url)
-                            {
-                                let _ = webbrowser::open(&url);
+                            if link_hit_at(row, col).is_some_and(|sp| sp.target == target) {
+                                match target {
+                                    LinkTarget::Url(url) => {
+                                        let _ = webbrowser::open(&url);
+                                    }
+                                    LinkTarget::File { path, line, col } => {
+                                        ctx.dispatch_typed_action(
+                                            crate::warpui::shell::CraneShellAction::OpenFileAtPath {
+                                                path,
+                                                line,
+                                                col,
+                                            },
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
-                    *self.url_pressed.borrow_mut() = None;
+                    *self.link_pressed.borrow_mut() = None;
                     return true;
                 }
                 _ => {}

@@ -67,6 +67,146 @@ fn scan_urls(row: &str) -> Vec<UrlHit> {
     hits
 }
 
+/// One local file path detected in a row of the visible grid. Only paths that
+/// resolve to something on disk are kept — path detection without the existence
+/// check would underline every dotted identifier in the output. `line` / `col`
+/// carry an optional `:LINE[:COL]` suffix parsed from compiler-style references
+/// (rustc / tsc / Claude Code). `path` is already resolved against the pane cwd.
+/// Ported from `src/terminal/view.rs:28-36,166-224`.
+struct PathHit {
+    col_start: usize,
+    col_end: usize,
+    path: std::path::PathBuf,
+    line: Option<u32>,
+    col: Option<u32>,
+}
+
+/// Split a token into its path part and optional `:LINE[:COL]` suffix. Accepts
+/// `path:N` and `path:N:M` where N/M are all digits; anything else falls through
+/// as a plain path with no line info. Ported from `src/terminal/view.rs:98-118`.
+fn split_line_col(s: &str) -> (&str, Option<u32>, Option<u32>) {
+    if let Some(c1) = s.rfind(':') {
+        let tail = &s[c1 + 1..];
+        let head = &s[..c1];
+        if let Ok(n1) = tail.parse::<u32>() {
+            if let Some(c2) = head.rfind(':') {
+                let mid = &head[c2 + 1..];
+                let head2 = &head[..c2];
+                if let Ok(n2) = mid.parse::<u32>() {
+                    return (head2, Some(n2), Some(n1));
+                }
+            }
+            return (head, Some(n1), None);
+        }
+    }
+    (s, None, None)
+}
+
+/// True when `s` looks like a bare filename (`main.rs`, `README.md`). The caller
+/// also accepts tokens that contain `/` or start with `~`, so this only needs to
+/// catch the no-separator case — reject dotted identifiers like `v1.2.3` or
+/// `Self.method` by requiring a short ASCII-alphanumeric extension. Ported from
+/// `src/terminal/view.rs:124-137`.
+fn looks_like_file(s: &str) -> bool {
+    let Some(dot) = s.rfind('.') else {
+        return false;
+    };
+    let ext = &s[dot + 1..];
+    if ext.is_empty() || ext.len() > 8 {
+        return false;
+    }
+    ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Resolve a terminal-emitted path token against the pane's cwd. `~` / `~/…`
+/// expand via `$HOME`; absolute tokens pass through; anything else is relative to
+/// `cwd`. Not canonicalized (would flatten symlinks the user clicked on purpose).
+/// Ported from `src/terminal/view.rs:141-158`.
+fn resolve_path(token: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+    if token == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home);
+        }
+    }
+    if let Some(rest) = token.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    let p = std::path::Path::new(token);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
+/// Scan a row of plain text for references to paths that exist on disk.
+/// Deliberately aggressive syntactically (any whitespace-separated token that
+/// contains `/`, a tilde prefix, or a plausible extension) then filtered by
+/// `Path::exists()` — the stat check is the load-bearing part. URLs are skipped
+/// so the URL scanner stays the authority for those. Ported from
+/// `src/terminal/view.rs:166-224`.
+fn scan_paths(row: &str, cwd: &std::path::Path) -> Vec<PathHit> {
+    let mut hits = Vec::new();
+    let chars: Vec<char> = row.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        while i < n && (chars[i].is_whitespace() || chars[i] == '\0') {
+            i += 1;
+        }
+        let start = i;
+        while i < n && !chars[i].is_whitespace() && chars[i] != '\0' {
+            i += 1;
+        }
+        if start == i {
+            break;
+        }
+        let mut ts = start;
+        let mut te = i;
+        while ts < te && matches!(chars[ts], '(' | '[' | '{' | '<' | '"' | '\'') {
+            ts += 1;
+        }
+        while te > ts
+            && matches!(
+                chars[te - 1],
+                '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\''
+            )
+        {
+            te -= 1;
+        }
+        if te - ts < 2 {
+            continue;
+        }
+        let token: String = chars[ts..te].iter().collect();
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("file://")
+        {
+            continue;
+        }
+        let (base, line_no, col_no) = split_line_col(&token);
+        if !(base.contains('/') || base.starts_with('~') || looks_like_file(base)) {
+            continue;
+        }
+        let resolved = resolve_path(base, cwd);
+        if !resolved.exists() {
+            continue;
+        }
+        let base_chars = base.chars().count();
+        hits.push(PathHit {
+            col_start: ts,
+            col_end: ts + base_chars,
+            path: resolved,
+            line: line_no,
+            col: col_no,
+        });
+    }
+    hits
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crane_term::index::{Column as TermColumn, Line as TermLine, Point as TermPoint, Side};
@@ -163,8 +303,9 @@ pub struct TerminalView {
     /// Hovered URL span: (row, col_start, col_end). Persists across per-frame
     /// rebuilds so GridElement can draw the underline between MouseMoved events.
     url_hover: Rc<StdCell<Option<(usize, usize, usize)>>>,
-    /// URL that was pressed at the last LeftMouseDown (click-without-drag detection).
-    url_pressed: Rc<RefCell<Option<String>>>,
+    /// Link target that was pressed at the last LeftMouseDown (click-without-drag
+    /// detection). URL or resolved file path.
+    link_pressed: Rc<RefCell<Option<crate::warpui::grid_element::LinkTarget>>>,
     /// Whether LeftMouseDragged fired since the last LeftMouseDown.
     url_did_drag: Rc<StdCell<bool>>,
 }
@@ -197,8 +338,27 @@ impl TerminalView {
         let initial = requested_cwd.borrow().clone();
         let controller = TerminalController::new(80, 24, initial.as_deref(), wake.clone())
             .expect("spawn terminal");
-        let repaint =
-            ctx.spawn_stream_local(rx, |_this, _item, ctx| ctx.notify(), |_this, _ctx| {});
+        // Reader-thread wake -> repaint. Also the drain point for OSC 9 / OSC 777
+        // desktop notifications the reader thread buffered on the controller: each
+        // is forwarded to the shell as a `CraneShellAction::TermNotification` (the
+        // shell renders the toast — not here). The dispatch is attributed to this
+        // TerminalView's view_id, so the shell can map it back to the source pane.
+        let repaint = ctx.spawn_stream_local(
+            rx,
+            |this, _item, ctx| {
+                let notes = this.controller.borrow().take_notifications();
+                for n in notes {
+                    ctx.dispatch_typed_action(
+                        &crate::warpui::shell::CraneShellAction::TermNotification {
+                            body: n.body,
+                            urgent: n.urgent,
+                        },
+                    );
+                }
+                ctx.notify();
+            },
+            |_this, _ctx| {},
+        );
 
         Self {
             font_family,
@@ -215,7 +375,7 @@ impl TerminalView {
             click_count: Rc::new(StdCell::new(0)),
             _repaint: repaint,
             url_hover: Rc::new(StdCell::new(None)),
-            url_pressed: Rc::new(RefCell::new(None)),
+            link_pressed: Rc::new(RefCell::new(None)),
             url_did_drag: Rc::new(StdCell::new(false)),
         }
     }
@@ -408,17 +568,43 @@ impl View for TerminalView {
             system_beep();
         }
 
-        // Scan visible rows for clickable URLs.
-        let url_spans: Vec<crate::warpui::grid_element::UrlSpan> = {
+        // Scan visible rows for clickable links: HTTP/HTTPS URLs and on-disk file
+        // paths (absolute / `~` / repo-relative, optional `:LINE[:COL]`). Paths
+        // resolve against the terminal's cwd and are kept only when they exist.
+        // URLs win on overlap (a URL is a strictly more specific match than a
+        // token-with-a-dot), so a path hit overlapping a URL span is dropped.
+        use crate::warpui::grid_element::{LinkSpan, LinkTarget};
+        let link_spans: Vec<LinkSpan> = {
+            let cwd = self.controller.borrow().cwd.clone();
             let mut spans = Vec::new();
             for r in 0..rows {
                 let row_text: String = (0..cols).map(|c| cells[r * cols + c].ch).collect();
+                let mut url_ranges: Vec<(usize, usize)> = Vec::new();
                 for hit in scan_urls(&row_text) {
-                    spans.push(crate::warpui::grid_element::UrlSpan {
+                    url_ranges.push((hit.col_start, hit.col_end));
+                    spans.push(LinkSpan {
                         row: r,
                         col_start: hit.col_start,
                         col_end: hit.col_end,
-                        url: hit.url,
+                        target: LinkTarget::Url(hit.url),
+                    });
+                }
+                for ph in scan_paths(&row_text, &cwd) {
+                    let overlaps_url = url_ranges
+                        .iter()
+                        .any(|&(s, e)| ph.col_start < e && s < ph.col_end);
+                    if overlaps_url {
+                        continue;
+                    }
+                    spans.push(LinkSpan {
+                        row: r,
+                        col_start: ph.col_start,
+                        col_end: ph.col_end,
+                        target: LinkTarget::File {
+                            path: ph.path,
+                            line: ph.line,
+                            col: ph.col,
+                        },
                     });
                 }
             }
@@ -600,10 +786,10 @@ impl View for TerminalView {
         .with_cursor_style(cursor_style.shape, cursor_style.blink)
         .on_mouse_report(mouse_report_cb)
         .on_mouse_select(self.sel_dragging.clone(), mouse_sel_cb)
-        .with_url_spans(
-            url_spans,
+        .with_link_spans(
+            link_spans,
             self.url_hover.clone(),
-            self.url_pressed.clone(),
+            self.link_pressed.clone(),
             self.url_did_drag.clone(),
         );
 

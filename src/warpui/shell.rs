@@ -5,7 +5,7 @@
 //! theme render in warpui exactly like the egui version.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -441,6 +441,29 @@ pub struct CraneShellView {
     /// (did_open on file open, the poll tick body, goto-definition) is gated on
     /// this flag. Persisted via `WarpuiState::lsp_enabled`.
     lsp_enabled: bool,
+
+    // ── Agent-native wiring ───────────────────────────────────────────────────
+    /// Filesystem watcher: external / agent edits under any watched Project or
+    /// Workspace (worktree) root trigger a Changes/Files/diff refresh for the
+    /// ACTIVE repo. Kept alive for the view's lifetime (Drop tears down the OS
+    /// watch + joins the debounce thread).
+    file_watcher: crate::warpui::file_watcher::FileWatcher,
+    /// Coalesced change events drained on the fast tick. Each `ChangeEvent.root`
+    /// is a canonicalized watched root (matched against `canonicalize(active_cwd)`
+    /// to decide whether the ACTIVE repo needs a refresh).
+    fs_events: std::sync::mpsc::Receiver<crate::warpui::file_watcher::ChangeEvent>,
+    /// Original path strings currently registered with `file_watcher`, so
+    /// `sync_watches` only canonicalizes / (un)registers on an actual change
+    /// instead of every tick.
+    watched: HashSet<String>,
+    /// Bounded FIFO of live notification toasts (OSC 9 / OSC 777). Swept by the
+    /// fast tick; rendered as a bottom-right overlay.
+    toasts: VecDeque<Toast>,
+    /// Monotonic toast id source.
+    next_toast_id: u64,
+    /// Keeps the fast (250ms) tick alive: sweeps expired toasts and drains
+    /// `fs_events` so external edits refresh the active repo without input.
+    _fast_tick: warpui::r#async::SpawnedLocalStream,
 }
 
 /// An in-flight goto-definition request token (server + JSON-RPC id) plus the
@@ -449,6 +472,45 @@ struct PendingGoto {
     server: crate::lsp::ServerKey,
     request_id: i64,
     dispatched_at: std::time::Instant,
+}
+
+/// One in-app desktop-notification toast surfaced from an OSC 9 / OSC 777
+/// escape a program in a Crane terminal emitted (agent CLI `Stop`/`Notification`
+/// hooks, build scripts, …). Bounded FIFO in `CraneShellView::toasts`; rendered
+/// as a bottom-right stack overlay that auto-dismisses after `TOAST_TTL`. Port
+/// of old egui `PaneNotification` + `src/modals/notification_toast.rs`, pared to
+/// what the warpui terminal view forwards — body + urgency. The view carries no
+/// pane locator, so the source is captured best-effort from the tab that was
+/// active when the notification arrived (used for the header label + click-to-
+/// focus).
+struct Toast {
+    /// Monotonic id (stable across re-renders) — the dismiss / focus actions
+    /// target a toast by id, not by shifting index.
+    id: u64,
+    body: String,
+    /// True for OSC 777 (urgent) — coloured stroke + WARNING glyph.
+    urgent: bool,
+    /// Best-effort source breadcrumb ("project / branch  ·  tab").
+    source: String,
+    /// The tab to activate when the toast body is clicked, or None.
+    tab_key: Option<(usize, usize, usize)>,
+    /// When the toast was raised — drives the TTL sweep.
+    at: std::time::Instant,
+}
+
+/// How long a toast stays on screen before the fast tick sweeps it.
+const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+/// Max simultaneous toasts — the oldest is dropped when a burst exceeds this.
+const TOAST_MAX: usize = 5;
+
+/// Clamp a notification body to `max` chars, appending an ellipsis when cut.
+fn truncate_body(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        // ASCII ellipsis — bundled JetBrains Mono may not cover U+2026.
+        out.push_str("...");
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -912,6 +974,33 @@ impl CraneShellView {
             |this: &mut Self, _instant, vctx| {
                 this.poll_worktrees(vctx);
                 this.poll_editor_disk_changes(vctx);
+                // Register any worktrees discovered this tick (idempotent — only
+                // canonicalizes/registers newly-seen roots).
+                this.sync_watches();
+            },
+            |_this, _vctx| {},
+        );
+        // Filesystem watcher for external / agent edits. Roots are registered
+        // below (`view.sync_watches()`); its receiver is drained on the fast tick.
+        let (file_watcher, fs_events) = crate::warpui::file_watcher::FileWatcher::new();
+        // Fast (250ms) tick: sweep expired toasts (so they self-dismiss without
+        // user input) and drain filesystem change events (so external edits
+        // refresh the active repo promptly). Both are cheap no-ops when idle.
+        let fast_ticker =
+            warpui::r#async::Timer::interval(std::time::Duration::from_millis(250));
+        let fast_tick = ctx.spawn_stream_local(
+            fast_ticker,
+            |this: &mut Self, _instant, vctx| {
+                this.drain_fs_events(vctx);
+                let before = this.toasts.len();
+                let now = std::time::Instant::now();
+                this.toasts
+                    .retain(|t| now.duration_since(t.at) < TOAST_TTL);
+                // Keep repainting while any toast is visible, plus one final
+                // repaint the tick a toast expired, so the overlay clears itself.
+                if !this.toasts.is_empty() || this.toasts.len() != before {
+                    vctx.notify();
+                }
             },
             |_this, _vctx| {},
         );
@@ -1016,7 +1105,16 @@ impl CraneShellView {
             pending_gotos: Vec::new(),
             _lsp_tick: lsp_tick,
             lsp_enabled: init_lsp_enabled,
+            file_watcher,
+            fs_events,
+            watched: HashSet::new(),
+            toasts: VecDeque::new(),
+            next_toast_id: 0,
+            _fast_tick: fast_tick,
         };
+        // Register every restored Project + Workspace root with the watcher so
+        // external / agent edits refresh the active repo from first paint.
+        view.sync_watches();
         // Backfill branch labels + diff/dirty badges for the whole (shallow-
         // loaded) tree off the UI thread. The sidebar is already visible; badges
         // stream in as this returns. ZERO synchronous `git` ran on this path.
@@ -1903,6 +2001,110 @@ impl CraneShellView {
                     ctx.dispatch_typed_action(CraneShellAction::CancelDelete);
                 }),
         )
+    }
+
+    // ---- Notification toasts ---------------------------------------------
+    //
+    // Bottom-right stack of small rounded cards, one per live toast. Unlike the
+    // menus/modals above it must NOT absorb clicks: the overlay is built from
+    // transparent, non-interactive spacers (Flex/Expanded/Rect all report
+    // events unhandled) so clicks fall through to the panes behind; only each
+    // card's own EventHandler consumes. Auto-dismiss is driven by the fast tick
+    // sweeping `self.toasts`; render only paints the still-live ones.
+
+    /// The bottom-right toast stack overlay. Newest toast at the bottom.
+    fn toast_overlay(&self) -> Box<dyn Element> {
+        let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::End);
+        for t in self.toasts.iter().filter(|t| t.at.elapsed() < TOAST_TTL) {
+            col = col.with_child(self.toast_card(t));
+            col = col.with_child(Self::spacer(8.0));
+        }
+        let cards = ConstrainedBox::new(col.finish()).with_width(360.0).finish();
+        // Right-align the fixed-width card column, with a right margin.
+        let row = Flex::row()
+            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+            .with_child(cards)
+            .with_child(Self::spacer(20.0))
+            .finish();
+        // Push the whole thing to the bottom with a bottom margin.
+        Flex::column()
+            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+            .with_child(row)
+            .with_child(Self::spacer(24.0))
+            .finish()
+    }
+
+    /// One toast card: header (source label + urgency glyph + X dismiss) and the
+    /// notification body. The card body is click-to-focus; the X dismisses.
+    fn toast_card(&self, t: &Toast) -> Box<dyn Element> {
+        let ui_font = self.ui_font;
+        let icon_font = self.icon_font;
+        let (stroke, accent, glyph) = if t.urgent {
+            (theme::error(), theme::error(), icons::WARNING)
+        } else {
+            (theme::border(), theme::accent(), icons::INFO)
+        };
+        let id = t.id;
+        // Far-right X dismiss button.
+        let close = EventHandler::new(
+            Container::new(
+                Text::new(icons::X.to_string(), icon_font, 12.0)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            )
+            .with_uniform_padding(4.0)
+            .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::DismissToast(id));
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+        // Header row: urgency glyph + source breadcrumb, X pinned right.
+        let header = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                Container::new(
+                    Text::new(glyph.to_string(), icon_font, 13.0)
+                        .with_color(accent)
+                        .finish(),
+                )
+                .with_padding_right(6.0)
+                .finish(),
+            )
+            .with_child(
+                Expanded::new(
+                    1.0,
+                    Text::new(t.source.clone(), ui_font, 11.0)
+                        .with_color(accent)
+                        .finish(),
+                )
+                .finish(),
+            )
+            .with_child(close)
+            .finish();
+        let body = Text::new(truncate_body(&t.body, 180), ui_font, 12.0)
+            .with_color(theme::text())
+            .finish();
+        let card = Container::new(
+            Flex::column()
+                .with_child(header)
+                .with_child(Self::spacer(4.0))
+                .with_child(body)
+                .finish(),
+        )
+        .with_background_color(theme::surface())
+        .with_border(Border::all(1.0).with_border_color(stroke))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.0)))
+        .with_uniform_padding(12.0)
+        .finish();
+        // Clicking the card body focuses the originating tab (best-effort).
+        EventHandler::new(card)
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::FocusToastSource(id));
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
     }
 
     // ---- Modal framework -------------------------------------------------
@@ -3902,6 +4104,107 @@ impl CraneShellView {
             &self.removed_project_paths,
             &self.project_tints,
         );
+        self.sync_watches();
+    }
+
+    /// Reconcile the filesystem watcher's registered roots against the current
+    /// Project + Workspace set: unwatch roots that vanished, watch newly-seen
+    /// ones. Cheap on a no-op — `watched` (original path strings) gates so a
+    /// `canonicalize` + OS (un)watch only runs on an actual change. Called on
+    /// startup, after project add/remove, and each worktree poll tick.
+    fn sync_watches(&mut self) {
+        let current: HashSet<String> = self
+            .projects
+            .iter()
+            .flat_map(|p| {
+                std::iter::once(p.path.clone())
+                    .chain(p.worktrees.iter().map(|w| w.path.clone()))
+            })
+            .collect();
+        // Drop watches for roots that are no longer present.
+        let stale: Vec<String> = self
+            .watched
+            .iter()
+            .filter(|r| !current.contains(*r))
+            .cloned()
+            .collect();
+        for path in stale {
+            self.file_watcher.unwatch(std::path::Path::new(&path));
+            self.watched.remove(&path);
+        }
+        // Register roots we are not yet watching (recursive; both Projects and
+        // Workspaces route as their own root).
+        let add: Vec<String> = current
+            .into_iter()
+            .filter(|r| !self.watched.contains(r))
+            .collect();
+        for path in add {
+            let _ = self
+                .file_watcher
+                .watch_project(std::path::Path::new(&path));
+            self.watched.insert(path);
+        }
+    }
+
+    /// Drain coalesced filesystem change events. Always empties the receiver
+    /// (keeps the mpsc bounded) and, if any batch belongs to the ACTIVE repo,
+    /// refreshes its Changes/Files panel + marks editor diffs dirty — so
+    /// external / agent edits update the Right Panel and diff panes without a
+    /// manual reload. Only the active repo is refreshed (cheap; other repos
+    /// refresh when focused).
+    fn drain_fs_events(&mut self, ctx: &mut ViewContext<Self>) {
+        let active_canon = self
+            .active_cwd
+            .as_ref()
+            .and_then(|p| std::fs::canonicalize(p).ok());
+        let mut active_touched = false;
+        while let Ok(ev) = self.fs_events.try_recv() {
+            if let Some(ac) = active_canon.as_ref() {
+                if &ev.root == ac {
+                    active_touched = true;
+                }
+            }
+        }
+        if active_touched {
+            self.refresh_panel(ctx);
+            self.invalidate_editor_diffs(&*ctx);
+        }
+    }
+
+    /// Best-effort "project / branch  ·  tab" breadcrumb for the tab identified
+    /// by `key` — used as a notification toast's source label. Any leg that has
+    /// gone stale falls back to a placeholder so the toast still names something.
+    fn notif_source_label(&self, key: (usize, usize, usize)) -> String {
+        let (pi, wi, tid) = key;
+        let proj = self
+            .projects
+            .get(pi)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "—".to_string());
+        let branch = self
+            .projects
+            .get(pi)
+            .and_then(|p| p.worktrees.get(wi))
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+        let tab = self
+            .worktree_tabs
+            .get(&(pi, wi))
+            .and_then(|tabs| tabs.iter().find(|t| t.id == tid))
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let mut out = proj;
+        if !branch.is_empty() {
+            out.push_str(" / ");
+            out.push_str(&branch);
+        }
+        if !tab.is_empty() {
+            // ASCII separator only — the bundled fonts don't cover glyphs like
+            // the middle dot, so they'd render as tofu (see CLAUDE.md).
+            out.push_str(" / ");
+            out.push_str(&tab);
+        }
+        out
     }
 
     /// After a `git checkout` in `root`, refresh the matching left-panel worktree
@@ -7040,6 +7343,12 @@ impl View for CraneShellView {
         if let Some(p) = &self.pending_delete {
             root_stack = root_stack.with_child(self.delete_confirm_overlay(p));
         }
+        // Notification toasts: above the panes / menus, BELOW the blocking modal.
+        // Only paint still-live toasts (the fast tick sweeps expired ones); the
+        // overlay itself is click-through except on each card.
+        if self.toasts.iter().any(|t| t.at.elapsed() < TOAST_TTL) {
+            root_stack = root_stack.with_child(self.toast_overlay());
+        }
         // The blocking modal renders LAST — topmost, over every other overlay.
         if let Some(m) = &self.modal {
             root_stack = root_stack.with_child(self.modal_overlay(m, app));
@@ -7325,6 +7634,27 @@ pub enum CraneShellAction {
     ShowFileMenu { path: PathBuf, is_dir: bool, x: f32, y: f32 },
     /// Open an absolute path in the editor/Files pane (context-menu Open).
     OpenFileAt(PathBuf),
+    /// Open a file in the editor/Files pane at an optional `:LINE[:COL]`,
+    /// dispatched when a clickable path in a Terminal pane is clicked. `path` is
+    /// already resolved (absolute) against the terminal's cwd. `line`/`col` are
+    /// 1-based when present. (`col` is recorded for future column-precise jumps;
+    /// the editor currently only supports goto-line.)
+    OpenFileAtPath {
+        path: PathBuf,
+        line: Option<u32>,
+        col: Option<u32>,
+    },
+    /// A desktop notification (OSC 9 / OSC 777) drained from a Terminal pane and
+    /// forwarded by its `TerminalView`. `urgent` is true for OSC 777. The shell
+    /// owns rendering the toast — the terminal view only forwards the payload.
+    TermNotification {
+        body: String,
+        urgent: bool,
+    },
+    /// Dismiss the notification toast with this id (the toast's X button).
+    DismissToast(u64),
+    /// Clicking a toast body: activate its originating tab, then dismiss it.
+    FocusToastSource(u64),
     /// Copy an arbitrary path string to the clipboard.
     CopyPathStr(String),
     /// Reveal an absolute path in the system file manager (`open -R`).
@@ -7824,6 +8154,84 @@ impl TypedActionView for CraneShellView {
                 self.selected_file = Some(path.clone());
                 self.open_file(path.clone(), ctx);
             }
+            CraneShellAction::OpenFileAtPath { path, line, col: _ } => {
+                // Clicked path in a Terminal pane: open in the editor and, when a
+                // `:LINE` suffix was present, scroll to it. Column-precise jumps
+                // are recorded on the action but not yet applied (editor exposes
+                // goto-line only).
+                self.row_menu = None;
+                // The grid scanner already resolves against the terminal's cwd, so
+                // `path` is normally absolute. Guard the relative case: resolve
+                // against the focused terminal's cwd, then the active repo root.
+                let resolved = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    let base = self
+                        .focused
+                        .and_then(|id| self.terminal_at(id))
+                        .map(|h| h.read(&*ctx, |v, _| v.cwd()))
+                        .or_else(|| self.active_cwd.clone());
+                    match base {
+                        Some(dir) => dir.join(path),
+                        None => path.clone(),
+                    }
+                };
+                self.selected_file = Some(resolved.clone());
+                self.open_file(resolved.clone(), ctx);
+                if let Some(l) = line {
+                    if let Some(h) = self.editor_views.get(&resolved).cloned() {
+                        h.update(ctx, |view, vctx| view.goto_line(*l as usize, vctx));
+                    }
+                }
+            }
+            CraneShellAction::TermNotification { body, urgent } => {
+                // A terminal emitted an OSC 9 / OSC 777 desktop notification. The
+                // view forwards no pane locator, so capture the active tab as a
+                // best-effort source (header label + click-to-focus target).
+                let source = self
+                    .active_tab
+                    .map(|k| self.notif_source_label(k))
+                    .unwrap_or_else(|| "Terminal".to_string());
+                let id = self.next_toast_id;
+                self.next_toast_id = self.next_toast_id.wrapping_add(1);
+                if self.toasts.len() >= TOAST_MAX {
+                    self.toasts.pop_front();
+                }
+                self.toasts.push_back(Toast {
+                    id,
+                    body: body.clone(),
+                    urgent: *urgent,
+                    source,
+                    tab_key: self.active_tab,
+                    at: std::time::Instant::now(),
+                });
+                ctx.notify();
+            }
+            CraneShellAction::DismissToast(id) => {
+                self.toasts.retain(|t| t.id != *id);
+            }
+            CraneShellAction::FocusToastSource(id) => {
+                // Activate the tab the notification came from (best-effort), then
+                // dismiss the toast. Reuses the same activation path as a left-panel
+                // tab click.
+                if let Some(t) = self.toasts.iter().find(|t| t.id == *id) {
+                    if let Some(key) = t.tab_key {
+                        let (pi, wi, tid) = key;
+                        let path = self
+                            .projects
+                            .get(pi)
+                            .and_then(|p| p.worktrees.get(wi))
+                            .map(|w| PathBuf::from(&w.path));
+                        if let Some(path) = path {
+                            self.handle_action(
+                                &CraneShellAction::Select { sel: (pi, wi, tid), path },
+                                ctx,
+                            );
+                        }
+                    }
+                }
+                self.toasts.retain(|t| t.id != *id);
+            }
             CraneShellAction::CopyPathStr(s) => {
                 self.row_menu = None;
                 ctx.clipboard()
@@ -8108,6 +8516,9 @@ impl TypedActionView for CraneShellView {
                                 &this.project_tints,
                             );
                             this.projects.extend(new_nodes);
+                            // Watch the newly added Project(s) + their Workspaces so
+                            // external / agent edits refresh the active repo.
+                            this.sync_watches();
                             let new_paths = crate::warpui::projects::scan_paths(
                                 &this.projects[start..],
                             );
@@ -8172,6 +8583,8 @@ impl TypedActionView for CraneShellView {
                 if *i < self.projects.len() {
                     self.projects.remove(*i);
                 }
+                // Reconcile watches: unwatch the removed Project + its Workspaces.
+                self.sync_watches();
                 let new_index: HashMap<String, usize> = self
                     .projects
                     .iter()
@@ -8451,6 +8864,8 @@ impl TypedActionView for CraneShellView {
                         p.worktrees.remove(wi);
                     }
                 }
+                // Stop watching the detached Workspace root.
+                self.sync_watches();
                 let new_wt_index: HashMap<String, usize> = self
                     .projects
                     .get(pi)

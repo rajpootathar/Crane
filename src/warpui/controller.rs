@@ -12,7 +12,7 @@ use std::thread;
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
-use crane_term::{Processor, Term};
+use crane_term::{Processor, Term, TermNotification};
 
 /// Called from the reader thread when the grid changes and the UI should
 /// repaint. Must be cheap and thread-safe (e.g. send on a channel).
@@ -32,6 +32,11 @@ pub struct TerminalController {
     /// this atomic (which also guarantees a UI wake even for a bare bell that
     /// doesn't otherwise dirty the grid) and the UI drains it via `take_bell`.
     bell: Arc<AtomicBool>,
+    /// Desktop notifications (OSC 9 / OSC 777) drained off the `Term` queue by
+    /// the reader thread and buffered here until the UI thread forwards them to
+    /// the shell (mirrors the `bell` latch: draining on the reader thread also
+    /// guarantees a UI wake even when the notification didn't dirty the grid).
+    notif_queue: Arc<Mutex<Vec<TermNotification>>>,
     /// The directory the shell was spawned in — persisted so a restored
     /// session reopens the terminal in the same place (old Crane parity).
     pub cwd: std::path::PathBuf,
@@ -90,6 +95,7 @@ impl TerminalController {
         let parser = Arc::new(Mutex::new(Processor::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let bell = Arc::new(AtomicBool::new(false));
+        let notif_queue: Arc<Mutex<Vec<TermNotification>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Reader thread: PTY -> crane_term, write back replies, wake the UI.
         // Lock order is ALWAYS parser-then-term (deadlock-critical).
@@ -99,6 +105,7 @@ impl TerminalController {
             let writer = writer.clone();
             let alive = alive.clone();
             let bell = bell.clone();
+            let notif_queue = notif_queue.clone();
             Some(thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -108,7 +115,7 @@ impl TerminalController {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            let (replies, epoch, cursor, rang);
+                            let (replies, epoch, cursor, rang, notes);
                             {
                                 let mut p = parser.lock();
                                 let mut t = term.lock();
@@ -120,6 +127,10 @@ impl TerminalController {
                                 // doesn't dirty the grid) still forces a wake and
                                 // reaches the UI via the atomic below.
                                 rang = t.take_bell();
+                                // Drain OSC 9 / OSC 777 desktop notifications for
+                                // the same reason: a bare notification may not
+                                // dirty the grid, so buffer + force a wake below.
+                                notes = t.take_notifications();
                             }
                             // Write replies BEFORE the next read (P10k workaround).
                             if !replies.is_empty() {
@@ -130,7 +141,11 @@ impl TerminalController {
                             if rang {
                                 bell.store(true, Ordering::Relaxed);
                             }
-                            if epoch != last_epoch || cursor != last_cursor || rang {
+                            let has_notes = !notes.is_empty();
+                            if has_notes {
+                                notif_queue.lock().extend(notes);
+                            }
+                            if epoch != last_epoch || cursor != last_cursor || rang || has_notes {
                                 last_epoch = epoch;
                                 last_cursor = cursor;
                                 wake();
@@ -158,8 +173,18 @@ impl TerminalController {
             rows,
             alive,
             bell,
+            notif_queue,
             cwd,
         })
+    }
+
+    /// Drain the desktop notifications (OSC 9 / OSC 777) buffered by the reader
+    /// thread since the last call. `&self` (interior `Arc<Mutex>`) so the render
+    /// / repaint path can forward them without `&mut`. Each is routed to the
+    /// shell as a `CraneShellAction::TermNotification`; the toast itself is
+    /// rendered by the shell, not here.
+    pub fn take_notifications(&self) -> Vec<TermNotification> {
+        std::mem::take(&mut *self.notif_queue.lock())
     }
 
     /// The terminal's window title (OSC 0 / OSC 2), if the shell or a program

@@ -16,6 +16,7 @@ pub mod controller;
 pub mod diff_view;
 pub mod editor_view;
 pub mod file_pane;
+pub mod file_watcher;
 pub mod find_bar_element;
 pub mod file_tree;
 pub mod fontsize;
