@@ -211,6 +211,11 @@ pub struct WarpuiState {
     /// `syntax_theme`).
     #[serde(default)]
     pub syntax_override: String,
+    /// Sidebar drag-drop ordering: (project path, worktree paths in order),
+    /// in project display order. Applied after the project load so freshly
+    /// discovered projects/worktrees (absent here) append at the end.
+    #[serde(default)]
+    pub sidebar_order: Vec<(String, Vec<String>)>,
 }
 
 /// Serde default for `format_on_save`: ON, so existing state files that predate

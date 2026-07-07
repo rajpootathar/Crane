@@ -113,6 +113,76 @@ impl Element for RectProbe {
     }
 }
 
+/// `ZoneProbe` — like [`RectProbe`], but appends `(rect, tag)` to a shared
+/// list at paint time instead of writing one cell. The sidebar drag-drop
+/// reorder collects every row's painted rect + drop scope this way (the list
+/// is cleared at the start of each left-panel render, so it always holds
+/// exactly the rows painted this frame, in visual order).
+pub type ZoneList<T> = Rc<std::cell::RefCell<Vec<(RectF, T)>>>;
+
+pub struct ZoneProbe<T: Clone + 'static> {
+    child: Box<dyn Element>,
+    zones: ZoneList<T>,
+    tag: T,
+    size: Option<Vector2F>,
+    origin: Option<Point>,
+}
+
+impl<T: Clone + 'static> ZoneProbe<T> {
+    pub fn new(child: Box<dyn Element>, zones: ZoneList<T>, tag: T) -> Self {
+        Self {
+            child,
+            zones,
+            tag,
+            size: None,
+            origin: None,
+        }
+    }
+}
+
+impl<T: Clone + 'static> Element for ZoneProbe<T> {
+    fn layout(
+        &mut self,
+        constraint: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &AppContext,
+    ) -> Vector2F {
+        let s = self.child.layout(constraint, ctx, app);
+        self.size = Some(s);
+        s
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
+        self.child.after_layout(ctx, app);
+    }
+
+    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+        self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
+        let size = self.size.unwrap_or_else(|| vec2f(0.0, 0.0));
+        self.zones
+            .borrow_mut()
+            .push((RectF::new(origin, size), self.tag.clone()));
+        self.child.paint(origin, ctx, app);
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.size
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.origin
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &warpui::event::DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &AppContext,
+    ) -> bool {
+        self.child.dispatch_event(event, ctx, app)
+    }
+}
+
 /// Find the (non-source) pane under `cursor` and the dock edge there.
 pub fn pane_under(
     rects: &[(PaneId, RectF)],

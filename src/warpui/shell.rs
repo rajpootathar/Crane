@@ -307,6 +307,14 @@ pub struct CraneShellView {
     syntax_override: Option<String>,
     /// Scroll state for the Settings section body.
     settings_scroll: ClippedScrollStateHandle,
+    /// In-flight sidebar row drag (None = no drag).
+    tree_drag: Option<TreeDrag>,
+    /// Window-space cursor during a sidebar drag (drives the drop-line).
+    tree_drag_pos: Rc<Cell<Option<warpui::geometry::vector::Vector2F>>>,
+    /// Sidebar row rects + scopes, repopulated at paint (visual order).
+    tree_zones: crate::warpui::rect_probe::ZoneList<TreeScope>,
+    /// Per-row `DraggableState`s, keyed by a stable row string.
+    tree_drag_states: std::cell::RefCell<HashMap<String, DraggableState>>,
     /// Loaded `git show` detail for the selected commit.
     git_log_detail: Option<crate::warpui::git_log::CommitDetail>,
     /// True while the selected commit's `git show` is computing.
@@ -727,6 +735,35 @@ enum GitLogOp {
     Revert,
 }
 
+/// An in-flight sidebar row drag (old `ui/projects.rs::TreeDrag`), identified
+/// by PATH (not index) so a background `poll_worktrees` tick that shifts
+/// indices mid-gesture can't retarget the drop.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TreeDrag {
+    /// A standalone or grouped project row; `group` = its `group_path`.
+    Project { path: String, group: Option<String> },
+    /// A folder-group header — the whole block moves as a unit.
+    Group { path: String },
+    /// A Workspace (branch) row inside `project`.
+    Worktree { project: String, path: String },
+    /// A Tab row inside (`project`, `worktree`).
+    Tab { project: String, worktree: String, id: usize },
+}
+
+/// Drop-scope tag on each sidebar row's painted rect (old `DropScope`): the
+/// drop dispatcher filters rows to siblings of the dragged item.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TreeScope {
+    /// Top-level row: standalone project or folder-group header.
+    Root,
+    /// Sub-project inside the folder group at `group`.
+    InBlock { group: String },
+    /// Workspace row of `project`.
+    Worktree { project: String },
+    /// Tab row of (`project`, `worktree`).
+    Tab { project: String, worktree: String },
+}
+
 /// Settings dialog sections (old `modals/settings.rs::SettingsSection`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
@@ -848,9 +885,39 @@ impl CraneShellView {
         // so the first frame paints immediately even with many worktrees. Branch
         // labels + diff/dirty badges are filled in a moment later by the async
         // scan kicked off at the end of `new` (see `spawn_git_scan` below).
-        let projects = crate::warpui::projects::load_projects_shallow(
+        let mut projects = crate::warpui::projects::load_projects_shallow(
             &init_added, &init_removed, &init_tints,
         );
+        // Apply the persisted sidebar drag-drop ordering BEFORE any keyed
+        // restore below — worktree_tabs / layouts were saved against these
+        // positions. Stable sort: paths absent from the saved order (freshly
+        // discovered projects/worktrees) keep their load order at the end.
+        if let Some(order) = saved_state.as_ref().map(|s| s.sidebar_order.clone()) {
+            if !order.is_empty() {
+                let p_rank: HashMap<&str, usize> = order
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (p, _))| (p.as_str(), i))
+                    .collect();
+                projects.sort_by_key(|p| {
+                    p_rank.get(p.path.as_str()).copied().unwrap_or(usize::MAX)
+                });
+                for p in projects.iter_mut() {
+                    if let Some((_, wts)) =
+                        order.iter().find(|(pp, _)| pp.as_str() == p.path.as_str())
+                    {
+                        let w_rank: HashMap<&str, usize> = wts
+                            .iter()
+                            .enumerate()
+                            .map(|(i, w)| (w.as_str(), i))
+                            .collect();
+                        p.worktrees.sort_by_key(|w| {
+                            w_rank.get(w.path.as_str()).copied().unwrap_or(usize::MAX)
+                        });
+                    }
+                }
+            }
+        }
         // Default the terminal to the first project's first worktree folder.
         let default_cwd = projects
             .first()
@@ -1256,6 +1323,10 @@ impl CraneShellView {
             trim_on_save: init_trim,
             syntax_override: init_syntax_override,
             settings_scroll: ClippedScrollStateHandle::new(),
+            tree_drag: None,
+            tree_drag_pos: Rc::new(Cell::new(None)),
+            tree_zones: Rc::new(std::cell::RefCell::new(Vec::new())),
+            tree_drag_states: std::cell::RefCell::new(HashMap::new()),
             git_log_hover: Rc::new(Cell::new(None)),
             git_log_detail: None,
             git_log_detail_loading: false,
@@ -1555,6 +1626,7 @@ impl CraneShellView {
             word_wrap: self.word_wrap_default,
             trim_on_save: self.trim_on_save,
             syntax_override: self.syntax_override.clone().unwrap_or_default(),
+            sidebar_order: self.order_snapshot(),
         });
     }
 
@@ -1784,6 +1856,441 @@ impl CraneShellView {
     /// of a folder-group removal). Extracted from the `RemoveProject` arm so
     /// `remove_group` can call it per member. Rekeys all (pi,*)-keyed maps by
     /// PATH after the in-place `Vec::remove` (indices shift). Runs ZERO git.
+    // ── Sidebar drag-drop reorder (old state.rs reorder_* ported 1:1) ──────
+
+    /// `new_index` is computed from the *pre-removal* list; removing the
+    /// source first shifts later positions down by one, so a downward drag
+    /// lands at `new_index - 1` (old `move_in_vec`).
+    fn move_in_vec<T>(vec: &mut Vec<T>, pos: usize, new_index: usize) {
+        let target = if pos < new_index { new_index - 1 } else { new_index };
+        let target = target.min(vec.len().saturating_sub(1));
+        if pos != target {
+            let item = vec.remove(pos);
+            vec.insert(target, item);
+        }
+    }
+
+    /// Root-level blocks: a standalone project, or a maximal contiguous run
+    /// sharing one `group_path`. Root reordering moves blocks atomically.
+    fn root_blocks(&self) -> Vec<std::ops::Range<usize>> {
+        let mut blocks = Vec::new();
+        let mut i = 0;
+        while i < self.projects.len() {
+            let start = i;
+            match self.projects[i].group_path.clone() {
+                None => i += 1,
+                Some(gp) => {
+                    while i < self.projects.len()
+                        && self.projects[i].group_path.as_ref() == Some(&gp)
+                    {
+                        i += 1;
+                    }
+                }
+            }
+            blocks.push(start..i);
+        }
+        blocks
+    }
+
+    /// Move root block `src_block_idx` to pre-removal slot `new_block_index`.
+    fn move_block(&mut self, src_block_idx: usize, new_block_index: usize) {
+        let blocks = self.root_blocks();
+        if src_block_idx >= blocks.len() {
+            return;
+        }
+        let target = new_block_index.min(blocks.len());
+        if target == src_block_idx || target == src_block_idx + 1 {
+            return;
+        }
+        let mut order: Vec<usize> = (0..blocks.len()).collect();
+        let item = order.remove(src_block_idx);
+        let insert_at = if target > src_block_idx { target - 1 } else { target };
+        order.insert(insert_at, item);
+        let n = self.projects.len();
+        let old = std::mem::take(&mut self.projects);
+        let mut taken: Vec<Option<crate::warpui::projects::ProjectNode>> =
+            old.into_iter().map(Some).collect();
+        let mut new_projects = Vec::with_capacity(n);
+        for &b_idx in &order {
+            for i in blocks[b_idx].clone() {
+                if let Some(p) = taken[i].take() {
+                    new_projects.push(p);
+                }
+            }
+        }
+        self.projects = new_projects;
+    }
+
+    /// Cluster each group's members contiguously at the group's first slot —
+    /// without this a single `group_path` can paint as multiple FOLDER
+    /// headers (the walk emits one per adjacent-row flip).
+    fn consolidate_groups(&mut self) {
+        let n = self.projects.len();
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut placed: HashSet<String> = HashSet::new();
+        for i in 0..n {
+            match &self.projects[i].group_path {
+                None => order.push(i),
+                Some(gp) => {
+                    if placed.contains(gp) {
+                        continue;
+                    }
+                    placed.insert(gp.clone());
+                    let gp = gp.clone();
+                    for j in 0..n {
+                        if self.projects[j].group_path.as_ref() == Some(&gp) {
+                            order.push(j);
+                        }
+                    }
+                }
+            }
+        }
+        if order.len() != n {
+            return;
+        }
+        let mut slots: Vec<Option<crate::warpui::projects::ProjectNode>> =
+            std::mem::take(&mut self.projects).into_iter().map(Some).collect();
+        let mut reordered = Vec::with_capacity(n);
+        for idx in order {
+            if let Some(p) = slots[idx].take() {
+                reordered.push(p);
+            }
+        }
+        self.projects = reordered;
+    }
+
+    /// Snapshot (project path, worktree paths) — taken before a reorder so
+    /// `rekey_after_reorder` can map old (pi, wi) keys to the new positions.
+    fn order_snapshot(&self) -> Vec<(String, Vec<String>)> {
+        self.projects
+            .iter()
+            .map(|p| {
+                (
+                    p.path.clone(),
+                    p.worktrees.iter().map(|w| w.path.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Rekey every (pi, wi, …)-indexed structure after `self.projects` (or a
+    /// project's worktrees) were REORDERED in place. A reorder never removes
+    /// anything, so this is a pure rekey — no teardown.
+    fn rekey_after_reorder(&mut self, old: &[(String, Vec<String>)]) {
+        let new_pi: HashMap<&str, usize> = self
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.path.as_str(), i))
+            .collect();
+        let new_wi: HashMap<(&str, &str), usize> = self
+            .projects
+            .iter()
+            .flat_map(|p| {
+                p.worktrees
+                    .iter()
+                    .enumerate()
+                    .map(move |(wi, w)| ((p.path.as_str(), w.path.as_str()), wi))
+            })
+            .collect();
+        let remap = |pi: usize, wi: usize| -> Option<(usize, usize)> {
+            let (ppath, wts) = old.get(pi)?;
+            let np = *new_pi.get(ppath.as_str())?;
+            let wpath = wts.get(wi)?;
+            let nw = *new_wi.get(&(ppath.as_str(), wpath.as_str()))?;
+            Some((np, nw))
+        };
+        let old_layouts = std::mem::take(&mut self.layouts);
+        for ((pi, wi, tid), node) in old_layouts {
+            if let Some((np, nw)) = remap(pi, wi) {
+                self.layouts.insert((np, nw, tid), node);
+            }
+        }
+        let old_tabs = std::mem::take(&mut self.worktree_tabs);
+        for ((pi, wi), tabs) in old_tabs {
+            if let Some((np, nw)) = remap(pi, wi) {
+                self.worktree_tabs.insert((np, nw), tabs);
+            }
+        }
+        if let Some((pi, wi, tid)) = self.active_tab {
+            if let Some((np, nw)) = remap(pi, wi) {
+                self.active_tab = Some((np, nw, tid));
+            }
+        }
+        {
+            let (pi, wi, tid) = self.selected;
+            if let Some((np, nw)) = remap(pi, wi) {
+                self.selected = (np, nw, tid);
+            }
+        }
+        self.expanded_projects = self
+            .expanded_projects
+            .iter()
+            .filter_map(|pi| {
+                old.get(*pi)
+                    .and_then(|(p, _)| new_pi.get(p.as_str()))
+                    .copied()
+            })
+            .collect();
+        self.expanded_worktrees = self
+            .expanded_worktrees
+            .iter()
+            .filter_map(|(pi, wi)| remap(*pi, *wi))
+            .collect();
+    }
+
+    /// Apply a completed sidebar drop: filter the painted zones to siblings
+    /// of the dragged row, require the release Y inside the sibling span
+    /// (±8px pad), count sibling centers at-or-above the release, and route
+    /// to the matching reorder (old `projects.rs` global drop dispatch).
+    fn apply_tree_drop(&mut self, cursor: warpui::geometry::vector::Vector2F, ctx: &mut ViewContext<Self>) {
+        let Some(drag) = self.tree_drag.take() else {
+            return;
+        };
+        self.tree_drag_pos.set(None);
+        let zones = self.tree_zones.borrow().clone();
+        let candidates: Vec<&(warpui::geometry::rect::RectF, TreeScope)> = zones
+            .iter()
+            .filter(|(_, scope)| match (&drag, scope) {
+                (TreeDrag::Project { group: None, .. }, TreeScope::Root) => true,
+                (TreeDrag::Group { .. }, TreeScope::Root) => true,
+                (
+                    TreeDrag::Project { group: Some(src), .. },
+                    TreeScope::InBlock { group },
+                ) => src == group,
+                (
+                    TreeDrag::Worktree { project, .. },
+                    TreeScope::Worktree { project: zp },
+                ) => project == zp,
+                (
+                    TreeDrag::Tab { project, worktree, .. },
+                    TreeScope::Tab { project: zp, worktree: zw },
+                ) => project == zp && worktree == zw,
+                _ => false,
+            })
+            .collect();
+        if candidates.is_empty() {
+            ctx.notify();
+            return;
+        }
+        let pad = 8.0;
+        let first_y = candidates.first().unwrap().0.origin().y() - pad;
+        let last_y = candidates.last().unwrap().0.max_y() + pad;
+        if cursor.y() < first_y || cursor.y() > last_y {
+            ctx.notify();
+            return;
+        }
+        let new_index = candidates
+            .iter()
+            .filter(|(r, _)| r.origin().y() + r.height() / 2.0 <= cursor.y())
+            .count();
+
+        let snapshot = self.order_snapshot();
+        match drag {
+            TreeDrag::Project { path, group: None } => {
+                let Some(pos) = self.projects.iter().position(|p| p.path == path) else {
+                    return;
+                };
+                if self.projects[pos].group_path.is_some() {
+                    return;
+                }
+                let blocks = self.root_blocks();
+                let Some(src) = blocks.iter().position(|b| b.contains(&pos)) else {
+                    return;
+                };
+                self.move_block(src, new_index);
+                self.consolidate_groups();
+            }
+            TreeDrag::Group { path } => {
+                let Some(pos) = self
+                    .projects
+                    .iter()
+                    .position(|p| p.group_path.as_deref() == Some(path.as_str()))
+                else {
+                    return;
+                };
+                let blocks = self.root_blocks();
+                let Some(src) = blocks.iter().position(|b| b.contains(&pos)) else {
+                    return;
+                };
+                self.move_block(src, new_index);
+                self.consolidate_groups();
+            }
+            TreeDrag::Project { path, group: Some(group) } => {
+                let Some(pos) = self.projects.iter().position(|p| p.path == path) else {
+                    return;
+                };
+                let blocks = self.root_blocks();
+                let Some(block) = blocks
+                    .iter()
+                    .find(|b| {
+                        b.contains(&pos)
+                            && self.projects[b.start].group_path.as_deref()
+                                == Some(group.as_str())
+                    })
+                    .cloned()
+                else {
+                    return;
+                };
+                let block_len = block.end - block.start;
+                let to = block.start + new_index.min(block_len);
+                Self::move_in_vec(&mut self.projects, pos, to);
+            }
+            TreeDrag::Worktree { project, path } => {
+                let Some(p) = self.projects.iter_mut().find(|p| p.path == project) else {
+                    return;
+                };
+                if let Some(pos) = p.worktrees.iter().position(|w| w.path == path) {
+                    Self::move_in_vec(&mut p.worktrees, pos, new_index);
+                }
+            }
+            TreeDrag::Tab { project, worktree, id } => {
+                let key = self
+                    .projects
+                    .iter()
+                    .position(|p| p.path == project)
+                    .and_then(|pi| {
+                        self.projects[pi]
+                            .worktrees
+                            .iter()
+                            .position(|w| w.path == worktree)
+                            .map(|wi| (pi, wi))
+                    });
+                if let Some(key) = key {
+                    if let Some(tabs) = self.worktree_tabs.get_mut(&key) {
+                        if let Some(pos) = tabs.iter().position(|t| t.id == id) {
+                            Self::move_in_vec(tabs, pos, new_index);
+                        }
+                    }
+                }
+                // Tab reorder shifts no (pi, wi) keys — skip the rekey.
+                self.save_state(&*ctx);
+                ctx.notify();
+                return;
+            }
+        }
+        self.rekey_after_reorder(&snapshot);
+        self.save_state(&*ctx);
+        ctx.notify();
+    }
+
+    /// Wrap a sidebar row in a `Draggable` carrying its `TreeDrag` identity —
+    /// clicks pass through (drag engages past the movement threshold); the
+    /// drop dispatches `TreeDrop` with the release cursor.
+    fn tree_draggable(
+        &self,
+        key: String,
+        drag: TreeDrag,
+        child: Box<dyn Element>,
+    ) -> Box<dyn Element> {
+        let state = self
+            .tree_drag_states
+            .borrow_mut()
+            .entry(key)
+            .or_default()
+            .clone();
+        let pos_cell = self.tree_drag_pos.clone();
+        let pos_cell_drop = self.tree_drag_pos.clone();
+        let drag_start = drag.clone();
+        let state_drag = state.clone();
+        let state_drop = state.clone();
+        Box::new(
+            Draggable::new(state, child)
+                .on_drag_start(move |ctx, _app, _rect| {
+                    ctx.dispatch_typed_action(CraneShellAction::TreeDragStart(
+                        drag_start.clone(),
+                    ));
+                })
+                .on_drag(move |_ctx, _app, rect, _data| {
+                    let off = state_drag
+                        .cursor_offset_within_element()
+                        .unwrap_or_else(|| vec2f(0.0, 0.0));
+                    pos_cell.set(Some(rect.origin() + off));
+                })
+                .on_drop(move |ctx, _app, rect, _data| {
+                    let off = state_drop
+                        .cursor_offset_within_element()
+                        .unwrap_or_else(|| vec2f(0.0, 0.0));
+                    let cursor = rect.origin() + off;
+                    pos_cell_drop.set(None);
+                    ctx.dispatch_typed_action(CraneShellAction::TreeDrop {
+                        x: cursor.x(),
+                        y: cursor.y(),
+                    });
+                }),
+        )
+    }
+
+    /// Wrap a sidebar row in a `ZoneProbe` recording its rect + drop scope.
+    fn tree_zone(&self, scope: TreeScope, child: Box<dyn Element>) -> Box<dyn Element> {
+        Box::new(crate::warpui::rect_probe::ZoneProbe::new(
+            child,
+            self.tree_zones.clone(),
+            scope,
+        ))
+    }
+
+    /// The 2px accent drop-line painted between sibling rows while a sidebar
+    /// drag is in flight (old `paint_drop_line`): the gap nearest the cursor
+    /// among scope-matching rows.
+    fn tree_drop_line_overlay(&self) -> Option<Box<dyn Element>> {
+        let drag = self.tree_drag.as_ref()?;
+        let cursor = self.tree_drag_pos.get()?;
+        let zones = self.tree_zones.borrow();
+        let candidates: Vec<&(warpui::geometry::rect::RectF, TreeScope)> = zones
+            .iter()
+            .filter(|(_, scope)| match (drag, scope) {
+                (TreeDrag::Project { group: None, .. }, TreeScope::Root) => true,
+                (TreeDrag::Group { .. }, TreeScope::Root) => true,
+                (
+                    TreeDrag::Project { group: Some(src), .. },
+                    TreeScope::InBlock { group },
+                ) => src == group,
+                (TreeDrag::Worktree { project, .. }, TreeScope::Worktree { project: zp }) => {
+                    project == zp
+                }
+                (
+                    TreeDrag::Tab { project, worktree, .. },
+                    TreeScope::Tab { project: zp, worktree: zw },
+                ) => project == zp && worktree == zw,
+                _ => false,
+            })
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let pad = 8.0;
+        let first_y = candidates.first().unwrap().0.origin().y() - pad;
+        let last_y = candidates.last().unwrap().0.max_y() + pad;
+        if cursor.y() < first_y || cursor.y() > last_y {
+            return None;
+        }
+        // The line sits at the top edge of the first row whose center is
+        // below the cursor, or the bottom edge of the last row.
+        let below_count = candidates
+            .iter()
+            .filter(|(r, _)| r.origin().y() + r.height() / 2.0 <= cursor.y())
+            .count();
+        let (x, w, y) = if below_count == candidates.len() {
+            let (r, _) = candidates.last().unwrap();
+            (r.origin().x() + 6.0, r.width() - 12.0, r.max_y() - 1.0)
+        } else {
+            let (r, _) = candidates[below_count];
+            (r.origin().x() + 6.0, r.width() - 12.0, r.origin().y())
+        };
+        Some(
+            Container::new(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::accent()).finish())
+                    .with_width(w.max(20.0))
+                    .with_height(2.0)
+                    .finish(),
+            )
+            .with_padding_left(x)
+            .with_padding_top(y)
+            .finish(),
+        )
+    }
+
     fn remove_project_at(&mut self, i: usize, ctx: &mut ViewContext<Self>) {
         let Some(removed_path) = self.projects.get(i).map(|p| p.path.clone()) else {
             return;
@@ -6103,6 +6610,9 @@ impl CraneShellView {
 
         // Real project tree loaded from ~/.crane/session.json: the user's
         // actual projects -> worktrees (branches) -> tabs.
+        // Drop-zone rects repopulate as the rows paint this frame (visual
+        // order); clear last frame's list first.
+        self.tree_zones.borrow_mut().clear();
         let mut col = Flex::column();
         if self.projects.is_empty() {
             col = col.with_child(self.tree_row(
@@ -6176,7 +6686,15 @@ impl CraneShellView {
                         DispatchEventResult::StopPropagation
                     })
                     .finish();
-                col = col.with_child(self.attention_wrap(folder_row, group_since, 21.0));
+                // Drag the header to reorder the whole group among root rows.
+                col = col.with_child(self.tree_zone(
+                    TreeScope::Root,
+                    self.tree_draggable(
+                        format!("g:{gp}"),
+                        TreeDrag::Group { path: gp.clone() },
+                        self.attention_wrap(folder_row, group_since, 21.0),
+                    ),
+                ));
             }
             last_group = p.group_path.clone();
             // Hide member projects (and their subtree) while the group is
@@ -6233,7 +6751,23 @@ impl CraneShellView {
             // Feature B: a COLLAPSED project row aggregates attention over all its
             // tabs (expanded → its own tab rows carry the pulse instead).
             let project_since = if p_expanded { None } else { self.project_attention(pi) };
-            col = col.with_child(self.attention_wrap(project_row, project_since, 21.0));
+            // Drag to reorder: standalone projects move among root rows;
+            // grouped members move only within their folder block.
+            let p_scope = match &p.group_path {
+                Some(g) => TreeScope::InBlock { group: g.clone() },
+                None => TreeScope::Root,
+            };
+            col = col.with_child(self.tree_zone(
+                p_scope,
+                self.tree_draggable(
+                    format!("p:{}", p.path),
+                    TreeDrag::Project {
+                        path: p.path.clone(),
+                        group: p.group_path.clone(),
+                    },
+                    self.attention_wrap(project_row, project_since, 21.0),
+                ),
+            ));
             if !p_expanded {
                 continue;
             }
@@ -6275,8 +6809,21 @@ impl CraneShellView {
                                 CraneShellAction::CloseTab(tkey),
                             );
                             let tab_row = self.tab_right_click(tab_base, tkey);
-                            col = col
-                                .with_child(self.attention_wrap(tab_row, t.attention_since, 19.0));
+                            col = col.with_child(self.tree_zone(
+                                TreeScope::Tab {
+                                    project: p.path.clone(),
+                                    worktree: w.path.clone(),
+                                },
+                                self.tree_draggable(
+                                    format!("t:{}:{}", w.path, t.id),
+                                    TreeDrag::Tab {
+                                        project: p.path.clone(),
+                                        worktree: w.path.clone(),
+                                        id: t.id,
+                                    },
+                                    self.attention_wrap(tab_row, t.attention_since, 19.0),
+                                ),
+                            ));
                         }
                     }
                     col = col.with_child(self.nav_row(
@@ -6355,7 +6902,18 @@ impl CraneShellView {
                 // Feature B: a COLLAPSED worktree row aggregates attention over its
                 // tabs (expanded → its tab rows carry the pulse instead).
                 let wt_since = if w_expanded { None } else { self.worktree_attention(pi, wi) };
-                col = col.with_child(self.attention_wrap(wt_row, wt_since, 20.0));
+                // Drag to reorder this Workspace among its project's siblings.
+                col = col.with_child(self.tree_zone(
+                    TreeScope::Worktree { project: p.path.clone() },
+                    self.tree_draggable(
+                        format!("w:{}", w.path),
+                        TreeDrag::Worktree {
+                            project: p.path.clone(),
+                            path: w.path.clone(),
+                        },
+                        self.attention_wrap(wt_row, wt_since, 20.0),
+                    ),
+                ));
                 if !w_expanded {
                     continue;
                 }
@@ -6409,8 +6967,21 @@ impl CraneShellView {
                         // Feature B: the leaf Tab row carries its own attention
                         // pulse directly (cleared when the user opens the tab).
                         let tab_row = self.tab_right_click(tab_base, tkey);
-                        col = col
-                            .with_child(self.attention_wrap(tab_row, t.attention_since, 19.0));
+                        col = col.with_child(self.tree_zone(
+                            TreeScope::Tab {
+                                project: p.path.clone(),
+                                worktree: w.path.clone(),
+                            },
+                            self.tree_draggable(
+                                format!("t:{}:{}", w.path, t.id),
+                                TreeDrag::Tab {
+                                    project: p.path.clone(),
+                                    worktree: w.path.clone(),
+                                    id: t.id,
+                                },
+                                self.attention_wrap(tab_row, t.attention_since, 19.0),
+                            ),
+                        ));
                     }
                 }
                 // "+ New tab" row for this worktree.
@@ -9441,6 +10012,10 @@ impl View for CraneShellView {
         if let Some((group, x, y)) = &self.folder_menu {
             root_stack = root_stack.with_child(self.folder_menu_overlay(group, *x, *y));
         }
+        // Sidebar drag: 2px accent drop-line at the gap nearest the cursor.
+        if let Some(line) = self.tree_drop_line_overlay() {
+            root_stack = root_stack.with_child(line);
+        }
         if let Some((sha, x, y)) = &self.git_log_menu {
             if self.git_log_branch_prompt.is_none() {
                 root_stack = root_stack.with_child(self.git_log_menu_overlay(sha, *x, *y));
@@ -9861,6 +10436,10 @@ pub enum CraneShellAction {
     /// Cmd+Opt+T — new tab in the focused Browser pane; opens a Browser pane
     /// when none is focused.
     BrowserNewTab,
+    /// A sidebar row drag crossed the movement threshold.
+    TreeDragStart(TreeDrag),
+    /// A sidebar row drag released at window position (x, y).
+    TreeDrop { x: f32, y: f32 },
     /// Open a read-only unified Diff pane (HEAD vs working copy) for the file at
     /// the given absolute path (dispatched by a Changes-row click).
     OpenDiff(PathBuf),
@@ -10699,6 +11278,12 @@ impl TypedActionView for CraneShellView {
                 ctx.notify();
             }
             CraneShellAction::OpenBrowser => self.open_browser(ctx),
+            CraneShellAction::TreeDragStart(drag) => {
+                self.tree_drag = Some(drag.clone());
+            }
+            CraneShellAction::TreeDrop { x, y } => {
+                self.apply_tree_drop(vec2f(*x, *y), ctx);
+            }
             CraneShellAction::BrowserNewTab => {
                 if let Some(h) = self.focused.and_then(|id| self.browser_at(id)) {
                     h.update(ctx, |view, vctx| {
