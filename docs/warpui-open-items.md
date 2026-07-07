@@ -26,33 +26,32 @@ staged auto-updater, OSC toasts (in-app), goto-line clamp, light syntect themes.
 - ~~Silent auto-reload of clean buffers lost~~ → disk-change poll reloads clean
   buffers silently; the banner is reserved for dirty buffers / vanished files.
 
-## Remaining HIGH features (each a real work item)
+## Remaining HIGH features — ALL BUILT (feature wave, 8 commits) except:
 
-- **Sidebar drag-drop reorder** (projects/groups/workspaces/tabs) — absent.
-- **Files-tree internal drag-drop move** (+ alt-copy, de-dupe naming,
-  drop-target highlight, external Finder drop, floating chip) — absent.
-- **Diff pane wave 2:** per-line syntax highlight; per-hunk stage/unstage
-  gutter; minimap; hunk nav + counter; in-body header w/ rename coloring;
-  image diff; proper scroll model; error row.
-- **Browser pane** — still a placeholder FileView. WKWebView embed (wry),
-  per-pane tabs, URL toolbar + normalization, clipboard selectors, Cmd+Opt+T.
-- **PDF pane** — absent entirely (pdfium).
-- **Git-Log wave 2:** refs left column w/ click-to-filter; commit context menu
-  (checkout/branch/cherry-pick/revert/copy hash); filter bar; fetch-all +
-  manual refresh buttons; keyboard nav; column resize; geometry/selection
-  persistence; MAX_COMMITS 5k→10k.
-- **Non-Latin fallback fonts** (PingFang/Hiragino/Noto CJK/Arabic/Hebrew/
-  Devanagari) + bundled JetBrains Mono/Cascadia for terminal — currently
-  system Menlo only → tofu risk.
+- **PDF pane** — still absent (pdfium); the one HIGH not started.
 - **OS notification banner** (notify_rust) for OSC 9/777 when unfocused —
-  in-app toast exists, OS banner missing.
-- **Cmd+` NSEvent interception** — handled in on_keydown only; needs runtime
-  verification that macOS doesn't pre-empt it; old code installed an NSEvent
-  monitor.
-- **Settings rebuild:** sidebar sections (Appearance/Editor/Terminal/LSP/
-  Shortcuts/About), font-size slider, theme swatches + open-themes-folder,
-  custom mono picker, syntax-theme override UI, editor prefs
-  (word-wrap/trim/single-click) persisted, per-server LSP status/install UI.
+  in-app toast exists, OS banner still missing.
+- **Cmd+` NSEvent interception** — still needs runtime verification.
+
+Done in the feature wave (each with documented v1 cuts):
+- ~~Sidebar drag-drop reorder~~ → all four row kinds, scope-validated,
+  drop-line, path-keyed, order persisted (`sidebar_order`).
+- ~~Files-tree drag-drop move + Finder drop + undo~~ → alt-drag COPY and the
+  floating drag chip remain open (warpui exposes no modifier state in drop
+  callbacks); internal move, de-dupe naming, drop highlight, recursive OS-drop
+  copy, Cmd+Z file-op undo all landed.
+- ~~Diff wave 2~~ → syntax highlight, hunk stage/unstage gutter, minimap,
+  hunk nav, rename header, real scrollbar, error rows, binary guard. Open:
+  actual image rendering (no warpui image element), horizontal scroll.
+- ~~Browser pane~~ → wry WKWebView embed, tabs, toolbar, SPA tracking,
+  memory footer, persistence. Open: clipboard NSEvent routing verification.
+- ~~Git-log wave 2~~ → refs column, filter bar, context menu, fetch-all,
+  keyboard nav, 10k depth. Open: column resize, geometry persistence.
+- ~~Fonts~~ → bundled JetBrains Mono everywhere; CJK/RTL/Braille fall back
+  natively via CoreText cascades (verified in vendor source).
+- ~~Settings rebuild~~ → six-section sidebar, swatches, font-size steppers,
+  syntax override, editor prefs persisted, LSP statuses. Open: custom mono
+  TTF picker (warpui can't hot-swap view fonts), per-server install UI.
 
 ## MEDIUM
 
