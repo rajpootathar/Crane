@@ -91,6 +91,16 @@ pub struct STerminal {
     pub history: String,
 }
 
+/// Persisted Browser Pane: its tabs as (url, title) + the active tab index.
+/// Page state (scroll, forms, history) is native WKWebView state and does not
+/// survive a relaunch — matching old Crane, which restored URLs only.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SBrowser {
+    pub tabs: Vec<(String, String)>,
+    #[serde(default)]
+    pub active: usize,
+}
+
 /// A project added via the warpui "Add Project" flow (not sourced from session.json).
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct AddedProject {
@@ -132,6 +142,10 @@ pub struct WarpuiState {
     /// Per terminal pane: cwd + ANSI scrollback snapshot, keyed by pane id.
     #[serde(default)]
     pub terminals: Vec<(PaneId, STerminal)>,
+    /// Per Browser pane: its tabs' URLs + titles, keyed by pane id, so the
+    /// restore loop rebuilds a Browser (not a terminal) at that leaf.
+    #[serde(default)]
+    pub browsers: Vec<(PaneId, SBrowser)>,
     /// Projects the user added via "Add Project" (not from session.json).
     #[serde(default)]
     pub added_projects: Vec<AddedProject>,

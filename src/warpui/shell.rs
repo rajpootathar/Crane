@@ -507,6 +507,11 @@ pub struct CraneShellView {
     /// Keeps the fast (250ms) tick alive: sweeps expired toasts and drains
     /// `fs_events` so external edits refresh the active repo without input.
     _fast_tick: warpui::r#async::SpawnedLocalStream,
+    /// 33ms browser reconcile tick (`browser_tick`). Near-idle when no Browser
+    /// Pane exists — a single `matches!` scan of `self.panes` per tick.
+    _browser_tick: warpui::r#async::SpawnedLocalStream,
+    /// Native WKWebView slots for Browser Panes, reconciled by `browser_tick`.
+    browser_host: crate::warpui::browser::BrowserHost,
 }
 
 /// An in-flight goto-definition request token (server + JSON-RPC id) plus the
@@ -678,6 +683,10 @@ pub enum PaneContent {
     Markdown(ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>),
     /// Read-only unified diff (HEAD vs working copy) for a changed file.
     Diff(ViewHandle<crate::warpui::diff_view::WarpDiffView>),
+    /// Embedded browser: the view draws tab strip / URL toolbar / footer and
+    /// reserves the body rect; the native WKWebViews are reconciled against it
+    /// by `browser::BrowserHost` on the shell's browser tick.
+    Browser(ViewHandle<crate::warpui::browser_view::WarpBrowserView>),
 }
 
 /// Map a dock edge to (split direction, dragged-goes-first?). Center → None
@@ -821,6 +830,8 @@ impl CraneShellView {
         > = HashMap::new();
         let mut restored_term_cache: HashMap<PaneId, crate::warpui::persist::STerminal> =
             HashMap::new();
+        let mut restored_browsers: HashMap<PaneId, crate::warpui::persist::SBrowser> =
+            HashMap::new();
         let mut saved_active: usize = 0;
 
         // Ensure built-in theme TOML files are written to ~/.crane/themes/ on
@@ -853,6 +864,7 @@ impl CraneShellView {
             let saved_paths = st.file_pane_paths.clone();
             saved_active = st.file_pane_active;
             restored_term_cache = st.terminals.iter().cloned().collect();
+            restored_browsers = st.browsers.iter().cloned().collect();
             for ((pi, wi), stabs) in &st.worktree_tabs {
                 let Some(wpath) = projects
                     .get(*pi)
@@ -893,6 +905,18 @@ impl CraneShellView {
                             restored_files_pane = Some(pid);
                             restored_file_paths = saved_paths.clone();
                             restored_active = active;
+                        } else if let Some(sb) = restored_browsers.get(&pid) {
+                            // Rebuild a Browser pane with its saved tabs; the
+                            // webviews materialise (and start loading) on the
+                            // first browser tick after the pane paints.
+                            let tabs = sb.tabs.clone();
+                            let active = sb.active;
+                            let h = ctx.add_typed_action_view(move |_ctx| {
+                                crate::warpui::browser_view::WarpBrowserView::new(
+                                    pid, ui_font, icon_font, tabs, active,
+                                )
+                            });
+                            panes.insert(pid, PaneContent::Browser(h));
                         } else if let Some(st) = restored_term_cache.get(&pid) {
                             // Restore the terminal in its saved cwd and replay its
                             // ANSI scrollback so it looks as it did last session.
@@ -1076,6 +1100,19 @@ impl CraneShellView {
             },
             |_this, _vctx| {},
         );
+        // Browser reconcile tick — 33ms (~2 paint frames) keeps the native
+        // WKWebView glued under its pane rect through splitter drags and
+        // window resizes without a per-frame hook; `browser_tick` is a cheap
+        // no-op scan while no Browser Pane exists.
+        let browser_ticker =
+            warpui::r#async::Timer::interval(std::time::Duration::from_millis(33));
+        let browser_tick = ctx.spawn_stream_local(
+            browser_ticker,
+            |this: &mut Self, _instant, vctx| {
+                this.browser_tick(vctx);
+            },
+            |_this, _vctx| {},
+        );
         let mut view = Self {
             ui_font,
             icon_font,
@@ -1197,6 +1234,8 @@ impl CraneShellView {
             toasts: VecDeque::new(),
             next_toast_id: 0,
             _fast_tick: fast_tick,
+            _browser_tick: browser_tick,
+            browser_host: crate::warpui::browser::BrowserHost::new(),
         };
         // Register every restored Project + Workspace root with the watcher so
         // external / agent edits refresh the active repo from first paint.
@@ -1318,6 +1357,17 @@ impl CraneShellView {
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
+        let browsers: Vec<(PaneId, crate::warpui::persist::SBrowser)> = self
+            .panes
+            .iter()
+            .filter_map(|(id, pc)| match pc {
+                PaneContent::Browser(h) => {
+                    let (tabs, active) = h.as_ref(app).persist_tabs();
+                    Some((*id, crate::warpui::persist::SBrowser { tabs, active }))
+                }
+                _ => None,
+            })
+            .collect();
         let worktree_tabs = self
             .worktree_tabs
             .iter()
@@ -1359,6 +1409,7 @@ impl CraneShellView {
             files_tab: self.files_tab,
             active_tab: self.active_tab,
             expanded_projects: self.expanded_projects.iter().copied().collect(),
+            browsers,
             expanded_worktrees: self.expanded_worktrees.iter().copied().collect(),
             worktree_tabs,
             next_tab_id: self.next_tab_id,
@@ -4598,6 +4649,111 @@ impl CraneShellView {
     /// file changed on disk; the notify makes the banner appear on its own. Only
     /// fires while a change is pending, and stops once the user hits Reload/Keep
     /// (both reset the editor's mtime baseline via `refresh_disk_mtime`).
+    /// Reconcile the native WKWebViews against the Browser Panes: pull each
+    /// pane's active/inactive tab slots + painted body rect, decide visibility
+    /// (active Tab's layout only; a maximized non-browser pane hides them; any
+    /// overlay — modal / context menu / branch picker / drag preview — hides
+    /// all, because the WKWebView composites ABOVE the GPU surface), then hand
+    /// everything to `BrowserHost::sync`. Runs on a 33ms tick; cheap no-op
+    /// while no Browser Pane exists.
+    ///
+    /// NOTE(choice): toasts do NOT hide the webviews — a 4s blink per
+    /// notification is worse than a toast sliding under a browser pane that
+    /// happens to occupy the bottom-right corner.
+    #[cfg(target_os = "macos")]
+    fn browser_tick(&mut self, ctx: &mut ViewContext<Self>) {
+        let has_browser = self
+            .panes
+            .values()
+            .any(|p| matches!(p, PaneContent::Browser(_)));
+        if !has_browser && self.browser_host.is_idle() {
+            return;
+        }
+        // Bridge starts from the queued nav actions (views push those on
+        // click); alive/inactive slots are pulled from the views here.
+        let mut bridge = crate::warpui::browser::take_bridge();
+        // Visible = leaves of the active Tab's layout, narrowed to just the
+        // maximized pane when one is maximized.
+        let visible: HashSet<PaneId> = match self.maximized {
+            Some(m) => std::iter::once(m).collect(),
+            None => self
+                .active_tab
+                .and_then(|t| self.layouts.get(&t))
+                .map(|n| {
+                    let mut v = Vec::new();
+                    n.leaves(&mut v);
+                    v.into_iter().collect()
+                })
+                .unwrap_or_default(),
+        };
+        let mut all_keys: HashSet<crate::warpui::browser::SlotKey> = HashSet::new();
+        let handles: Vec<(PaneId, ViewHandle<crate::warpui::browser_view::WarpBrowserView>)> =
+            self.panes
+                .iter()
+                .filter_map(|(id, pc)| match pc {
+                    PaneContent::Browser(h) => Some((*id, h.clone())),
+                    _ => None,
+                })
+                .collect();
+        for (id, h) in &handles {
+            h.read(&*ctx, |v, _| {
+                for k in v.all_keys() {
+                    all_keys.insert(k);
+                }
+                let (key, rect, url) = v.active_slot();
+                if visible.contains(id) && rect.width() > 1.0 && rect.height() > 1.0 {
+                    bridge.alive.push((key, rect, url));
+                } else {
+                    bridge.inactive.push((key, url));
+                }
+                for (k, u) in v.inactive_slots() {
+                    bridge.inactive.push((k, u));
+                }
+            });
+        }
+        let hide_all = self.modal.is_some()
+            || self.context_menu.is_some()
+            || self.row_menu.is_some()
+            || self.worktree_menu.is_some()
+            || self.tab_menu.is_some()
+            || self.folder_menu.is_some()
+            || self.branch_picker.is_some()
+            || self.drop_preview.borrow().is_some();
+        let Some(win) = crate::warpui::browser::HostWindow::current() else {
+            return;
+        };
+        let wake = self.ui_wake.clone();
+        self.browser_host
+            .sync(&win, &wake, bridge, hide_all, &all_keys);
+        // Apply WKWebView-reported URL changes (redirects, link clicks, SPA
+        // routes) back to the owning tabs so the URL bar tracks the page.
+        let updates = self.browser_host.drain_url_updates();
+        if !updates.is_empty() {
+            for (_, h) in &handles {
+                h.update(ctx, |v, vctx| {
+                    let mut changed = false;
+                    for (k, u) in &updates {
+                        changed |= v.apply_url_update(*k, u);
+                    }
+                    if changed {
+                        vctx.notify();
+                    }
+                });
+            }
+        }
+        crate::warpui::browser::set_loading_snapshot(self.browser_host.loading_set());
+        if has_browser {
+            crate::warpui::browser::set_memory_snapshot(self.browser_host.memory.snapshot());
+        }
+        // Keep the tab-chip spinners animating / footer fresh while loading.
+        if !self.browser_host.loading_set().is_empty() {
+            ctx.notify();
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn browser_tick(&mut self, _ctx: &mut ViewContext<Self>) {}
+
     fn poll_editor_disk_changes(&mut self, ctx: &mut ViewContext<Self>) {
         let handles: Vec<_> = self.editor_views.values().cloned().collect();
         for h in handles {
@@ -6900,6 +7056,7 @@ impl CraneShellView {
             Some(PaneContent::File(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Editor(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Welcome(h)) => ChildView::new(h).finish(),
+            Some(PaneContent::Browser(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Markdown(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Diff(h)) => ChildView::new(h).finish(),
             None => Rect::new().with_background_color(theme::bg()).finish(),
@@ -7135,6 +7292,7 @@ impl CraneShellView {
                 Some(PaneContent::Diff(h)) => {
                     (icons::GIT_DIFF, format!("Diff: {}", h.as_ref(app).title()))
                 }
+                Some(PaneContent::Browser(h)) => (icons::GLOBE, h.as_ref(app).title()),
                 _ => (icons::TERMINAL_WINDOW, "Terminal".to_string()),
             };
             EventHandler::new(
@@ -7355,6 +7513,16 @@ impl CraneShellView {
     fn editor_at(&self, id: PaneId) -> Option<ViewHandle<crate::warpui::editor_view::WarpEditorView>> {
         match self.panes.get(&id) {
             Some(PaneContent::Editor(h)) => Some(h.clone()),
+            _ => None,
+        }
+    }
+
+    fn browser_at(
+        &self,
+        id: PaneId,
+    ) -> Option<ViewHandle<crate::warpui::browser_view::WarpBrowserView>> {
+        match self.panes.get(&id) {
+            Some(PaneContent::Browser(h)) => Some(h.clone()),
             _ => None,
         }
     }
@@ -7846,14 +8014,28 @@ impl CraneShellView {
     /// Open a placeholder Browser pane (WKWebView embed pending).
     fn open_browser(&mut self, ctx: &mut ViewContext<Self>) {
         self.ensure_active_tab(ctx);
-        let lines = vec![
-            "Browser pane".to_string(),
-            String::new(),
-            "(embedded WKWebView pending — old Crane's browser_view)".to_string(),
-        ];
-        let handle =
-            ctx.add_view(move |ctx| FileView::from_text(ctx, "Browser".to_string(), lines));
-        self.split_with(PaneContent::File(handle));
+        self.open_browser_with(Vec::new(), 0, ctx);
+    }
+
+    /// Create a Browser Pane beside the focused pane, optionally seeded with
+    /// restored `(url, title)` tabs. The view is constructed with the PaneId
+    /// that `split_with` is about to assign (peeked from `next_pane_id`) —
+    /// it keys the native webview slots by `(pane, tab)`.
+    fn open_browser_with(
+        &mut self,
+        tabs: Vec<(String, String)>,
+        active: usize,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let pane_id = self.next_pane_id;
+        let ui_font = self.ui_font;
+        let icon_font = self.icon_font;
+        let handle = ctx.add_typed_action_view(move |_ctx| {
+            crate::warpui::browser_view::WarpBrowserView::new(
+                pane_id, ui_font, icon_font, tabs, active,
+            )
+        });
+        self.split_with(PaneContent::Browser(handle));
     }
 
     /// Open a read-only unified Diff pane (HEAD vs working copy) for `path` in a
@@ -8596,6 +8778,12 @@ impl View for CraneShellView {
                     ctx.dispatch_typed_action(CraneShellAction::ToggleWordWrap);
                     return DispatchEventResult::StopPropagation;
                 }
+                // Cmd+Opt+T — new tab in the focused Browser pane, or open a
+                // Browser pane when none is focused (old shortcuts.rs chord).
+                if ks.cmd && ks.alt && !ks.ctrl && ks.key.to_ascii_lowercase() == "t" {
+                    ctx.dispatch_typed_action(CraneShellAction::BrowserNewTab);
+                    return DispatchEventResult::StopPropagation;
+                }
                 // F12: LSP goto-definition at the caret in the focused editor.
                 if !ks.cmd && !ks.ctrl && !ks.alt && ks.key.to_ascii_lowercase() == "f12" {
                     ctx.dispatch_typed_action(CraneShellAction::LspGotoAtCursor);
@@ -8768,6 +8956,9 @@ pub enum CraneShellAction {
     GitLogDetailScroll(i32),
     /// Open a Browser pane (placeholder).
     OpenBrowser,
+    /// Cmd+Opt+T — new tab in the focused Browser pane; opens a Browser pane
+    /// when none is focused.
+    BrowserNewTab,
     /// Open a read-only unified Diff pane (HEAD vs working copy) for the file at
     /// the given absolute path (dispatched by a Changes-row click).
     OpenDiff(PathBuf),
@@ -9015,6 +9206,11 @@ impl TypedActionView for CraneShellView {
                     } else if let Some(h) = self.editor_at(id) {
                         // Warp editor pane: translate the keystroke and apply it.
                         h.update(ctx, |view, vctx| view.input_key(ks, vctx));
+                    } else if let Some(h) = self.browser_at(id) {
+                        // Browser pane: typing routes to the URL field while it
+                        // owns focus; inert otherwise (the WKWebView receives
+                        // its own keys natively as AppKit first responder).
+                        h.update(ctx, |view, vctx| view.input_key(ks, vctx));
                     } else if let Some(h) = self.file_at(id) {
                         // Editable File pane: route keys to its buffer.
                         h.update(ctx, |view, vctx| {
@@ -9190,6 +9386,13 @@ impl TypedActionView for CraneShellView {
                         });
                     } else if let Some(h) = self.editor_at(id) {
                         h.update(ctx, |view, vctx| view.paste(&text, vctx));
+                    } else if let Some(h) = self.browser_at(id) {
+                        h.update(ctx, |view, vctx| {
+                            view.handle_action(
+                                &crate::warpui::browser_view::BrowserAction::Paste(text.clone()),
+                                vctx,
+                            )
+                        });
                     }
                 }
             }
@@ -9497,6 +9700,18 @@ impl TypedActionView for CraneShellView {
                 ctx.notify();
             }
             CraneShellAction::OpenBrowser => self.open_browser(ctx),
+            CraneShellAction::BrowserNewTab => {
+                if let Some(h) = self.focused.and_then(|id| self.browser_at(id)) {
+                    h.update(ctx, |view, vctx| {
+                        view.handle_action(
+                            &crate::warpui::browser_view::BrowserAction::NewTab,
+                            vctx,
+                        )
+                    });
+                } else {
+                    self.open_browser(ctx);
+                }
+            }
             CraneShellAction::OpenDiff(p) => self.open_diff(p.clone(), ctx),
             CraneShellAction::OpenWelcome => self.open_welcome(ctx),
             CraneShellAction::FontZoomIn

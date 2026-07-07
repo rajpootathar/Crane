@@ -11,6 +11,8 @@ use rust_embed::RustEmbed;
 use warpui::geometry::vector::vec2f;
 use warpui::{platform, AddWindowOptions, AssetProvider};
 
+pub mod browser;
+pub mod browser_view;
 pub mod color;
 pub mod controller;
 pub mod diff_view;

@@ -112,6 +112,13 @@ tempfile = "3"
 # de-facto winit-era replacement for the older tao menu API.
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.15"
+# Embedded WKWebView for the Browser Pane. wry parents a native webview
+# under the main NSWindow's content view; we hand it a raw AppKit window
+# handle fetched via objc2 (see src/warpui/browser.rs::HostWindow). Same
+# major versions the old egui frontend shipped with — the WKWebView glue
+# (SPA URL hook, page-load events, set_bounds-every-frame) is a 1:1 port.
+wry = "0.55"
+raw-window-handle = "0.6"
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = [
     "NSEvent", "NSPasteboard", "NSImage", "NSBitmapImageRep", "NSResponder",

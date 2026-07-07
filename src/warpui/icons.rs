@@ -22,6 +22,7 @@ pub const ARROW_DOWN: &str = "\u{E03E}";
 pub const ARROW_RIGHT: &str = "\u{E06C}";
 pub const CHECK: &str = "\u{E182}";
 pub const ARROW_CLOCKWISE: &str = "\u{E036}";
+pub const ARROW_SQUARE_OUT: &str = "\u{E5DE}";
 pub const ARROW_COUNTER_CLOCKWISE: &str = "\u{E038}";
 pub const ARROWS_OUT: &str = "\u{E0A2}";
 pub const DOWNLOAD_SIMPLE: &str = "\u{E20C}";
