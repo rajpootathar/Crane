@@ -11,7 +11,21 @@ use parking_lot::Mutex;
 pub struct Change {
     /// Porcelain XY status, trimmed (e.g. "M", "A", "D", "??", "R").
     pub status: String,
+    /// The RAW two-column porcelain XY code (e.g. "MM", "M ", " M", "??",
+    /// "R "). `status` collapses this to one letter and `staged` to one
+    /// bool, both of which lose the index-vs-worktree distinction; the
+    /// shell needs the un-collapsed columns to render an `MM` file's
+    /// tri-state (index modified AND worktree modified) correctly and to
+    /// offer BOTH Stage (the worktree change) and Unstage (the index
+    /// change) for it. X = column 0 (index/staged), Y = column 1 (worktree).
+    pub xy: String,
+    /// For renames/copies this is the NEW path. The shell groups and
+    /// sorts by this so a renamed file lands in its destination folder.
     pub path: String,
+    /// Source side of a rename/copy, if any. Only set when the record
+    /// is an `R`/`C` — `path` holds the new name, `old_path` the old
+    /// name — so the shell can show `old -> new` and stage correctly.
+    pub old_path: Option<String>,
     /// True if the change is staged (index column X is set).
     pub staged: bool,
 }
@@ -46,9 +60,54 @@ pub fn commit(repo: &Path, message: &str) -> Result<(), String> {
     run(repo, &["commit", "-m", message])
 }
 
-/// `git push` non-interactively (1:1 old Crane). Network op — call off-thread.
-pub fn push(repo: &Path) -> Result<(), String> {
-    run(repo, &["push"])
+/// `git push` non-interactively (1:1 old Crane). Network op — call
+/// off-thread (see [`spawn_git_op`]). Returns the real ref-update
+/// summary parsed from git's stderr on success, git's stderr verbatim
+/// on failure.
+///
+/// `stdin(Stdio::null())` + `GIT_TERMINAL_PROMPT=0` so an HTTPS remote
+/// that wants credentials fails fast instead of blocking the background
+/// thread forever on a tty / askpass prompt.
+pub fn push(repo: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["push"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        // git pushes the actual error to stderr; preserve it verbatim
+        // so the user sees auth failures / network errors clearly.
+        return Err(if stderr.is_empty() {
+            "git push failed (no error output)".into()
+        } else {
+            stderr
+        });
+    }
+    // git push reports progress to stderr even on success ("To
+    // git@host…\n   abc..def  branch -> branch"). Look for the
+    // ref-update line; otherwise distinguish "Everything up-to-date"
+    // from a generic success.
+    let combined = if stderr.is_empty() { stdout } else { stderr };
+    let summary = combined
+        .lines()
+        .rev()
+        .find_map(|l| {
+            let t = l.trim();
+            if t.contains("Everything up-to-date") {
+                Some(t.to_string())
+            } else if t.starts_with('*') || t.contains("->") {
+                Some(t.trim_start_matches('*').trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "Pushed".to_string());
+    Ok(summary)
 }
 
 /// Current branch name in `root` (or a short SHA when detached), empty on error.
@@ -289,11 +348,25 @@ pub fn create_branch(repo: &Path, name: &str, checkout: bool) -> Result<(), Stri
 }
 
 /// Working-tree changes in `root`, or empty on any error / non-repo.
+///
+/// Runs `git status --porcelain -z --untracked-files=all`:
+/// - `-z` emits NUL-separated records with paths left verbatim. Without
+///   it, porcelain wraps any path with spaces / non-ASCII / shell-
+///   specials in double quotes and C-escapes it — and the shell then
+///   passes that quoted, escaped string straight to `git add -- <path>`,
+///   which fails with `fatal: pathspec '"…"' did not match any files`.
+/// - `--untracked-files=all` makes git enumerate every untracked file
+///   instead of collapsing a brand-new directory into one nameless
+///   `dir/` row.
+///
+/// With `-z`, a rename/copy (`R`/`C`) emits TWO consecutive records: the
+/// new path first, then the old path with no status prefix. We peek the
+/// follow-up record and keep it as `old_path`.
 pub fn changes(root: &Path) -> Vec<Change> {
     let Ok(out) = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "-z", "--untracked-files=all"])
         .output()
     else {
         return Vec::new();
@@ -301,54 +374,65 @@ pub fn changes(root: &Path) -> Vec<Change> {
     if !out.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            // Porcelain v1: "XY <path>" (or "XY <old> -> <new>" for renames).
-            // Index by char count, not bytes, to stay panic-safe on unicode.
-            if l.chars().count() < 4 {
-                return None;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each record is NUL-terminated. Split and drop the trailing empty.
+    let records: Vec<&str> = stdout.split('\0').filter(|s| !s.is_empty()).collect();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < records.len() {
+        let l = records[i];
+        i += 1;
+        // Record layout: "XY <path>" — the two status columns, a space,
+        // then the path (verbatim under -z). Index by char count so a
+        // multi-byte first path char can't panic the slice.
+        if l.chars().count() < 4 {
+            continue;
+        }
+        let xy: String = l.chars().take(2).collect();
+        let x = xy.chars().next().unwrap_or(' ');
+        // Index column (X) set and not untracked → staged.
+        let staged = x != ' ' && x != '?';
+        // Single normalized status letter (most significant).
+        let status = if xy.contains('?') {
+            "?"
+        } else if xy.contains('A') {
+            "A"
+        } else if xy.contains('D') {
+            "D"
+        } else if xy.contains('R') {
+            "R"
+        } else if xy.contains('C') {
+            "C"
+        } else if xy.contains('M') {
+            "M"
+        } else if xy.contains('U') {
+            "U"
+        } else {
+            xy.trim()
+        }
+        .to_string();
+        let path: String = l.chars().skip(3).collect();
+        // Rename/copy: the OLD path is the next NUL-separated record
+        // (under -z it is a separate record, not " -> " joined).
+        let is_rename = xy.contains('R') || xy.contains('C');
+        let old_path = if is_rename {
+            let old = records.get(i).map(|s| s.to_string());
+            if old.is_some() {
+                i += 1;
             }
-            let xy: String = l.chars().take(2).collect();
-            // Index column (X) set and not untracked → staged.
-            let staged = {
-                let x = xy.chars().next().unwrap_or(' ');
-                x != ' ' && x != '?'
-            };
-            // Single normalized status letter (most significant).
-            let status = if xy.contains('?') {
-                "?"
-            } else if xy.contains('A') {
-                "A"
-            } else if xy.contains('D') {
-                "D"
-            } else if xy.contains('R') {
-                "R"
-            } else if xy.contains('C') {
-                "C"
-            } else if xy.contains('M') {
-                "M"
-            } else if xy.contains('U') {
-                "U"
-            } else {
-                xy.trim()
-            }
-            .to_string();
-            let rest: String = l.chars().skip(3).collect();
-            // Renames/copies: "old -> new" — show the new path.
-            let path = rest
-                .rsplit(" -> ")
-                .next()
-                .unwrap_or(&rest)
-                .trim_matches('"')
-                .to_string();
-            Some(Change {
-                status,
-                path,
-                staged,
-            })
-        })
-        .collect()
+            old
+        } else {
+            None
+        };
+        result.push(Change {
+            status,
+            xy: xy.clone(),
+            path,
+            old_path,
+            staged,
+        });
+    }
+    result
 }
 
 /// Working-tree changes as a flat `(path, staged, status_char)` tuple list,
@@ -617,6 +701,12 @@ pub enum OpState {
 pub struct OpStatus {
     pub kind: Option<OpKind>,
     pub state: OpState,
+    /// The repo the current / last op ran against, so the shell can
+    /// attribute a Running / Done / Failed pill to its project and stop
+    /// project A's push error from bleeding into project B's UI. Empty
+    /// while `Idle`; set to the op's `dir` by [`spawn_git_op`] /
+    /// [`spawn_git_commit`] the moment they flip to `Running`.
+    pub repo: PathBuf,
 }
 
 impl Default for OpStatus {
@@ -624,6 +714,7 @@ impl Default for OpStatus {
         OpStatus {
             kind: None,
             state: OpState::Idle,
+            repo: PathBuf::new(),
         }
     }
 }
@@ -657,6 +748,7 @@ pub fn spawn_git_op(
             return;
         }
         guard.kind = Some(kind);
+        guard.repo = dir.clone();
         guard.state = OpState::Running;
     }
 
@@ -686,7 +778,7 @@ pub fn spawn_git_op(
 
     std::thread::spawn(move || {
         let result: Result<String, String> = match kind {
-            OpKind::Push => push(&dir).map(|()| "Pushed".to_string()),
+            OpKind::Push => push(&dir),
             OpKind::Pull => pull(&dir),
             OpKind::Fetch => fetch(&dir),
             OpKind::Commit => Err("Commit requires a message — use spawn_git_commit".into()),
@@ -718,6 +810,7 @@ pub fn spawn_git_commit(
             return;
         }
         guard.kind = Some(OpKind::Commit);
+        guard.repo = dir.clone();
         guard.state = OpState::Running;
     }
     std::thread::spawn(move || {

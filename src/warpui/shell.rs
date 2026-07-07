@@ -67,6 +67,15 @@ enum Modal {
     /// "New Workspace" — create a git worktree for a branch. State lives in
     /// `CraneShellView::new_workspace`.
     NewWorkspace,
+    /// "Remove Worktree" confirm — raised from the worktree-row menu before
+    /// `git worktree remove`. Carries the `(project, worktree)` indices; the
+    /// human label + path + dirty/unpushed WARNING for the card come from
+    /// `remove_wt_info`, computed once when the modal opens (never per frame).
+    ConfirmRemoveWorktree { pi: usize, wi: usize },
+    /// "Close Tab" confirm — raised before tearing down a tab's layout + PTYs
+    /// when it holds a running terminal or an editor with unsaved edits.
+    /// Carries the `(project, worktree, tab)` key.
+    ConfirmCloseTab { key: (usize, usize, usize) },
 }
 
 /// Visual style of a modal button (`modal_button`).
@@ -78,6 +87,21 @@ enum ModalBtn {
     Plain,
     /// Filled accent — the primary / affirmative action (Create, Confirm).
     Primary,
+}
+
+/// Precomputed detail for the `ConfirmRemoveWorktree` modal. Filled once when
+/// the modal opens (a couple of quick git shell-outs) so the card render stays
+/// pure — no per-frame `git` calls.
+struct RemoveWtInfo {
+    /// Human label for the worktree (its display name / branch).
+    label: String,
+    /// Filesystem path of the worktree checkout.
+    path: String,
+    /// True when the worktree has uncommitted changes (incl. untracked).
+    dirty: bool,
+    /// Commits ahead of upstream that would be discarded if the branch is only
+    /// checked out here — `> 0` warns "unpushed commits".
+    ahead: usize,
 }
 
 /// State for an open project right-click context menu.
@@ -93,7 +117,9 @@ struct ProjectContextMenu {
 /// width-constrained popover with the `Dismiss` overlay pattern.
 enum RowMenu {
     /// Changes-tab file row: Stage / Unstage / Open as File / Copy Path / Open Diff.
-    Change { path: String, staged: bool, x: f32, y: f32 },
+    /// `staged` = index side set, `has_unstaged` = worktree side set; an `MM`
+    /// file is both, so the menu offers Stage AND Unstage.
+    Change { path: String, staged: bool, has_unstaged: bool, x: f32, y: f32 },
     /// Files-tab row: Open / Reveal / Copy Path / New File / New Folder / Delete.
     File { path: PathBuf, is_dir: bool, x: f32, y: f32 },
 }
@@ -119,7 +145,13 @@ struct ChangeDir {
 struct ChangeFile {
     name: String,
     path: String,
+    /// True when the index column (X) is set — the file has content staged.
     staged: bool,
+    /// True when the worktree column (Y) is set — the file has content NOT
+    /// yet staged. Independent of `staged`: an `MM` file is BOTH `staged`
+    /// (index modified) AND `has_unstaged` (worktree modified). Drives the
+    /// row's Stage-vs-Unstage action and the context menu's dual entries.
+    has_unstaged: bool,
     status: char,
 }
 
@@ -134,25 +166,31 @@ impl ChangeDir {
         }
     }
 
-    /// `(all_staged, any_staged)` across the subtree.
+    /// `(all_staged, any_staged)` across the subtree. "Fully staged" means
+    /// every file has its worktree side clean (no `has_unstaged`) — so a
+    /// folder holding an `MM` file reads as NOT fully staged, and its bulk
+    /// marker offers Stage (add the remaining worktree changes) rather than
+    /// Unstage.
     fn staged_state(&self) -> (bool, bool) {
         let mut total = 0usize;
-        let mut staged = 0usize;
+        let mut fully_staged = 0usize;
         let mut any = false;
-        fn walk(n: &ChangeDir, total: &mut usize, staged: &mut usize, any: &mut bool) {
+        fn walk(n: &ChangeDir, total: &mut usize, fully_staged: &mut usize, any: &mut bool) {
             for c in n.dirs.values() {
-                walk(c, total, staged, any);
+                walk(c, total, fully_staged, any);
             }
             for f in &n.files {
                 *total += 1;
                 if f.staged {
-                    *staged += 1;
                     *any = true;
+                    if !f.has_unstaged {
+                        *fully_staged += 1;
+                    }
                 }
             }
         }
-        walk(self, &mut total, &mut staged, &mut any);
-        (total > 0 && staged == total, any)
+        walk(self, &mut total, &mut fully_staged, &mut any);
+        (total > 0 && fully_staged == total, any)
     }
 }
 
@@ -330,6 +368,9 @@ pub struct CraneShellView {
     /// / Help), or None. Rendered last (topmost) in the root stack. Transient —
     /// never persisted.
     modal: Option<Modal>,
+    /// Detail for the open `Modal::ConfirmRemoveWorktree` card (label / path /
+    /// dirty / unpushed warning), computed once when that modal opens.
+    remove_wt_info: Option<RemoveWtInfo>,
     /// Set once the user confirms Quit in the ConfirmQuit modal so the re-issued
     /// terminate passes straight through the `on_should_terminate_app` guard.
     confirmed_quit: bool,
@@ -944,6 +985,7 @@ impl CraneShellView {
             last_wt_click: None,
             last_tab_click: None,
             modal: None,
+            remove_wt_info: None,
             confirmed_quit: false,
             modal_scroll: ClippedScrollStateHandle::new(),
             find_in_files: None,
@@ -1462,15 +1504,20 @@ impl CraneShellView {
     /// Right-Panel row context menu (Changes row or Files row).
     fn row_menu_overlay(&self, menu: &RowMenu) -> Box<dyn Element> {
         match menu {
-            RowMenu::Change { path, staged, x, y } => {
+            RowMenu::Change { path, staged, has_unstaged, x, y } => {
                 let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-                if !*staged {
+                // Offer Stage when a worktree change exists and Unstage when an
+                // index change exists — for an `MM` file BOTH appear, so the
+                // user can stage the worktree edit or unstage the index edit
+                // independently.
+                if *has_unstaged {
                     items = items.with_child(self.menu_item(
                         icons::PLUS,
                         "Stage",
                         CraneShellAction::StagePaths(vec![path.clone()]),
                     ));
-                } else {
+                }
+                if *staged {
                     items = items.with_child(self.menu_item(
                         icons::MINUS,
                         "Unstage",
@@ -1781,7 +1828,7 @@ impl CraneShellView {
         .finish();
         let del = EventHandler::new(
             Container::new(
-                Text::new("Delete".to_string(), self.ui_font, 12.0)
+                Text::new("Move to Trash".to_string(), self.ui_font, 12.0)
                     .with_color(ColorU::new(255, 255, 255, 255))
                     .finish(),
             )
@@ -1807,7 +1854,8 @@ impl CraneShellView {
                 .with_child(Self::spacer(6.0))
                 .with_child(
                     Text::new(
-                        "This cannot be undone.".to_string(),
+                        "Moves to the system Trash — recoverable from there."
+                            .to_string(),
                         self.ui_font,
                         11.0,
                     )
@@ -1938,6 +1986,10 @@ impl CraneShellView {
             Modal::TabSwitcher => self.tab_switcher_card(),
             Modal::SwitchBranch => self.switch_branch_card(),
             Modal::NewWorkspace => self.new_workspace_card(),
+            Modal::ConfirmRemoveWorktree { pi, wi } => {
+                self.confirm_remove_worktree_card(*pi, *wi)
+            }
+            Modal::ConfirmCloseTab { key } => self.confirm_close_tab_card(*key, app),
         };
         self.modal_scaffold(card)
     }
@@ -2059,6 +2111,169 @@ impl CraneShellView {
             )
             .finish();
         self.modal_card(360.0, col)
+    }
+
+    /// ConfirmRemoveWorktree card — raised from the worktree-row menu before
+    /// `git worktree remove`. Reads the precomputed `remove_wt_info` so it can
+    /// warn about uncommitted / unpushed work without shelling out per frame.
+    fn confirm_remove_worktree_card(&self, pi: usize, wi: usize) -> Box<dyn Element> {
+        let info = self.remove_wt_info.as_ref();
+        let label = info.map(|i| i.label.clone()).unwrap_or_default();
+        let path = info.map(|i| i.path.clone()).unwrap_or_default();
+        let dirty = info.map(|i| i.dirty).unwrap_or(false);
+        let ahead = info.map(|i| i.ahead).unwrap_or(0);
+
+        let mut col = Flex::column()
+            .with_child(
+                Text::new("Remove Worktree?".to_string(), self.ui_font, 15.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_child(Self::spacer(8.0))
+            .with_child(
+                Text::new(
+                    format!("“{label}” will be detached with git worktree remove."),
+                    self.ui_font,
+                    12.0,
+                )
+                .with_color(theme::text_muted())
+                .finish(),
+            );
+        if !path.is_empty() {
+            col = col.with_child(Self::spacer(6.0)).with_child(
+                Text::new(path, self.ui_font, 11.0)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            );
+        }
+        // WARN when there is work that would be lost — dirty tree and/or
+        // commits not yet pushed. These drive the `--force` removal, so the
+        // user gets an explicit heads-up before confirming.
+        if dirty {
+            col = col.with_child(Self::spacer(10.0)).with_child(
+                Text::new(
+                    format!(
+                        "{}  Uncommitted changes here will be lost.",
+                        icons::WARNING
+                    ),
+                    self.ui_font,
+                    12.0,
+                )
+                .with_color(theme::warning())
+                .finish(),
+            );
+        }
+        if ahead > 0 {
+            col = col.with_child(Self::spacer(6.0)).with_child(
+                Text::new(
+                    format!(
+                        "{}  {ahead} unpushed commit{} on this branch.",
+                        icons::WARNING,
+                        if ahead == 1 { "" } else { "s" }
+                    ),
+                    self.ui_font,
+                    12.0,
+                )
+                .with_color(theme::warning())
+                .finish(),
+            );
+        }
+        col = col.with_child(Self::spacer(16.0)).with_child(
+            Flex::row()
+                .with_child(Expanded::new(1.0, Flex::row().finish()).finish())
+                .with_child(self.modal_button(
+                    "Cancel",
+                    ModalBtn::Plain,
+                    CraneShellAction::CloseModal,
+                ))
+                .with_child(Self::spacer(8.0))
+                .with_child(self.modal_button(
+                    "Remove",
+                    ModalBtn::Danger,
+                    CraneShellAction::RemoveWorktreeConfirmed { pi, wi },
+                ))
+                .finish(),
+        );
+        self.modal_card(380.0, col.finish())
+    }
+
+    /// ConfirmCloseTab card — raised before tearing down a tab that holds a
+    /// running terminal or an editor with unsaved edits. Cancel keeps the tab.
+    fn confirm_close_tab_card(
+        &self,
+        key: (usize, usize, usize),
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let (running, unsaved) = self.tab_close_hazards(key, app);
+        let body = if running && unsaved {
+            "This tab has a running terminal and unsaved editor changes."
+        } else if running {
+            "A process is still running in this tab's terminal."
+        } else if unsaved {
+            "This tab has an editor with unsaved changes."
+        } else {
+            "Close this tab and its panes?"
+        };
+        let col = Flex::column()
+            .with_child(
+                Text::new("Close this tab?".to_string(), self.ui_font, 15.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_child(Self::spacer(8.0))
+            .with_child(
+                Text::new(body.to_string(), self.ui_font, 12.0)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            )
+            .with_child(Self::spacer(16.0))
+            .with_child(
+                Flex::row()
+                    .with_child(Expanded::new(1.0, Flex::row().finish()).finish())
+                    .with_child(self.modal_button(
+                        "Cancel",
+                        ModalBtn::Plain,
+                        CraneShellAction::CloseModal,
+                    ))
+                    .with_child(Self::spacer(8.0))
+                    .with_child(self.modal_button(
+                        "Close Tab",
+                        ModalBtn::Danger,
+                        CraneShellAction::CloseTabConfirmed(key),
+                    ))
+                    .finish(),
+            )
+            .finish();
+        self.modal_card(380.0, col)
+    }
+
+    /// `(has_running_terminal, has_unsaved_editor)` across a tab's panes —
+    /// drives whether closing it needs a confirm and what the card says.
+    fn tab_close_hazards(
+        &self,
+        key: (usize, usize, usize),
+        app: &AppContext,
+    ) -> (bool, bool) {
+        let Some(node) = self.layouts.get(&key) else {
+            return (false, false);
+        };
+        let mut leaves = Vec::new();
+        node.leaves(&mut leaves);
+        let mut running = false;
+        let mut unsaved = false;
+        for id in leaves {
+            if let Some(h) = self.terminal_at(id) {
+                if h.as_ref(app).has_foreground_process() {
+                    running = true;
+                }
+            }
+            if let Some(h) = self.editor_at(id) {
+                if h.as_ref(app).is_dirty(app) {
+                    unsaved = true;
+                }
+            }
+        }
+        (running, unsaved)
     }
 
     /// Help / keyboard cheat-sheet card — a 2-column chord → description grid.
@@ -3467,9 +3682,10 @@ impl CraneShellView {
             }
         }
         // Apply at most one dead-worktree removal via the full teardown path
-        // (it remaps every (pi, wi, *)-keyed structure).
+        // (it remaps every (pi, wi, *)-keyed structure). The checkout already
+        // vanished on disk, so tear down directly — no confirm modal.
         if let Some((pi, wi)) = dead_remove {
-            let a = CraneShellAction::RemoveWorktree { pi, wi };
+            let a = CraneShellAction::RemoveWorktreeConfirmed { pi, wi };
             self.handle_action(&a, ctx);
             // handle_action already notified; nothing more to do.
             return;
@@ -4746,10 +4962,26 @@ impl CraneShellView {
         self.tab_label("Changes", active, CraneShellAction::SetTab { files: false })
     }
 
+    /// The shared git-op status, but ONLY when it belongs to the active repo.
+    /// Push/Pull/Fetch/Commit run against `active_cwd` and flip a single
+    /// app-wide `OpStatus` slot (now stamped with `repo` by `spawn_git_op` /
+    /// `spawn_git_commit`). Without this gate, a Running spinner or a Failed
+    /// pill from project A would bleed into project B's Changes tab the moment
+    /// the user switches projects. Compare `op.repo` against the active cwd and
+    /// hand back a fresh Idle default when they differ, so each project's
+    /// Changes tab only reflects its OWN op.
+    fn active_op_status(&self) -> crate::warpui::git::OpStatus {
+        let op = self.git_op.lock().clone();
+        match &self.active_cwd {
+            Some(cwd) if op.repo == *cwd => op,
+            _ => crate::warpui::git::OpStatus::default(),
+        }
+    }
+
     /// Branch + ahead/behind + Push/Pull/Fetch header at the top of the Changes
     /// area. Port of old egui `render_changes` top toolbar.
     fn changes_header(&self) -> Box<dyn Element> {
-        let op = self.git_op.lock().clone();
+        let op = self.active_op_status();
         let running = op.is_running();
         let run_kind = if running { op.kind } else { None };
 
@@ -4893,10 +5125,16 @@ impl CraneShellView {
                 node = node.dirs.entry((*d).to_string()).or_default();
             }
             let ch = c.status.chars().next().unwrap_or(' ');
+            // Y column (worktree side). Set for a still-unstaged change; an
+            // `MM` file has both X (`staged`) and Y set. Untracked ("??")
+            // reports Y='?', which is a worktree change too.
+            let y = c.xy.chars().nth(1).unwrap_or(' ');
+            let has_unstaged = y != ' ';
             node.files.push(ChangeFile {
                 name: (*file).to_string(),
                 path: c.path.clone(),
                 staged: c.staged,
+                has_unstaged,
                 status: ch,
             });
         }
@@ -5017,15 +5255,20 @@ impl CraneShellView {
     fn change_file_row(&self, f: &ChangeFile, depth: usize) -> Box<dyn Element> {
         let indent = 8.0 + depth as f32 * 14.0;
         let color = Self::status_color(f.status);
-        let (marker, marker_color) = if f.staged {
-            (icons::MINUS, theme::success())
-        } else {
+        // Marker click stages the WORKTREE change whenever one exists (so an
+        // `MM` file's click stages its remaining worktree edit, matching old
+        // Crane's tri-state). Only a file that is fully staged (index set,
+        // worktree clean) offers Unstage. This inverts the naive `f.staged`
+        // test, which wrongly unstaged an `MM` file on its first click.
+        let (marker, marker_color) = if f.has_unstaged {
             (icons::PLUS, theme::text_muted())
-        };
-        let stage_action = if f.staged {
-            CraneShellAction::UnstagePaths(vec![f.path.clone()])
         } else {
+            (icons::MINUS, theme::success())
+        };
+        let stage_action = if f.has_unstaged {
             CraneShellAction::StagePaths(vec![f.path.clone()])
+        } else {
+            CraneShellAction::UnstagePaths(vec![f.path.clone()])
         };
         let marker_btn = EventHandler::new(
             Container::new(self.icon(marker, 11.0, marker_color))
@@ -5083,11 +5326,13 @@ impl CraneShellView {
         // Right-click → Changes-row context menu.
         let menu_path = f.path.clone();
         let staged = f.staged;
+        let has_unstaged = f.has_unstaged;
         EventHandler::new(row)
             .on_right_mouse_down(move |ctx, _app, pos| {
                 ctx.dispatch_typed_action(CraneShellAction::ShowChangeMenu {
                     path: menu_path.clone(),
                     staged,
+                    has_unstaged,
                     x: pos.x(),
                     y: pos.y(),
                 });
@@ -5102,7 +5347,7 @@ impl CraneShellView {
     fn commit_box(&self) -> Box<dyn Element> {
         let staged = self.changes.iter().filter(|c| c.staged).count();
         let has_message = !self.commit_msg.trim().is_empty();
-        let op = self.git_op.lock().clone();
+        let op = self.active_op_status();
         let any_running = op.is_running();
         let can_commit = staged > 0 && has_message && !any_running;
 
@@ -6951,7 +7196,7 @@ pub enum CraneShellAction {
     GitPull,
     GitFetch,
     /// Open the Changes-row right-click menu.
-    ShowChangeMenu { path: String, staged: bool, x: f32, y: f32 },
+    ShowChangeMenu { path: String, staged: bool, has_unstaged: bool, x: f32, y: f32 },
     /// Open the Files-row right-click menu.
     ShowFileMenu { path: PathBuf, is_dir: bool, x: f32, y: f32 },
     /// Open an absolute path in the editor/Files pane (context-menu Open).
@@ -6998,8 +7243,14 @@ pub enum CraneShellAction {
     NewTab,
     /// Add a new tab to a specific worktree (left-panel + button).
     NewTabIn(usize, usize),
-    /// Close a tab (project, worktree, tab_id) from the strip.
+    /// Close a tab (project, worktree, tab_id) from the strip. Guarded: if the
+    /// tab holds a running terminal or an unsaved editor it opens the
+    /// `ConfirmCloseTab` modal instead of tearing down immediately.
     CloseTab((usize, usize, usize)),
+    /// Actually tear down a tab's layout + PTYs — the post-confirm companion to
+    /// `CloseTab` (and the bypass used by bulk / automatic teardown paths that
+    /// have their own confirmation or none is warranted).
+    CloseTabConfirmed((usize, usize, usize)),
     /// Switch to a named theme (cycles through all installed themes).
     SetTheme(String),
     /// Open a native folder picker and add the chosen directory as a new project.
@@ -7029,8 +7280,14 @@ pub enum CraneShellAction {
     StartRenameWorktree { pi: usize, wi: usize },
     /// Start an inline rename of the Tab row (from its menu).
     StartRenameTab { key: (usize, usize, usize) },
-    /// `git worktree remove --force` the worktree, then tear down its panes.
+    /// Open the `ConfirmRemoveWorktree` modal (computes the dirty/unpushed
+    /// warning first). The destructive `git worktree remove` only runs on
+    /// explicit confirm via `RemoveWorktreeConfirmed`.
     RemoveWorktree { pi: usize, wi: usize },
+    /// `git worktree remove --force` the worktree, then tear down its panes —
+    /// the post-confirm companion to `RemoveWorktree`. Also the entry point for
+    /// automatic cleanup of a worktree whose checkout dir vanished on disk.
+    RemoveWorktreeConfirmed { pi: usize, wi: usize },
     /// Set / clear a per-worktree tint (keyed by the worktree path).
     SetWorktreeTint {
         pi: usize,
@@ -7417,10 +7674,11 @@ impl TypedActionView for CraneShellView {
             CraneShellAction::GitPush => self.spawn_op(crate::warpui::git::OpKind::Push),
             CraneShellAction::GitPull => self.spawn_op(crate::warpui::git::OpKind::Pull),
             CraneShellAction::GitFetch => self.spawn_op(crate::warpui::git::OpKind::Fetch),
-            CraneShellAction::ShowChangeMenu { path, staged, x, y } => {
+            CraneShellAction::ShowChangeMenu { path, staged, has_unstaged, x, y } => {
                 self.row_menu = Some(RowMenu::Change {
                     path: path.clone(),
                     staged: *staged,
+                    has_unstaged: *has_unstaged,
                     x: *x,
                     y: *y,
                 });
@@ -7470,12 +7728,14 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::ConfirmDelete => {
                 if let Some(path) = self.pending_delete.take() {
-                    let _ = if path.is_dir() {
-                        std::fs::remove_dir_all(&path)
-                    } else {
-                        std::fs::remove_file(&path)
-                    };
-                    if self.selected_file.as_deref() == Some(path.as_path()) {
+                    // Recoverable delete: move to the system Trash rather than
+                    // permanently unlinking (matches old Crane's
+                    // `confirm_delete_file` modal). Works for both files and
+                    // directories. Surface any failure instead of silently
+                    // dropping the request.
+                    if let Err(e) = trash::delete(&path) {
+                        self.commit_error = Some(format!("Trash: {e}"));
+                    } else if self.selected_file.as_deref() == Some(path.as_path()) {
                         self.selected_file = None;
                     }
                     self.refresh_panel(ctx);
@@ -7572,6 +7832,22 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::NewTabIn(pi, wi) => self.add_tab(*pi, *wi, ctx),
             CraneShellAction::CloseTab((pi, wi, tid)) => {
+                // Guard: if this tab holds a running terminal or an editor with
+                // unsaved edits, confirm before tearing it (and its PTYs) down.
+                // Otherwise close immediately. The confirm's affirmative button
+                // dispatches CloseTabConfirmed.
+                let key = (*pi, *wi, *tid);
+                let (running, unsaved) = self.tab_close_hazards(key, &*ctx);
+                if running || unsaved {
+                    self.tab_menu = None;
+                    self.modal = Some(Modal::ConfirmCloseTab { key });
+                } else {
+                    let a = CraneShellAction::CloseTabConfirmed(key);
+                    self.handle_action(&a, ctx);
+                }
+            }
+            CraneShellAction::CloseTabConfirmed((pi, wi, tid)) => {
+                self.modal = None;
                 // Drop the tab's layout + every pane it owns.
                 if let Some(node) = self.layouts.remove(&(*pi, *wi, *tid)) {
                     let mut leaves = Vec::new();
@@ -7877,7 +8153,9 @@ impl TypedActionView for CraneShellView {
                     })
                     .unwrap_or_default();
                 for oid in others {
-                    let a = CraneShellAction::CloseTab((*pi, *wi, oid));
+                    // Bulk close bypasses the per-tab confirm modal (only one
+                    // modal can be open at a time); tear each down directly.
+                    let a = CraneShellAction::CloseTabConfirmed((*pi, *wi, oid));
                     self.handle_action(&a, ctx);
                 }
                 // The kept tab becomes the active one.
@@ -7963,6 +8241,50 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::RemoveWorktree { pi, wi } => {
                 self.worktree_menu = None;
+                let pi = *pi;
+                let wi = *wi;
+                let Some(main_path) = self.projects.get(pi).map(|p| p.path.clone()) else {
+                    return;
+                };
+                let Some((wt_path, wt_name, wt_dirty)) = self
+                    .projects
+                    .get(pi)
+                    .and_then(|p| p.worktrees.get(wi))
+                    .map(|w| (w.path.clone(), w.name.clone(), w.dirty))
+                else {
+                    return;
+                };
+                // Primary working tree can't be `git worktree remove`d — there is
+                // no worktree to detach (the project itself would have to be
+                // removed). Don't even open the confirm; it would be a no-op.
+                if wt_path.is_empty() || wt_path == main_path {
+                    return;
+                }
+                // Compute the dirty / unpushed WARNING once (a couple of quick
+                // shell-outs) and stash it for the card. The destructive
+                // `git worktree remove` runs only on explicit confirm
+                // (RemoveWorktreeConfirmed).
+                let label = self
+                    .worktree_names
+                    .get(&wt_path)
+                    .cloned()
+                    .unwrap_or(wt_name);
+                let wt_pathbuf = std::path::PathBuf::from(&wt_path);
+                let dirty = wt_dirty || crate::warpui::git::is_dirty(&wt_pathbuf);
+                let ahead = crate::warpui::git::ahead_behind(&wt_pathbuf)
+                    .map(|(a, _)| a)
+                    .unwrap_or(0);
+                self.remove_wt_info = Some(RemoveWtInfo {
+                    label,
+                    path: wt_path,
+                    dirty,
+                    ahead,
+                });
+                self.modal = Some(Modal::ConfirmRemoveWorktree { pi, wi });
+            }
+            CraneShellAction::RemoveWorktreeConfirmed { pi, wi } => {
+                self.modal = None;
+                self.remove_wt_info = None;
                 let pi = *pi;
                 let wi = *wi;
                 let Some(main_path) = self.projects.get(pi).map(|p| p.path.clone()) else {
@@ -8207,6 +8529,7 @@ impl TypedActionView for CraneShellView {
                 self.tab_switcher = None;
                 self.switch_branch = None;
                 self.new_workspace = None;
+                self.remove_wt_info = None;
             }
             CraneShellAction::OpenHelp => {
                 self.modal = Some(Modal::Help);

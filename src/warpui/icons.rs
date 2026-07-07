@@ -28,6 +28,7 @@ pub const DOWNLOAD_SIMPLE: &str = "\u{E20C}";
 pub const GEAR: &str = "\u{E270}";
 pub const GLOBE: &str = "\u{E288}";
 pub const INFO: &str = "\u{E2CE}";
+pub const WARNING: &str = "\u{E4E0}";
 pub const PAINT_BRUSH: &str = "\u{E6F0}";
 pub const CODE: &str = "\u{E1BC}";
 pub const KEYBOARD: &str = "\u{E2D8}";
