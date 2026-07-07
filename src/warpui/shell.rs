@@ -348,6 +348,13 @@ pub struct CraneShellView {
     worktree_menu: Option<(usize, usize, f32, f32)>,
     /// Active Tab row context menu ((pi, wi, tid), x, y), or None.
     tab_menu: Option<((usize, usize, usize), f32, f32)>,
+    /// Active folder-group header context menu ((group_path, x, y)), or None.
+    /// Opened by right-clicking a container-folder header; offers the tint
+    /// palette + "Remove folder group" (removes every member project atomically).
+    folder_menu: Option<(String, f32, f32)>,
+    /// Per folder-group tint overrides keyed by the container folder's own path
+    /// (`ProjectNode::group_path`). Painted on the FOLDER header icon + label.
+    group_tints: HashMap<String, [u8; 3]>,
     /// In-flight inline rename (worktree or tab), or None. While `Some`, typed
     /// keys route to its buffer (top priority in `SendKeys`).
     renaming: Option<RenameState>,
@@ -521,6 +528,11 @@ pub struct TabMeta {
     /// its chosen `name` and no longer follows the terminal's live OSC-0/2
     /// title (which would otherwise clobber the rename on the next PTY byte).
     pub renamed: bool,
+    /// When a background notification / bell last arrived for this tab, driving
+    /// the Left-Panel attention pulse. `Some` → the row breathes an accent glow +
+    /// unread dot until the user opens the tab (which clears it). Runtime-only
+    /// (not persisted). Port of old egui `Tab::attention_since`.
+    pub attention_since: Option<std::time::Instant>,
 }
 
 /// A single match row in the Find-in-Files modal.
@@ -686,6 +698,10 @@ impl CraneShellView {
         let init_tab_tints: HashMap<(String, usize), [u8; 3]> = saved_state
             .as_ref()
             .map(|s| s.tab_tints.iter().cloned().collect())
+            .unwrap_or_default();
+        let init_group_tints: HashMap<String, [u8; 3]> = saved_state
+            .as_ref()
+            .map(|s| s.group_tints.iter().cloned().collect())
             .unwrap_or_default();
         // LSP opt-in, restored from warpui-state.json (default OFF — read here
         // before `saved_state` is consumed by the restore block below).
@@ -862,6 +878,7 @@ impl CraneShellView {
                         id: stab.id,
                         name: stab.name.clone(),
                         renamed: stab.renamed,
+                        attention_since: None,
                     });
                 }
                 if !metas.is_empty() {
@@ -902,7 +919,7 @@ impl CraneShellView {
                 .map(|name| {
                     let id = next_tab_id;
                     next_tab_id += 1;
-                    TabMeta { id, name, renamed: false }
+                    TabMeta { id, name, renamed: false, attention_since: None }
                 })
                 .collect();
             let first_id = metas[0].id;
@@ -992,13 +1009,20 @@ impl CraneShellView {
             fast_ticker,
             |this: &mut Self, _instant, vctx| {
                 this.drain_fs_events(vctx);
+                // Refresh terminal owner-tab keys so a background bell/notification
+                // is attributed to the right tab even with no user interaction.
+                this.sync_terminal_owners(&*vctx);
                 let before = this.toasts.len();
                 let now = std::time::Instant::now();
                 this.toasts
                     .retain(|t| now.duration_since(t.at) < TOAST_TTL);
-                // Keep repainting while any toast is visible, plus one final
-                // repaint the tick a toast expired, so the overlay clears itself.
-                if !this.toasts.is_empty() || this.toasts.len() != before {
+                // Keep repainting while any toast is visible (plus one final tick
+                // when one expired) OR while any attention pulse is still breathing
+                // — the latter animates + decays the sidebar glow without input.
+                if !this.toasts.is_empty()
+                    || this.toasts.len() != before
+                    || this.any_attention_active()
+                {
                     vctx.notify();
                 }
             },
@@ -1077,6 +1101,8 @@ impl CraneShellView {
             branch_scroll: ClippedScrollStateHandle::new(),
             worktree_menu: None,
             tab_menu: None,
+            folder_menu: None,
+            group_tints: init_group_tints,
             renaming: None,
             worktree_names: init_wt_names,
             worktree_tints: init_wt_tints,
@@ -1303,6 +1329,11 @@ impl CraneShellView {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
+            group_tints: self
+                .group_tints
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             lsp_enabled: self.lsp_enabled,
         });
     }
@@ -1319,6 +1350,336 @@ impl CraneShellView {
         // matching old egui `projects.rs` (`tint_color.unwrap_or_else(accent)`),
         // NOT a per-index rainbow.
         theme::accent()
+    }
+
+    // ---- Folder groups + attention pulse ---------------------------------
+
+    /// Number of projects that belong to the folder group `group`.
+    fn group_member_count(&self, group: &str) -> usize {
+        self.projects
+            .iter()
+            .filter(|p| p.group_path.as_deref() == Some(group))
+            .count()
+    }
+
+    /// True when the project at `pi` is one of MULTIPLE members of a folder
+    /// group. Such projects hide their individual "Remove Project" menu item —
+    /// the group is removed atomically via the folder header instead.
+    fn in_multi_group(&self, pi: usize) -> bool {
+        self.projects
+            .get(pi)
+            .and_then(|p| p.group_path.as_deref())
+            .is_some_and(|g| self.group_member_count(g) > 1)
+    }
+
+    /// Remove EVERY member project of `group` atomically. Members are resolved
+    /// by PATH and removed one at a time (each `remove_project_at` shifts the
+    /// remaining indices, so we re-scan for the next member each pass).
+    fn remove_group(&mut self, group: &str, ctx: &mut ViewContext<Self>) {
+        self.group_tints.remove(group);
+        self.collapsed_groups.remove(group);
+        loop {
+            let Some(idx) = self
+                .projects
+                .iter()
+                .position(|p| p.group_path.as_deref() == Some(group))
+            else {
+                break;
+            };
+            self.remove_project_at(idx, ctx);
+        }
+    }
+
+    /// Resolve the folder-group tint (icon + label) for `group`, or the muted
+    /// default when the user hasn't set one. Mirrors the project tint fallback.
+    fn group_color_for(&self, group: &str) -> ColorU {
+        match self.group_tints.get(group) {
+            Some([r, g, b]) => ColorU::new(*r, *g, *b, 255),
+            None => theme::text_muted(),
+        }
+    }
+
+    /// Latch attention on `key`'s tab so the Left Panel pulses. No-op when the
+    /// tab is already the active one (never nag about the surface in view) or
+    /// when it already has a pending timestamp (keep the first ping).
+    fn flag_attention(&mut self, key: Option<(usize, usize, usize)>) {
+        let Some((pi, wi, tid)) = key else { return };
+        if self.active_tab == Some((pi, wi, tid)) {
+            return;
+        }
+        if let Some(tabs) = self.worktree_tabs.get_mut(&(pi, wi)) {
+            if let Some(t) = tabs.iter_mut().find(|t| t.id == tid) {
+                if t.attention_since.is_none() {
+                    t.attention_since = Some(std::time::Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Clear the pending-attention flag on the active tab. Called after every
+    /// action so any activation path (click, shortcut, toast-focus) settles the
+    /// pulse without threading a setter through each one (old egui parity).
+    fn clear_active_attention(&mut self) {
+        let Some((pi, wi, tid)) = self.active_tab else { return };
+        if let Some(tabs) = self.worktree_tabs.get_mut(&(pi, wi)) {
+            if let Some(t) = tabs.iter_mut().find(|t| t.id == tid) {
+                t.attention_since = None;
+            }
+        }
+    }
+
+    /// Freshest pending-attention timestamp among a worktree's tabs.
+    fn worktree_attention(&self, pi: usize, wi: usize) -> Option<std::time::Instant> {
+        self.worktree_tabs
+            .get(&(pi, wi))
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.attention_since)
+            .max()
+    }
+
+    /// Freshest pending-attention timestamp among ALL tabs of a project.
+    fn project_attention(&self, pi: usize) -> Option<std::time::Instant> {
+        let n = self.projects.get(pi).map(|p| p.worktrees.len()).unwrap_or(0);
+        (0..n).filter_map(|wi| self.worktree_attention(pi, wi)).max()
+    }
+
+    /// Freshest pending-attention timestamp among every project in `group`.
+    fn group_attention(&self, group: &str) -> Option<std::time::Instant> {
+        self.projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.group_path.as_deref() == Some(group))
+            .filter_map(|(pi, _)| self.project_attention(pi))
+            .max()
+    }
+
+    /// True while ANY tab still has pending attention — keeps the pulse repaint
+    /// stream alive (fast tick) so the glow breathes + decays without input.
+    fn any_attention_active(&self) -> bool {
+        self.worktree_tabs
+            .values()
+            .flatten()
+            .any(|t| t.attention_since.is_some())
+    }
+
+    /// 0..1 breathing intensity for a pending-attention `since`, or None when
+    /// there is no pending notification. Smooth raised-cosine that loops every
+    /// ~2.6s until the tab is opened (port of old egui `AttentionViz`).
+    fn attention_glow(since: Option<std::time::Instant>) -> Option<f32> {
+        let e = since?.elapsed().as_secs_f32();
+        let phase = (e / 2.6) * std::f32::consts::TAU;
+        Some((1.0 - phase.cos()) * 0.5)
+    }
+
+    /// A small accent unread-dot, drawn as a rounded (circular) Rect — NOT a
+    /// font glyph (bundled fonts lack a dot codepoint). Alpha tracks the glow.
+    fn attention_dot(glow: f32) -> Box<dyn Element> {
+        let a = (110.0 + 145.0 * glow).clamp(0.0, 255.0) as u8;
+        let base = theme::accent();
+        let dot = ColorU::new(base.r, base.g, base.b, a);
+        Container::new(
+            ConstrainedBox::new(
+                Rect::new()
+                    .with_background_color(dot)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                    .finish(),
+            )
+            .with_width(6.0)
+            .with_height(6.0)
+            .finish(),
+        )
+        .with_padding_left(6.0)
+        .with_padding_top(4.0)
+        .finish()
+    }
+
+    /// Wrap a built left-tree `row` with the attention pulse when `since` is set:
+    /// a low-alpha accent glow layered BEHIND the row plus a right-pinned unread
+    /// dot. The row is kept the TOPMOST child so its transparent hit layer still
+    /// receives clicks (the glow/dot are non-interactive layers beneath it, and
+    /// the row's non-selected background is transparent so both show through).
+    fn attention_wrap(
+        &self,
+        row: Box<dyn Element>,
+        since: Option<std::time::Instant>,
+        row_h: f32,
+    ) -> Box<dyn Element> {
+        let Some(glow) = Self::attention_glow(since) else {
+            return row;
+        };
+        let base = theme::accent();
+        let ga = (30.0 * glow).clamp(0.0, 255.0) as u8;
+        let glow_bg = ConstrainedBox::new(
+            Rect::new()
+                .with_background_color(ColorU::new(base.r, base.g, base.b, ga))
+                .finish(),
+        )
+        .with_height(row_h)
+        .finish();
+        // Full-width layer that pushes the dot to the right edge; sits beneath the
+        // row so it never steals the row's click.
+        let dot_layer = Container::new(
+            Flex::row()
+                .with_child(
+                    Expanded::new(
+                        1.0,
+                        Container::new(Text::new("", self.ui_font, 10.0).finish()).finish(),
+                    )
+                    .finish(),
+                )
+                .with_child(Self::attention_dot(glow))
+                .finish(),
+        )
+        .with_padding_right(8.0)
+        .finish();
+        Stack::new()
+            .with_child(glow_bg)
+            .with_child(dot_layer)
+            .with_child(row)
+            .finish()
+    }
+
+    /// Sync each live terminal's `owner_key` from the authoritative `layouts`
+    /// map so a notification/bell it dispatches names the right source tab.
+    /// O(panes). Called ONLY from the shell's fast tick — NOT from `handle_action`:
+    /// a terminal-dispatched notification runs `handle_action` synchronously while
+    /// that terminal is taken out of the view map, and reading it there would
+    /// panic ("circular view reference"). The fast tick is the shell's own stream,
+    /// so every terminal is safely in the map when this reads them.
+    fn sync_terminal_owners(&self, ctx: &AppContext) {
+        for (key, node) in self.layouts.iter() {
+            let mut leaves = Vec::new();
+            node.leaves(&mut leaves);
+            for id in leaves {
+                if let Some(h) = self.terminal_at(id) {
+                    let cell = h.read(ctx, |v, _| v.owner_cell());
+                    cell.set(Some(*key));
+                }
+            }
+        }
+    }
+
+    /// Remove the project at position `i` (context-menu Remove, or one member
+    /// of a folder-group removal). Extracted from the `RemoveProject` arm so
+    /// `remove_group` can call it per member. Rekeys all (pi,*)-keyed maps by
+    /// PATH after the in-place `Vec::remove` (indices shift). Runs ZERO git.
+    fn remove_project_at(&mut self, i: usize, ctx: &mut ViewContext<Self>) {
+        let Some(removed_path) = self.projects.get(i).map(|p| p.path.clone()) else {
+            return;
+        };
+                self.added_projects.retain(|ap| ap.path != removed_path);
+                if !self.removed_project_paths.contains(&removed_path) {
+                    self.removed_project_paths.push(removed_path.clone());
+                }
+                // Positional-index remap: every (pi, *)-keyed map (layouts,
+                // worktree_tabs, active_tab, selected, expanded_*) is keyed by a
+                // project's POSITION in `self.projects`. Removing a non-last (or
+                // the active) project shifts later projects' indices, so we must
+                // rekey those maps to the post-removal positions and tear down the
+                // vanished project's panes/PTYs. We match by PATH (robust to the
+                // single-index shift).
+                //
+                // IMPORTANT (perf / OG parity): removal is done IN PLACE via
+                // `Vec::remove`. We deliberately do NOT call `reload_projects()`
+                // here — that would re-shell `git status`/`git diff` for EVERY
+                // project + worktree + discovered child repo in the whole tree
+                // (the reported freeze). A single-project remove must run ZERO git
+                // subprocesses. `removed_project_paths` was already updated above
+                // so any *future* reload (e.g. a later Add Project) still excludes
+                // this path.
+                let old_paths: Vec<String> =
+                    self.projects.iter().map(|p| p.path.clone()).collect();
+                if i < self.projects.len() {
+                    self.projects.remove(i);
+                }
+                // Reconcile watches: unwatch the removed Project + its Workspaces.
+                self.sync_watches();
+                let new_index: HashMap<String, usize> = self
+                    .projects
+                    .iter()
+                    .enumerate()
+                    .map(|(ni, p)| (p.path.clone(), ni))
+                    .collect();
+                // old project index -> new project index (None = project gone).
+                let remap = |pi: usize| -> Option<usize> {
+                    old_paths.get(pi).and_then(|path| new_index.get(path).copied())
+                };
+                // 1) Tear down layouts (+ PTYs) for projects that vanished.
+                let dead_layouts: Vec<(usize, usize, usize)> = self
+                    .layouts
+                    .keys()
+                    .copied()
+                    .filter(|(pi, _, _)| remap(*pi).is_none())
+                    .collect();
+                for key in dead_layouts {
+                    self.tear_down_layout(key);
+                }
+                // 2) Rekey the surviving layouts to their new project indices.
+                let old_layouts = std::mem::take(&mut self.layouts);
+                for ((pi, wi, tid), node) in old_layouts {
+                    if let Some(np) = remap(pi) {
+                        self.layouts.insert((np, wi, tid), node);
+                    }
+                }
+                // 3) Rekey worktree_tabs.
+                let old_tabs = std::mem::take(&mut self.worktree_tabs);
+                for ((pi, wi), tabs) in old_tabs {
+                    if let Some(np) = remap(pi) {
+                        self.worktree_tabs.insert((np, wi), tabs);
+                    }
+                }
+                // 4) Rekey expand state.
+                self.expanded_projects =
+                    self.expanded_projects.iter().filter_map(|pi| remap(*pi)).collect();
+                self.expanded_worktrees = self
+                    .expanded_worktrees
+                    .iter()
+                    .filter_map(|(pi, wi)| remap(*pi).map(|np| (np, *wi)))
+                    .collect();
+                // 5) Repoint active_tab / selected.
+                self.active_tab =
+                    self.active_tab.and_then(|(pi, wi, tid)| remap(pi).map(|np| (np, wi, tid)));
+                let (spi, swi, stid) = self.selected;
+                self.selected = match remap(spi) {
+                    Some(np) => (np, swi, stid),
+                    None => (0, 0, usize::MAX),
+                };
+                // 6) Clear any focused/files pane whose backing pane was town down.
+                if let Some(fp) = self.files_pane {
+                    if !self.panes.contains_key(&fp) {
+                        self.files_pane = None;
+                        self.file_pane_paths.clear();
+                        self.file_pane_active = 0;
+                    }
+                }
+                if let Some(f) = self.focused {
+                    if !self.panes.contains_key(&f) {
+                        self.focused = None;
+                    }
+                }
+                // 7) If the active tab survived but lost focus, refocus its first
+                // leaf. If it was removed, drop the panel's cwd context.
+                match self.active_tab {
+                    Some(at) => {
+                        if self.focused.is_none() {
+                            self.focused = self.layouts.get(&at).map(|n| n.first_leaf());
+                        }
+                    }
+                    None => {
+                        self.focused = None;
+                        self.active_cwd = None;
+                    }
+                }
+                // Rebuild the right panel ONLY when the active worktree changed.
+                // Removing a *non-active* project leaves the active repo's
+                // branch/changes/files untouched, so we skip the git shell-out
+                // entirely. When the active tab itself was torn down, active_cwd
+                // is None and refresh_panel clears the panel with ZERO git. Either
+                // way a remove runs no git subprocess.
+                if self.active_tab.is_none() {
+                    self.refresh_panel(ctx);
+                }
     }
 
     /// A 2px-wide accent vertical bar pinned to the left edge of a row, inset
@@ -1549,13 +1910,18 @@ impl CraneShellView {
             "Default color",
             CraneShellAction::SetProjectTint(pi, None),
         ));
-        items = items.with_child(self.menu_separator());
-
-        items = items.with_child(self.menu_item(
-            icons::TRASH,
-            "Remove Project",
-            CraneShellAction::RemoveProject(pi),
-        ));
+        // Atomic-group rule: when this project is one of MULTIPLE members of a
+        // folder group, hide its individual "Remove Project" — the group is
+        // removed whole via the folder header's "Remove folder group". A single-
+        // member group (or a standalone project) keeps the individual remove.
+        if !self.in_multi_group(pi) {
+            items = items.with_child(self.menu_separator());
+            items = items.with_child(self.menu_item(
+                icons::TRASH,
+                "Remove Project",
+                CraneShellAction::RemoveProject(pi),
+            ));
+        }
 
         let menu_box = ConstrainedBox::new(
             Container::new(items.finish())
@@ -1908,6 +2274,97 @@ impl CraneShellView {
             icons::ARROW_COUNTER_CLOCKWISE,
             "Default color",
             CraneShellAction::SetTabTint { key, tint: None },
+        ));
+        self.menu_popover(items.finish(), x, y)
+    }
+
+    /// A single row of 8 FOLDER-glyph tint swatches for the folder-group menu.
+    /// Mirrors `tint_palette_row` but paints the FOLDER icon (a group is a
+    /// container folder). `on_pick` maps the chosen RGB to the dispatched action.
+    fn folder_tint_palette_row<F>(&self, on_pick: F) -> Box<dyn Element>
+    where
+        F: Fn([u8; 3]) -> CraneShellAction,
+    {
+        const PALETTE: [[u8; 3]; 8] = [
+            [239, 83, 80],
+            [255, 152, 0],
+            [255, 202, 40],
+            [102, 187, 106],
+            [38, 166, 154],
+            [66, 165, 245],
+            [171, 71, 188],
+            [236, 64, 122],
+        ];
+        let icon_font = self.icon_font;
+        let mut swatches = Flex::row();
+        for rgb in PALETTE {
+            let color = ColorU::new(rgb[0], rgb[1], rgb[2], 255);
+            let action = on_pick(rgb);
+            let state = self.hover_handle(&format!("gsw:{}:{}:{}", rgb[0], rgb[1], rgb[2]));
+            let swatch = Hoverable::new(state, move |ms| {
+                let bg = if ms.is_hovered() {
+                    theme::row_hover()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                };
+                Container::new(
+                    Text::new(icons::FOLDER.to_string(), icon_font, 14.0)
+                        .with_color(color)
+                        .finish(),
+                )
+                .with_background_color(bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_uniform_padding(4.0)
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+                ctx.dispatch_typed_action(action.clone());
+            })
+            .finish();
+            swatches = swatches.with_child(swatch);
+        }
+        Container::new(swatches.finish())
+            .with_padding_left(6.0)
+            .with_padding_right(6.0)
+            .with_padding_top(4.0)
+            .with_padding_bottom(2.0)
+            .finish()
+    }
+
+    /// The folder-group header context menu: a "Highlight color" label, an
+    /// 8-swatch FOLDER-glyph tint palette, a "Default color" reset, a separator,
+    /// and "Remove folder group" (removes every member project atomically).
+    fn folder_menu_overlay(&self, group: &str, x: f32, y: f32) -> Box<dyn Element> {
+        let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        // Small muted "Highlight color" heading above the palette.
+        items = items.with_child(
+            Container::new(
+                Text::new("Highlight color".to_string(), self.ui_font, 11.0)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            )
+            .with_padding_left(10.0)
+            .with_padding_right(10.0)
+            .with_padding_top(6.0)
+            .with_padding_bottom(2.0)
+            .finish(),
+        );
+        let g_pick = group.to_string();
+        items = items.with_child(self.folder_tint_palette_row(move |rgb| {
+            CraneShellAction::SetGroupTint { group: g_pick.clone(), tint: Some(rgb) }
+        }));
+        items = items.with_child(self.menu_item(
+            icons::ARROW_COUNTER_CLOCKWISE,
+            "Default color",
+            CraneShellAction::SetGroupTint { group: group.to_string(), tint: None },
+        ));
+        items = items.with_child(self.menu_separator());
+        items = items.with_child(self.menu_item(
+            icons::X,
+            "Remove folder group",
+            CraneShellAction::RemoveGroup(group.to_string()),
         ));
         self.menu_popover(items.finish(), x, y)
     }
@@ -4827,17 +5284,40 @@ impl CraneShellView {
                 } else {
                     icons::FOLDER_OPEN
                 };
-                col = col.with_child(self.nav_row(
+                // Feature A: paint the folder icon + label in the group tint when
+                // set (else muted default). Feature B: aggregate attention over
+                // every member project while the group is collapsed.
+                let gcolor = self.group_color_for(&gp);
+                let group_since = if group_collapsed {
+                    self.group_attention(&gp)
+                } else {
+                    None
+                };
+                let folder_base = self.nav_row(
                     Some(!group_collapsed),
                     folder_glyph,
-                    theme::text(),
+                    gcolor,
                     &group_label,
                     13.0,
-                    theme::text(),
+                    gcolor,
                     10.0,
                     false,
-                    CraneShellAction::ToggleGroup(gp),
-                ));
+                    CraneShellAction::ToggleGroup(gp.clone()),
+                );
+                // Right-click the header → folder-group context menu (tint /
+                // remove whole group). Left-click still toggles collapse.
+                let gp_menu = gp.clone();
+                let folder_row = EventHandler::new(folder_base)
+                    .on_right_mouse_down(move |ctx, _, pos| {
+                        ctx.dispatch_typed_action(CraneShellAction::ShowFolderMenu {
+                            group: gp_menu.clone(),
+                            x: pos.x(),
+                            y: pos.y(),
+                        });
+                        DispatchEventResult::StopPropagation
+                    })
+                    .finish();
+                col = col.with_child(self.attention_wrap(folder_row, group_since, 21.0));
             }
             last_group = p.group_path.clone();
             // Hide member projects (and their subtree) while the group is
@@ -4891,7 +5371,10 @@ impl CraneShellView {
                     DispatchEventResult::StopPropagation
                 })
                 .finish();
-            col = col.with_child(project_row);
+            // Feature B: a COLLAPSED project row aggregates attention over all its
+            // tabs (expanded → its own tab rows carry the pulse instead).
+            let project_since = if p_expanded { None } else { self.project_attention(pi) };
+            col = col.with_child(self.attention_wrap(project_row, project_since, 21.0));
             if !p_expanded {
                 continue;
             }
@@ -4932,7 +5415,9 @@ impl CraneShellView {
                                 select,
                                 CraneShellAction::CloseTab(tkey),
                             );
-                            col = col.with_child(self.tab_right_click(tab_base, tkey));
+                            let tab_row = self.tab_right_click(tab_base, tkey);
+                            col = col
+                                .with_child(self.attention_wrap(tab_row, t.attention_since, 19.0));
                         }
                     }
                     col = col.with_child(self.nav_row(
@@ -5008,7 +5493,10 @@ impl CraneShellView {
                         DispatchEventResult::StopPropagation
                     })
                     .finish();
-                col = col.with_child(wt_row);
+                // Feature B: a COLLAPSED worktree row aggregates attention over its
+                // tabs (expanded → its tab rows carry the pulse instead).
+                let wt_since = if w_expanded { None } else { self.worktree_attention(pi, wi) };
+                col = col.with_child(self.attention_wrap(wt_row, wt_since, 20.0));
                 if !w_expanded {
                     continue;
                 }
@@ -5059,7 +5547,11 @@ impl CraneShellView {
                             select,
                             CraneShellAction::CloseTab(tkey),
                         );
-                        col = col.with_child(self.tab_right_click(tab_base, tkey));
+                        // Feature B: the leaf Tab row carries its own attention
+                        // pulse directly (cleared when the user opens the tab).
+                        let tab_row = self.tab_right_click(tab_base, tkey);
+                        col = col
+                            .with_child(self.attention_wrap(tab_row, t.attention_since, 19.0));
                     }
                 }
                 // "+ New tab" row for this worktree.
@@ -7051,7 +7543,7 @@ impl CraneShellView {
         self.worktree_tabs
             .entry((pi, wi))
             .or_default()
-            .push(TabMeta { id, name, renamed: false });
+            .push(TabMeta { id, name, renamed: false, attention_since: None });
         let path = self
             .projects
             .get(pi)
@@ -7324,6 +7816,9 @@ impl View for CraneShellView {
         if let Some((key, x, y)) = self.tab_menu {
             root_stack = root_stack.with_child(self.tab_menu_overlay(key, x, y));
         }
+        if let Some((group, x, y)) = &self.folder_menu {
+            root_stack = root_stack.with_child(self.folder_menu_overlay(group, *x, *y));
+        }
         if let Some((x, y)) = self.branch_picker {
             // Clamp the popover origin so a long list opened near the window edge
             // stays on-screen (menu is 220px wide; height is estimated).
@@ -7575,6 +8070,13 @@ pub enum CraneShellAction {
     /// Toggle collapse/expand of a folder group, keyed by its shared parent
     /// directory path (`ProjectNode::group_path`).
     ToggleGroup(String),
+    /// Open the folder-group header context menu at (x, y), keyed by group path.
+    ShowFolderMenu { group: String, x: f32, y: f32 },
+    /// Set (Some) or reset (None) the folder-group tint keyed by group path.
+    SetGroupTint { group: String, tint: Option<[u8; 3]> },
+    /// Remove EVERY member project of the folder group atomically (the group is
+    /// removed whole via the header, never member-by-member).
+    RemoveGroup(String),
     /// Split the focused pane (Horizontal = side by side, Vertical = stacked).
     SplitFocused(Dir),
     /// Close the focused pane.
@@ -7650,6 +8152,15 @@ pub enum CraneShellAction {
     TermNotification {
         body: String,
         urgent: bool,
+        /// Source tab (project_idx, worktree_idx, tab_id) the emitting terminal
+        /// lives in, as synced onto its `TerminalView::owner_key`. Drives the
+        /// Left-Panel attention pulse; `None` before the shell has synced owners.
+        source: Option<(usize, usize, usize)>,
+    },
+    /// A background terminal rang BEL — flag attention on `source` (if it isn't
+    /// the active tab). No toast; pulse only. `source` as in `TermNotification`.
+    TermBell {
+        source: Option<(usize, usize, usize)>,
     },
     /// Dismiss the notification toast with this id (the toast's X button).
     DismissToast(u64),
@@ -8184,12 +8695,16 @@ impl TypedActionView for CraneShellView {
                     }
                 }
             }
-            CraneShellAction::TermNotification { body, urgent } => {
-                // A terminal emitted an OSC 9 / OSC 777 desktop notification. The
-                // view forwards no pane locator, so capture the active tab as a
-                // best-effort source (header label + click-to-focus target).
-                let source = self
-                    .active_tab
+            CraneShellAction::TermNotification { body, urgent, source } => {
+                // A terminal emitted an OSC 9 / OSC 777 desktop notification.
+                // `source` is the emitting terminal's owner tab (synced from
+                // `layouts`); fall back to the active tab if it hasn't synced yet.
+                let source_key = source.or(self.active_tab);
+                // Pulse the source tab in the Left Panel unless it's already the
+                // active tab (no point nagging about what you're looking at). Only
+                // latch the first ping so the dot reflects the earliest one.
+                self.flag_attention(source_key);
+                let label = source_key
                     .map(|k| self.notif_source_label(k))
                     .unwrap_or_else(|| "Terminal".to_string());
                 let id = self.next_toast_id;
@@ -8201,11 +8716,20 @@ impl TypedActionView for CraneShellView {
                     id,
                     body: body.clone(),
                     urgent: *urgent,
-                    source,
-                    tab_key: self.active_tab,
+                    source: label,
+                    tab_key: source_key,
                     at: std::time::Instant::now(),
                 });
                 ctx.notify();
+            }
+            CraneShellAction::TermBell { source } => {
+                // Background bell → pulse only (no toast). `flag_attention`
+                // ignores the active tab, so a bell in the focused terminal is a
+                // no-op here (its audible beep already fired in the paint path).
+                // Early-return so frequent bells never spam the `save_state` tail.
+                self.flag_attention(source.or(self.active_tab));
+                ctx.notify();
+                return;
             }
             CraneShellAction::DismissToast(id) => {
                 self.toasts.retain(|t| t.id != *id);
@@ -8471,6 +8995,24 @@ impl TypedActionView for CraneShellView {
                     self.collapsed_groups.insert(g.clone());
                 }
             }
+            CraneShellAction::ShowFolderMenu { group, x, y } => {
+                self.folder_menu = Some((group.clone(), *x, *y));
+            }
+            CraneShellAction::SetGroupTint { group, tint } => {
+                self.folder_menu = None;
+                match tint {
+                    Some(rgb) => {
+                        self.group_tints.insert(group.clone(), *rgb);
+                    }
+                    None => {
+                        self.group_tints.remove(group);
+                    }
+                }
+            }
+            CraneShellAction::RemoveGroup(group) => {
+                self.folder_menu = None;
+                self.remove_group(group, ctx);
+            }
             CraneShellAction::SetTheme(name) => {
                 if let Some(t) = crate::theme::find_by_name(name) {
                     crate::theme::set(t);
@@ -8555,121 +9097,7 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::RemoveProject(i) => {
                 self.context_menu = None;
-                let Some(removed_path) = self.projects.get(*i).map(|p| p.path.clone()) else {
-                    return;
-                };
-                self.added_projects.retain(|ap| ap.path != removed_path);
-                if !self.removed_project_paths.contains(&removed_path) {
-                    self.removed_project_paths.push(removed_path.clone());
-                }
-                // Positional-index remap: every (pi, *)-keyed map (layouts,
-                // worktree_tabs, active_tab, selected, expanded_*) is keyed by a
-                // project's POSITION in `self.projects`. Removing a non-last (or
-                // the active) project shifts later projects' indices, so we must
-                // rekey those maps to the post-removal positions and tear down the
-                // vanished project's panes/PTYs. We match by PATH (robust to the
-                // single-index shift).
-                //
-                // IMPORTANT (perf / OG parity): removal is done IN PLACE via
-                // `Vec::remove`. We deliberately do NOT call `reload_projects()`
-                // here — that would re-shell `git status`/`git diff` for EVERY
-                // project + worktree + discovered child repo in the whole tree
-                // (the reported freeze). A single-project remove must run ZERO git
-                // subprocesses. `removed_project_paths` was already updated above
-                // so any *future* reload (e.g. a later Add Project) still excludes
-                // this path.
-                let old_paths: Vec<String> =
-                    self.projects.iter().map(|p| p.path.clone()).collect();
-                if *i < self.projects.len() {
-                    self.projects.remove(*i);
-                }
-                // Reconcile watches: unwatch the removed Project + its Workspaces.
-                self.sync_watches();
-                let new_index: HashMap<String, usize> = self
-                    .projects
-                    .iter()
-                    .enumerate()
-                    .map(|(ni, p)| (p.path.clone(), ni))
-                    .collect();
-                // old project index -> new project index (None = project gone).
-                let remap = |pi: usize| -> Option<usize> {
-                    old_paths.get(pi).and_then(|path| new_index.get(path).copied())
-                };
-                // 1) Tear down layouts (+ PTYs) for projects that vanished.
-                let dead_layouts: Vec<(usize, usize, usize)> = self
-                    .layouts
-                    .keys()
-                    .copied()
-                    .filter(|(pi, _, _)| remap(*pi).is_none())
-                    .collect();
-                for key in dead_layouts {
-                    self.tear_down_layout(key);
-                }
-                // 2) Rekey the surviving layouts to their new project indices.
-                let old_layouts = std::mem::take(&mut self.layouts);
-                for ((pi, wi, tid), node) in old_layouts {
-                    if let Some(np) = remap(pi) {
-                        self.layouts.insert((np, wi, tid), node);
-                    }
-                }
-                // 3) Rekey worktree_tabs.
-                let old_tabs = std::mem::take(&mut self.worktree_tabs);
-                for ((pi, wi), tabs) in old_tabs {
-                    if let Some(np) = remap(pi) {
-                        self.worktree_tabs.insert((np, wi), tabs);
-                    }
-                }
-                // 4) Rekey expand state.
-                self.expanded_projects =
-                    self.expanded_projects.iter().filter_map(|pi| remap(*pi)).collect();
-                self.expanded_worktrees = self
-                    .expanded_worktrees
-                    .iter()
-                    .filter_map(|(pi, wi)| remap(*pi).map(|np| (np, *wi)))
-                    .collect();
-                // 5) Repoint active_tab / selected.
-                self.active_tab =
-                    self.active_tab.and_then(|(pi, wi, tid)| remap(pi).map(|np| (np, wi, tid)));
-                let (spi, swi, stid) = self.selected;
-                self.selected = match remap(spi) {
-                    Some(np) => (np, swi, stid),
-                    None => (0, 0, usize::MAX),
-                };
-                // 6) Clear any focused/files pane whose backing pane was town down.
-                if let Some(fp) = self.files_pane {
-                    if !self.panes.contains_key(&fp) {
-                        self.files_pane = None;
-                        self.file_pane_paths.clear();
-                        self.file_pane_active = 0;
-                    }
-                }
-                if let Some(f) = self.focused {
-                    if !self.panes.contains_key(&f) {
-                        self.focused = None;
-                    }
-                }
-                // 7) If the active tab survived but lost focus, refocus its first
-                // leaf. If it was removed, drop the panel's cwd context.
-                match self.active_tab {
-                    Some(at) => {
-                        if self.focused.is_none() {
-                            self.focused = self.layouts.get(&at).map(|n| n.first_leaf());
-                        }
-                    }
-                    None => {
-                        self.focused = None;
-                        self.active_cwd = None;
-                    }
-                }
-                // Rebuild the right panel ONLY when the active worktree changed.
-                // Removing a *non-active* project leaves the active repo's
-                // branch/changes/files untouched, so we skip the git shell-out
-                // entirely. When the active tab itself was torn down, active_cwd
-                // is None and refresh_panel clears the panel with ZERO git. Either
-                // way a remove runs no git subprocess.
-                if self.active_tab.is_none() {
-                    self.refresh_panel(ctx);
-                }
+                self.remove_project_at(*i, ctx);
             }
             CraneShellAction::ShowProjectMenu { project_idx, x, y } => {
                 self.context_menu = Some(ProjectContextMenu {
@@ -9007,6 +9435,7 @@ impl TypedActionView for CraneShellView {
                 self.branch_picker = None;
                 self.worktree_menu = None;
                 self.tab_menu = None;
+                self.folder_menu = None;
             }
             CraneShellAction::RevealProjectInFinder(i) => {
                 self.context_menu = None;
@@ -9248,6 +9677,10 @@ impl TypedActionView for CraneShellView {
                 }
             }
         }
+        // Settle the attention pulse on whatever tab is now active — covers
+        // every activation path (click, shortcut, toast-focus) from one choke
+        // point instead of threading a clear into each (old egui parity).
+        self.clear_active_attention();
         // Persist UI state after every action so a restart restores the
         // workspace. Re-snapshotting terminal scrollback is expensive, so only
         // do it on non-keystroke actions (a keystroke's output is captured on

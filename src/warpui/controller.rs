@@ -32,6 +32,12 @@ pub struct TerminalController {
     /// this atomic (which also guarantees a UI wake even for a bare bell that
     /// doesn't otherwise dirty the grid) and the UI drains it via `take_bell`.
     bell: Arc<AtomicBool>,
+    /// Second, independent BEL latch used ONLY to drive the Left-Panel attention
+    /// pulse. Set alongside `bell` in the reader thread and drained by the
+    /// TerminalView's repaint stream (`take_bell_notify`). Kept separate from
+    /// `bell` so consuming it for attention never steals the audible beep the
+    /// paint path drains from `bell`.
+    bell_notify: Arc<AtomicBool>,
     /// Desktop notifications (OSC 9 / OSC 777) drained off the `Term` queue by
     /// the reader thread and buffered here until the UI thread forwards them to
     /// the shell (mirrors the `bell` latch: draining on the reader thread also
@@ -95,6 +101,7 @@ impl TerminalController {
         let parser = Arc::new(Mutex::new(Processor::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let bell = Arc::new(AtomicBool::new(false));
+        let bell_notify = Arc::new(AtomicBool::new(false));
         let notif_queue: Arc<Mutex<Vec<TermNotification>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Reader thread: PTY -> crane_term, write back replies, wake the UI.
@@ -105,6 +112,7 @@ impl TerminalController {
             let writer = writer.clone();
             let alive = alive.clone();
             let bell = bell.clone();
+            let bell_notify = bell_notify.clone();
             let notif_queue = notif_queue.clone();
             Some(thread::spawn(move || {
                 let mut reader = reader;
@@ -140,6 +148,7 @@ impl TerminalController {
                             }
                             if rang {
                                 bell.store(true, Ordering::Relaxed);
+                                bell_notify.store(true, Ordering::Relaxed);
                             }
                             let has_notes = !notes.is_empty();
                             if has_notes {
@@ -173,6 +182,7 @@ impl TerminalController {
             rows,
             alive,
             bell,
+            bell_notify,
             notif_queue,
             cwd,
         })
@@ -198,6 +208,12 @@ impl TerminalController {
     /// to the UI even when the bell didn't otherwise dirty the grid.
     pub fn take_bell(&self) -> bool {
         self.bell.swap(false, Ordering::Relaxed)
+    }
+
+    /// Read-and-clear the attention-only BEL latch. Independent of `take_bell`
+    /// so draining it to pulse the sidebar never suppresses the audible beep.
+    pub fn take_bell_notify(&self) -> bool {
+        self.bell_notify.swap(false, Ordering::Relaxed)
     }
 
     /// Render the current grid + scrollback to an ANSI snapshot (for session

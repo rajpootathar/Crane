@@ -152,6 +152,11 @@ pub struct WarpuiState {
     /// reloads even though (project_idx, worktree_idx) shift.
     #[serde(default)]
     pub tab_tints: Vec<((String, usize), [u8; 3])>,
+    /// Per folder-group tint overrides keyed by the container folder's own path
+    /// (`ProjectNode::group_path`). Painted on the collapsible FOLDER header's
+    /// icon + label. Stable across reloads (the container path never shifts).
+    #[serde(default)]
+    pub group_tints: Vec<(String, [u8; 3])>,
     /// Last saved window width in logical pixels (0.0 = unset / use default).
     #[serde(default)]
     pub window_w: f32,

@@ -308,6 +308,12 @@ pub struct TerminalView {
     link_pressed: Rc<RefCell<Option<crate::warpui::grid_element::LinkTarget>>>,
     /// Whether LeftMouseDragged fired since the last LeftMouseDown.
     url_did_drag: Rc<StdCell<bool>>,
+    /// The (project_idx, worktree_idx, tab_id) this terminal currently lives in,
+    /// synced by the shell from its authoritative `layouts` map. Attached to the
+    /// `TermNotification` / `TermBell` this view dispatches so the shell can flag
+    /// attention on the *source* tab (not the active one). `None` until the shell
+    /// first syncs it.
+    owner_key: Rc<StdCell<Option<(usize, usize, usize)>>>,
 }
 
 impl TerminalView {
@@ -346,13 +352,25 @@ impl TerminalView {
         let repaint = ctx.spawn_stream_local(
             rx,
             |this, _item, ctx| {
+                let source = this.owner_key.get();
                 let notes = this.controller.borrow().take_notifications();
                 for n in notes {
                     ctx.dispatch_typed_action(
                         &crate::warpui::shell::CraneShellAction::TermNotification {
                             body: n.body,
                             urgent: n.urgent,
+                            source,
                         },
+                    );
+                }
+                // Bell attention path: a background terminal ringing BEL is a
+                // legit "wants attention" signal. Drained via the dedicated
+                // `bell_notify` latch (NOT the audible-bell latch the paint path
+                // owns, so the system beep is untouched). The shell only pulses
+                // when `source` isn't the active tab.
+                if this.controller.borrow().take_bell_notify() {
+                    ctx.dispatch_typed_action(
+                        &crate::warpui::shell::CraneShellAction::TermBell { source },
                     );
                 }
                 ctx.notify();
@@ -377,7 +395,14 @@ impl TerminalView {
             url_hover: Rc::new(StdCell::new(None)),
             link_pressed: Rc::new(RefCell::new(None)),
             url_did_drag: Rc::new(StdCell::new(false)),
+            owner_key: Rc::new(StdCell::new(None)),
         }
+    }
+
+    /// A cloned handle to this terminal's owner-tab cell. The shell sets it from
+    /// its `layouts` map so dispatched notifications carry the right source tab.
+    pub fn owner_cell(&self) -> Rc<StdCell<Option<(usize, usize, usize)>>> {
+        self.owner_key.clone()
     }
 
     /// Restore a terminal from a persisted session: spawn in `cwd`, then replay
