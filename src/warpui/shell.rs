@@ -277,6 +277,26 @@ pub struct CraneShellView {
     git_log_scroll: Rc<Cell<f32>>,
     /// Hovered commit-list row index (shared with the element).
     git_log_hover: Rc<Cell<Option<usize>>>,
+    /// Ref-scoped log filter (a branch/tag picked in the refs column);
+    /// `None` = `--all` (the full graph).
+    git_log_ref_filter: Option<String>,
+    /// Case-insensitive text filter over subject / hash / author; "" = off.
+    git_log_filter: String,
+    /// True while the git-log filter field owns typing (`SendKeys` routes here).
+    git_log_filter_active: bool,
+    /// Filtered-frame cache keyed by (needle, generation) — `filtered_frame`
+    /// re-runs lane layout over up to 10k commits, which must not happen per
+    /// paint. RefCell: filled lazily from `render` (which is `&self`).
+    git_log_filtered:
+        std::cell::RefCell<Option<(String, u64, Rc<crate::warpui::git_log::GraphFrame>)>>,
+    /// Open commit context menu: (sha, window x, window y).
+    git_log_menu: Option<(String, f32, f32)>,
+    /// Inline "create branch from commit" prompt: (sha, name buffer).
+    git_log_branch_prompt: Option<(String, String)>,
+    /// True while `git fetch --all --prune --tags` runs off-thread.
+    git_log_fetching: bool,
+    /// Scroll state for the refs column.
+    git_log_refs_scroll: ClippedScrollStateHandle,
     /// Loaded `git show` detail for the selected commit.
     git_log_detail: Option<crate::warpui::git_log::CommitDetail>,
     /// True while the selected commit's `git show` is computing.
@@ -687,6 +707,14 @@ pub enum PaneContent {
     /// reserves the body rect; the native WKWebViews are reconciled against it
     /// by `browser::BrowserHost` on the shell's browser tick.
     Browser(ViewHandle<crate::warpui::browser_view::WarpBrowserView>),
+}
+
+/// A mutating git-log commit operation (context-menu verbs).
+#[derive(Clone, Copy)]
+enum GitLogOp {
+    Checkout,
+    CherryPick,
+    Revert,
 }
 
 /// Map a dock edge to (split direction, dragged-goes-first?). Center → None
@@ -1150,6 +1178,14 @@ impl CraneShellView {
             git_log_last_reload: std::time::Instant::now(),
             git_log_selected: None,
             git_log_scroll: Rc::new(Cell::new(0.0)),
+            git_log_ref_filter: None,
+            git_log_filter: String::new(),
+            git_log_filter_active: false,
+            git_log_filtered: std::cell::RefCell::new(None),
+            git_log_menu: None,
+            git_log_branch_prompt: None,
+            git_log_fetching: false,
+            git_log_refs_scroll: ClippedScrollStateHandle::new(),
             git_log_hover: Rc::new(Cell::new(None)),
             git_log_detail: None,
             git_log_detail_loading: false,
@@ -7727,7 +7763,10 @@ impl CraneShellView {
         self.git_log_gen = self.git_log_gen.wrapping_add(1);
         self.git_log_last_reload = std::time::Instant::now();
         let load_gen = self.git_log_gen;
-        let fut = async move { crate::warpui::git_log::load(&repo) };
+        let ref_filter = self.git_log_ref_filter.clone();
+        let fut = async move {
+            crate::warpui::git_log::load_graph_for(&repo, ref_filter.as_deref())
+        };
         ctx.spawn(fut, move |this, frame, vctx| {
             // Ignore a result from a superseded reload (newer gen already ran).
             if this.git_log_gen != load_gen {
@@ -7750,6 +7789,126 @@ impl CraneShellView {
         if self.git_log_repo.as_deref() != self.active_cwd.as_deref() {
             self.reload_git_log(ctx);
         }
+    }
+
+    /// Typing routed to the git-log text-filter field. Chars append, Backspace
+    /// pops, Enter/Escape drop focus (Escape also clears). Same simplified
+    /// field model as the find bar. Arrow keys step the selection even while
+    /// the field is focused (old log.rs let you filter-then-arrow).
+    fn edit_git_log_filter(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
+        if ks.cmd || ks.ctrl {
+            return;
+        }
+        match ks.key.as_str() {
+            "up" | "down" => {
+                let a = CraneShellAction::GitLogStepSelection(ks.key == "down");
+                self.handle_action(&a, ctx);
+            }
+            "enter" => self.git_log_filter_active = false,
+            "escape" => {
+                self.git_log_filter.clear();
+                self.git_log_filter_active = false;
+            }
+            "backspace" => {
+                self.git_log_filter.pop();
+            }
+            "space" => self.git_log_filter.push(' '),
+            k if k.chars().count() == 1 => self.git_log_filter.push_str(k),
+            _ => {}
+        }
+    }
+
+    /// Typing routed to the "create branch from commit" prompt. Enter runs
+    /// `git branch <name> <sha>` off-thread; Escape cancels.
+    fn edit_git_log_branch_prompt(
+        &mut self,
+        ks: &warpui::keymap::Keystroke,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if ks.cmd || ks.ctrl {
+            return;
+        }
+        let Some((sha, buf)) = self.git_log_branch_prompt.as_mut() else {
+            return;
+        };
+        match ks.key.as_str() {
+            "enter" => {
+                let name = buf.trim().to_string();
+                let sha = sha.clone();
+                self.git_log_branch_prompt = None;
+                self.git_log_menu = None;
+                if name.is_empty() {
+                    return;
+                }
+                let Some(repo) = self.active_cwd.clone() else {
+                    return;
+                };
+                let fut =
+                    async move { crate::warpui::git::branch_from(&repo, &name, &sha) };
+                ctx.spawn(fut, move |this, res, vctx| {
+                    if let Err(e) = res {
+                        this.commit_error = Some(e);
+                    }
+                    this.reload_git_log(vctx);
+                    vctx.notify();
+                });
+            }
+            "escape" => {
+                self.git_log_branch_prompt = None;
+                self.git_log_menu = None;
+            }
+            "backspace" => {
+                buf.pop();
+            }
+            k if k.chars().count() == 1 => buf.push_str(k),
+            _ => {}
+        }
+    }
+
+    /// The frame the commit list is currently displaying: the raw loaded frame,
+    /// or — when the text filter is non-empty — the cached filtered frame
+    /// (recomputed only when the needle or the load generation changes; the
+    /// lane relayout over up to 10k commits must not run per paint).
+    fn git_log_shown_frame(&self) -> Option<Rc<crate::warpui::git_log::GraphFrame>> {
+        let frame = self.git_log_frame.clone()?;
+        let needle = self.git_log_filter.trim().to_string();
+        if needle.is_empty() {
+            return Some(frame);
+        }
+        let mut cache = self.git_log_filtered.borrow_mut();
+        if let Some((n, g, cached)) = cache.as_ref() {
+            if *n == needle && *g == self.git_log_gen {
+                return Some(cached.clone());
+            }
+        }
+        let filtered = Rc::new(crate::warpui::git_log::filtered_frame(&frame, &needle));
+        *cache = Some((needle, self.git_log_gen, filtered.clone()));
+        Some(filtered)
+    }
+
+    /// Run a mutating commit op (checkout / cherry-pick / revert) off-thread,
+    /// surface failure in the error banner, then refresh everything a repo
+    /// mutation invalidates (graph, Changes, editor gutters).
+    fn run_git_log_op(&mut self, ctx: &mut ViewContext<Self>, sha: String, op: GitLogOp) {
+        let Some(repo) = self.active_cwd.clone() else {
+            return;
+        };
+        let fut = async move {
+            match op {
+                GitLogOp::Checkout => crate::warpui::git::checkout_commit(&repo, &sha),
+                GitLogOp::CherryPick => crate::warpui::git::cherry_pick(&repo, &sha),
+                GitLogOp::Revert => crate::warpui::git::revert(&repo, &sha),
+            }
+        };
+        ctx.spawn(fut, move |this, res, vctx| {
+            if let Err(e) = res {
+                this.commit_error = Some(e);
+            }
+            this.reload_git_log(vctx);
+            this.refresh_panel(vctx);
+            this.invalidate_editor_diffs(&*vctx);
+            vctx.notify();
+        });
     }
 
     /// A commit row was clicked: select it and load its `git show` detail
@@ -7781,13 +7940,21 @@ impl CraneShellView {
     /// commit list (custom lane element) on the left, the selected commit's
     /// message + diff on the right.
     fn git_log_dock(&self) -> Box<dyn Element> {
+        // The list renders the FILTERED frame when the text filter is active
+        // (cached per needle+generation); counts show "N of M" then.
+        let shown = self.git_log_shown_frame();
         // ── Header strip ──────────────────────────────────────────────────
         let status = if self.git_log_loading && self.git_log_frame.is_none() {
             "loading…".to_string()
+        } else if self.git_log_fetching {
+            "fetching…".to_string()
         } else {
-            match &self.git_log_frame {
-                Some(f) => format!("{} commits", f.commits.len()),
-                None => "no commits".to_string(),
+            match (&shown, &self.git_log_frame) {
+                (Some(s), Some(f)) if s.commits.len() != f.commits.len() => {
+                    format!("{} of {} commits", s.commits.len(), f.commits.len())
+                }
+                (_, Some(f)) => format!("{} commits", f.commits.len()),
+                _ => "no commits".to_string(),
             }
         };
         let header = ConstrainedBox::new(
@@ -7828,6 +7995,12 @@ impl CraneShellView {
                             )
                             .finish(),
                         )
+                        .with_child(
+                            self.icon_button(
+                                icons::ARROW_COUNTER_CLOCKWISE,
+                                CraneShellAction::GitLogFetchAll,
+                            ),
+                        )
                         .with_child(self.icon_button(icons::X, CraneShellAction::OpenGitLog))
                         .finish(),
                 )
@@ -7836,17 +8009,29 @@ impl CraneShellView {
         .with_height(26.0)
         .finish();
 
+        // ── Filter bar: text field + active-ref pill ──────────────────────
+        let filter_bar = self.git_log_filter_bar();
+
         // ── Commit list (lane graph) ──────────────────────────────────────
-        let list: Box<dyn Element> = match &self.git_log_frame {
+        let list: Box<dyn Element> = match &shown {
             Some(frame) if !frame.commits.is_empty() => {
-                Box::new(crate::warpui::git_log_element::GitLogListElement::new(
-                    frame.clone(),
-                    self.mono_font,
-                    12.0,
-                    self.git_log_scroll.clone(),
-                    self.git_log_selected.clone(),
-                    self.git_log_hover.clone(),
-                )) as Box<dyn Element>
+                Box::new(
+                    crate::warpui::git_log_element::GitLogListElement::new(
+                        frame.clone(),
+                        self.mono_font,
+                        12.0,
+                        self.git_log_scroll.clone(),
+                        self.git_log_selected.clone(),
+                        self.git_log_hover.clone(),
+                    )
+                    .with_context_menu(Rc::new(|sha: &str, x, y, ectx| {
+                        ectx.dispatch_typed_action(CraneShellAction::GitLogShowMenu {
+                            sha: sha.to_string(),
+                            x,
+                            y,
+                        });
+                    })),
+                ) as Box<dyn Element>
             }
             _ => {
                 let msg = if self.git_log_loading {
@@ -7872,6 +8057,12 @@ impl CraneShellView {
         let detail = self.git_log_detail_panel();
 
         let body = Flex::row()
+            .with_child(self.git_log_refs_column())
+            .with_child(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                    .with_width(1.0)
+                    .finish(),
+            )
             .with_child(Expanded::new(1.4, list).finish())
             .with_child(
                 ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
@@ -7883,8 +8074,296 @@ impl CraneShellView {
 
         Flex::column()
             .with_child(header)
+            .with_child(filter_bar)
             .with_child(Expanded::new(1.0, body).finish())
             .finish()
+    }
+
+    /// The git-log text-filter row: a magnifier + simplified editable field
+    /// (click to focus; typing routes via `SendKeys`) and, when a ref scope is
+    /// active, a dismissible `ref ×` pill.
+    fn git_log_filter_bar(&self) -> Box<dyn Element> {
+        let mut row = Flex::row();
+        row = row.with_child(
+            Container::new(self.icon(icons::MAGNIFYING_GLASS, 11.0, theme::text_muted()))
+                .with_padding_left(10.0)
+                .with_padding_right(6.0)
+                .with_padding_top(4.0)
+                .finish(),
+        );
+        let shown = if self.git_log_filter.is_empty() && !self.git_log_filter_active {
+            "Filter commits (subject / hash / author)".to_string()
+        } else {
+            self.git_log_filter.clone()
+        };
+        let mut field = Flex::row().with_child(
+            Text::new(shown, self.ui_font, 11.0)
+                .with_color(
+                    if self.git_log_filter.is_empty() && !self.git_log_filter_active {
+                        theme::text_muted()
+                    } else {
+                        theme::text()
+                    },
+                )
+                .finish(),
+        );
+        if self.git_log_filter_active {
+            field = field.with_child(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::accent()).finish())
+                    .with_width(2.0)
+                    .with_height(12.0)
+                    .finish(),
+            );
+        }
+        let field = EventHandler::new(
+            Container::new(field.finish())
+                .with_background_color(theme::bg())
+                .with_border(Border::all(1.0).with_border_color(
+                    if self.git_log_filter_active {
+                        theme::accent()
+                    } else {
+                        theme::border()
+                    },
+                ))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_padding_left(8.0)
+                .with_padding_right(8.0)
+                .with_padding_top(2.0)
+                .with_padding_bottom(2.0)
+                .finish(),
+        )
+        .on_left_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::GitLogFocusFilter);
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+        row = row.with_child(Expanded::new(1.0, field).finish());
+        if let Some(r) = &self.git_log_ref_filter {
+            let label = r.clone();
+            let pill = EventHandler::new(
+                Container::new(
+                    Flex::row()
+                        .with_child(
+                            Text::new(label, self.ui_font, 10.5)
+                                .with_color(theme::accent())
+                                .finish(),
+                        )
+                        .with_child(
+                            Container::new(self.icon(icons::X, 9.0, theme::text_muted()))
+                                .with_padding_left(5.0)
+                                .finish(),
+                        )
+                        .finish(),
+                )
+                .with_background_color(theme::surface())
+                .with_border(Border::all(1.0).with_border_color(theme::accent()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.0)))
+                .with_padding_left(8.0)
+                .with_padding_right(6.0)
+                .with_padding_top(1.0)
+                .with_padding_bottom(1.0)
+                .finish(),
+            )
+            .on_left_mouse_down(|ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::GitLogSetRefFilter(None));
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            row = row.with_child(Container::new(pill).with_padding_left(6.0).finish());
+        }
+        ConstrainedBox::new(
+            Container::new(row.finish())
+                .with_background_color(theme::topbar_bg())
+                .with_border(Border::bottom(1.0).with_border_color(theme::divider()))
+                .with_padding_right(10.0)
+                .with_padding_bottom(3.0)
+                .finish(),
+        )
+        .with_height(24.0)
+        .finish()
+    }
+
+    /// The refs column (old view/refs.rs): LOCAL / REMOTE / TAGS groups, each
+    /// ref a click-to-scope row; the active scope row is accent-highlighted
+    /// and clicking it again clears the scope.
+    fn git_log_refs_column(&self) -> Box<dyn Element> {
+        let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        if let Some(frame) = &self.git_log_frame {
+            for group in crate::warpui::git_log::ref_groups(&frame.refs) {
+                col = col.with_child(
+                    Container::new(
+                        Text::new(group.title.to_string(), self.ui_font, 9.5)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    )
+                    .with_padding_left(10.0)
+                    .with_padding_top(8.0)
+                    .with_padding_bottom(2.0)
+                    .finish(),
+                );
+                for item in group.items {
+                    let active =
+                        self.git_log_ref_filter.as_deref() == Some(item.display.as_str());
+                    let row = EventHandler::new(
+                        Container::new(
+                            Flex::row()
+                                .with_child(
+                                    Text::new(item.display.clone(), self.ui_font, 11.0)
+                                        .with_color(if active {
+                                            theme::accent()
+                                        } else if item.is_head {
+                                            theme::text()
+                                        } else {
+                                            theme::text_muted()
+                                        })
+                                        .finish(),
+                                )
+                                .finish(),
+                        )
+                        .with_background_color(if active {
+                            theme::surface()
+                        } else {
+                            theme::bg()
+                        })
+                        .with_padding_left(14.0)
+                        .with_padding_top(2.0)
+                        .with_padding_bottom(2.0)
+                        .finish(),
+                    )
+                    .on_left_mouse_down({
+                        // `display` is what `git log <ref>` resolves (`main`,
+                        // `origin/main`, tag name) — exactly the scope string.
+                        let name = item.display.clone();
+                        move |ctx, _app, _pos| {
+                            ctx.dispatch_typed_action(CraneShellAction::GitLogSetRefFilter(
+                                Some(name.clone()),
+                            ));
+                            DispatchEventResult::StopPropagation
+                        }
+                    })
+                    .finish();
+                    col = col.with_child(row);
+                }
+            }
+        }
+        ConstrainedBox::new(
+            ClippedScrollable::vertical(
+                self.git_log_refs_scroll.clone(),
+                Container::new(col.finish())
+                    .with_background_color(theme::bg())
+                    .finish(),
+                ScrollbarWidth::Auto,
+                Fill::Solid(theme::border()),
+                Fill::Solid(theme::text_muted()),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_width(170.0)
+        .finish()
+    }
+
+    /// The commit context menu (right-click on a lane row): checkout /
+    /// branch-from / cherry-pick / revert / copy hash. Old log.rs menu, minus
+    /// the worktree verb (worktrees are a Left Panel concept here).
+    fn git_log_menu_overlay(&self, sha: &str, x: f32, y: f32) -> Box<dyn Element> {
+        let short: String = sha.chars().take(7).collect();
+        let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        items = items.with_child(self.menu_item(
+            icons::GIT_BRANCH,
+            &format!("Checkout {short} (detached)"),
+            CraneShellAction::GitLogCheckout(sha.to_string()),
+        ));
+        items = items.with_child(self.menu_item(
+            icons::PLUS,
+            "Create branch from here…",
+            CraneShellAction::GitLogBranchPrompt(sha.to_string()),
+        ));
+        items = items.with_child(self.menu_separator());
+        items = items.with_child(self.menu_item(
+            icons::CHECK,
+            "Cherry-pick onto current",
+            CraneShellAction::GitLogCherryPick(sha.to_string()),
+        ));
+        items = items.with_child(self.menu_item(
+            icons::ARROW_COUNTER_CLOCKWISE,
+            "Revert this commit",
+            CraneShellAction::GitLogRevert(sha.to_string()),
+        ));
+        items = items.with_child(self.menu_separator());
+        items = items.with_child(self.menu_item(
+            icons::COPY,
+            "Copy hash",
+            CraneShellAction::CopyPathStr(sha.to_string()),
+        ));
+        self.menu_popover(items.finish(), x, y)
+    }
+
+    /// The inline "create branch from commit" prompt, anchored like a menu.
+    /// Enter creates the branch (`git branch <name> <sha>`), Escape cancels.
+    fn git_log_branch_prompt_overlay(&self, sha: &str, buf: &str) -> Box<dyn Element> {
+        let short: String = sha.chars().take(7).collect();
+        let col = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(
+                Container::new(
+                    Text::new(format!("New branch at {short}"), self.ui_font, 11.0)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .with_padding_bottom(6.0)
+                .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Flex::row()
+                        .with_child(
+                            Text::new(buf.to_string(), self.ui_font, 12.0)
+                                .with_color(theme::text())
+                                .finish(),
+                        )
+                        .with_child(
+                            ConstrainedBox::new(
+                                Rect::new().with_background_color(theme::accent()).finish(),
+                            )
+                            .with_width(2.0)
+                            .with_height(13.0)
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .with_background_color(theme::bg())
+                .with_border(Border::all(1.0).with_border_color(theme::accent()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_padding_left(8.0)
+                .with_padding_right(8.0)
+                .with_padding_top(4.0)
+                .with_padding_bottom(4.0)
+                .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Text::new("Enter creates · Esc cancels".to_string(), self.ui_font, 10.0)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .with_padding_top(6.0)
+                .finish(),
+            )
+            .finish();
+        // Center-ish placement: reuse the menu popover chrome at a fixed spot.
+        let (x, y) = self
+            .git_log_menu
+            .as_ref()
+            .map(|(_, x, y)| (*x, *y))
+            .unwrap_or((300.0, 300.0));
+        self.menu_popover(
+            ConstrainedBox::new(Container::new(col).with_padding_left(4.0).finish())
+                .with_width(260.0)
+                .finish(),
+            x,
+            y,
+        )
     }
 
     /// The right-hand detail panel: the selected commit's message header then
@@ -8562,6 +9041,14 @@ impl View for CraneShellView {
         if let Some((group, x, y)) = &self.folder_menu {
             root_stack = root_stack.with_child(self.folder_menu_overlay(group, *x, *y));
         }
+        if let Some((sha, x, y)) = &self.git_log_menu {
+            if self.git_log_branch_prompt.is_none() {
+                root_stack = root_stack.with_child(self.git_log_menu_overlay(sha, *x, *y));
+            }
+        }
+        if let Some((sha, buf)) = &self.git_log_branch_prompt {
+            root_stack = root_stack.with_child(self.git_log_branch_prompt_overlay(sha, buf));
+        }
         if let Some((x, y)) = self.branch_picker {
             // Clamp the popover origin so a long list opened near the window edge
             // stays on-screen (menu is 220px wide; height is estimated).
@@ -8948,6 +9435,25 @@ pub enum CraneShellAction {
     /// Select a commit in the Git Log list (dispatched by the lane element on a
     /// row click) — highlights it and loads its `git show` detail off-thread.
     GitLogSelect(String),
+    /// Right-click on a commit row — open the commit context menu at (x, y).
+    GitLogShowMenu { sha: String, x: f32, y: f32 },
+    /// Detach-checkout the commit (`git checkout <sha>`).
+    GitLogCheckout(String),
+    /// Cherry-pick the commit onto the current branch.
+    GitLogCherryPick(String),
+    /// Revert the commit (`git revert --no-edit`).
+    GitLogRevert(String),
+    /// Open the inline "create branch from commit" prompt.
+    GitLogBranchPrompt(String),
+    /// Scope the log to one ref (`git log <ref>`), or None for `--all`.
+    GitLogSetRefFilter(Option<String>),
+    /// Click into the git-log text-filter field — take typing focus.
+    GitLogFocusFilter,
+    /// Arrow-key selection step through the (possibly filtered) commit list;
+    /// `true` = down (older).
+    GitLogStepSelection(bool),
+    /// `git fetch --all --prune --tags` off-thread, then reload the graph.
+    GitLogFetchAll,
     /// Scroll the Git Log detail/diff panel by N rows (positive = down).
     GitLogDetailScroll(i32),
     /// Open a Browser pane (placeholder).
@@ -9194,6 +9700,10 @@ impl TypedActionView for CraneShellView {
                     self.edit_rename(ks);
                 } else if self.pending_new_entry.is_some() {
                     self.edit_new_entry(ks, ctx);
+                } else if self.git_log_branch_prompt.is_some() {
+                    self.edit_git_log_branch_prompt(ks, ctx);
+                } else if self.git_log_filter_active {
+                    self.edit_git_log_filter(ks, ctx);
                 } else if self.commit_focused {
                     self.edit_commit(ks);
                 } else if let Some(id) = self.active_input_pane() {
@@ -9685,6 +10195,83 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::OpenGitLog => self.toggle_gitlog(ctx),
             CraneShellAction::GitLogSelect(sha) => self.select_git_log_commit(sha.clone(), ctx),
+            CraneShellAction::GitLogShowMenu { sha, x, y } => {
+                self.git_log_menu = Some((sha.clone(), *x, *y));
+            }
+            CraneShellAction::GitLogCheckout(sha) => {
+                self.git_log_menu = None;
+                self.run_git_log_op(ctx, sha.clone(), GitLogOp::Checkout);
+            }
+            CraneShellAction::GitLogCherryPick(sha) => {
+                self.git_log_menu = None;
+                self.run_git_log_op(ctx, sha.clone(), GitLogOp::CherryPick);
+            }
+            CraneShellAction::GitLogRevert(sha) => {
+                self.git_log_menu = None;
+                self.run_git_log_op(ctx, sha.clone(), GitLogOp::Revert);
+            }
+            CraneShellAction::GitLogBranchPrompt(sha) => {
+                // Keep git_log_menu's (x, y) — the prompt overlay anchors
+                // there; the menu itself stops rendering while the prompt is
+                // open (render gates on branch_prompt.is_none()).
+                self.git_log_branch_prompt = Some((sha.clone(), String::new()));
+            }
+            CraneShellAction::GitLogSetRefFilter(r) => {
+                // Clicking the already-active ref clears the scope (toggle).
+                self.git_log_ref_filter = if self.git_log_ref_filter == *r {
+                    None
+                } else {
+                    r.clone()
+                };
+                self.reload_git_log(ctx);
+            }
+            CraneShellAction::GitLogFocusFilter => {
+                self.git_log_filter_active = true;
+            }
+            CraneShellAction::GitLogStepSelection(down) => {
+                let shown = self.git_log_shown_frame();
+                if let Some(frame) = shown {
+                    if let Some(sha) = crate::warpui::git_log::step_selection(
+                        &frame.commits,
+                        self.git_log_selected.as_deref(),
+                        *down,
+                    ) {
+                        let row = frame
+                            .commits
+                            .iter()
+                            .position(|c| c.sha == sha)
+                            .unwrap_or(0);
+                        self.select_git_log_commit(sha, ctx);
+                        // Reveal with a conservative viewport estimate — the
+                        // element owns the real row math; 15 rows keeps the
+                        // selection comfortably in view for any dock height.
+                        self.git_log_scroll.set(crate::warpui::git_log::reveal_offset(
+                            self.git_log_scroll.get(),
+                            row,
+                            15,
+                        ));
+                    }
+                }
+            }
+            CraneShellAction::GitLogFetchAll => {
+                if !self.git_log_fetching {
+                    if let Some(repo) = self.active_cwd.clone() {
+                        self.git_log_fetching = true;
+                        let fut = async move { crate::warpui::git::fetch_all(&repo) };
+                        ctx.spawn(fut, move |this, res, vctx| {
+                            this.git_log_fetching = false;
+                            if let Err(e) = res {
+                                this.commit_error = Some(e);
+                            }
+                            // The .git/refs FileWatcher usually fires too, but a
+                            // no-op fetch produces no ref writes — reload anyway
+                            // so "up to date" still refreshes the frame.
+                            this.reload_git_log(vctx);
+                            vctx.notify();
+                        });
+                    }
+                }
+            }
             CraneShellAction::GitLogDetailScroll(delta) => {
                 let max = self
                     .git_log_detail
@@ -10278,6 +10865,8 @@ impl TypedActionView for CraneShellView {
                 self.worktree_menu = None;
                 self.tab_menu = None;
                 self.folder_menu = None;
+                self.git_log_menu = None;
+                self.git_log_branch_prompt = None;
             }
             CraneShellAction::RevealProjectInFinder(i) => {
                 self.context_menu = None;
