@@ -168,6 +168,11 @@ pub struct LineScrollbar {
     /// Called with the drag target fraction (0.0 = top/oldest, 1.0 = bottom/live)
     /// on mouse-down or drag. `None` = display-only (e.g. editor for now).
     on_scroll: Option<Rc<dyn Fn(f32)>>,
+    /// Ctx-aware variant of `on_scroll` — receives the EventContext so the
+    /// owning view can dispatch a typed action (and thereby notify a repaint)
+    /// from the drag. Used by the Diff Pane; the terminal keeps the plain
+    /// callback + its own wake channel.
+    on_scroll_ctx: Option<Rc<dyn Fn(&mut EventContext, f32)>>,
 }
 
 impl LineScrollbar {
@@ -182,6 +187,7 @@ impl LineScrollbar {
             origin_vec: None,
             dragging: Rc::new(Cell::new(false)),
             on_scroll: None,
+            on_scroll_ctx: None,
         }
     }
 
@@ -191,6 +197,19 @@ impl LineScrollbar {
     pub fn draggable(mut self, dragging: Rc<Cell<bool>>, on_scroll: Rc<dyn Fn(f32)>) -> Self {
         self.dragging = dragging;
         self.on_scroll = Some(on_scroll);
+        self
+    }
+
+    /// Like [`Self::draggable`], but the callback also receives the
+    /// [`EventContext`] so the owning view can dispatch a typed action from
+    /// the drag (which handles the notify/repaint the plain callback can't).
+    pub fn draggable_with_ctx(
+        mut self,
+        dragging: Rc<Cell<bool>>,
+        on_scroll: Rc<dyn Fn(&mut EventContext, f32)>,
+    ) -> Self {
+        self.dragging = dragging;
+        self.on_scroll_ctx = Some(on_scroll);
         self
     }
 }
@@ -249,12 +268,12 @@ impl Element for LineScrollbar {
     fn dispatch_event(
         &mut self,
         event: &DispatchedEvent,
-        _ctx: &mut EventContext,
+        ctx: &mut EventContext,
         _app: &AppContext,
     ) -> bool {
-        let Some(on_scroll) = self.on_scroll.as_ref() else {
+        if self.on_scroll.is_none() && self.on_scroll_ctx.is_none() {
             return false;
-        };
+        }
         let (Some(o), Some(s)) = (self.origin_vec, self.size) else {
             return false;
         };
@@ -262,14 +281,22 @@ impl Element for LineScrollbar {
         let in_bounds = |p: &Vector2F| {
             p.x() >= o.x() && p.x() <= o.x() + s.x() && p.y() >= o.y() && p.y() <= o.y() + s.y()
         };
+        let fire = |ctx: &mut EventContext, frac: f32| {
+            if let Some(f) = self.on_scroll.as_ref() {
+                f(frac);
+            }
+            if let Some(f) = self.on_scroll_ctx.as_ref() {
+                f(ctx, frac);
+            }
+        };
         match event.raw_event() {
             Event::LeftMouseDown { position, .. } if in_bounds(position) => {
                 self.dragging.set(true);
-                on_scroll(frac_at(position.y()));
+                fire(ctx, frac_at(position.y()));
                 true
             }
             Event::LeftMouseDragged { position, .. } if self.dragging.get() => {
-                on_scroll(frac_at(position.y()));
+                fire(ctx, frac_at(position.y()));
                 true
             }
             Event::LeftMouseUp { .. } => {

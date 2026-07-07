@@ -110,6 +110,39 @@ pub fn push(repo: &Path) -> Result<String, String> {
     Ok(summary)
 }
 
+/// Content of `rel_path` at HEAD as RAW BYTES (`git show HEAD:<path>`) — the
+/// Diff Pane needs bytes to detect binary files before assuming UTF-8, and it
+/// needs failure semantics richer than "empty string" (which the old
+/// `head_content` collapsed everything to, silently diffing empty text):
+///
+/// - `Ok(Some(bytes))` — the file exists in HEAD.
+/// - `Ok(None)` — the file is NOT in HEAD (untracked / newly added / unborn
+///   HEAD on a fresh repo). The caller diffs against empty content, so every
+///   line renders as an add — the legitimate outcome, not an error.
+/// - `Err(msg)` — a real git failure (git missing, not a repository, corrupt
+///   object store). The caller surfaces `msg` as an error row.
+pub fn head_bytes(repo: &Path, rel_path: &str) -> Result<Option<Vec<u8>>, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &format!("HEAD:{rel_path}")])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if out.status.success() {
+        return Ok(Some(out.stdout));
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    // Expected "not in HEAD" shapes (per `git show` messages):
+    //   "fatal: path 'x' does not exist in 'HEAD'"
+    //   "fatal: path 'x' exists on disk, but not in 'HEAD'"
+    //   "fatal: invalid object name 'HEAD'"   (unborn HEAD, fresh repo)
+    let absent = err.contains("does not exist in")
+        || err.contains("exists on disk, but not in")
+        || err.contains("invalid object name");
+    if absent { Ok(None) } else { Err(err) }
+}
+
 /// Current branch name in `root` (or a short SHA when detached), empty on error.
 pub fn current_branch(root: &Path) -> String {
     let Ok(out) = Command::new("git")
