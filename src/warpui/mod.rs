@@ -19,6 +19,7 @@ pub mod file_pane;
 pub mod file_watcher;
 pub mod find_bar_element;
 pub mod file_tree;
+pub mod formatter;
 pub mod fontsize;
 pub mod git;
 pub mod markdown_view;

@@ -448,6 +448,11 @@ pub struct CraneShellView {
     /// (did_open on file open, the poll tick body, goto-definition) is gated on
     /// this flag. Persisted via `WarpuiState::lsp_enabled`.
     lsp_enabled: bool,
+    /// Editor format-on-save opt-in. ON by default (old-egui parity). When on,
+    /// Cmd+S routes through `EditorView::save_on_cmd_s`, which formats the buffer
+    /// off-thread before the write; a formatter error keeps the original bytes.
+    /// Toggled from Settings > Editor. Persisted via `WarpuiState::format_on_save`.
+    format_on_save: bool,
 
     // ── Agent-native wiring ───────────────────────────────────────────────────
     /// Filesystem watcher: external / agent edits under any watched Project or
@@ -707,6 +712,10 @@ impl CraneShellView {
         // before `saved_state` is consumed by the restore block below).
         let init_lsp_enabled: bool =
             saved_state.as_ref().map(|s| s.lsp_enabled).unwrap_or(false);
+        // Format-on-save opt-in — default ON (old-egui parity) when there is no
+        // saved state at all; existing state files carry the persisted value.
+        let init_format_on_save: bool =
+            saved_state.as_ref().map(|s| s.format_on_save).unwrap_or(true);
         // SHALLOW load: build the full tree STRUCTURE with zero `git` subprocess
         // so the first frame paints immediately even with many worktrees. Branch
         // labels + diff/dirty badges are filled in a moment later by the async
@@ -1131,6 +1140,7 @@ impl CraneShellView {
             pending_gotos: Vec::new(),
             _lsp_tick: lsp_tick,
             lsp_enabled: init_lsp_enabled,
+            format_on_save: init_format_on_save,
             file_watcher,
             fs_events,
             watched: HashSet::new(),
@@ -1335,6 +1345,7 @@ impl CraneShellView {
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
             lsp_enabled: self.lsp_enabled,
+            format_on_save: self.format_on_save,
         });
     }
 
@@ -3027,6 +3038,76 @@ impl CraneShellView {
         self.modal_card(480.0, col)
     }
 
+    /// Settings > About: the actionable auto-update row. Reads the updater's
+    /// state accessor fresh every render (the shell re-renders on the update
+    /// waker fed to `spawn_check` / `start_download`), so the lifecycle —
+    /// available → downloading → ready → restart — surfaces live here.
+    fn update_row(&self) -> Box<dyn Element> {
+        use crate::warpui::update::{self, UpdateState};
+        match update::update_state() {
+            UpdateState::UpdateAvailable { version } => Flex::column()
+                .with_child(
+                    Text::new(format!("Update available: {version}"), self.ui_font, 12.0)
+                        .with_color(theme::accent())
+                        .finish(),
+                )
+                .with_child(Self::spacer(6.0))
+                .with_child(self.modal_button(
+                    "Download & Install",
+                    ModalBtn::Primary,
+                    CraneShellAction::StartUpdateDownload,
+                ))
+                .finish(),
+            UpdateState::Downloading { received, total } => {
+                let label = if total > 0 {
+                    let pct = ((received.saturating_mul(100)) / total).min(100);
+                    format!("Downloading… {pct}%")
+                } else {
+                    format!("Downloading… {} KB", received / 1024)
+                };
+                Text::new(label, self.ui_font, 12.0)
+                    .with_color(theme::text())
+                    .finish()
+            }
+            UpdateState::Ready { path } => Flex::column()
+                .with_child(
+                    Text::new("Update ready to install.".to_string(), self.ui_font, 12.0)
+                        .with_color(theme::accent())
+                        .finish(),
+                )
+                .with_child(Self::spacer(6.0))
+                .with_child(self.modal_button(
+                    "Install & Restart",
+                    ModalBtn::Primary,
+                    CraneShellAction::ApplyUpdate(path),
+                ))
+                .finish(),
+            UpdateState::Failed { msg } => Flex::column()
+                .with_child(
+                    Text::new(format!("Update failed: {msg}"), self.ui_font, 11.0)
+                        .with_color(theme::error())
+                        .finish(),
+                )
+                .with_child(Self::spacer(6.0))
+                .with_child(self.modal_button(
+                    "Retry",
+                    ModalBtn::Plain,
+                    CraneShellAction::StartUpdateDownload,
+                ))
+                .finish(),
+            UpdateState::Checking => Text::new(
+                "Checking for updates…".to_string(),
+                self.ui_font,
+                11.0,
+            )
+            .with_color(theme::text_muted())
+            .finish(),
+            UpdateState::Idle => Text::new("Up to date".to_string(), self.ui_font, 11.0)
+                .with_color(theme::text_muted())
+                .finish(),
+        }
+    }
+
     /// Settings card — Appearance (theme picker + zoom) + About (version).
     fn settings_card(&self) -> Box<dyn Element> {
         let current_theme = crate::theme::current().name;
@@ -3172,6 +3253,92 @@ impl CraneShellView {
         })
         .finish();
 
+        // --- Editor: Format-on-save toggle row ---
+        // Same bordered-checkbox style as the LSP row; dispatches
+        // ToggleFormatOnSave. ON by default (old-egui parity): Cmd+S formats the
+        // buffer through rustfmt / prettier / ruff / gofmt before writing.
+        let fmt_on = self.format_on_save;
+        let fmt_state = self.hover_handle("settings:format_toggle");
+        let format_toggle = Hoverable::new(fmt_state, move |ms| {
+            let row_bg = if ms.is_hovered() {
+                theme::row_hover()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            let check_inner: Box<dyn Element> = if fmt_on {
+                Text::new(icons::CHECK.to_string(), icon_font, 11.0)
+                    .with_color(ColorU::new(255, 255, 255, 255))
+                    .finish()
+            } else {
+                Rect::new().finish()
+            };
+            let check_bg = if fmt_on {
+                theme::accent()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            let checkbox = ConstrainedBox::new(
+                Container::new(check_inner)
+                    .with_background_color(check_bg)
+                    .with_border(Border::all(1.0).with_border_color(theme::border()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                    .finish(),
+            )
+            .with_width(16.0)
+            .with_height(16.0)
+            .finish();
+            let title_row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Text::new("Format on save".to_string(), ui_font, 12.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_child(Self::spacer(8.0))
+                .with_child(
+                    Text::new(
+                        if fmt_on { "On".to_string() } else { "Off".to_string() },
+                        ui_font,
+                        11.0,
+                    )
+                    .with_color(if fmt_on { theme::accent() } else { theme::text_muted() })
+                    .finish(),
+                )
+                .finish();
+            let text_col = Flex::column()
+                .with_child(title_row)
+                .with_child(Self::spacer(2.0))
+                .with_child(
+                    Text::new(
+                        "Runs rustfmt / prettier / ruff / gofmt on Cmd+S. \
+                         A formatter error keeps the original file unchanged."
+                            .to_string(),
+                        ui_font,
+                        10.5,
+                    )
+                    .with_color(theme::text_muted())
+                    .finish(),
+                )
+                .finish();
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(checkbox)
+                    .with_child(Self::spacer(10.0))
+                    .with_child(text_col)
+                    .finish(),
+            )
+            .with_background_color(row_bg)
+            .with_padding_top(6.0)
+            .with_padding_bottom(6.0)
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::ToggleFormatOnSave);
+        })
+        .finish();
+
         let col = Flex::column()
             .with_child(self.modal_header("Settings"))
             .with_child(Self::spacer(6.0))
@@ -3214,6 +3381,8 @@ impl CraneShellView {
             )
             .with_child(Self::spacer(6.0))
             .with_child(lsp_toggle)
+            .with_child(Self::spacer(8.0))
+            .with_child(format_toggle)
             .with_child(Self::spacer(14.0))
             // --- About ---
             .with_child(
@@ -3242,32 +3411,7 @@ impl CraneShellView {
                 .finish(),
             )
             .with_child(Self::spacer(6.0))
-            .with_child(match crate::warpui::update::latest_available() {
-                Some(v) => Flex::column()
-                    .with_child(
-                        Text::new(
-                            format!("Update available: {v}"),
-                            self.ui_font,
-                            12.0,
-                        )
-                        .with_color(theme::accent())
-                        .finish(),
-                    )
-                    .with_child(Self::spacer(2.0))
-                    .with_child(
-                        Text::new(
-                            "https://github.com/rajpootathar/Crane/releases/latest".to_string(),
-                            self.ui_font,
-                            10.5,
-                        )
-                        .with_color(theme::text_muted())
-                        .finish(),
-                    )
-                    .finish(),
-                None => Text::new("Up to date".to_string(), self.ui_font, 11.0)
-                    .with_color(theme::text_muted())
-                    .finish(),
-            })
+            .with_child(self.update_row())
             .finish();
         self.modal_card(420.0, col)
     }
@@ -8313,6 +8457,14 @@ pub enum CraneShellAction {
     /// live editor file so servers spawn + diagnostics start; OFF tears down all
     /// running servers and clears the squiggles from every open editor.
     ToggleLsp,
+    /// Settings toggle: flip the editor format-on-save opt-in, then persist.
+    ToggleFormatOnSave,
+    /// Settings > About: begin the background download + stage of the latest
+    /// release DMG (idempotent — a no-op if one is already in flight or staged).
+    StartUpdateDownload,
+    /// Settings > About: swap the running install for the staged `Crane.app` and
+    /// relaunch. Carries the staged bundle path from `UpdateState::Ready`.
+    ApplyUpdate(PathBuf),
     /// Open the "Switch Branch" modal (searchable local + remote branch list).
     /// Trigger: click the status-bar branch label, or Cmd+Shift+B.
     OpenSwitchBranch,
@@ -8449,16 +8601,22 @@ impl TypedActionView for CraneShellView {
                         view.save();
                     });
                 } else if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
+                    // Route through `save_on_cmd_s`: when `format_on_save` is on
+                    // (and a formatter for this file's language is on PATH), it
+                    // formats the buffer off-thread and writes the formatted text;
+                    // otherwise it falls through to the plain synchronous `save`.
+                    // A formatter error never mutates the file — the original
+                    // buffer bytes are written unchanged.
+                    let fmt = self.format_on_save;
                     h.update(ctx, |view, vctx| {
-                        view.save(vctx);
+                        view.save_on_cmd_s(vctx, fmt);
                     });
                     // Notify the LSP of the on-disk save (rust-analyzer runs
                     // cargo check on didSave for full error coverage). Reads the
                     // just-saved buffer back so the server sees the same bytes.
-                    // NOTE: format-on-save is deferred — `LspManager` exposes no
-                    // textDocument/formatting request yet (the `format_on_save`
-                    // config flag is a Phase-2 placeholder), so there is nothing
-                    // to apply before the write.
+                    // When formatting runs async the server re-syncs on the next
+                    // `poll_lsp` tick (it watches `buffer_version`), so no extra
+                    // wiring is needed here.
                     let (path, text) =
                         h.read(ctx, |v, app| (v.file_path().to_path_buf(), v.buffer_text(app)));
                     if !path.as_os_str().is_empty() {
@@ -9599,6 +9757,23 @@ impl TypedActionView for CraneShellView {
                 }
                 // Persisted by the unconditional `save_state` at the end of
                 // `handle_action`.
+            }
+            CraneShellAction::ToggleFormatOnSave => {
+                self.format_on_save = !self.format_on_save;
+                // Persisted by the unconditional `save_state` at the tail of
+                // `handle_action`.
+            }
+            CraneShellAction::StartUpdateDownload => {
+                // Hand the updater the shell repaint waker so Downloading /
+                // Ready / Failed transitions surface in Settings > About without
+                // waiting for an incidental repaint. Idempotent + non-blocking.
+                let wake = self.ui_wake.clone();
+                crate::warpui::update::start_download(move || wake());
+            }
+            CraneShellAction::ApplyUpdate(path) => {
+                // Swaps the running install for the staged bundle and relaunches
+                // (exits this process on success; macOS only).
+                crate::warpui::update::apply_and_restart(path);
             }
             CraneShellAction::OpenSwitchBranch => {
                 self.open_switch_branch(ctx);

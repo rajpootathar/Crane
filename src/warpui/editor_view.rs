@@ -723,6 +723,136 @@ impl WarpEditorView {
         }
     }
 
+    /// Cmd+S entry point with optional format-on-save. **The shell must call
+    /// this instead of [`save`](Self::save)** for editor panes.
+    ///
+    /// When `format_on_save` is `true`, the buffer isn't read-only, and a
+    /// formatter for this file's language is installed on `PATH`, the formatter
+    /// runs as a subprocess **off the UI thread** (`ctx.spawn`, the same
+    /// background executor the diff view uses). Its stdout replaces the buffer
+    /// (caret preserved as best as possible) and the *formatted* text is written
+    /// to disk in the spawn callback. Otherwise — formatting disabled, no
+    /// formatter installed, empty path, or read-only — the buffer is written
+    /// straight to disk synchronously via [`save`](Self::save).
+    ///
+    /// Robustness guarantees (never lose or corrupt data):
+    /// * A formatter that fails (missing binary, non-zero exit, non-UTF-8 or an
+    ///   empty result) yields `None`; the callback then writes the **current
+    ///   buffer text** unchanged — the file is never blanked by a broken tool.
+    /// * If the user keeps typing after pressing Cmd+S (the buffer version moves
+    ///   on before the async format lands), the stale formatted text is **not**
+    ///   applied; the callback writes the current buffer text so the newer edits
+    ///   aren't clobbered and the save still lands.
+    /// * Large files can't deadlock — see [`formatter::run`].
+    ///
+    /// LSP note: when formatting runs async the shell's post-save `did_save`
+    /// fires with the pre-format text, but `poll_lsp` observes the bumped buffer
+    /// version and sends a `did_change` with the formatted text on the next tick,
+    /// so the server re-syncs on its own — no extra shell wiring required.
+    ///
+    /// Returns `true` when the save was initiated (async) or completed (sync).
+    pub fn save_on_cmd_s(&mut self, ctx: &mut ViewContext<Self>, format_on_save: bool) -> bool {
+        if self.path.as_os_str().is_empty() {
+            return false;
+        }
+        let formatter = if format_on_save && !self.read_only {
+            crate::warpui::formatter::for_path(&self.path)
+        } else {
+            None
+        };
+        let Some(fmt) = formatter else {
+            // No formatting for this file → the plain synchronous write.
+            return self.save(ctx);
+        };
+
+        // Snapshot the exact bytes + buffer version we're handing the formatter.
+        // The version lets the callback detect edits made after Cmd+S and refuse
+        // to overwrite them with a now-stale reformat.
+        let text = self.buffer_text(ctx);
+        let submitted_version = self.buffer_version(ctx);
+
+        let fut = async move { crate::warpui::formatter::run(&fmt, &text) };
+        ctx.spawn(fut, move |this, formatted, vctx| {
+            this.apply_format_result(formatted, submitted_version, vctx);
+        });
+        true
+    }
+
+    /// Spawn-callback for [`save_on_cmd_s`](Self::save_on_cmd_s): adopt the
+    /// formatter output (when safe) and persist to disk. See that method for the
+    /// data-safety rules encoded here.
+    fn apply_format_result(
+        &mut self,
+        formatted: Option<String>,
+        submitted_version: u64,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Did the user edit after pressing Cmd+S? If so, never apply a reformat
+        // computed from the older text — just persist what's on screen now.
+        let raced = self.buffer_version(ctx) != submitted_version;
+
+        let to_write = match (formatted, raced) {
+            (Some(f), false) => {
+                self.apply_formatted_text(&f, ctx);
+                f
+            }
+            // Formatter failed, or the buffer moved on — write the live text so
+            // the save still happens and disk matches what the user sees.
+            _ => self.buffer_text(ctx),
+        };
+
+        if std::fs::write(&self.path, &to_write).is_ok() {
+            self.saved_text = to_write;
+            self.loaded_mtime = file_mtime(&self.path);
+            self.diff.borrow_mut().dirty = true;
+        }
+        ctx.notify();
+    }
+
+    /// Replace the buffer with `formatted` as ONE model edit (a single undo step,
+    /// no full re-highlight smear), preserving the caret's char offset across the
+    /// reformat as best as possible. No-op when the text is already identical.
+    fn apply_formatted_text(&mut self, formatted: &str, ctx: &mut ViewContext<Self>) {
+        let old = self.buffer_text(ctx);
+        let Some((s, old_end, replacement)) = minimal_char_diff(&old, formatted) else {
+            return;
+        };
+        // Best-effort caret preservation: unchanged before the edit, shifted by
+        // the net length delta after it, clamped to the edit end when the caret
+        // sat inside the reformatted region.
+        let cursor = self.cursor_text_offset(ctx);
+        let new_len = replacement.chars().count();
+        let removed = old_end - s;
+        let raw_cursor = if cursor <= s {
+            cursor
+        } else if cursor >= old_end {
+            (cursor + new_len).saturating_sub(removed)
+        } else {
+            s + new_len
+        };
+        let new_total = old.chars().count() + new_len - removed;
+        let new_cursor = raw_cursor.min(new_total);
+
+        let model = self.model.clone();
+        model.update(ctx, |m: &mut CodeModel, mctx| {
+            let cs = CharOffset::from(s).add_signed(1);
+            let ce = CharOffset::from(old_end).add_signed(1);
+            let sel = m.selection.clone();
+            sel.update(mctx, |sm, sctx| {
+                sm.set_cursor(cs, sctx);
+                sm.set_last_head(ce, sctx);
+            });
+            m.user_insert(&replacement, mctx);
+            let c = CharOffset::from(new_cursor).add_signed(1);
+            sel.update(mctx, |sm, sctx| sm.set_cursor(c, sctx));
+        });
+        if self.find.is_some() {
+            self.recompute_matches(ctx);
+        } else {
+            self.refresh_decorations(ctx);
+        }
+    }
+
     /// Invalidate the cached gutter git-diff so the next paint recomputes it.
     /// The shell calls this after a git op (stage / commit / checkout) that can
     /// change the working-tree-vs-HEAD diff without an edit to this buffer.

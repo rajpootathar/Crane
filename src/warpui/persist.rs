@@ -174,6 +174,18 @@ pub struct WarpuiState {
     /// unless the user explicitly enables this in Settings.
     #[serde(default)]
     pub lsp_enabled: bool,
+    /// Editor format-on-save. ON by default — matches the old egui build, which
+    /// ran the buffer through rustfmt / prettier / ruff / gofmt before every
+    /// write. A formatter error (missing binary, non-zero exit) never mutates
+    /// the file; the original buffer is written unchanged.
+    #[serde(default = "default_true")]
+    pub format_on_save: bool,
+}
+
+/// Serde default for `format_on_save`: ON, so existing state files that predate
+/// the field (and the `Default` fallback path) still format on save.
+fn default_true() -> bool {
+    true
 }
 
 fn state_file() -> Option<PathBuf> {
