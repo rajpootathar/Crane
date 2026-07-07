@@ -6877,20 +6877,30 @@ impl CraneShellView {
         if selected {
             stack = stack.with_child(self.active_bar(row_h));
         }
-        let mut stack = stack.with_child(label).with_child(hit_layer);
-        if let Some(pa) = plus_action {
-            // Trailing "+ new tab" affordance on the row's right edge (old
-            // hover-revealed PLUS; rendered above the hit layer so it wins the
-            // click). Replaces the taller per-worktree "New tab" row item.
-            stack = stack.with_child(self.trailing_plus_overlay(row_h, pa));
-        }
-        let stack = stack.finish();
-        EventHandler::new(stack)
+        let stack = stack.with_child(label).with_child(hit_layer).finish();
+        let base = EventHandler::new(stack)
             .on_left_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(action.clone());
                 DispatchEventResult::StopPropagation
             })
-            .finish()
+            .finish();
+        match plus_action {
+            None => base,
+            Some(pa) => {
+                // Hover-revealed trailing "+ new tab" on the row's right edge
+                // (old Crane's hover affordance) — the overlay only joins the
+                // stack while the pointer is over the row.
+                let state = self.hover_handle(&format!("wtplus:{pa:?}"));
+                let overlay = self.trailing_plus_overlay(row_h, pa);
+                Box::new(Hoverable::new(state, move |ms| {
+                    if ms.is_hovered() {
+                        Stack::new().with_child(base).with_child(overlay).finish()
+                    } else {
+                        base
+                    }
+                }))
+            }
+        }
     }
 
     /// A right-aligned "+" button layered over a tree row (topmost, so it wins
@@ -7000,6 +7010,7 @@ impl CraneShellView {
             .finish();
 
         // Close button — inner EventHandler stops propagation so select doesn't fire.
+        let hover_key = format!("tabx:{close_action:?}");
         let close_btn = EventHandler::new(
             Container::new(self.icon(icons::X, 9.0, theme::text_muted()))
                 .with_padding_right(6.0)
@@ -7012,22 +7023,28 @@ impl CraneShellView {
         })
         .finish();
 
-        // Compose: Expanded(label) + close button, layered over background.
-        let row_content = Flex::row()
-            .with_child(Expanded::new(1.0, label).finish())
-            .with_child(close_btn)
-            .finish();
-        let mut stack = Stack::new().with_child(bg_layer);
-        if selected {
-            stack = stack.with_child(self.active_bar(row_h));
-        }
-        let stack = stack.with_child(row_content).finish();
-        EventHandler::new(stack)
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(select_action.clone());
-                DispatchEventResult::StopPropagation
-            })
-            .finish()
+        // Compose inside a Hoverable: the × only joins the row while the
+        // pointer is over it (old Crane's hover-revealed affordance).
+        let active_bar: Option<Box<dyn Element>> =
+            selected.then(|| self.active_bar(row_h));
+        let state = self.hover_handle(&hover_key);
+        Box::new(Hoverable::new(state, move |ms| {
+            let mut row = Flex::row().with_child(Expanded::new(1.0, label).finish());
+            if ms.is_hovered() {
+                row = row.with_child(close_btn);
+            }
+            let mut stack = Stack::new().with_child(bg_layer);
+            if let Some(bar) = active_bar {
+                stack = stack.with_child(bar);
+            }
+            let stack = stack.with_child(row.finish()).finish();
+            EventHandler::new(stack)
+                .on_left_mouse_down(move |ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(select_action.clone());
+                    DispatchEventResult::StopPropagation
+                })
+                .finish()
+        }))
     }
 
     fn panel(&self, bg: warpui::color::ColorU, content: Box<dyn Element>) -> Box<dyn Element> {
@@ -7241,10 +7258,18 @@ impl CraneShellView {
             } else {
                 CraneShellAction::OpenNewWorkspace { pi, branch: None }
             };
-            let project_row = Stack::new()
-                .with_child(project_row)
-                .with_child(self.trailing_plus_overlay(21.0, plus_action))
-                .finish();
+            let plus_state = self.hover_handle(&format!("pplus:{}", p.path));
+            let plus_overlay = self.trailing_plus_overlay(21.0, plus_action);
+            let project_row = Box::new(Hoverable::new(plus_state, move |ms| {
+                if ms.is_hovered() {
+                    Stack::new()
+                        .with_child(project_row)
+                        .with_child(plus_overlay)
+                        .finish()
+                } else {
+                    project_row
+                }
+            })) as Box<dyn Element>;
             // Drag to reorder: standalone projects move among root rows;
             // grouped members move only within their folder block.
             let p_scope = match &p.group_path {
