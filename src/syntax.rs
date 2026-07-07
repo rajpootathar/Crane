@@ -40,6 +40,26 @@ pub fn fallback_theme() -> &'static syntect::highlighting::Theme {
     FALLBACK.get_or_init(syntect::highlighting::Theme::default)
 }
 
+/// User syntect-theme override (Settings > Appearance). `None` = auto: pair
+/// with the UI theme's `syntax_theme` field. Read by the editor/diff theme
+/// resolvers per call, so a change repaints live.
+static THEME_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_theme_override(name: Option<String>) {
+    *THEME_OVERRIDE.lock().unwrap() = name;
+}
+
+pub fn theme_override() -> Option<String> {
+    THEME_OVERRIDE.lock().unwrap().clone()
+}
+
+/// Sorted list of every installed syntect theme name (for the Settings picker).
+pub fn theme_names() -> Vec<String> {
+    let mut names: Vec<String> = themes().themes.keys().cloned().collect();
+    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    names
+}
+
 pub fn themes() -> &'static ThemeSet {
     THEMES.get_or_init(|| {
         let mut set = ThemeSet::load_defaults();

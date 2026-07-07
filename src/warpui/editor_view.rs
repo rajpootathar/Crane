@@ -53,7 +53,9 @@ const DISK_STAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// `fallback_theme()` (which paints near-black text that clashes with the UI).
 fn render_theme() -> &'static syntect::highlighting::Theme {
     let all = &crate::syntax::themes().themes;
-    let requested = crate::theme::current().syntax_theme.clone();
+    // Settings > Appearance override wins; otherwise pair with the UI theme.
+    let requested = crate::syntax::theme_override()
+        .unwrap_or_else(|| crate::theme::current().syntax_theme.clone());
     all.get(&requested)
         .or_else(|| all.get("OneHalfDark"))
         .or_else(|| all.get("base16-eighties.dark"))
@@ -1084,6 +1086,12 @@ impl WarpEditorView {
     /// and its dependent SelectionModel in place — the shared `Buffer` (content +
     /// undo history) is preserved, and the caret offset is restored after the
     /// relayout. Only runs on an explicit toggle, so the rebuild cost is fine.
+    /// Settings > Editor "trim trailing whitespace on save" — applied by the
+    /// shell to every open editor when the pref flips (and at construction).
+    pub fn set_trim_on_save(&mut self, on: bool) {
+        self.trim_on_save = on;
+    }
+
     pub fn set_word_wrap(&mut self, on: bool, ctx: &mut ViewContext<Self>) {
         if self.word_wrap == on {
             return;

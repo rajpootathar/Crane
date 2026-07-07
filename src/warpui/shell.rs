@@ -297,6 +297,16 @@ pub struct CraneShellView {
     git_log_fetching: bool,
     /// Scroll state for the refs column.
     git_log_refs_scroll: ClippedScrollStateHandle,
+    /// Active Settings section (sidebar selection).
+    settings_section: SettingsSection,
+    /// Editor soft word-wrap default for newly opened files (persisted).
+    word_wrap_default: bool,
+    /// Strip trailing whitespace on save (persisted; applied to every editor).
+    trim_on_save: bool,
+    /// Syntect theme override (mirrors `crate::syntax::theme_override`).
+    syntax_override: Option<String>,
+    /// Scroll state for the Settings section body.
+    settings_scroll: ClippedScrollStateHandle,
     /// Loaded `git show` detail for the selected commit.
     git_log_detail: Option<crate::warpui::git_log::CommitDetail>,
     /// True while the selected commit's `git show` is computing.
@@ -717,6 +727,38 @@ enum GitLogOp {
     Revert,
 }
 
+/// Settings dialog sections (old `modals/settings.rs::SettingsSection`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsSection {
+    Appearance,
+    Editor,
+    Terminal,
+    LanguageServers,
+    Shortcuts,
+    About,
+}
+
+impl SettingsSection {
+    const ALL: [SettingsSection; 6] = [
+        SettingsSection::Appearance,
+        SettingsSection::Editor,
+        SettingsSection::Terminal,
+        SettingsSection::LanguageServers,
+        SettingsSection::Shortcuts,
+        SettingsSection::About,
+    ];
+    fn title(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => "Appearance",
+            SettingsSection::Editor => "Editor",
+            SettingsSection::Terminal => "Terminal",
+            SettingsSection::LanguageServers => "Language Servers",
+            SettingsSection::Shortcuts => "Shortcuts",
+            SettingsSection::About => "About",
+        }
+    }
+}
+
 /// Map a dock edge to (split direction, dragged-goes-first?). Center → None
 /// (handled as a swap, not a split).
 fn edge_dir_before(edge: DockEdge) -> Option<(Dir, bool)> {
@@ -785,6 +827,23 @@ impl CraneShellView {
         // saved state at all; existing state files carry the persisted value.
         let init_format_on_save: bool =
             saved_state.as_ref().map(|s| s.format_on_save).unwrap_or(true);
+        let init_word_wrap: bool = saved_state.as_ref().map(|s| s.word_wrap).unwrap_or(false);
+        let init_trim: bool = saved_state.as_ref().map(|s| s.trim_on_save).unwrap_or(false);
+        let init_syntax_override: Option<String> = saved_state
+            .as_ref()
+            .map(|s| s.syntax_override.clone())
+            .filter(|s| !s.is_empty());
+        // Base font sizes + syntax override are process-global (read per paint),
+        // so seed them before the first frame.
+        if let Some(st) = saved_state.as_ref() {
+            if st.terminal_font > 0.0 {
+                crate::warpui::fontsize::set_base(st.terminal_font);
+            }
+            if st.editor_font > 0.0 {
+                crate::warpui::fontsize::set_editor(st.editor_font);
+            }
+        }
+        crate::syntax::set_theme_override(init_syntax_override.clone());
         // SHALLOW load: build the full tree STRUCTURE with zero `git` subprocess
         // so the first frame paints immediately even with many worktrees. Branch
         // labels + diff/dirty badges are filled in a moment later by the async
@@ -921,6 +980,12 @@ impl CraneShellView {
                                         ctx, content, mono, pc,
                                     )
                                     .with_goto(goto)
+                                });
+                                h.update(ctx, |v, vctx| {
+                                    if init_word_wrap {
+                                        v.set_word_wrap(true, vctx);
+                                    }
+                                    v.set_trim_on_save(init_trim);
                                 });
                                 restored_editor_views.insert(p.clone(), h);
                             }
@@ -1186,6 +1251,11 @@ impl CraneShellView {
             git_log_branch_prompt: None,
             git_log_fetching: false,
             git_log_refs_scroll: ClippedScrollStateHandle::new(),
+            settings_section: SettingsSection::Appearance,
+            word_wrap_default: init_word_wrap,
+            trim_on_save: init_trim,
+            syntax_override: init_syntax_override,
+            settings_scroll: ClippedScrollStateHandle::new(),
             git_log_hover: Rc::new(Cell::new(None)),
             git_log_detail: None,
             git_log_detail_loading: false,
@@ -1480,6 +1550,11 @@ impl CraneShellView {
                 .collect(),
             lsp_enabled: self.lsp_enabled,
             format_on_save: self.format_on_save,
+            terminal_font: crate::warpui::fontsize::base(),
+            editor_font: crate::warpui::fontsize::editor(),
+            word_wrap: self.word_wrap_default,
+            trim_on_save: self.trim_on_save,
+            syntax_override: self.syntax_override.clone().unwrap_or_default(),
         });
     }
 
@@ -3299,298 +3374,482 @@ impl CraneShellView {
     }
 
     /// Settings card — Appearance (theme picker + zoom) + About (version).
-    fn settings_card(&self) -> Box<dyn Element> {
+    /// Generic Settings bordered-checkbox toggle row (LSP / format-on-save /
+    /// word-wrap / trim-on-save all share this shape): accent-filled CHECK box,
+    /// title + On/Off tag, muted hint line, row hover, click dispatches.
+    fn settings_toggle_row(
+        &self,
+        key: &str,
+        title: &'static str,
+        hint: &'static str,
+        on: bool,
+        action: CraneShellAction,
+    ) -> Box<dyn Element> {
+        let ui_font = self.ui_font;
+        let icon_font = self.icon_font;
+        let state = self.hover_handle(key);
+        Hoverable::new(state, move |ms| {
+            let row_bg = if ms.is_hovered() {
+                theme::row_hover()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            let check_inner: Box<dyn Element> = if on {
+                Text::new(icons::CHECK.to_string(), icon_font, 11.0)
+                    .with_color(ColorU::new(255, 255, 255, 255))
+                    .finish()
+            } else {
+                Rect::new().finish()
+            };
+            let check_bg = if on {
+                theme::accent()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            let checkbox = ConstrainedBox::new(
+                Container::new(check_inner)
+                    .with_background_color(check_bg)
+                    .with_border(Border::all(1.0).with_border_color(theme::border()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                    .finish(),
+            )
+            .with_width(16.0)
+            .with_height(16.0)
+            .finish();
+            let title_row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Text::new(title.to_string(), ui_font, 12.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_child(Self::spacer(8.0))
+                .with_child(
+                    Text::new(
+                        if on { "On".to_string() } else { "Off".to_string() },
+                        ui_font,
+                        11.0,
+                    )
+                    .with_color(if on { theme::accent() } else { theme::text_muted() })
+                    .finish(),
+                )
+                .finish();
+            let text_col = Flex::column()
+                .with_child(title_row)
+                .with_child(Self::spacer(2.0))
+                .with_child(
+                    Text::new(hint.to_string(), ui_font, 10.5)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .finish();
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(checkbox)
+                    .with_child(Self::spacer(10.0))
+                    .with_child(text_col)
+                    .finish(),
+            )
+            .with_background_color(row_bg)
+            .with_padding_top(6.0)
+            .with_padding_bottom(6.0)
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(action.clone());
+        })
+        .finish()
+    }
+
+    /// A `label   [−]  N pt  [+]` stepper row for one of the base font sizes.
+    fn settings_font_row(&self, label: &'static str, value: f32, editor: bool) -> Box<dyn Element> {
+        let step = |glyph: &str, delta: f32| -> Box<dyn Element> {
+            EventHandler::new(
+                Container::new(
+                    Text::new(glyph.to_string(), self.icon_font, 11.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_background_color(theme::surface())
+                .with_border(Border::all(1.0).with_border_color(theme::border()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                .with_padding_left(7.0)
+                .with_padding_right(7.0)
+                .with_padding_top(2.0)
+                .with_padding_bottom(2.0)
+                .finish(),
+            )
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::FontBaseStep { editor, delta });
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+        };
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                Text::new(label.to_string(), self.ui_font, 12.0)
+                    .with_color(theme::text())
+                    .finish(),
+            )
+            .with_child(Expanded::new(1.0, Flex::row().finish()).finish())
+            .with_child(step(icons::MINUS, -1.0))
+            .with_child(Self::spacer(8.0))
+            .with_child(
+                Text::new(format!("{value:.0} pt"), self.ui_font, 12.0)
+                    .with_color(theme::text_muted())
+                    .finish(),
+            )
+            .with_child(Self::spacer(8.0))
+            .with_child(step(icons::PLUS, 1.0))
+            .finish()
+    }
+
+    /// Muted section heading inside a Settings body.
+    fn settings_heading(&self, label: &'static str) -> Box<dyn Element> {
+        Container::new(
+            Text::new(label.to_string(), self.ui_font, 11.0)
+                .with_color(theme::text_muted())
+                .finish(),
+        )
+        .with_padding_top(10.0)
+        .with_padding_bottom(4.0)
+        .finish()
+    }
+
+    /// Settings > Appearance: theme rows with color swatches, zoom + base font
+    /// sizes, syntax-theme override, themes-folder shortcut.
+    fn settings_appearance(&self) -> Box<dyn Element> {
         let current_theme = crate::theme::current().name;
-        // Theme picker: one clickable row per installed theme; the active one is
-        // highlighted and gets a check. Click applies via the existing SetTheme flow.
-        let mut theme_rows = Flex::column();
+        let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+
+        col = col.with_child(self.settings_heading("Theme"));
         for t in crate::theme::load_all() {
             let is_active = t.name == current_theme;
             let name = t.name.clone();
-            let mut inner = Flex::row().with_child(
-                ConstrainedBox::new(if is_active {
-                    self.icon(icons::CHECK, 12.0, theme::accent())
-                } else {
-                    Flex::row().finish()
-                })
-                .with_width(18.0)
-                .finish(),
-            );
-            inner = inner.with_child(
-                Text::new(name.clone(), self.ui_font, 12.0)
-                    .with_color(if is_active { theme::text() } else { theme::text_muted() })
+            // Five color swatches preview the theme (old settings.rs swatch row).
+            let mut swatches = Flex::row();
+            for c in [t.bg, t.surface, t.accent, t.text, t.surface_hi] {
+                swatches = swatches.with_child(
+                    Container::new(
+                        ConstrainedBox::new(
+                            Rect::new().with_background_color(c.to_warp()).finish(),
+                        )
+                        .with_width(12.0)
+                        .with_height(12.0)
+                        .finish(),
+                    )
+                    .with_padding_right(4.0)
                     .finish(),
-            );
-            let mut bg = Rect::new();
-            if is_active {
-                bg = bg.with_background_color(theme::row_active());
+                );
             }
-            let bg_layer = ConstrainedBox::new(bg.finish()).with_height(24.0).finish();
-            let label = Container::new(inner.finish())
-                .with_padding_left(6.0)
-                .with_padding_top(5.0)
-                .finish();
-            let row = EventHandler::new(Stack::new().with_child(bg_layer).with_child(label).finish())
-                .on_left_mouse_down(move |ctx, _app, _pos| {
-                    ctx.dispatch_typed_action(CraneShellAction::SetTheme(name.clone()));
-                    DispatchEventResult::StopPropagation
-                })
-                .finish();
-            theme_rows = theme_rows.with_child(row);
-        }
-        let theme_scrolled = ConstrainedBox::new(
-            ClippedScrollable::vertical(
-                self.modal_scroll.clone(),
-                theme_rows.finish(),
-                ScrollbarWidth::Auto,
-                Fill::Solid(theme::border()),
-                Fill::Solid(theme::text_muted()),
-                Fill::None,
+            let mut row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(swatches.finish())
+                .with_child(Self::spacer(8.0))
+                .with_child(
+                    Text::new(name.clone(), self.ui_font, 12.5)
+                        .with_color(if is_active { theme::text() } else { theme::text_muted() })
+                        .finish(),
+                );
+            row = row.with_child(Expanded::new(1.0, Flex::row().finish()).finish());
+            if is_active {
+                row = row.with_child(self.icon(icons::CHECK, 12.0, theme::accent()));
+            }
+            let row = EventHandler::new(
+                Container::new(row.finish())
+                    .with_background_color(if is_active {
+                        theme::row_active()
+                    } else {
+                        ColorU::new(0, 0, 0, 0)
+                    })
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                    .with_padding_left(8.0)
+                    .with_padding_right(8.0)
+                    .with_padding_top(6.0)
+                    .with_padding_bottom(6.0)
+                    .finish(),
             )
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::SetTheme(name.clone()));
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+            col = col.with_child(row);
+        }
+        // Themes folder hint + open shortcut.
+        let themes_dir = crate::theme::themes_dir();
+        col = col.with_child(Self::spacer(6.0)).with_child(
+            Text::new(
+                format!("Custom themes (.toml) live in {}", themes_dir.display()),
+                self.ui_font,
+                10.5,
+            )
+            .with_color(theme::text_muted())
+            .finish(),
+        );
+        col = col.with_child(Self::spacer(4.0)).with_child(
+            EventHandler::new(
+                Container::new(
+                    Text::new("Open themes folder".to_string(), self.ui_font, 11.0)
+                        .with_color(theme::accent())
+                        .finish(),
+                )
+                .with_padding_top(2.0)
+                .with_padding_bottom(2.0)
+                .finish(),
+            )
+            .on_left_mouse_down(|ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::OpenThemesFolder);
+                DispatchEventResult::StopPropagation
+            })
+            .finish(),
+        );
+
+        col = col.with_child(self.settings_heading("Fonts"));
+        let zoom_pct = (crate::warpui::fontsize::zoom_level() * 100.0).round() as i32;
+        col = col.with_child(
+            Text::new(
+                format!("Zoom: {zoom_pct}%   (Cmd+= / Cmd+- / Cmd+0)"),
+                self.ui_font,
+                11.0,
+            )
+            .with_color(theme::text_muted())
+            .finish(),
+        );
+        col = col.with_child(Self::spacer(8.0)).with_child(self.settings_font_row(
+            "Terminal font size",
+            crate::warpui::fontsize::base(),
+            false,
+        ));
+        col = col.with_child(Self::spacer(6.0)).with_child(self.settings_font_row(
+            "Editor font size",
+            crate::warpui::fontsize::editor(),
+            true,
+        ));
+
+        col = col.with_child(self.settings_heading("Syntax highlighting"));
+        // "Auto" row + every installed syntect theme; the active row checks.
+        let auto_active = self.syntax_override.is_none();
+        let auto_label = format!("Auto (pair with UI theme: {})", crate::theme::current().syntax_theme);
+        col = col.with_child(self.syntax_theme_row(auto_label, auto_active, None));
+        for name in crate::syntax::theme_names() {
+            let active = self.syntax_override.as_deref() == Some(name.as_str());
+            col = col.with_child(self.syntax_theme_row(name.clone(), active, Some(name)));
+        }
+        col.finish()
+    }
+
+    /// One clickable row in the syntax-theme override list.
+    fn syntax_theme_row(
+        &self,
+        label: String,
+        active: bool,
+        value: Option<String>,
+    ) -> Box<dyn Element> {
+        let mut row = Flex::row().with_child(
+            ConstrainedBox::new(if active {
+                self.icon(icons::CHECK, 11.0, theme::accent())
+            } else {
+                Flex::row().finish()
+            })
+            .with_width(18.0)
+            .finish(),
+        );
+        row = row.with_child(
+            Text::new(label, self.ui_font, 11.5)
+                .with_color(if active { theme::text() } else { theme::text_muted() })
+                .finish(),
+        );
+        EventHandler::new(
+            Container::new(row.finish())
+                .with_padding_left(6.0)
+                .with_padding_top(3.0)
+                .with_padding_bottom(3.0)
+                .finish(),
+        )
+        .on_left_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::SetSyntaxOverride(value.clone()));
+            DispatchEventResult::StopPropagation
+        })
+        .finish()
+    }
+
+    /// Settings > Editor: behavior toggles.
+    fn settings_editor(&self) -> Box<dyn Element> {
+        Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.settings_toggle_row(
+                "settings:wrap_toggle",
+                "Word wrap",
+                "Soft-wrap long lines to the pane width. Cmd+Opt+W still toggles per file.",
+                self.word_wrap_default,
+                CraneShellAction::ToggleWordWrapDefault,
+            ))
+            .with_child(Self::spacer(6.0))
+            .with_child(self.settings_toggle_row(
+                "settings:trim_toggle",
+                "Trim trailing whitespace on save",
+                "Strips spaces/tabs at line ends before every write.",
+                self.trim_on_save,
+                CraneShellAction::ToggleTrimOnSave,
+            ))
+            .with_child(Self::spacer(6.0))
+            .with_child(self.settings_toggle_row(
+                "settings:format_toggle",
+                "Format on save",
+                "Cmd+S runs rustfmt / prettier / ruff / gofmt off-thread when installed. \
+                 A formatter failure never corrupts the file.",
+                self.format_on_save,
+                CraneShellAction::ToggleFormatOnSave,
+            ))
+            .finish()
+    }
+
+    /// Settings > Terminal: placeholder — 1:1 with the old dialog, which also
+    /// only promised shell/cursor/scrollback prefs "will land here".
+    fn settings_terminal(&self) -> Box<dyn Element> {
+        Container::new(
+            Text::new(
+                "Shell override, cursor style and scrollback size will land here."
+                    .to_string(),
+                self.ui_font,
+                11.5,
+            )
+            .with_color(theme::text_muted())
             .finish(),
         )
-        .with_height(200.0)
-        .finish();
+        .with_padding_top(6.0)
+        .finish()
+    }
 
-        let zoom_pct = (crate::warpui::fontsize::zoom_level() * 100.0).round() as i32;
-
-        // --- Editor: Language Server (LSP) opt-in toggle row ---
-        // A bordered checkbox (accent fill + CHECK when on) matching the
-        // New-Workspace "create new branch" style — NOT a raw glyph — wrapped in
-        // a Hoverable that dispatches ToggleLsp. OFF by default: the agent CLI
-        // handles code intelligence; enabling spawns rust-analyzer et al.
-        let lsp_on = self.lsp_enabled;
-        let ui_font = self.ui_font;
-        let icon_font = self.icon_font;
-        let lsp_state = self.hover_handle("settings:lsp_toggle");
-        let lsp_toggle = Hoverable::new(lsp_state, move |ms| {
-            let row_bg = if ms.is_hovered() {
-                theme::row_hover()
-            } else {
-                ColorU::new(0, 0, 0, 0)
-            };
-            let check_inner: Box<dyn Element> = if lsp_on {
-                Text::new(icons::CHECK.to_string(), icon_font, 11.0)
-                    .with_color(ColorU::new(255, 255, 255, 255))
-                    .finish()
-            } else {
-                Rect::new().finish()
-            };
-            let check_bg = if lsp_on {
-                theme::accent()
-            } else {
-                ColorU::new(0, 0, 0, 0)
-            };
-            let checkbox = ConstrainedBox::new(
-                Container::new(check_inner)
-                    .with_background_color(check_bg)
-                    .with_border(Border::all(1.0).with_border_color(theme::border()))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
-                    .finish(),
-            )
-            .with_width(16.0)
-            .with_height(16.0)
-            .finish();
-            let title_row = Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(
-                    Text::new("Language Server (LSP)".to_string(), ui_font, 12.0)
-                        .with_color(theme::text())
-                        .finish(),
-                )
-                .with_child(Self::spacer(8.0))
-                .with_child(
+    /// Settings > Language Servers: the opt-in toggle + a live status line per
+    /// running server (old settings_lsp.rs, minus the per-server install UI).
+    fn settings_lsp(&self) -> Box<dyn Element> {
+        let mut col = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.settings_toggle_row(
+                "settings:lsp_toggle",
+                "Language Server (LSP)",
+                "Off by default — the agent handles code intelligence. \
+                 Spawns rust-analyzer etc. when on.",
+                self.lsp_enabled,
+                CraneShellAction::ToggleLsp,
+            ));
+        if self.lsp_enabled {
+            col = col.with_child(self.settings_heading("Servers"));
+            let statuses = self.lsp.statuses();
+            if statuses.is_empty() {
+                col = col.with_child(
                     Text::new(
-                        if lsp_on { "On".to_string() } else { "Off".to_string() },
-                        ui_font,
+                        "No servers running yet — one starts when a matching file opens."
+                            .to_string(),
+                        self.ui_font,
                         11.0,
                     )
-                    .with_color(if lsp_on { theme::accent() } else { theme::text_muted() })
-                    .finish(),
-                )
-                .finish();
-            let text_col = Flex::column()
-                .with_child(title_row)
-                .with_child(Self::spacer(2.0))
-                .with_child(
-                    Text::new(
-                        "Off by default — the agent handles code intelligence. \
-                         Spawns rust-analyzer etc. when on."
-                            .to_string(),
-                        ui_font,
-                        10.5,
-                    )
                     .with_color(theme::text_muted())
                     .finish(),
-                )
-                .finish();
-            Container::new(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(checkbox)
-                    .with_child(Self::spacer(10.0))
-                    .with_child(text_col)
+                );
+            }
+            for (key, status) in statuses {
+                col = col.with_child(
+                    Container::new(
+                        Text::new(
+                            format!("{key:?} — {status:?}"),
+                            self.ui_font,
+                            11.0,
+                        )
+                        .with_color(theme::text_muted())
+                        .finish(),
+                    )
+                    .with_padding_top(2.0)
                     .finish(),
-            )
-            .with_background_color(row_bg)
-            .with_padding_top(6.0)
-            .with_padding_bottom(6.0)
-            .finish()
-        })
-        .with_cursor(Cursor::PointingHand)
-        .on_mouse_down(|ctx, _app, _pos| {
-            ctx.dispatch_typed_action(CraneShellAction::ToggleLsp);
-        })
-        .finish();
+                );
+            }
+        }
+        col.finish()
+    }
 
-        // --- Editor: Format-on-save toggle row ---
-        // Same bordered-checkbox style as the LSP row; dispatches
-        // ToggleFormatOnSave. ON by default (old-egui parity): Cmd+S formats the
-        // buffer through rustfmt / prettier / ruff / gofmt before writing.
-        let fmt_on = self.format_on_save;
-        let fmt_state = self.hover_handle("settings:format_toggle");
-        let format_toggle = Hoverable::new(fmt_state, move |ms| {
-            let row_bg = if ms.is_hovered() {
-                theme::row_hover()
-            } else {
-                ColorU::new(0, 0, 0, 0)
-            };
-            let check_inner: Box<dyn Element> = if fmt_on {
-                Text::new(icons::CHECK.to_string(), icon_font, 11.0)
-                    .with_color(ColorU::new(255, 255, 255, 255))
-                    .finish()
-            } else {
-                Rect::new().finish()
-            };
-            let check_bg = if fmt_on {
-                theme::accent()
-            } else {
-                ColorU::new(0, 0, 0, 0)
-            };
-            let checkbox = ConstrainedBox::new(
-                Container::new(check_inner)
-                    .with_background_color(check_bg)
-                    .with_border(Border::all(1.0).with_border_color(theme::border()))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
-                    .finish(),
-            )
-            .with_width(16.0)
-            .with_height(16.0)
-            .finish();
-            let title_row = Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(
-                    Text::new("Format on save".to_string(), ui_font, 12.0)
-                        .with_color(theme::text())
+    /// Settings > Shortcuts: the canonical chord table (old settings.rs list).
+    fn settings_shortcuts(&self) -> Box<dyn Element> {
+        const ROWS: &[(&str, &str)] = &[
+            ("Cmd+T", "Split active Pane with new terminal"),
+            ("Cmd+Shift+T", "New Tab in active Workspace"),
+            ("Cmd+D / Cmd+Shift+D", "Split Pane side-by-side / stacked"),
+            ("Cmd+W / Cmd+Shift+W", "Close focused Pane / active Tab"),
+            ("Cmd+[ / Cmd+]", "Focus prev / next Pane"),
+            ("Cmd+B / Cmd+/", "Toggle Left / Right Panel"),
+            ("Cmd+Shift+B", "Switch Branch"),
+            ("Cmd+= / Cmd+- / Cmd+0", "Zoom in / out / reset"),
+            ("Cmd+S", "Save file (formats when Format-on-save is on)"),
+            ("Cmd+F / Cmd+H / Cmd+G", "Find / Replace / Goto line in editor"),
+            ("Cmd+Shift+F", "Find in Files (project-wide)"),
+            ("Cmd+`", "Tab switcher (Shift or ~ steps back)"),
+            ("Cmd+K", "Terminal: clear screen + scrollback"),
+            ("Cmd+Opt+W", "Toggle editor word-wrap (per file)"),
+            ("Cmd+Opt+T", "Browser: new tab (opens a Browser Pane)"),
+            ("Shift+Tab", "Terminal: back-tab (CSI Z) for TUIs"),
+            ("F12", "LSP goto definition at caret"),
+            ("Escape", "Close modal / restore maximized pane"),
+        ];
+        let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        for (chord, desc) in ROWS {
+            col = col.with_child(
+                Container::new(
+                    Flex::row()
+                        .with_child(
+                            ConstrainedBox::new(
+                                Text::new(chord.to_string(), self.mono_font, 11.0)
+                                    .with_color(theme::text())
+                                    .finish(),
+                            )
+                            .with_width(190.0)
+                            .finish(),
+                        )
+                        .with_child(
+                            Text::new(desc.to_string(), self.ui_font, 11.0)
+                                .with_color(theme::text_muted())
+                                .finish(),
+                        )
                         .finish(),
                 )
-                .with_child(Self::spacer(8.0))
-                .with_child(
-                    Text::new(
-                        if fmt_on { "On".to_string() } else { "Off".to_string() },
-                        ui_font,
-                        11.0,
-                    )
-                    .with_color(if fmt_on { theme::accent() } else { theme::text_muted() })
-                    .finish(),
-                )
-                .finish();
-            let text_col = Flex::column()
-                .with_child(title_row)
-                .with_child(Self::spacer(2.0))
-                .with_child(
-                    Text::new(
-                        "Runs rustfmt / prettier / ruff / gofmt on Cmd+S. \
-                         A formatter error keeps the original file unchanged."
-                            .to_string(),
-                        ui_font,
-                        10.5,
-                    )
-                    .with_color(theme::text_muted())
-                    .finish(),
-                )
-                .finish();
-            Container::new(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(checkbox)
-                    .with_child(Self::spacer(10.0))
-                    .with_child(text_col)
-                    .finish(),
-            )
-            .with_background_color(row_bg)
-            .with_padding_top(6.0)
-            .with_padding_bottom(6.0)
-            .finish()
-        })
-        .with_cursor(Cursor::PointingHand)
-        .on_mouse_down(|ctx, _app, _pos| {
-            ctx.dispatch_typed_action(CraneShellAction::ToggleFormatOnSave);
-        })
-        .finish();
+                .with_padding_top(3.0)
+                .with_padding_bottom(3.0)
+                .finish(),
+            );
+        }
+        col.finish()
+    }
 
-        let col = Flex::column()
-            .with_child(self.modal_header("Settings"))
-            .with_child(Self::spacer(6.0))
-            .with_child(
-                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
-                    .with_height(1.0)
-                    .finish(),
+    /// Settings > About: version, tagline, updater lifecycle, project links,
+    /// manual re-check.
+    fn settings_about(&self) -> Box<dyn Element> {
+        let link = |label: &'static str, url: &'static str| -> Box<dyn Element> {
+            EventHandler::new(
+                Container::new(
+                    Text::new(label.to_string(), self.ui_font, 11.5)
+                        .with_color(theme::accent())
+                        .finish(),
+                )
+                .with_padding_right(14.0)
+                .finish(),
             )
-            .with_child(Self::spacer(12.0))
-            // --- Appearance ---
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::OpenUrl(url.to_string()));
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+        };
+        Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(
-                Text::new("Appearance".to_string(), self.ui_font, 12.0)
-                    .with_color(theme::text_header())
-                    .finish(),
-            )
-            .with_child(Self::spacer(6.0))
-            .with_child(
-                Text::new("Theme".to_string(), self.ui_font, 11.0)
-                    .with_color(theme::text_muted())
+                Text::new(format!("Crane {}", env!("CARGO_PKG_VERSION")), self.ui_font, 14.0)
+                    .with_color(theme::text())
                     .finish(),
             )
             .with_child(Self::spacer(4.0))
-            .with_child(theme_scrolled)
-            .with_child(Self::spacer(10.0))
-            .with_child(
-                Text::new(
-                    format!("Zoom: {zoom_pct}%   (Cmd+= / Cmd+- / Cmd+0)"),
-                    self.ui_font,
-                    11.0,
-                )
-                .with_color(theme::text_muted())
-                .finish(),
-            )
-            .with_child(Self::spacer(14.0))
-            // --- Editor ---
-            .with_child(
-                Text::new("Editor".to_string(), self.ui_font, 12.0)
-                    .with_color(theme::text_header())
-                    .finish(),
-            )
-            .with_child(Self::spacer(6.0))
-            .with_child(lsp_toggle)
-            .with_child(Self::spacer(8.0))
-            .with_child(format_toggle)
-            .with_child(Self::spacer(14.0))
-            // --- About ---
-            .with_child(
-                Text::new("About".to_string(), self.ui_font, 12.0)
-                    .with_color(theme::text_header())
-                    .finish(),
-            )
-            .with_child(Self::spacer(6.0))
-            .with_child(
-                Text::new(
-                    format!("Crane {}", env!("CARGO_PKG_VERSION")),
-                    self.ui_font,
-                    12.0,
-                )
-                .with_color(theme::text())
-                .finish(),
-            )
-            .with_child(Self::spacer(2.0))
             .with_child(
                 Text::new(
                     "Native GPU-rendered development environment.".to_string(),
@@ -3600,10 +3859,141 @@ impl CraneShellView {
                 .with_color(theme::text_muted())
                 .finish(),
             )
-            .with_child(Self::spacer(6.0))
+            .with_child(Self::spacer(10.0))
             .with_child(self.update_row())
+            .with_child(Self::spacer(12.0))
+            .with_child(
+                Flex::row()
+                    .with_child(link("GitHub", "https://github.com/rajpootathar/Crane"))
+                    .with_child(link(
+                        "Releases",
+                        "https://github.com/rajpootathar/Crane/releases",
+                    ))
+                    .with_child(
+                        EventHandler::new(
+                            Container::new(
+                                Text::new(
+                                    "Check for updates".to_string(),
+                                    self.ui_font,
+                                    11.5,
+                                )
+                                .with_color(theme::accent())
+                                .finish(),
+                            )
+                            .finish(),
+                        )
+                        .on_left_mouse_down(|ctx, _app, _pos| {
+                            ctx.dispatch_typed_action(CraneShellAction::UpdateCheckNow);
+                            DispatchEventResult::StopPropagation
+                        })
+                        .finish(),
+                    )
+                    .finish(),
+            )
+            .finish()
+    }
+
+    /// The Settings dialog: a 6-section sidebar (old modals/settings.rs) beside
+    /// the active section's scrollable body.
+    fn settings_card(&self) -> Box<dyn Element> {
+        // Sidebar — one row per section, active row highlighted.
+        let mut side = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        side = side.with_child(
+            Container::new(
+                Text::new("Settings".to_string(), self.ui_font, 15.0)
+                    .with_color(theme::text_header())
+                    .finish(),
+            )
+            .with_padding_bottom(10.0)
+            .finish(),
+        );
+        for section in SettingsSection::ALL {
+            let active = section == self.settings_section;
+            let row = EventHandler::new(
+                Container::new(
+                    Text::new(section.title().to_string(), self.ui_font, 12.0)
+                        .with_color(if active { theme::text() } else { theme::text_muted() })
+                        .finish(),
+                )
+                .with_background_color(if active {
+                    theme::row_active()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                })
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_padding_left(8.0)
+                .with_padding_top(5.0)
+                .with_padding_bottom(5.0)
+                .finish(),
+            )
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::SettingsGoto(section));
+                DispatchEventResult::StopPropagation
+            })
             .finish();
-        self.modal_card(420.0, col)
+            side = side.with_child(Container::new(row).with_padding_bottom(2.0).finish());
+        }
+        let sidebar = ConstrainedBox::new(
+            Container::new(side.finish()).with_padding_right(10.0).finish(),
+        )
+        .with_width(150.0)
+        .finish();
+
+        let body = match self.settings_section {
+            SettingsSection::Appearance => self.settings_appearance(),
+            SettingsSection::Editor => self.settings_editor(),
+            SettingsSection::Terminal => self.settings_terminal(),
+            SettingsSection::LanguageServers => self.settings_lsp(),
+            SettingsSection::Shortcuts => self.settings_shortcuts(),
+            SettingsSection::About => self.settings_about(),
+        };
+        let body = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(
+                Container::new(
+                    Text::new(
+                        self.settings_section.title().to_string(),
+                        self.ui_font,
+                        13.0,
+                    )
+                    .with_color(theme::text_header())
+                    .finish(),
+                )
+                .with_padding_bottom(6.0)
+                .finish(),
+            )
+            .with_child(body)
+            .finish();
+        let body_scrolled = ConstrainedBox::new(
+            ClippedScrollable::vertical(
+                self.settings_scroll.clone(),
+                Container::new(body).with_padding_right(6.0).finish(),
+                ScrollbarWidth::Auto,
+                Fill::Solid(theme::border()),
+                Fill::Solid(theme::text_muted()),
+                Fill::None,
+            )
+            .finish(),
+        )
+        .with_height(430.0)
+        .finish();
+
+        let row = Flex::row()
+            .with_child(sidebar)
+            .with_child(
+                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                    .with_width(1.0)
+                    .finish(),
+            )
+            .with_child(
+                Expanded::new(
+                    1.0,
+                    Container::new(body_scrolled).with_padding_left(12.0).finish(),
+                )
+                .finish(),
+            )
+            .finish();
+        self.modal_card(640.0, Flex::column().with_child(row).finish())
     }
 
     /// Find-in-Files card — Cmd+Shift+F. A read-only query field (keys route in
@@ -7504,6 +7894,16 @@ impl CraneShellView {
                 crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, p)
                     .with_goto(goto)
             });
+            // Apply the persisted editor prefs (Settings > Editor) to the fresh
+            // buffer: word-wrap default + trim-on-save.
+            let wrap = self.word_wrap_default;
+            let trim = self.trim_on_save;
+            h.update(ctx, |v, vctx| {
+                if wrap {
+                    v.set_word_wrap(true, vctx);
+                }
+                v.set_trim_on_save(trim);
+            });
             self.editor_views.insert(path.clone(), h.clone());
             h
         };
@@ -9579,6 +9979,22 @@ pub enum CraneShellAction {
     /// live editor file so servers spawn + diagnostics start; OFF tears down all
     /// running servers and clears the squiggles from every open editor.
     ToggleLsp,
+    /// Switch the active Settings sidebar section.
+    SettingsGoto(SettingsSection),
+    /// Step a base font size by ±1pt; `editor` picks editor vs terminal.
+    FontBaseStep { editor: bool, delta: f32 },
+    /// Toggle the editor word-wrap default (applies to every open editor).
+    ToggleWordWrapDefault,
+    /// Toggle trim-trailing-whitespace-on-save (applies to every open editor).
+    ToggleTrimOnSave,
+    /// Set (or clear, None = auto) the syntect theme override.
+    SetSyntaxOverride(Option<String>),
+    /// Create + reveal `~/.crane/themes` in Finder.
+    OpenThemesFolder,
+    /// Open a URL in the system browser (About links).
+    OpenUrl(String),
+    /// Manual "Check for updates" (About) — re-runs the release check.
+    UpdateCheckNow,
     /// Settings toggle: flip the editor format-on-save opt-in, then persist.
     ToggleFormatOnSave,
     /// Settings > About: begin the background download + stage of the latest
@@ -10995,6 +11411,59 @@ impl TypedActionView for CraneShellView {
                         self.lsp_start_goto(path, line, character, ctx);
                     }
                 }
+            }
+            CraneShellAction::SettingsGoto(section) => {
+                self.settings_section = *section;
+            }
+            CraneShellAction::FontBaseStep { editor, delta } => {
+                if *editor {
+                    crate::warpui::fontsize::set_editor(
+                        crate::warpui::fontsize::editor() + delta,
+                    );
+                } else {
+                    crate::warpui::fontsize::set_base(crate::warpui::fontsize::base() + delta);
+                }
+            }
+            CraneShellAction::ToggleWordWrapDefault => {
+                self.word_wrap_default = !self.word_wrap_default;
+                let on = self.word_wrap_default;
+                let handles: Vec<_> = self.editor_views.values().cloned().collect();
+                for h in handles {
+                    h.update(ctx, |v, vctx| v.set_word_wrap(on, vctx));
+                }
+            }
+            CraneShellAction::ToggleTrimOnSave => {
+                self.trim_on_save = !self.trim_on_save;
+                let on = self.trim_on_save;
+                let handles: Vec<_> = self.editor_views.values().cloned().collect();
+                for h in handles {
+                    h.update(ctx, |v, _| v.set_trim_on_save(on));
+                }
+            }
+            CraneShellAction::SetSyntaxOverride(name) => {
+                self.syntax_override = name.clone();
+                crate::syntax::set_theme_override(name.clone());
+                // Recolor every open buffer with the new theme.
+                let handles: Vec<_> = self.editor_views.values().cloned().collect();
+                for h in handles {
+                    h.update(ctx, |v, vctx| {
+                        v.mark_diff_dirty();
+                        vctx.notify();
+                    });
+                }
+            }
+            CraneShellAction::OpenThemesFolder => {
+                let dir = crate::theme::themes_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&dir).spawn();
+            }
+            CraneShellAction::OpenUrl(url) => {
+                let _ = webbrowser::open(url);
+            }
+            CraneShellAction::UpdateCheckNow => {
+                let wake = self.ui_wake.clone();
+                crate::warpui::update::spawn_check(move || wake());
             }
             CraneShellAction::ToggleLsp => {
                 self.lsp_enabled = !self.lsp_enabled;

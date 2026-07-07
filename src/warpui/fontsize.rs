@@ -13,17 +13,43 @@ const DEFAULT_ZOOM: f32 = 1.0;
 const MIN_ZOOM: f32 = 0.5;
 const MAX_ZOOM: f32 = 4.0;
 const STEP: f32 = 0.1;
+/// Settable base-size bounds (Settings > Appearance steppers) — the old egui
+/// slider's 9..=28 range.
+const MIN_BASE: f32 = 9.0;
+const MAX_BASE: f32 = 28.0;
 
 static ZOOM: AtomicU32 = AtomicU32::new(0); // 0 = unset → DEFAULT_ZOOM
+static TERM_BASE: AtomicU32 = AtomicU32::new(0); // 0 = unset → TERMINAL_FONT
+static EDITOR_BASE: AtomicU32 = AtomicU32::new(0); // 0 = unset → EDITOR_FONT
 
-/// Terminal base font size (before global zoom).
+fn read(cell: &AtomicU32, default: f32) -> f32 {
+    let bits = cell.load(Ordering::Relaxed);
+    if bits == 0 {
+        default
+    } else {
+        f32::from_bits(bits)
+    }
+}
+
+/// Terminal base font size (before global zoom). Views read this per paint,
+/// so a Settings change takes effect on the next repaint.
 pub fn base() -> f32 {
-    TERMINAL_FONT
+    read(&TERM_BASE, TERMINAL_FONT)
 }
 
 /// Editor base font size (before global zoom).
 pub fn editor() -> f32 {
-    EDITOR_FONT
+    read(&EDITOR_BASE, EDITOR_FONT)
+}
+
+/// Set the terminal base size (Settings stepper / persisted restore).
+pub fn set_base(v: f32) {
+    TERM_BASE.store(v.clamp(MIN_BASE, MAX_BASE).to_bits(), Ordering::Relaxed);
+}
+
+/// Set the editor base size.
+pub fn set_editor(v: f32) {
+    EDITOR_BASE.store(v.clamp(MIN_BASE, MAX_BASE).to_bits(), Ordering::Relaxed);
 }
 
 /// Current zoom level (1.0 = 100%). Persisted; drives `set_zoom_factor`.

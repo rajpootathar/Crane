@@ -194,6 +194,23 @@ pub struct WarpuiState {
     /// the file; the original buffer is written unchanged.
     #[serde(default = "default_true")]
     pub format_on_save: bool,
+    /// Terminal base font size in points (0.0 = unset → default 14).
+    #[serde(default)]
+    pub terminal_font: f32,
+    /// Editor base font size in points (0.0 = unset → default 13).
+    #[serde(default)]
+    pub editor_font: f32,
+    /// Editor soft word-wrap default for newly opened files (Cmd+Opt+W still
+    /// toggles per-editor at runtime).
+    #[serde(default)]
+    pub word_wrap: bool,
+    /// Strip trailing whitespace on save (old `prefs.trim_on_save`).
+    #[serde(default)]
+    pub trim_on_save: bool,
+    /// Syntect theme override; "" = auto (pair with the UI theme's
+    /// `syntax_theme`).
+    #[serde(default)]
+    pub syntax_override: String,
 }
 
 /// Serde default for `format_on_save`: ON, so existing state files that predate
