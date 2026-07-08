@@ -303,6 +303,13 @@ pub struct CraneShellView {
     update_prompts: HashMap<String, UpdatePrompt>,
     /// Version whose banner was closed (×/Later) this session — transient.
     update_dismissed_session: Option<String>,
+    /// True from the moment the user explicitly triggers "Check for
+    /// Updates…" (menu or Settings) until the result is acknowledged. Old
+    /// Crane's `manual_check`/`manual_result_seen`: a routine background
+    /// check that finds nothing stays silent, but a check the user asked
+    /// for always gets a visible answer — including "you're up to date",
+    /// shown in the same persistent banner rather than a separate toast.
+    manual_update_check: bool,
     /// Set when a typing-rate action skipped the per-action `save_state`;
     /// the 1.5s poll tick flushes it so nothing is ever lost for long.
     state_dirty: Cell<bool>,
@@ -1437,6 +1444,7 @@ impl CraneShellView {
             last_update_check: std::time::Instant::now(),
             update_prompts: init_update_prompts,
             update_dismissed_session: None,
+            manual_update_check: false,
             state_dirty: Cell::new(false),
             git_log_refs_scroll: ClippedScrollStateHandle::new(),
             settings_section: SettingsSection::Appearance,
@@ -6251,7 +6259,13 @@ impl CraneShellView {
                 let v = crate::warpui::update::latest_available().unwrap_or_default();
                 !session_dismissed(&v)
             }
-            _ => false,
+            // A routine background check that finds nothing stays silent, but
+            // a check the user explicitly asked for (menu / Settings button)
+            // always gets a visible answer — old check.rs `manual_check`
+            // semantics, surfaced in the same persistent banner rather than a
+            // separate toast type.
+            UpdateState::Idle => self.manual_update_check,
+            UpdateState::Checking => false,
         }
     }
 
@@ -6292,7 +6306,8 @@ impl CraneShellView {
             UpdateState::Downloading { .. } => "Downloading update…".to_string(),
             UpdateState::Ready { .. } => "Update ready".to_string(),
             UpdateState::Failed { .. } => "Update failed".to_string(),
-            _ => String::new(),
+            UpdateState::Idle => format!("You're up to date — v{}", env!("CARGO_PKG_VERSION")),
+            UpdateState::Checking => String::new(),
         };
         let close = EventHandler::new(
             Container::new(self.icon(icons::X, 10.0, theme::text_muted()))
@@ -6376,7 +6391,19 @@ impl CraneShellView {
                     .with_child(Self::spacer(6.0))
                     .with_child(small("Retry", CraneShellAction::StartUpdateDownload));
             }
-            _ => {}
+            UpdateState::Idle => {
+                col = col.with_child(
+                    Text::new(
+                        "No new release yet — you'll get a banner the moment one ships."
+                            .to_string(),
+                        self.ui_font,
+                        10.5,
+                    )
+                    .with_color(theme::text_muted())
+                    .finish(),
+                );
+            }
+            UpdateState::Checking => {}
         }
         Container::new(
             ConstrainedBox::new(
@@ -13177,8 +13204,12 @@ impl CraneShellView {
             }
             CraneShellAction::UpdateCheckNow => {
                 // A manual check re-surfaces the banner even if it was closed
-                // this session (old check.rs `manual_check` semantics).
+                // this session (old check.rs `manual_check` semantics), and —
+                // unlike the silent routine background check — always gets a
+                // visible answer: `manual_update_check` makes the banner show
+                // "you're up to date" too when the result is Idle.
                 self.update_dismissed_session = None;
+                self.manual_update_check = true;
                 let wake = self.ui_wake.clone();
                 crate::warpui::update::spawn_recheck(move || wake());
             }
@@ -13200,6 +13231,9 @@ impl CraneShellView {
             CraneShellAction::UpdateDismissSession => {
                 self.update_dismissed_session =
                     Some(crate::warpui::update::latest_available().unwrap_or_default());
+                // Also closes the manual "you're up to date" banner so it
+                // can't reappear on some later unrelated repaint.
+                self.manual_update_check = false;
             }
             CraneShellAction::ToggleLsp => {
                 self.lsp_enabled = !self.lsp_enabled;
