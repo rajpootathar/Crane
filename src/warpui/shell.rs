@@ -299,6 +299,9 @@ pub struct CraneShellView {
     last_update_check: std::time::Instant,
     /// A "new version available" toast fires at most once per discovery.
     update_toast_shown: bool,
+    /// Set when a typing-rate action skipped the per-action `save_state`;
+    /// the 1.5s poll tick flushes it so nothing is ever lost for long.
+    state_dirty: Cell<bool>,
     /// Scroll state for the refs column.
     git_log_refs_scroll: ClippedScrollStateHandle,
     /// Active Settings section (sidebar selection).
@@ -1277,6 +1280,12 @@ impl CraneShellView {
                 // canonicalizes/registers newly-seen roots).
                 this.sync_watches();
                 this.update_tick(vctx);
+                // Flush state deferred by typing-rate actions (see the
+                // handle_action tail): at most one disk write per tick.
+                if this.state_dirty.get() {
+                    this.state_dirty.set(false);
+                    this.save_state(&*vctx);
+                }
             },
             |_this, _vctx| {},
         );
@@ -1376,6 +1385,7 @@ impl CraneShellView {
             git_log_fetching: false,
             last_update_check: std::time::Instant::now(),
             update_toast_shown: false,
+            state_dirty: Cell::new(false),
             git_log_refs_scroll: ClippedScrollStateHandle::new(),
             settings_section: SettingsSection::Appearance,
             word_wrap_default: init_word_wrap,
@@ -13019,6 +13029,21 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::Noop => {}
         }
+        // Typing-rate actions (every keystroke routes through SendKeys and the
+        // modal key-forwarders) must stay CHEAP: skip the per-action pane
+        // relayout sweep (typing never changes geometry — notifying every
+        // ChildView forced a full multi-pane relayout per key) and defer the
+        // save_state disk write (JSON serialize + fs write, plus the 400ms
+        // full-scrollback ANSI snapshot) to the 1.5s dirty-flush tick. This
+        // was THE felt input latency across terminals and editors.
+        let typing = matches!(
+            action,
+            CraneShellAction::SendKeys(_)
+                | CraneShellAction::FindInFilesKey(_)
+                | CraneShellAction::TabSwitcherKey(_)
+                | CraneShellAction::SwitchBranchKey(_)
+                | CraneShellAction::NewWorkspaceKey(_)
+        );
         // Keep KEYBOARD focus in sync with the focused pane so it receives
         // keys/mouse (terminal, file, or warp editor view).
         if let Some(id) = self.focused {
@@ -13036,20 +13061,22 @@ impl TypedActionView for CraneShellView {
         // byte. ChildView caches the child's element tree, so the child view
         // must be notified to re-run its layout at the new pane size. The same
         // pass keeps each terminal's focus-dim in sync (unfocused grids fade).
-        if let Some(tab) = self.active_tab {
-            if let Some(node) = self.layouts.get(&tab) {
-                let mut leaves = Vec::new();
-                node.leaves(&mut leaves);
-                let multi = leaves.len() > 1;
-                let focused = self.focused;
-                for id in leaves {
-                    if let Some(h) = self.terminal_at(id) {
-                        h.update(ctx, |v, vctx| {
-                            v.set_dimmed(multi && focused != Some(id));
-                            vctx.notify();
-                        });
-                    } else if let Some(h) = self.file_at(id) {
-                        h.update(ctx, |_, vctx| vctx.notify());
+        if !typing {
+            if let Some(tab) = self.active_tab {
+                if let Some(node) = self.layouts.get(&tab) {
+                    let mut leaves = Vec::new();
+                    node.leaves(&mut leaves);
+                    let multi = leaves.len() > 1;
+                    let focused = self.focused;
+                    for id in leaves {
+                        if let Some(h) = self.terminal_at(id) {
+                            h.update(ctx, |v, vctx| {
+                                v.set_dimmed(multi && focused != Some(id));
+                                vctx.notify();
+                            });
+                        } else if let Some(h) = self.file_at(id) {
+                            h.update(ctx, |_, vctx| vctx.notify());
+                        }
                     }
                 }
             }
@@ -13058,11 +13085,15 @@ impl TypedActionView for CraneShellView {
         // every activation path (click, shortcut, toast-focus) from one choke
         // point instead of threading a clear into each (old egui parity).
         self.clear_active_attention();
-        // Persist UI state after every action so a restart restores the
-        // workspace. Re-snapshotting terminal scrollback is expensive, so only
-        // do it on non-keystroke actions (a keystroke's output is captured on
-        // the next heavier action, e.g. focus/switch/split).
-        self.save_state(&*ctx);
+        // Persist UI state after every non-typing action so a restart restores
+        // the workspace; typing marks the state dirty and the poll tick
+        // flushes it within 1.5s (a rename committed via Enter still lands).
+        if typing {
+            self.state_dirty.set(true);
+        } else {
+            self.save_state(&*ctx);
+            self.state_dirty.set(false);
+        }
         // Mark the view dirty so warpui re-renders.
         ctx.notify();
     }
