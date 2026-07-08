@@ -1273,9 +1273,11 @@ impl CraneShellView {
         let git_repaint = ctx.spawn_stream_local(
             git_rx,
             |this: &mut Self, _item, vctx| {
-                this.refresh_panel(vctx);
-                this.invalidate_editor_diffs(&*vctx);
-                vctx.notify();
+                guarded_tick(this, vctx, "git-wake", |this, vctx| {
+                    this.refresh_panel(vctx);
+                    this.invalidate_editor_diffs(&*vctx);
+                    vctx.notify();
+                });
             },
             |_this, _vctx| {},
         );
@@ -1301,7 +1303,7 @@ impl CraneShellView {
         let lsp_tick = ctx.spawn_stream_local(
             lsp_ticker,
             |this: &mut Self, _instant, vctx| {
-                this.poll_lsp(vctx);
+                guarded_tick(this, vctx, "lsp", |this, vctx| this.poll_lsp(vctx));
             },
             |_this, _vctx| {},
         );
@@ -1316,18 +1318,20 @@ impl CraneShellView {
         let worktree_tick = ctx.spawn_stream_local(
             wt_ticker,
             |this: &mut Self, _instant, vctx| {
-                this.poll_worktrees(vctx);
-                this.poll_editor_disk_changes(vctx);
-                // Register any worktrees discovered this tick (idempotent — only
-                // canonicalizes/registers newly-seen roots).
-                this.sync_watches();
-                this.update_tick(vctx);
-                // Flush state deferred by typing-rate actions (see the
-                // handle_action tail): at most one disk write per tick.
-                if this.state_dirty.get() {
-                    this.state_dirty.set(false);
-                    this.save_state(&*vctx);
-                }
+                guarded_tick(this, vctx, "worktree", |this, vctx| {
+                    this.poll_worktrees(vctx);
+                    this.poll_editor_disk_changes(vctx);
+                    // Register any worktrees discovered this tick (idempotent —
+                    // only canonicalizes/registers newly-seen roots).
+                    this.sync_watches();
+                    this.update_tick(vctx);
+                    // Flush state deferred by typing-rate actions (see the
+                    // handle_action tail): at most one disk write per tick.
+                    if this.state_dirty.get() {
+                        this.state_dirty.set(false);
+                        this.save_state(&*vctx);
+                    }
+                });
             },
             |_this, _vctx| {},
         );
@@ -1342,26 +1346,31 @@ impl CraneShellView {
         let fast_tick = ctx.spawn_stream_local(
             fast_ticker,
             |this: &mut Self, _instant, vctx| {
-                this.drain_fs_events(vctx);
-                // Reload the Git Log graph when the Workspace switched while the
-                // dock is open (fs events don't fire on a checkout to a warm repo).
-                this.git_log_tick(vctx);
-                // Refresh terminal owner-tab keys so a background bell/notification
-                // is attributed to the right tab even with no user interaction.
-                this.sync_terminal_owners(&*vctx);
-                let before = this.toasts.len();
-                let now = std::time::Instant::now();
-                this.toasts
-                    .retain(|t| now.duration_since(t.at) < TOAST_TTL);
-                // Keep repainting while any toast is visible (plus one final tick
-                // when one expired) OR while any attention pulse is still breathing
-                // — the latter animates + decays the sidebar glow without input.
-                if !this.toasts.is_empty()
-                    || this.toasts.len() != before
-                    || this.any_attention_active()
-                {
-                    vctx.notify();
-                }
+                guarded_tick(this, vctx, "fast", |this, vctx| {
+                    this.drain_fs_events(vctx);
+                    // Reload the Git Log graph when the Workspace switched while
+                    // the dock is open (fs events don't fire on a checkout to a
+                    // warm repo).
+                    this.git_log_tick(vctx);
+                    // Refresh terminal owner-tab keys so a background bell/
+                    // notification is attributed to the right tab even with no
+                    // user interaction.
+                    this.sync_terminal_owners(&*vctx);
+                    let before = this.toasts.len();
+                    let now = std::time::Instant::now();
+                    this.toasts
+                        .retain(|t| now.duration_since(t.at) < TOAST_TTL);
+                    // Keep repainting while any toast is visible (plus one final
+                    // tick when one expired) OR while any attention pulse is
+                    // still breathing — the latter animates + decays the
+                    // sidebar glow without input.
+                    if !this.toasts.is_empty()
+                        || this.toasts.len() != before
+                        || this.any_attention_active()
+                    {
+                        vctx.notify();
+                    }
+                });
             },
             |_this, _vctx| {},
         );
@@ -1374,7 +1383,7 @@ impl CraneShellView {
         let browser_tick = ctx.spawn_stream_local(
             browser_ticker,
             |this: &mut Self, _instant, vctx| {
-                this.browser_tick(vctx);
+                guarded_tick(this, vctx, "browser", |this, vctx| this.browser_tick(vctx));
             },
             |_this, _vctx| {},
         );
@@ -11638,9 +11647,54 @@ pub enum CraneShellAction {
     Noop,
 }
 
+/// Run a periodic-tick body under `catch_unwind`, logging (via the panic hook
+/// in main.rs, which writes to `~/.crane/crash.log`) and skipping that tick on
+/// panic instead of letting it unwind into the libdispatch/CFRunLoop callback
+/// that's driving warpui's timer stream — crossing that FFI boundary aborts
+/// the whole process (see `handle_action`'s doc comment for the confirmed
+/// production crash this mirrors). Every `ctx.spawn_stream_local` tick body in
+/// `CraneShellView::new` should route through this.
+fn guarded_tick(
+    this: &mut CraneShellView,
+    ctx: &mut ViewContext<CraneShellView>,
+    label: &'static str,
+    f: impl FnOnce(&mut CraneShellView, &mut ViewContext<CraneShellView>),
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(this, ctx)));
+    if result.is_err() {
+        log::error!("crane: recovered from a panic in the {label} tick — see ~/.crane/crash.log");
+    }
+}
+
 impl TypedActionView for CraneShellView {
     type Action = CraneShellAction;
+    /// Every user action (click, keystroke, menu item, tick) dispatches
+    /// through here. Wrapped in `catch_unwind`: a panic anywhere in the match
+    /// below used to unwind straight through warpui's executor into the
+    /// libdispatch/AppKit callback that invoked it — crossing that FFI
+    /// boundary aborts the WHOLE process (confirmed from a real production
+    /// crash: `_dispatch_client_callout` sits directly above the crashed
+    /// frames). Catching it here means one bad action logs to
+    /// `~/.crane/crash.log` (via the panic hook in main.rs) and gets skipped
+    /// — the rest of the app keeps running instead of taking the user's
+    /// whole session down.
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
+        let action = action.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handle_action_impl(&action, ctx);
+        }));
+        if result.is_err() {
+            log::error!("crane: recovered from a panic in handle_action({action:?}) — see ~/.crane/crash.log");
+            // The action may have partially mutated state before panicking;
+            // repaint so the UI reflects whatever did land instead of
+            // silently freezing on stale content.
+            ctx.notify();
+        }
+    }
+}
+
+impl CraneShellView {
+    fn handle_action_impl(&mut self, action: &CraneShellAction, ctx: &mut ViewContext<Self>) {
         match action {
             CraneShellAction::Select { sel, path } => {
                 self.selected = *sel;

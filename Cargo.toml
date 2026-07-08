@@ -135,12 +135,16 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-# Release profile: strip symbols + panic=abort for modest size cut without
-# trading away iteration speed. LTO was tried; the size win didn't justify
-# the ~3× build time cost.
+# Release profile. LTO was tried; the size win didn't justify the ~3× build
+# time cost. `strip = "debuginfo"` (not "symbols"): drops DWARF debug info for
+# a real size cut but KEEPS the symbol table, so a crash — whether macOS's own
+# .ips report or our panic hook's backtrace (main.rs::install_crash_logger) —
+# resolves to real function names instead of bare hex offsets. A previous
+# `strip = "symbols"` build made a production crash unsymbolicatable without
+# rebuilding the exact commit from source.
 [profile.release]
 opt-level = 3
-strip = "symbols"
+strip = "debuginfo"
 
 # --- warpui (Warp) integration pins ---------------------------------------
 # Warp's `warpui` (vendored under vendor/warp) builds against a git-pinned
