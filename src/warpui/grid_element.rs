@@ -467,19 +467,24 @@ impl Element for GridElement {
         ctx: &mut EventContext,
         _app: &AppContext,
     ) -> bool {
-        // Scroll wheel — handled first; no bounds check needed (hit rect covers all).
-        if let Some(cb) = self.scroll_cb.as_ref() {
-            if let Event::ScrollWheel { delta, precise, .. } = event.raw_event() {
-                cb(delta.y(), *precise);
-                return true;
-            }
-        }
-
-        // URL hover + click — runs before selection so we can detect a
-        // click-without-drag on a URL and open it instead of clearing selection.
         let (Some(o), Some(s)) = (self.origin_vec, self.size) else {
             return false;
         };
+        // Scroll wheel — bounds-gated: with several terminal panes (or the
+        // git-log dock / other scrollables) on screen, an ungated arm here
+        // would consume wheel events destined for siblings.
+        if let Some(cb) = self.scroll_cb.as_ref() {
+            if let Event::ScrollWheel { delta, precise, position, .. } = event.raw_event() {
+                let inside = position.x() >= o.x()
+                    && position.x() <= o.x() + s.x()
+                    && position.y() >= o.y()
+                    && position.y() <= o.y() + s.y();
+                if inside {
+                    cb(delta.y(), *precise);
+                    return true;
+                }
+            }
+        }
         let (cw, ch) = (self.cell_w, self.cell_h);
         let in_bounds = |p: &Vector2F| -> bool {
             p.x() >= o.x()

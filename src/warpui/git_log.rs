@@ -667,6 +667,26 @@ pub struct DiffLine {
 pub struct CommitDetail {
     pub header: Vec<String>,
     pub diff: Vec<DiffLine>,
+    /// The patch split per changed file (JetBrains-style file list): each
+    /// entry owns its slice of `diff`'s lines plus add/delete counts.
+    pub files: Vec<CommitFileDiff>,
+}
+
+/// One changed file's slice of a commit's patch.
+#[derive(Clone, Debug, Default)]
+pub struct CommitFileDiff {
+    /// New-side path (`b/…` of the `diff --git` header; the rename target).
+    pub path: String,
+    pub added: usize,
+    pub deleted: usize,
+    pub lines: Vec<DiffLine>,
+}
+
+/// New-side path out of a `diff --git a/<old> b/<new>` header line.
+fn diff_git_new_path(line: &str) -> String {
+    line.rsplit_once(" b/")
+        .map(|(_, b)| b.trim_matches('"').to_string())
+        .unwrap_or_else(|| line.to_string())
 }
 
 /// Classify one raw patch line by its leading character(s).
@@ -711,21 +731,38 @@ pub fn load_detail(repo: &Path, sha: &str) -> CommitDetail {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut header = Vec::new();
     let mut diff = Vec::new();
+    let mut files: Vec<CommitFileDiff> = Vec::new();
     let mut in_diff = false;
     for line in text.lines() {
         if !in_diff && line.starts_with("diff --git") {
             in_diff = true;
         }
         if in_diff {
-            diff.push(DiffLine {
+            let dl = DiffLine {
                 kind: classify(line),
                 text: line.to_string(),
-            });
+            };
+            // Per-file split: each `diff --git` starts a new file section.
+            if line.starts_with("diff --git") {
+                files.push(CommitFileDiff {
+                    path: diff_git_new_path(line),
+                    ..Default::default()
+                });
+            }
+            if let Some(f) = files.last_mut() {
+                match dl.kind {
+                    DiffLineKind::Add => f.added += 1,
+                    DiffLineKind::Del => f.deleted += 1,
+                    _ => {}
+                }
+                f.lines.push(dl.clone());
+            }
+            diff.push(dl);
         } else {
             header.push(line.to_string());
         }
     }
-    CommitDetail { header, diff }
+    CommitDetail { header, diff, files }
 }
 
 #[cfg(test)]

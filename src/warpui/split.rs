@@ -174,15 +174,24 @@ impl Element for SplitBox {
                 if self.dragging.get() {
                     let r = ((pos_axis(position) - origin_axis) / (total - SPLIT_W)).clamp(0.1, 0.9);
                     self.ratio.set(r);
-                    // Request a repaint so the resize is LIVE — mutating the
-                    // ratio Cell alone doesn't tell warpui to re-render.
-                    ctx.notify();
+                    // Relayout the pane children LIVE: ChildView caches each
+                    // child's element tree, so mutating the ratio Cell (+ a
+                    // bare notify) repaints the shell but leaves terminal
+                    // grids at their stale size until the next action. The
+                    // shell's RelayoutPanes nudges every child view (terminal
+                    // PTYs get their SIGWINCH mid-drag).
+                    ctx.dispatch_typed_action(
+                        crate::warpui::shell::CraneShellAction::RelayoutPanes,
+                    );
                     return true;
                 }
             }
             Event::LeftMouseUp { .. } => {
                 if self.dragging.get() {
                     self.dragging.set(false);
+                    ctx.dispatch_typed_action(
+                        crate::warpui::shell::CraneShellAction::RelayoutPanes,
+                    );
                     return true;
                 }
             }

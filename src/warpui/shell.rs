@@ -337,6 +337,8 @@ pub struct CraneShellView {
     git_log_detail_loading: bool,
     /// Row scroll offset for the detail/diff panel.
     git_log_detail_scroll: usize,
+    /// Selected index in the commit detail's changed-files list.
+    git_log_detail_file: usize,
     /// Commit message buffer + whether the commit box has keyboard focus
     /// (keys route to it instead of the terminal).
     commit_msg: String,
@@ -1388,6 +1390,7 @@ impl CraneShellView {
             git_log_detail: None,
             git_log_detail_loading: false,
             git_log_detail_scroll: 0,
+            git_log_detail_file: 0,
             active_cwd,
             left_ratio: Rc::new(Cell::new(0.18)),
             left_drag: Rc::new(Cell::new(false)),
@@ -2927,10 +2930,10 @@ impl CraneShellView {
         )
         .with_width(220.0)
         .finish();
-        let positioned = Container::new(menu_box)
-            .with_padding_top(y)
-            .with_padding_left(x)
-            .finish();
+        // Popover clamps on-screen: pulled left of the right edge, flipped
+        // ABOVE the click when the menu would cross the window bottom.
+        let positioned =
+            Box::new(crate::warpui::rect_probe::Popover::new(menu_box, x, y));
         Box::new(
             Dismiss::new(positioned)
                 .prevent_interaction_with_other_elements()
@@ -9462,6 +9465,7 @@ impl CraneShellView {
         self.git_log_detail = None;
         self.git_log_detail_loading = true;
         self.git_log_detail_scroll = 0;
+        self.git_log_detail_file = 0;
         let Some(repo) = self.active_cwd.clone() else {
             self.git_log_detail_loading = false;
             return;
@@ -9733,6 +9737,7 @@ impl CraneShellView {
         let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         if let Some(frame) = &self.git_log_frame {
             for group in crate::warpui::git_log::ref_groups(&frame.refs) {
+                // Section header: caps label over a hairline divider.
                 col = col.with_child(
                     Container::new(
                         Text::new(group.title.to_string(), self.ui_font, 9.5)
@@ -9740,49 +9745,98 @@ impl CraneShellView {
                             .finish(),
                     )
                     .with_padding_left(10.0)
-                    .with_padding_top(8.0)
-                    .with_padding_bottom(2.0)
+                    .with_padding_top(10.0)
+                    .with_padding_bottom(3.0)
                     .finish(),
                 );
+                col = col.with_child(
+                    Container::new(
+                        ConstrainedBox::new(
+                            Rect::new().with_background_color(theme::divider()).finish(),
+                        )
+                        .with_height(1.0)
+                        .finish(),
+                    )
+                    .with_padding_left(10.0)
+                    .with_padding_right(10.0)
+                    .finish(),
+                );
+                let glyph = match group.title {
+                    "REMOTE" => icons::CLOUD,
+                    "TAGS" => icons::TAG,
+                    _ => icons::GIT_BRANCH,
+                };
                 for item in group.items {
                     let active =
                         self.git_log_ref_filter.as_deref() == Some(item.display.as_str());
-                    let row = EventHandler::new(
-                        Container::new(
-                            Flex::row()
-                                .with_child(
-                                    Text::new(item.display.clone(), self.ui_font, 11.0)
-                                        .with_color(if active {
-                                            theme::accent()
-                                        } else if item.is_head {
-                                            theme::text()
-                                        } else {
-                                            theme::text_muted()
-                                        })
-                                        .finish(),
-                                )
+                    // Truncate long ref names so the 170px column never
+                    // clips mid-glyph (full name still shows in the pill).
+                    let shown = if item.display.chars().count() > 22 {
+                        let cut: String = item.display.chars().take(21).collect();
+                        format!("{cut}…")
+                    } else {
+                        item.display.clone()
+                    };
+                    let name_color = if active {
+                        theme::accent()
+                    } else if item.is_head {
+                        theme::text()
+                    } else {
+                        theme::text_muted()
+                    };
+                    let mut inner = Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Container::new(self.icon(glyph, 10.0, name_color))
+                                .with_padding_right(6.0)
                                 .finish(),
                         )
-                        .with_background_color(if active {
-                            theme::surface()
-                        } else {
-                            theme::bg()
-                        })
-                        .with_padding_left(14.0)
-                        .with_padding_top(2.0)
-                        .with_padding_bottom(2.0)
-                        .finish(),
-                    )
-                    .on_left_mouse_down({
+                        .with_child(
+                            Text::new(shown, self.ui_font, 11.0)
+                                .with_color(name_color)
+                                .finish(),
+                        );
+                    if item.is_head {
+                        inner = inner
+                            .with_child(Expanded::new(
+                                1.0,
+                                ConstrainedBox::new(Rect::new().finish())
+                                    .with_height(1.0)
+                                    .finish(),
+                            )
+                            .finish())
+                            .with_child(
+                                Container::new(self.icon(icons::CHECK, 9.0, theme::accent()))
+                                    .with_padding_right(8.0)
+                                    .finish(),
+                            );
+                    }
+                    let name = item.display.clone();
+                    let state =
+                        self.hover_handle(&format!("glref:{}:{}", group.title, item.display));
+                    let ui_row = Container::new(inner.finish())
+                        .with_padding_left(12.0)
+                        .with_padding_top(3.0)
+                        .with_padding_bottom(3.0);
+                    let active_bg = active;
+                    let row = Hoverable::new(state, move |ms| {
+                        ui_row
+                            .with_background_color(if active_bg {
+                                theme::row_active()
+                            } else if ms.is_hovered() {
+                                theme::row_hover()
+                            } else {
+                                ColorU::new(0, 0, 0, 0)
+                            })
+                            .finish()
+                    })
+                    .with_cursor(Cursor::PointingHand)
+                    .on_mouse_down(move |ctx, _app, _pos| {
                         // `display` is what `git log <ref>` resolves (`main`,
                         // `origin/main`, tag name) — exactly the scope string.
-                        let name = item.display.clone();
-                        move |ctx, _app, _pos| {
-                            ctx.dispatch_typed_action(CraneShellAction::GitLogSetRefFilter(
-                                Some(name.clone()),
-                            ));
-                            DispatchEventResult::StopPropagation
-                        }
+                        ctx.dispatch_typed_action(CraneShellAction::GitLogSetRefFilter(
+                            Some(name.clone()),
+                        ));
                     })
                     .finish();
                     col = col.with_child(row);
@@ -9982,12 +10036,93 @@ impl CraneShellView {
                         .finish(),
                     );
                 }
-                // Patch body, windowed by the detail scroll offset.
+                // Changed-files list (JetBrains style): one clickable row per
+                // file with +/- counts; the selected file's patch renders
+                // below instead of one monolithic dump.
+                let sel_file = self.git_log_detail_file.min(detail.files.len().saturating_sub(1));
+                for (fi, f) in detail.files.iter().enumerate() {
+                    let active = fi == sel_file;
+                    let mut frow = Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Container::new(self.icon(icons::FILE, 10.0, theme::text_muted()))
+                                .with_padding_right(6.0)
+                                .finish(),
+                        )
+                        .with_child(
+                            Text::new(f.path.clone(), self.ui_font, 11.5)
+                                .with_color(if active { theme::text() } else { theme::text_muted() })
+                                .finish(),
+                        )
+                        .with_child(Expanded::new(
+                            1.0,
+                            ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish(),
+                        )
+                        .finish());
+                    if f.added > 0 {
+                        frow = frow.with_child(
+                            Container::new(
+                                Text::new(format!("+{}", f.added), self.ui_font, 10.5)
+                                    .with_color(theme::success())
+                                    .finish(),
+                            )
+                            .with_padding_right(4.0)
+                            .finish(),
+                        );
+                    }
+                    if f.deleted > 0 {
+                        frow = frow.with_child(
+                            Container::new(
+                                Text::new(format!("-{}", f.deleted), self.ui_font, 10.5)
+                                    .with_color(theme::error())
+                                    .finish(),
+                            )
+                            .with_padding_right(4.0)
+                            .finish(),
+                        );
+                    }
+                    let row = EventHandler::new(
+                        Container::new(frow.finish())
+                            .with_background_color(if active {
+                                theme::row_active()
+                            } else {
+                                ColorU::new(0, 0, 0, 0)
+                            })
+                            .with_padding_left(12.0)
+                            .with_padding_right(8.0)
+                            .with_padding_top(2.0)
+                            .with_padding_bottom(2.0)
+                            .finish(),
+                    )
+                    .on_left_mouse_down(move |ctx, _app, _pos| {
+                        ctx.dispatch_typed_action(CraneShellAction::GitLogDetailFile(fi));
+                        DispatchEventResult::StopPropagation
+                    })
+                    .finish();
+                    col = col.with_child(row);
+                }
+                if !detail.files.is_empty() {
+                    col = col.with_child(
+                        ConstrainedBox::new(
+                            Rect::new().with_background_color(theme::divider()).finish(),
+                        )
+                        .with_height(1.0)
+                        .finish(),
+                    );
+                }
+                // Selected file's patch, windowed by the detail scroll offset.
+                // (Falls back to the whole diff when the split found no files —
+                // e.g. a merge commit rendered without -m.)
                 use crate::warpui::git_log::DiffLineKind;
+                let lines: &[crate::warpui::git_log::DiffLine] =
+                    match detail.files.get(sel_file) {
+                        Some(f) => &f.lines,
+                        None => &detail.diff,
+                    };
                 let start = self
                     .git_log_detail_scroll
-                    .min(detail.diff.len().saturating_sub(1));
-                for dl in detail.diff.iter().skip(start).take(1500) {
+                    .min(lines.len().saturating_sub(1));
+                for dl in lines.iter().skip(start).take(1500) {
                     let (fg, bg) = match dl.kind {
                         DiffLineKind::Add => (theme::success(), tint(theme::success(), 38)),
                         DiffLineKind::Del => (theme::error(), tint(theme::error(), 38)),
@@ -10992,6 +11127,8 @@ pub enum CraneShellAction {
     GitLogRevert(String),
     /// Open the inline "create branch from commit" prompt.
     GitLogBranchPrompt(String),
+    /// Select a file in the commit detail's changed-files list.
+    GitLogDetailFile(usize),
     /// Scope the log to one ref (`git log <ref>`), or None for `--all`.
     GitLogSetRefFilter(Option<String>),
     /// Click into the git-log text-filter field — take typing focus.
@@ -11008,6 +11145,11 @@ pub enum CraneShellAction {
     /// Cmd+Opt+T — new tab in the focused Browser pane; opens a Browser pane
     /// when none is focused.
     BrowserNewTab,
+    /// Re-layout the active tab's pane children (terminal grids get their
+    /// SIGWINCH) after a geometry change that happens WITHOUT an action —
+    /// splitter drags (ratio Cells mutate silently) and window resizes.
+    /// Deliberately skips the handle_action tail (no save_state per drag tick).
+    RelayoutPanes,
     /// A sidebar row drag crossed the movement threshold.
     TreeDragStart(TreeDrag),
     /// A sidebar row drag released at window position (x, y).
@@ -11791,6 +11933,10 @@ impl TypedActionView for CraneShellView {
                 self.git_log_menu = None;
                 self.run_git_log_op(ctx, sha.clone(), GitLogOp::Revert);
             }
+            CraneShellAction::GitLogDetailFile(fi) => {
+                self.git_log_detail_file = *fi;
+                self.git_log_detail_scroll = 0;
+            }
             CraneShellAction::GitLogBranchPrompt(sha) => {
                 // Keep git_log_menu's (x, y) — the prompt overlay anchors
                 // there; the menu itself stops rendering while the prompt is
@@ -11864,6 +12010,29 @@ impl TypedActionView for CraneShellView {
                 ctx.notify();
             }
             CraneShellAction::OpenBrowser => self.open_browser(ctx),
+            CraneShellAction::RelayoutPanes => {
+                if let Some(tab) = self.active_tab {
+                    if let Some(node) = self.layouts.get(&tab) {
+                        let mut leaves = Vec::new();
+                        node.leaves(&mut leaves);
+                        for id in leaves {
+                            if let Some(h) = self.terminal_at(id) {
+                                h.update(ctx, |_, vctx| vctx.notify());
+                            } else if let Some(h) = self.file_at(id) {
+                                h.update(ctx, |_, vctx| vctx.notify());
+                            } else if let Some(h) = self.editor_at(id) {
+                                h.update(ctx, |_, vctx| vctx.notify());
+                            } else if let Some(h) = self.browser_at(id) {
+                                h.update(ctx, |_, vctx| vctx.notify());
+                            }
+                        }
+                    }
+                }
+                ctx.notify();
+                // Skip the tail: per-drag-tick save_state / focus churn would
+                // hammer the disk while the splitter moves.
+                return;
+            }
             CraneShellAction::TreeDragStart(drag) => {
                 self.tree_drag = Some(drag.clone());
             }

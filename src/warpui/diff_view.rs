@@ -1360,7 +1360,9 @@ impl Element for DiffBodyElement {
         };
 
         match event.raw_event() {
-            Event::ScrollWheel { delta, precise, .. } => {
+            // Bounds-gated so an open Diff pane can't eat wheel events meant
+            // for other panes/panels (events dispatch tree-wide).
+            Event::ScrollWheel { delta, precise, position, .. } if in_bounds(position) => {
                 // Same feel as the Git Log list: precise (trackpad) deltas are
                 // pixels → rows; line deltas map 1:1 to rows.
                 let dy = delta.y();

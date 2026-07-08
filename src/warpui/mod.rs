@@ -124,6 +124,19 @@ pub fn run() {
     callbacks.on_should_close_window = Some(Box::new(
         move |_wid: WindowId, app: &mut AppContext| approve(&shell_close, app),
     ));
+    // Window resize happens without a shell action, and ChildView caches each
+    // pane child's element tree — terminals would keep their stale grid size
+    // (no SIGWINCH) until the next click. Nudge every pane child on resize.
+    let shell_resize = shell.clone();
+    callbacks.on_window_resized = Some(Box::new(move |app: &mut AppContext| {
+        let handle = shell_resize.borrow().as_ref().map(|(_, h)| h.clone());
+        if let Some(handle) = handle {
+            handle.update(app, |view, vctx| {
+                use warpui::TypedActionView as _;
+                view.handle_action(&shell::CraneShellAction::RelayoutPanes, vctx);
+            });
+        }
+    }));
 
     let mut app_builder = platform::AppBuilder::new(callbacks, Box::new(ASSETS), None);
     // Install the native macOS menu bar (no-op off macOS). Its item callbacks

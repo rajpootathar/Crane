@@ -41,3 +41,5 @@ pub const COPY: &str = "\u{E1CA}";
 pub const PENCIL_SIMPLE: &str = "\u{E3B4}";
 pub const TRASH: &str = "\u{E4A6}";
 pub const CARET_UP: &str = "\u{E13C}";
+pub const TAG: &str = "\u{E478}";
+pub const CLOUD: &str = "\u{E1AA}";

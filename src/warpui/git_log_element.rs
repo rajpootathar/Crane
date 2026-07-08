@@ -445,7 +445,11 @@ impl Element for GitLogListElement {
         };
 
         match event.raw_event() {
-            Event::ScrollWheel { delta, precise, .. } => {
+            // Bounds-gated: the shell dispatches events across its whole
+            // element tree, so an ungated arm here would eat every wheel
+            // event window-wide while the dock is open (dead scroll in the
+            // refs column, Files tree, editor — everywhere).
+            Event::ScrollWheel { delta, precise, position, .. } if in_bounds(position) => {
                 let dy = delta.y();
                 let delta_rows = if *precise { dy / self.row_h } else { dy };
                 // Positive dy scrolls content up (toward newer) → decrease offset.

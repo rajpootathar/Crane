@@ -183,6 +183,96 @@ impl<T: Clone + 'static> Element for ZoneProbe<T> {
     }
 }
 
+/// `Popover` — positions `child` at a window-space anchor, CLAMPED on-screen:
+/// x pulls left of the right edge, and when the child would extend past the
+/// window bottom it flips ABOVE the anchor (context menus opened near the
+/// bottom grow upward instead of running off-screen). The element itself
+/// fills the window (it lives on an overlay layer), so the anchor is
+/// window-absolute; the child's measured layout size drives the clamp.
+pub struct Popover {
+    child: Box<dyn Element>,
+    anchor: Vector2F,
+    size: Option<Vector2F>,
+    child_size: Option<Vector2F>,
+    origin: Option<Point>,
+    /// Where the child actually painted (post-clamp) — hit-testing forwards
+    /// events regardless; the child's own origin handles containment.
+    child_origin: std::cell::Cell<Vector2F>,
+}
+
+impl Popover {
+    pub fn new(child: Box<dyn Element>, x: f32, y: f32) -> Self {
+        Self {
+            child,
+            anchor: vec2f(x, y),
+            size: None,
+            child_size: None,
+            origin: None,
+            child_origin: std::cell::Cell::new(vec2f(0.0, 0.0)),
+        }
+    }
+}
+
+impl Element for Popover {
+    fn layout(
+        &mut self,
+        constraint: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &AppContext,
+    ) -> Vector2F {
+        // Child sizes itself (loose constraint up to the window).
+        let child_constraint = SizeConstraint {
+            min: vec2f(0.0, 0.0),
+            max: constraint.max,
+        };
+        self.child_size = Some(self.child.layout(child_constraint, ctx, app));
+        // The popover layer spans the window so the anchor stays absolute.
+        self.size = Some(constraint.max);
+        constraint.max
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
+        self.child.after_layout(ctx, app);
+    }
+
+    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+        self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
+        let win = self.size.unwrap_or_else(|| vec2f(0.0, 0.0));
+        let c = self.child_size.unwrap_or_else(|| vec2f(0.0, 0.0));
+        const PAD: f32 = 8.0;
+        let x = self
+            .anchor
+            .x()
+            .min((win.x() - c.x() - PAD).max(PAD));
+        // Flip above the anchor when the menu would cross the bottom edge.
+        let y = if self.anchor.y() + c.y() > win.y() - PAD {
+            (self.anchor.y() - c.y()).max(PAD)
+        } else {
+            self.anchor.y()
+        };
+        let pos = origin + vec2f(x, y);
+        self.child_origin.set(pos);
+        self.child.paint(pos, ctx, app);
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.size
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.origin
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &warpui::event::DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &AppContext,
+    ) -> bool {
+        self.child.dispatch_event(event, ctx, app)
+    }
+}
+
 /// `FileDropSink` — routes OS drag-and-drop file events (Finder → Crane) to a
 /// callback when the drop lands inside this element's painted rect. warpui
 /// surfaces `Event::DragAndDropFiles { paths, location }` at window scope but
