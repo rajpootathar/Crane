@@ -297,8 +297,12 @@ pub struct CraneShellView {
     git_log_fetching: bool,
     /// Last release re-check (in-session updates are re-polled every 6h).
     last_update_check: std::time::Instant,
-    /// A "new version available" toast fires at most once per discovery.
-    update_toast_shown: bool,
+    /// Per-version update-prompt decisions (old check.rs semantics): Skip =
+    /// never show that version again; Remind = resurface after 7 days.
+    /// Persisted via `WarpuiState::update_prompts`.
+    update_prompts: HashMap<String, UpdatePrompt>,
+    /// Version whose banner was closed (×/Later) this session — transient.
+    update_dismissed_session: Option<String>,
     /// Set when a typing-rate action skipped the per-action `save_state`;
     /// the 1.5s poll tick flushes it so nothing is ever lost for long.
     state_dirty: Cell<bool>,
@@ -811,6 +815,26 @@ pub enum TreeScope {
     Tab { project: String, worktree: String },
 }
 
+/// One release version's persisted update-prompt decision (old
+/// `update/check.rs::PromptState`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UpdatePrompt {
+    /// "Skip this version" — never prompt for it again.
+    Dismissed,
+    /// "Remind in 7 days" — resurface once `now >= at` (epoch seconds).
+    RemindAt(u64),
+}
+
+/// Old check.rs `REMIND_AFTER_SECS`.
+const UPDATE_REMIND_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// A completed (undoable) Files-tree file operation — old Crane's
 /// `undo_last_file_op` stack. Trash is not undoable programmatically (the
 /// `trash` crate has no restore), so only Move/Copy land here.
@@ -940,6 +964,24 @@ impl CraneShellView {
             }
         }
         crate::syntax::set_theme_override(init_syntax_override.clone());
+        // Restore per-version update-prompt decisions ("skip" / "remind").
+        let init_update_prompts: HashMap<String, UpdatePrompt> = saved_state
+            .as_ref()
+            .map(|s| {
+                s.update_prompts
+                    .iter()
+                    .filter_map(|(v, p)| {
+                        if p == "dismissed" {
+                            Some((v.clone(), UpdatePrompt::Dismissed))
+                        } else {
+                            p.strip_prefix("remind:")
+                                .and_then(|t| t.parse::<u64>().ok())
+                                .map(|t| (v.clone(), UpdatePrompt::RemindAt(t)))
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // SHALLOW load: build the full tree STRUCTURE with zero `git` subprocess
         // so the first frame paints immediately even with many worktrees. Branch
         // labels + diff/dirty badges are filled in a moment later by the async
@@ -1384,7 +1426,8 @@ impl CraneShellView {
             git_log_branch_prompt: None,
             git_log_fetching: false,
             last_update_check: std::time::Instant::now(),
-            update_toast_shown: false,
+            update_prompts: init_update_prompts,
+            update_dismissed_session: None,
             state_dirty: Cell::new(false),
             git_log_refs_scroll: ClippedScrollStateHandle::new(),
             settings_section: SettingsSection::Appearance,
@@ -1704,6 +1747,17 @@ impl CraneShellView {
             trim_on_save: self.trim_on_save,
             syntax_override: self.syntax_override.clone().unwrap_or_default(),
             sidebar_order: self.order_snapshot(),
+            update_prompts: self
+                .update_prompts
+                .iter()
+                .map(|(v, p)| {
+                    let s = match p {
+                        UpdatePrompt::Dismissed => "dismissed".to_string(),
+                        UpdatePrompt::RemindAt(t) => format!("remind:{t}"),
+                    };
+                    (v.clone(), s)
+                })
+                .collect(),
         });
     }
 
@@ -6153,29 +6207,184 @@ impl CraneShellView {
             let wake = self.ui_wake.clone();
             crate::warpui::update::spawn_recheck(move || wake());
         }
-        if !self.update_toast_shown {
-            if let crate::warpui::update::UpdateState::UpdateAvailable { version } =
-                crate::warpui::update::update_state()
-            {
-                self.update_toast_shown = true;
-                let id = self.next_toast_id;
-                self.next_toast_id = self.next_toast_id.wrapping_add(1);
-                if self.toasts.len() >= TOAST_MAX {
-                    self.toasts.pop_front();
-                }
-                self.toasts.push_back(Toast {
-                    id,
-                    body: format!(
-                        "Crane v{version} is available — install from Settings > About."
-                    ),
-                    urgent: false,
-                    source: "Updater".to_string(),
-                    tab_key: None,
-                    at: std::time::Instant::now(),
-                });
-                ctx.notify();
-            }
+        // The banner overlay (update_banner) is render-driven off
+        // update_state() + the prompt decisions; just repaint when a discovery
+        // could have landed so it appears without user input.
+        if matches!(
+            crate::warpui::update::update_state(),
+            crate::warpui::update::UpdateState::UpdateAvailable { .. }
+        ) {
+            ctx.notify();
         }
+    }
+
+    /// Old check.rs `should_show`: the update banner appears for an available
+    /// version unless it was closed this session, skipped forever, or is
+    /// inside its 7-day remind window. Once the user engages (download /
+    /// ready / failed), the banner persists through those states unless
+    /// closed this session.
+    fn update_banner_should_show(&self) -> bool {
+        use crate::warpui::update::UpdateState;
+        let session_dismissed = |v: &str| self.update_dismissed_session.as_deref() == Some(v);
+        match crate::warpui::update::update_state() {
+            UpdateState::UpdateAvailable { version } => {
+                if session_dismissed(&version) {
+                    return false;
+                }
+                match self.update_prompts.get(&version) {
+                    None => true,
+                    Some(UpdatePrompt::Dismissed) => false,
+                    Some(UpdatePrompt::RemindAt(t)) => now_epoch_secs() >= *t,
+                }
+            }
+            UpdateState::Downloading { .. } | UpdateState::Ready { .. }
+            | UpdateState::Failed { .. } => {
+                let v = crate::warpui::update::latest_available().unwrap_or_default();
+                !session_dismissed(&v)
+            }
+            _ => false,
+        }
+    }
+
+    /// The persistent bottom-right update card (old `modals/update_toast.rs`):
+    /// Install / Remind-in-7-days / Skip-this-version on discovery, live
+    /// progress while downloading, Restart-now / Later when staged, error +
+    /// Retry on failure. Backed by the same lifecycle Settings > About shows.
+    fn update_banner(&self) -> Box<dyn Element> {
+        use crate::warpui::update::{self, UpdateState};
+        let small = |label: &str, action: CraneShellAction| -> Box<dyn Element> {
+            EventHandler::new(
+                Container::new(
+                    Text::new(label.to_string(), self.ui_font, 11.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_background_color(theme::surface())
+                .with_border(Border::all(1.0).with_border_color(theme::border()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_padding_left(9.0)
+                .with_padding_right(9.0)
+                .with_padding_top(3.0)
+                .with_padding_bottom(3.0)
+                .finish(),
+            )
+            .on_left_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(action.clone());
+                DispatchEventResult::StopPropagation
+            })
+            .finish()
+        };
+        let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        // Header row: title + close ×.
+        let title = match update::update_state() {
+            UpdateState::UpdateAvailable { ref version } => {
+                format!("Crane v{version} is available")
+            }
+            UpdateState::Downloading { .. } => "Downloading update…".to_string(),
+            UpdateState::Ready { .. } => "Update ready".to_string(),
+            UpdateState::Failed { .. } => "Update failed".to_string(),
+            _ => String::new(),
+        };
+        let close = EventHandler::new(
+            Container::new(self.icon(icons::X, 10.0, theme::text_muted()))
+                .with_padding_left(8.0)
+                .finish(),
+        )
+        .on_left_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::UpdateDismissSession);
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
+        col = col.with_child(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Text::new(title, self.ui_font, 12.5)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_child(Expanded::new(
+                    1.0,
+                    ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish(),
+                )
+                .finish())
+                .with_child(close)
+                .finish(),
+        );
+        col = col.with_child(Self::spacer(8.0));
+        match update::update_state() {
+            UpdateState::UpdateAvailable { .. } => {
+                col = col.with_child(
+                    Flex::row()
+                        .with_child(small(
+                            "Install update",
+                            CraneShellAction::StartUpdateDownload,
+                        ))
+                        .with_child(Self::spacer(6.0))
+                        .with_child(small(
+                            "Remind in 7 days",
+                            CraneShellAction::UpdateRemindLater,
+                        ))
+                        .with_child(Self::spacer(6.0))
+                        .with_child(small(
+                            "Skip this version",
+                            CraneShellAction::UpdateSkipVersion,
+                        ))
+                        .finish(),
+                );
+            }
+            UpdateState::Downloading { received, total } => {
+                let label = if total > 0 {
+                    format!("{}%", ((received.saturating_mul(100)) / total).min(100))
+                } else {
+                    format!("{} KB", received / 1024)
+                };
+                col = col.with_child(
+                    Text::new(label, self.ui_font, 11.5)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                );
+            }
+            UpdateState::Ready { path } => {
+                col = col.with_child(
+                    Flex::row()
+                        .with_child(small(
+                            "Restart now",
+                            CraneShellAction::ApplyUpdate(path),
+                        ))
+                        .with_child(Self::spacer(6.0))
+                        .with_child(small("Later", CraneShellAction::UpdateDismissSession))
+                        .finish(),
+                );
+            }
+            UpdateState::Failed { msg } => {
+                col = col
+                    .with_child(
+                        Text::new(msg, self.ui_font, 10.5)
+                            .with_color(theme::error())
+                            .finish(),
+                    )
+                    .with_child(Self::spacer(6.0))
+                    .with_child(small("Retry", CraneShellAction::StartUpdateDownload));
+            }
+            _ => {}
+        }
+        Container::new(
+            ConstrainedBox::new(
+                Container::new(col.finish())
+                    .with_background_color(theme::surface())
+                    .with_border(Border::all(1.0).with_border_color(theme::accent()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
+                    .with_padding_left(12.0)
+                    .with_padding_right(12.0)
+                    .with_padding_top(10.0)
+                    .with_padding_bottom(10.0)
+                    .finish(),
+            )
+            .with_width(360.0)
+            .finish(),
+        )
+        .finish()
     }
 
     fn poll_editor_disk_changes(&mut self, ctx: &mut ViewContext<Self>) {
@@ -10833,6 +11042,23 @@ impl View for CraneShellView {
         if self.toasts.iter().any(|t| t.at.elapsed() < TOAST_TTL) {
             root_stack = root_stack.with_child(self.toast_overlay());
         }
+        // Persistent update banner (old update_toast.rs) — bottom-right, above
+        // the transient toasts, below the blocking modal.
+        if self.update_banner_should_show() {
+            let card = self.update_banner();
+            let row = Flex::row()
+                .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+                .with_child(card)
+                .with_child(Self::spacer(20.0))
+                .finish();
+            root_stack = root_stack.with_child(
+                Flex::column()
+                    .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+                    .with_child(row)
+                    .with_child(Self::spacer(24.0))
+                    .finish(),
+            );
+        }
         // The blocking modal renders LAST — topmost, over every other overlay.
         if let Some(m) = &self.modal {
             root_stack = root_stack.with_child(self.modal_overlay(m, app));
@@ -11376,6 +11602,12 @@ pub enum CraneShellAction {
     /// Settings > About: begin the background download + stage of the latest
     /// release DMG (idempotent — a no-op if one is already in flight or staged).
     StartUpdateDownload,
+    /// Update banner: "Remind in 7 days" — persists a RemindAt for the version.
+    UpdateRemindLater,
+    /// Update banner: "Skip this version" — never prompt for it again.
+    UpdateSkipVersion,
+    /// Update banner: × / "Later" — hide it for the rest of this session.
+    UpdateDismissSession,
     /// Settings > About: swap the running install for the staged `Crane.app` and
     /// relaunch. Carries the staged bundle path from `UpdateState::Ready`.
     ApplyUpdate(PathBuf),
@@ -12890,8 +13122,30 @@ impl TypedActionView for CraneShellView {
                 let _ = webbrowser::open(url);
             }
             CraneShellAction::UpdateCheckNow => {
+                // A manual check re-surfaces the banner even if it was closed
+                // this session (old check.rs `manual_check` semantics).
+                self.update_dismissed_session = None;
                 let wake = self.ui_wake.clone();
                 crate::warpui::update::spawn_recheck(move || wake());
+            }
+            CraneShellAction::UpdateRemindLater => {
+                if let Some(v) = crate::warpui::update::latest_available() {
+                    self.update_prompts.insert(
+                        v.clone(),
+                        UpdatePrompt::RemindAt(now_epoch_secs() + UPDATE_REMIND_SECS),
+                    );
+                    self.update_dismissed_session = Some(v);
+                }
+            }
+            CraneShellAction::UpdateSkipVersion => {
+                if let Some(v) = crate::warpui::update::latest_available() {
+                    self.update_prompts.insert(v.clone(), UpdatePrompt::Dismissed);
+                    self.update_dismissed_session = Some(v);
+                }
+            }
+            CraneShellAction::UpdateDismissSession => {
+                self.update_dismissed_session =
+                    Some(crate::warpui::update::latest_available().unwrap_or_default());
             }
             CraneShellAction::ToggleLsp => {
                 self.lsp_enabled = !self.lsp_enabled;

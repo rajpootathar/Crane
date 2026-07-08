@@ -216,6 +216,11 @@ pub struct WarpuiState {
     /// discovered projects/worktrees (absent here) append at the end.
     #[serde(default)]
     pub sidebar_order: Vec<(String, Vec<String>)>,
+    /// Per-version update-prompt decisions (old check.rs `PromptState`):
+    /// value is `"dismissed"` (Skip this version) or `"remind:<epoch-secs>"`
+    /// (Remind in 7 days). Keyed by the release version string.
+    #[serde(default)]
+    pub update_prompts: Vec<(String, String)>,
 }
 
 /// Serde default for `format_on_save`: ON, so existing state files that predate
