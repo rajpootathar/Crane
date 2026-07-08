@@ -110,6 +110,18 @@ mod mac {
                     None,
                     CraneShellAction::OpenSettings,
                 ),
+                // Manual re-check (old Crane's `ID_CHECK_UPDATES` item, same
+                // position: directly under About, above the separator). Runs
+                // the same spawn_recheck path as Settings > About's button —
+                // bypasses the once-per-launch guard and re-surfaces the
+                // persistent update banner even if it was dismissed this
+                // session, so a manual check always gets a visible result.
+                item(
+                    shell,
+                    "Check for Updates…",
+                    None,
+                    CraneShellAction::UpdateCheckNow,
+                ),
                 MenuItem::Separator,
                 item(
                     shell,
