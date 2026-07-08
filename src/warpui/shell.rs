@@ -295,6 +295,10 @@ pub struct CraneShellView {
     git_log_branch_prompt: Option<(String, String)>,
     /// True while `git fetch --all --prune --tags` runs off-thread.
     git_log_fetching: bool,
+    /// Last release re-check (in-session updates are re-polled every 6h).
+    last_update_check: std::time::Instant,
+    /// A "new version available" toast fires at most once per discovery.
+    update_toast_shown: bool,
     /// Scroll state for the refs column.
     git_log_refs_scroll: ClippedScrollStateHandle,
     /// Active Settings section (sidebar selection).
@@ -1272,6 +1276,7 @@ impl CraneShellView {
                 // Register any worktrees discovered this tick (idempotent — only
                 // canonicalizes/registers newly-seen roots).
                 this.sync_watches();
+                this.update_tick(vctx);
             },
             |_this, _vctx| {},
         );
@@ -1369,6 +1374,8 @@ impl CraneShellView {
             git_log_menu: None,
             git_log_branch_prompt: None,
             git_log_fetching: false,
+            last_update_check: std::time::Instant::now(),
+            update_toast_shown: false,
             git_log_refs_scroll: ClippedScrollStateHandle::new(),
             settings_section: SettingsSection::Appearance,
             word_wrap_default: init_word_wrap,
@@ -6124,6 +6131,42 @@ impl CraneShellView {
 
     #[cfg(not(target_os = "macos"))]
     fn browser_tick(&mut self, _ctx: &mut ViewContext<Self>) {}
+
+    /// In-session update awareness (rides the 1.5s poll tick): re-check the
+    /// GitHub latest release every 6 hours — a release published while Crane
+    /// runs gets noticed without a relaunch — and surface a one-shot toast the
+    /// first time a newer version lands (install lives in Settings > About).
+    fn update_tick(&mut self, ctx: &mut ViewContext<Self>) {
+        const RECHECK: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+        if self.last_update_check.elapsed() >= RECHECK {
+            self.last_update_check = std::time::Instant::now();
+            let wake = self.ui_wake.clone();
+            crate::warpui::update::spawn_recheck(move || wake());
+        }
+        if !self.update_toast_shown {
+            if let crate::warpui::update::UpdateState::UpdateAvailable { version } =
+                crate::warpui::update::update_state()
+            {
+                self.update_toast_shown = true;
+                let id = self.next_toast_id;
+                self.next_toast_id = self.next_toast_id.wrapping_add(1);
+                if self.toasts.len() >= TOAST_MAX {
+                    self.toasts.pop_front();
+                }
+                self.toasts.push_back(Toast {
+                    id,
+                    body: format!(
+                        "Crane v{version} is available — install from Settings > About."
+                    ),
+                    urgent: false,
+                    source: "Updater".to_string(),
+                    tab_key: None,
+                    at: std::time::Instant::now(),
+                });
+                ctx.notify();
+            }
+        }
+    }
 
     fn poll_editor_disk_changes(&mut self, ctx: &mut ViewContext<Self>) {
         let handles: Vec<_> = self.editor_views.values().cloned().collect();
@@ -12075,6 +12118,8 @@ impl TypedActionView for CraneShellView {
                 // tabs, breadcrumb, status bar, menus, terminal, editor) and
                 // invalidates all views — so no manual per-pane repaint needed.
                 ctx.set_zoom_factor(level);
+                #[cfg(debug_assertions)]
+                eprintln!("crane: zoom action fired, level={level}");
                 self.save_state(&*ctx);
             }
             CraneShellAction::NewTab => {
@@ -12812,7 +12857,7 @@ impl TypedActionView for CraneShellView {
             }
             CraneShellAction::UpdateCheckNow => {
                 let wake = self.ui_wake.clone();
-                crate::warpui::update::spawn_check(move || wake());
+                crate::warpui::update::spawn_recheck(move || wake());
             }
             CraneShellAction::ToggleLsp => {
                 self.lsp_enabled = !self.lsp_enabled;

@@ -118,6 +118,25 @@ pub fn spawn_check(wake: impl Fn() + Send + 'static) {
     if started().set(()).is_err() {
         return;
     }
+    run_check(wake);
+}
+
+/// Re-run the release check (Settings > About "Check for updates" and the
+/// periodic in-session re-check). Unlike [`spawn_check`] this bypasses the
+/// once-per-process guard, but it never interrupts an in-flight check or a
+/// download/install already in progress.
+pub fn spawn_recheck(wake: impl Fn() + Send + 'static) {
+    match update_state() {
+        UpdateState::Checking | UpdateState::Downloading { .. } | UpdateState::Ready { .. } => {
+            return
+        }
+        _ => {}
+    }
+    let _ = started().set(());
+    run_check(wake);
+}
+
+fn run_check(wake: impl Fn() + Send + 'static) {
     set_state(UpdateState::Checking);
     std::thread::spawn(move || {
         match fetch_latest() {
