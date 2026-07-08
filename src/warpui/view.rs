@@ -291,6 +291,11 @@ pub struct TerminalView {
     /// Fractional line accumulator for mouse/alt-screen forwarding (SGR events /
     /// PageUp-Down), which are discrete and can't take sub-line deltas.
     page_accum: Rc<StdCell<f32>>,
+    /// True while this terminal's pane is NOT the focused pane of a multi-pane
+    /// Layout: text renders at reduced alpha and the cursor hides — the
+    /// warpui-safe replacement for old Crane's inactive-pane dim overlay (a
+    /// translucent Rect overlay would swallow clicks/hit-testing here).
+    dimmed: StdCell<bool>,
     /// Persisted drag state for the scrollbar thumb (element is rebuilt each frame).
     scrollbar_drag: Rc<StdCell<bool>>,
     /// Persisted drag state for mouse text selection (element is rebuilt each frame).
@@ -329,6 +334,12 @@ impl TerminalView {
     /// a shared `wake`/`rx` so the SHELL can also ping a repaint (e.g. when a
     /// tab click changes the cwd — the terminal respawns immediately instead of
     /// waiting for the next PTY byte).
+    /// Shell-driven focus dim (see the `dimmed` field). Interior-mutable so the
+    /// shell can flip it from its action tail without a full view update pass.
+    pub fn set_dimmed(&self, on: bool) {
+        self.dimmed.set(on);
+    }
+
     pub fn new_with(
         ctx: &mut ViewContext<Self>,
         requested_cwd: Rc<RefCell<Option<std::path::PathBuf>>>,
@@ -387,6 +398,7 @@ impl TerminalView {
             wake,
             scroll_pos: Rc::new(StdCell::new(0.0)),
             page_accum: Rc::new(StdCell::new(0.0)),
+            dimmed: StdCell::new(false),
             scrollbar_drag: Rc::new(StdCell::new(false)),
             sel_dragging: Rc::new(StdCell::new(false)),
             last_click: Rc::new(RefCell::new(None)),
@@ -796,6 +808,17 @@ impl View for TerminalView {
             None
         };
 
+        // Inactive-pane dim: fade every glyph toward the background and hide
+        // the cursor while another pane owns focus (shell drives `set_dimmed`).
+        let (cells, cursor) = if self.dimmed.get() {
+            let mut cells = cells;
+            for c in cells.iter_mut() {
+                c.fg.a = (c.fg.a as f32 * 0.45) as u8;
+            }
+            (cells, None)
+        } else {
+            (cells, cursor)
+        };
         let grid = GridElement::new(
             rows,
             cols,

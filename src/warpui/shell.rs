@@ -8673,6 +8673,31 @@ impl CraneShellView {
             Some(PaneContent::Diff(h)) => ChildView::new(h).finish(),
             None => Rect::new().with_background_color(theme::bg()).finish(),
         };
+        // Focus ring (canonical UI rule): with 2+ panes in the Layout, the
+        // focused pane body gets a 2px accent border and the others a subtle
+        // 1px border, so the active pane reads at a glance (paired with the
+        // terminal-side dim of unfocused grids). A solo pane stays chromeless.
+        let multi = self
+            .active_tab
+            .and_then(|t| self.layouts.get(&t))
+            .map(|n| {
+                let mut v = Vec::new();
+                n.leaves(&mut v);
+                v.len() > 1
+            })
+            .unwrap_or(false);
+        let inner = if multi {
+            let focused = self.focused == Some(id);
+            Container::new(inner)
+                .with_border(if focused {
+                    Border::all(2.0).with_border_color(theme::accent())
+                } else {
+                    Border::all(1.0).with_border_color(theme::border())
+                })
+                .finish()
+        } else {
+            inner
+        };
         // Click anywhere inside the pane body focuses it. `with_always_handle` so
         // it fires even when the child (e.g. the editor) consumes the click to
         // place its caret — otherwise clicking into the file wouldn't focus it.
@@ -13010,14 +13035,20 @@ impl TypedActionView for CraneShellView {
         // Re-layout the active tab's panes so a CLOSE/SPLIT/DOCK resizes the
         // remaining terminals' grids NOW (SIGWINCH) instead of on the next PTY
         // byte. ChildView caches the child's element tree, so the child view
-        // must be notified to re-run its layout at the new pane size.
+        // must be notified to re-run its layout at the new pane size. The same
+        // pass keeps each terminal's focus-dim in sync (unfocused grids fade).
         if let Some(tab) = self.active_tab {
             if let Some(node) = self.layouts.get(&tab) {
                 let mut leaves = Vec::new();
                 node.leaves(&mut leaves);
+                let multi = leaves.len() > 1;
+                let focused = self.focused;
                 for id in leaves {
                     if let Some(h) = self.terminal_at(id) {
-                        h.update(ctx, |_, vctx| vctx.notify());
+                        h.update(ctx, |v, vctx| {
+                            v.set_dimmed(multi && focused != Some(id));
+                            vctx.notify();
+                        });
                     } else if let Some(h) = self.file_at(id) {
                         h.update(ctx, |_, vctx| vctx.notify());
                     }
