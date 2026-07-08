@@ -8686,14 +8686,13 @@ impl CraneShellView {
                 v.len() > 1
             })
             .unwrap_or(false);
-        let inner = if multi {
-            let focused = self.focused == Some(id);
+        let inner = if multi && self.focused == Some(id) {
+            // Subtle: a 1px hairline in half-strength accent — the unfocused
+            // panes' text dim does the heavy lifting; the ring just confirms.
+            let mut ring = theme::accent();
+            ring.a = 120;
             Container::new(inner)
-                .with_border(if focused {
-                    Border::all(2.0).with_border_color(theme::accent())
-                } else {
-                    Border::all(1.0).with_border_color(theme::border())
-                })
+                .with_border(Border::all(1.0).with_border_color(ring))
                 .finish()
         } else {
             inner
