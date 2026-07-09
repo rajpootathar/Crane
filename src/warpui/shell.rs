@@ -13378,6 +13378,16 @@ impl CraneShellView {
         // save_state disk write (JSON serialize + fs write, plus the 400ms
         // full-scrollback ANSI snapshot) to the 1.5s dirty-flush tick. This
         // was THE felt input latency across terminals and editors.
+        // TermNotification joins this set for a different reason than typing
+        // latency: it's dispatched from INSIDE the emitting TerminalView's own
+        // `spawn_stream_local` closure (view.rs — its wake stream fires while
+        // its ViewHandle is still checked out / mid-update). The relayout
+        // sweep and `save_state` below both read or update EVERY terminal
+        // pane, including that same one, which the framework's view registry
+        // still has removed at this point — touching it panics with "circular
+        // view reference"/"Circular view update" (crash.log, v0.5.3 onward).
+        // `TermBell` already sidesteps this with its own early return just
+        // below; TermNotification didn't, which was the actual crash trigger.
         let typing = matches!(
             action,
             CraneShellAction::SendKeys(_)
@@ -13385,6 +13395,7 @@ impl CraneShellView {
                 | CraneShellAction::TabSwitcherKey(_)
                 | CraneShellAction::SwitchBranchKey(_)
                 | CraneShellAction::NewWorkspaceKey(_)
+                | CraneShellAction::TermNotification { .. }
         );
         // Keep KEYBOARD focus in sync with the focused pane so it receives
         // keys/mouse (terminal, file, or warp editor view).
