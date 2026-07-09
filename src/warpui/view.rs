@@ -219,9 +219,7 @@ use warpui::elements::{
 use warpui::fonts::FamilyId;
 use warpui::keymap::Keystroke;
 use warpui::r#async::SpawnedLocalStream;
-use warpui::{
-    AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext,
-};
+use warpui::{AppContext, Entity, SingletonEntity as _, View, ViewContext};
 
 use crate::warpui::color;
 use crate::warpui::controller::{TerminalController, Wake};
@@ -1005,6 +1003,20 @@ impl TerminalView {
     pub fn clear_screen(&self) {
         self.controller.borrow().clear_screen_two_regime();
     }
+
+    /// Paste clipboard content into THIS terminal: an image (written to
+    /// `~/.crane/paste-images/` and pasted by path, matching
+    /// Ghostty/iTerm2/Warp) takes priority over plain text. Called from the
+    /// shell's `PasteFocused` handler — the actual Cmd+V dispatch path.
+    pub fn paste_clipboard(&self, content: &warpui::clipboard::ClipboardContent) {
+        if let Some(image) = content.images.as_ref().and_then(|imgs| imgs.first()) {
+            if let Some(path) = write_pasted_image(image) {
+                self.paste_text(&path);
+                return;
+            }
+        }
+        self.paste_text(&content.plain_text);
+    }
 }
 
 /// Write clipboard image data to `~/.crane/paste-images/<id>.<ext>` and
@@ -1034,38 +1046,4 @@ fn write_pasted_image(image: &warpui::clipboard::ImageData) -> Option<String> {
     let path = dir.join(format!("{id}.{ext}"));
     std::fs::write(&path, &image.data).ok()?;
     Some(path.to_string_lossy().into_owned())
-}
-
-#[derive(Debug, Clone)]
-pub enum TerminalViewAction {
-    /// Cmd+V — paste clipboard text, or an image (written to
-    /// `~/.crane/paste-images/` and pasted by path) when the clipboard
-    /// holds one instead of text.
-    Paste,
-    /// Cmd+K — clear the screen (Ctrl+L: shell clears + redraws prompt).
-    Clear,
-}
-
-impl TypedActionView for TerminalView {
-    type Action = TerminalViewAction;
-    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
-        match action {
-            TerminalViewAction::Paste => {
-                let content = ctx.clipboard().read();
-                if let Some(image) = content.images.as_ref().and_then(|imgs| imgs.first()) {
-                    if let Some(path) = write_pasted_image(image) {
-                        self.paste_text(&path);
-                        return;
-                    }
-                }
-                if content.plain_text.is_empty() {
-                    return;
-                }
-                self.paste_text(&content.plain_text);
-            }
-            TerminalViewAction::Clear => {
-                self.controller.borrow().clear_screen_two_regime();
-            }
-        }
-    }
 }

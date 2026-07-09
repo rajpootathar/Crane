@@ -11994,21 +11994,26 @@ impl CraneShellView {
             CraneShellAction::FocusCommit => self.commit_focused = true,
             CraneShellAction::CommitStaged => self.commit_now(),
             CraneShellAction::PasteFocused => {
-                let text = ctx.clipboard().read().plain_text;
+                // Full clipboard content (not just plain_text): a terminal
+                // pane needs the image branch too, matching Cmd+V's old-Crane
+                // behavior of pasting an image-clipboard entry by file path.
+                let content = ctx.clipboard().read();
                 if let Some(id) = self.active_input_pane() {
                     if let Some(h) = self.terminal_at(id) {
-                        h.update(ctx, |view, _| view.paste_text(&text));
+                        h.update(ctx, |view, _| view.paste_clipboard(&content));
                     } else if let Some(h) = self.file_at(id) {
                         h.update(ctx, |view, vctx| {
-                            view.paste_at_cursor(&text);
+                            view.paste_at_cursor(&content.plain_text);
                             vctx.notify();
                         });
                     } else if let Some(h) = self.editor_at(id) {
-                        h.update(ctx, |view, vctx| view.paste(&text, vctx));
+                        h.update(ctx, |view, vctx| view.paste(&content.plain_text, vctx));
                     } else if let Some(h) = self.browser_at(id) {
                         h.update(ctx, |view, vctx| {
                             view.handle_action(
-                                &crate::warpui::browser_view::BrowserAction::Paste(text.clone()),
+                                &crate::warpui::browser_view::BrowserAction::Paste(
+                                    content.plain_text.clone(),
+                                ),
                                 vctx,
                             )
                         });
