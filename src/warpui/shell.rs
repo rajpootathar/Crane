@@ -22,8 +22,8 @@ use warpui::color::ColorU;
 use warpui::elements::{
     Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
     CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, Draggable, DraggableState,
-    EventHandler, Expanded, Fill, Flex, Hoverable, MouseStateHandle, ParentElement, Radius, Rect,
-    ScrollbarWidth, Stack, Text,
+    Empty, EventHandler, Expanded, Fill, Flex, Hoverable, MouseStateHandle, ParentElement, Radius,
+    Rect, ScrollbarWidth, Stack, Text,
 };
 use warpui::platform::Cursor;
 use warpui::geometry::rect::RectF;
@@ -3540,15 +3540,21 @@ impl CraneShellView {
             col = col.with_child(Self::spacer(8.0));
         }
         let cards = ConstrainedBox::new(col.finish()).with_width(360.0).finish();
-        // Right-align the fixed-width card column, with a right margin.
+        // Right-align the fixed-width card column, with a right margin. The
+        // leading Expanded spacer uses Empty, not Rect: Rect always registers
+        // a hit-test region on paint even with no background, so a bare Rect
+        // here would swallow clicks across the ENTIRE window (everything left
+        // of the toast column) while any toast is showing. Empty renders
+        // nothing and never registers a hit region.
         let row = Flex::row()
-            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+            .with_child(Expanded::new(1.0, Empty::new().finish()).finish())
             .with_child(cards)
             .with_child(Self::spacer(20.0))
             .finish();
-        // Push the whole thing to the bottom with a bottom margin.
+        // Push the whole thing to the bottom with a bottom margin. Same
+        // click-through reasoning as the row's leading spacer above.
         Flex::column()
-            .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+            .with_child(Expanded::new(1.0, Empty::new().finish()).finish())
             .with_child(row)
             .with_child(Self::spacer(24.0))
             .finish()
@@ -11082,14 +11088,20 @@ impl View for CraneShellView {
         // the transient toasts, below the blocking modal.
         if self.update_banner_should_show() {
             let card = self.update_banner();
+            // Empty, not Rect, for the same reason as toast_overlay's leading
+            // spacers: a bare Rect always registers a hit-test region even
+            // with no background, which would swallow every click across the
+            // window (not just the banner's own corner) for as long as the
+            // banner is showing — including clicks on its own × close button
+            // if the banner's layer ended up beneath this spacer's.
             let row = Flex::row()
-                .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+                .with_child(Expanded::new(1.0, Empty::new().finish()).finish())
                 .with_child(card)
                 .with_child(Self::spacer(20.0))
                 .finish();
             root_stack = root_stack.with_child(
                 Flex::column()
-                    .with_child(Expanded::new(1.0, Rect::new().finish()).finish())
+                    .with_child(Expanded::new(1.0, Empty::new().finish()).finish())
                     .with_child(row)
                     .with_child(Self::spacer(24.0))
                     .finish(),
