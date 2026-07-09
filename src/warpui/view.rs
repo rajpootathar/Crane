@@ -1007,9 +1007,40 @@ impl TerminalView {
     }
 }
 
+/// Write clipboard image data to `~/.crane/paste-images/<id>.<ext>` and
+/// return the absolute path, matching Ghostty/iTerm2/Warp's convention of
+/// pasting a file path (not raw bytes) so downstream TUIs — Claude Code
+/// etc. — can ingest it. `content.images` may hold several entries for a
+/// single clipboard image (one per representation the OS offered, e.g.
+/// PNG + JPEG); only the first is written.
+fn write_pasted_image(image: &warpui::clipboard::ImageData) -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let dir = std::path::PathBuf::from(home)
+        .join(".crane")
+        .join("paste-images");
+    std::fs::create_dir_all(&dir).ok()?;
+    let ext = match image.mime_type.as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        _ => "png",
+    };
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let path = dir.join(format!("{id}.{ext}"));
+    std::fs::write(&path, &image.data).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
 #[derive(Debug, Clone)]
 pub enum TerminalViewAction {
-    /// Cmd+V — paste clipboard text (bracketed when the app requested it).
+    /// Cmd+V — paste clipboard text, or an image (written to
+    /// `~/.crane/paste-images/` and pasted by path) when the clipboard
+    /// holds one instead of text.
     Paste,
     /// Cmd+K — clear the screen (Ctrl+L: shell clears + redraws prompt).
     Clear,
@@ -1020,21 +1051,17 @@ impl TypedActionView for TerminalView {
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
             TerminalViewAction::Paste => {
-                let text = ctx.clipboard().read().plain_text;
-                if text.is_empty() {
+                let content = ctx.clipboard().read();
+                if let Some(image) = content.images.as_ref().and_then(|imgs| imgs.first()) {
+                    if let Some(path) = write_pasted_image(image) {
+                        self.paste_text(&path);
+                        return;
+                    }
+                }
+                if content.plain_text.is_empty() {
                     return;
                 }
-                let ctrl = self.controller.borrow();
-                let bracketed = ctrl.term.lock().is_bracketed_paste();
-                let bytes = if bracketed {
-                    let mut b = b"\x1b[200~".to_vec();
-                    b.extend_from_slice(text.as_bytes());
-                    b.extend_from_slice(b"\x1b[201~");
-                    b
-                } else {
-                    text.into_bytes()
-                };
-                ctrl.write_input(&bytes);
+                self.paste_text(&content.plain_text);
             }
             TerminalViewAction::Clear => {
                 self.controller.borrow().clear_screen_two_regime();
