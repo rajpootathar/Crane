@@ -620,8 +620,10 @@ struct Toast {
     at: std::time::Instant,
 }
 
-/// How long a toast stays on screen before the fast tick sweeps it.
-const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long a toast stays on screen before the fast tick sweeps it. Long enough
+/// to notice + read a background agent's "done" ping and click through to it,
+/// without lingering so long a burst piles up (bounded further by `TOAST_MAX`).
+const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Max simultaneous toasts — the oldest is dropped when a burst exceeds this.
 const TOAST_MAX: usize = 5;
 
