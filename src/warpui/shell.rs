@@ -2825,11 +2825,12 @@ impl CraneShellView {
         .finish()
     }
 
-    /// A single-row palette of 8 coloured CUBE swatches for a context menu.
-    /// `on_pick` maps a chosen RGB to the action dispatched (after closing the
-    /// menu). Mirrors the project menu's inline swatch row, reused for the
-    /// worktree + tab Highlight rows.
-    fn tint_palette_row<F>(&self, on_pick: F) -> Box<dyn Element>
+    /// A single-row palette of 8 coloured tint swatches for a context menu, each
+    /// drawn with `glyph` so the palette echoes what it tints — `GIT_BRANCH` for
+    /// the worktree row, `TERMINAL_WINDOW` for the tab row (the folder-group row
+    /// has its own `folder_tint_palette_row`). `on_pick` maps a chosen RGB to the
+    /// action dispatched (after closing the menu).
+    fn tint_palette_row<F>(&self, glyph: &'static str, on_pick: F) -> Box<dyn Element>
     where
         F: Fn([u8; 3]) -> CraneShellAction,
     {
@@ -2856,7 +2857,7 @@ impl CraneShellView {
                     ColorU::new(0, 0, 0, 0)
                 };
                 Container::new(
-                    Text::new(icons::CUBE.to_string(), icon_font, 14.0)
+                    Text::new(glyph.to_string(), icon_font, 14.0)
                         .with_color(color)
                         .finish(),
                 )
@@ -3269,10 +3270,8 @@ impl CraneShellView {
         // Highlight: an 8-swatch tint palette + a Default-color reset. Keyed by
         // the worktree path so it survives index shifts on reload.
         items = items.with_child(
-            self.tint_palette_row(move |rgb| CraneShellAction::SetWorktreeTint {
-                pi,
-                wi,
-                tint: Some(rgb),
+            self.tint_palette_row(icons::GIT_BRANCH, move |rgb| {
+                CraneShellAction::SetWorktreeTint { pi, wi, tint: Some(rgb) }
             }),
         );
         items = items.with_child(self.menu_item(
@@ -3328,9 +3327,8 @@ impl CraneShellView {
         ));
         // Highlight: tint palette keyed by (worktree_path, tab_id) + reset.
         items = items.with_child(
-            self.tint_palette_row(move |rgb| CraneShellAction::SetTabTint {
-                key,
-                tint: Some(rgb),
+            self.tint_palette_row(icons::TERMINAL_WINDOW, move |rgb| {
+                CraneShellAction::SetTabTint { key, tint: Some(rgb) }
             }),
         );
         items = items.with_child(self.menu_item(
