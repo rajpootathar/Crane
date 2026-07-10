@@ -2,6 +2,7 @@
 //! worktree, parsed into status + path. Matches Crane's rule of shelling out
 //! to the `git` binary (never libgit2).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -387,6 +388,128 @@ pub fn list_worktrees(main_repo: &Path) -> Vec<(PathBuf, String)> {
         }
     }
     flush(&mut result, cur_path.take(), cur_branch.take());
+    result
+}
+
+/// Discover every git repo at or under `start`, up to `max_depth` levels deep.
+/// Iterative DFS that records any dir where `.git` exists and **recurses into
+/// repos** (so nested submodules / cloned external repos are found). Skips the
+/// usual build-output / dependency dirs (`node_modules`, `target`, …), all
+/// hidden dirs (including `.git` itself — repo detection is `dir/.git` at the
+/// parent, so there is never a reason to walk git internals), and symlinks.
+/// `sort` + `dedup` for stable output. Always includes `start` itself when it
+/// is a repo. 1:1 port of old Crane's `discover_repos`.
+pub fn discover_repos(start: &Path, max_depth: usize) -> Vec<PathBuf> {
+    fn skip(name: &str) -> bool {
+        matches!(
+            name,
+            "node_modules" | "target" | "dist" | "build" | ".next" | "vendor"
+                | ".venv" | "venv" | ".cache" | ".turbo" | ".cargo"
+        )
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(start.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let is_repo = dir.join(".git").exists();
+        if is_repo {
+            out.push(dir.clone());
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        // Recurse into every directory (including repos, so nested clones are
+        // found). Skip hidden dirs (`.git` included — nothing under it is a
+        // repo) and `skip()`'s node_modules / target / etc.
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_dir() || ft.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(n) = name.to_str() else { continue };
+            if n.starts_with('.') || skip(n) {
+                continue;
+            }
+            stack.push((entry.path(), depth + 1));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Absolute paths of every submodule `repo` tracks (recursively), normalized
+/// via `canonicalize` where possible. Submodules share commits with the parent
+/// repo, so grouping treats them as hidden (Crane's own `vendor/warp` must not
+/// surface as a sibling). Computed ONCE per grouping pass so membership can be
+/// tested per candidate without re-forking `git` for each one.
+pub fn submodule_paths(repo: &Path) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["submodule", "status", "--recursive"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return set,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        // Format: " <sha> <path> (<describe>)"; leading char may be
+        // '-' (uninit), '+' (different sha), 'U' (merge conflict).
+        let rest = line.get(1..).unwrap_or("").trim_start();
+        let mut parts = rest.splitn(3, ' ');
+        let _sha = parts.next();
+        let Some(sub_path) = parts.next() else { continue };
+        let abs = repo.join(sub_path);
+        set.insert(abs.canonicalize().unwrap_or(abs));
+    }
+    set
+}
+
+/// Subset of `paths` ignored by `repo`'s gitignore rules, decided in a SINGLE
+/// `git check-ignore` invocation (it accepts many pathnames and echoes back the
+/// ignored ones) instead of one fork per path. Grouping promotes a gitignored,
+/// non-submodule nested clone (an external repo dropped into a monorepo) to its
+/// own Project. Returned paths are the exact `PathBuf`s from `paths`.
+pub fn ignored_paths(repo: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
+    let mut result = HashSet::new();
+    // Map the relative string handed to git back to the original abs path;
+    // `check-ignore` echoes each ignored pathname verbatim as passed.
+    let mut rel_to_abs: HashMap<String, PathBuf> = HashMap::new();
+    let mut rels: Vec<String> = Vec::new();
+    for p in paths {
+        let rel = p.strip_prefix(repo).unwrap_or(p);
+        if let Some(s) = rel.to_str() {
+            rel_to_abs.insert(s.to_string(), p.clone());
+            rels.push(s.to_string());
+        }
+    }
+    if rels.is_empty() {
+        return result;
+    }
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "--"])
+        .args(&rels)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    {
+        // Exit 0 = one or more ignored, 1 = none ignored; 128 = error (bad
+        // repo / pathspec) — treat anything else as "nothing ignored".
+        Ok(o) if matches!(o.status.code(), Some(0) | Some(1)) => o,
+        _ => return result,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if let Some(abs) = rel_to_abs.get(line) {
+            result.insert(abs.clone());
+        }
+    }
     result
 }
 

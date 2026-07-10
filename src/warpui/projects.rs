@@ -183,44 +183,6 @@ struct OpenedFolder {
     worktrees: Vec<WorktreeNode>,
 }
 
-/// Names of child directories that are never scanned when detecting whether a
-/// non-git container folder holds git repos (build output / dependency dirs).
-fn skip_dir(name: &str) -> bool {
-    matches!(
-        name,
-        "node_modules" | "target" | "dist" | "build" | ".next" | "vendor"
-            | ".venv" | "venv" | ".cache" | ".turbo" | ".cargo"
-    )
-}
-
-/// Immediate child directories of `dir` that are themselves git repos (contain
-/// a `.git` entry). Only the FIRST level is scanned — grouping is intrinsic to
-/// the one opened container folder, so we never recurse into a parent the user
-/// didn't open. Sorted for stable ordering across reloads.
-fn immediate_child_repos(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in rd.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() || ft.is_symlink() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(n) = name.to_str() else { continue };
-        if n.starts_with('.') || skip_dir(n) {
-            continue;
-        }
-        let path = entry.path();
-        if path.join(".git").exists() {
-            out.push(path);
-        }
-    }
-    out.sort();
-    out
-}
-
 /// Basename of a path as a `String`, falling back to `fallback`.
 fn basename(path: &Path, fallback: &str) -> String {
     path.file_name()
@@ -305,13 +267,25 @@ fn default_worktree(path: &Path, folder_name: &str, with_git: bool) -> WorktreeN
     }
 }
 
-/// Expand one opened folder. `removed` is the raw removal set keyed by the path
-/// the user acted on. A top-level opened folder is filtered out before this is
-/// called (by `folders.retain`), but a container's discovered CHILD repos are
-/// keyed by their OWN path, not the container path — so "Remove Project" on a
-/// grouped child lands a child path in `removed` that the container filter can
-/// never see. We therefore re-check each child's own path here and suppress a
-/// removed child so container expansion does not re-emit it.
+/// Expand one opened folder into the flat `ProjectNode`s it contributes,
+/// applying old-Crane's multi-git grouping rules (see
+/// `docs/specs/2026-07-09-multi-git-grouping-and-instant-branch-design.md`):
+/// - Discover nested git repos with `discover_repos(path, 5)` (recurses into
+///   repos, skips build/dep dirs + symlinks).
+/// - Parent IS a repo  → group the parent (as the first member, full git
+///   wiring) plus any gitignored, non-submodule nested clones (submodules
+///   share history with the parent and stay hidden — e.g. `vendor/warp`).
+/// - Parent is NOT a repo → group every nested repo under a folder header.
+/// - No nested repos → a git repo renders as itself (top-level); a non-git
+///   folder renders as a loose folder.
+///
+/// `removed` is the raw removal set keyed by the path the user acted on. A
+/// top-level opened folder is filtered out before this is called (by
+/// `folders.retain`), but a container's discovered CHILD repos are keyed by
+/// their OWN path — so "Remove Project" on a grouped child lands a child path
+/// in `removed` that the container filter can never see. We re-check each
+/// child's own path here and suppress a removed child so container expansion
+/// does not re-emit it.
 fn expand_folder(
     opened: OpenedFolder,
     removed: &[String],
@@ -320,6 +294,78 @@ fn expand_folder(
 ) {
     let path = Path::new(&opened.path);
     let is_git = path.join(".git").exists();
+    // The opened folder's own path: doubles as the group key AND the parent's
+    // own `path` field when it becomes a group member.
+    let container = opened.path.clone();
+
+    // Nested repos under the opened folder (the folder itself is excluded).
+    let nested: Vec<PathBuf> = if opened.path.is_empty() {
+        Vec::new()
+    } else {
+        crate::warpui::git::discover_repos(path, 5)
+            .into_iter()
+            .filter(|p| p.as_path() != path)
+            .collect()
+    };
+
+    // Filter siblings per old-Crane rules.
+    let siblings: Vec<PathBuf> = if is_git {
+        // Parent is a repo: only gitignored, non-submodule nested clones.
+        // Resolve the submodule set and the ignored subset ONCE (one `git`
+        // fork each) rather than shelling out per candidate.
+        let submods = crate::warpui::git::submodule_paths(path);
+        let ignored = crate::warpui::git::ignored_paths(path, &nested);
+        nested
+            .into_iter()
+            .filter(|p| {
+                ignored.contains(p)
+                    && !submods.contains(&p.canonicalize().unwrap_or_else(|_| p.clone()))
+            })
+            .collect()
+    } else {
+        // Parent is not a repo: every nested repo.
+        nested
+    };
+
+    if !siblings.is_empty() {
+        // GROUP under a collapsible folder header (label = opened folder
+        // basename), keyed by the container's own path via `group_path`.
+        if is_git {
+            // The parent is itself a repo: add it FIRST as a real group member
+            // (full git wiring — its branch / Commit UI work) so the user can
+            // operate on the parent alongside the nested clones, exactly as old
+            // Crane did. 1:1 with old `add_project_from_path`.
+            let worktrees = if opened.worktrees.is_empty() {
+                vec![default_worktree(path, &opened.name, with_git)]
+            } else {
+                opened.worktrees
+            };
+            out.push(ProjectNode {
+                name: opened.name,
+                path: container.clone(),
+                worktrees,
+                tint: None,
+                is_loose: false,
+                group_path: Some(container.clone()),
+            });
+        }
+        for child in &siblings {
+            // Suppress a child repo the user explicitly removed. "Remove
+            // Project" on a grouped child records the child's OWN path in
+            // `removed`; the top-level `folders.retain` keys on the container
+            // path and can't filter it, so it must be dropped here or it
+            // re-appears on reload. If every child is removed the container
+            // contributes nothing (it never falls through to a loose folder).
+            let cpath = child.to_string_lossy().to_string();
+            if removed.contains(&cpath) {
+                continue;
+            }
+            out.push(child_project_node(child, &container, with_git));
+        }
+        return;
+    }
+
+    // No nested repos to group: a git repo renders as itself, top-level.
     if is_git {
         let worktrees = if opened.worktrees.is_empty() {
             vec![default_worktree(path, &opened.name, with_git)]
@@ -328,7 +374,7 @@ fn expand_folder(
         };
         out.push(ProjectNode {
             name: opened.name,
-            path: opened.path,
+            path: container.clone(),
             worktrees,
             tint: None,
             is_loose: false,
@@ -336,29 +382,8 @@ fn expand_folder(
         });
         return;
     }
-    // Non-git folder: is it a CONTAINER (immediate children are git repos)?
-    let children = if opened.path.is_empty() {
-        Vec::new()
-    } else {
-        immediate_child_repos(path)
-    };
-    if !children.is_empty() {
-        for child in &children {
-            // Suppress a child repo the user explicitly removed. "Remove Project"
-            // on a grouped child records the child's OWN path in `removed`; the
-            // top-level `folders.retain` keys on the container path and can't
-            // filter it, so it must be dropped here or it re-appears on reload.
-            // If every child is removed the container contributes nothing (it
-            // never falls through to render as a loose folder).
-            let cpath = child.to_string_lossy().to_string();
-            if removed.contains(&cpath) {
-                continue;
-            }
-            out.push(child_project_node(child, &opened.path, with_git));
-        }
-        return;
-    }
-    // Loose folder (non-git, no git children): tabs render directly under it,
+
+    // Loose folder (non-git, no nested repos): tabs render directly under it,
     // but it still needs a worktree to hold those tabs.
     let worktrees = if opened.worktrees.is_empty() {
         vec![default_worktree(path, &opened.name, with_git)]
@@ -367,7 +392,7 @@ fn expand_folder(
     };
     out.push(ProjectNode {
         name: opened.name,
-        path: opened.path,
+        path: container.clone(),
         worktrees,
         tint: None,
         is_loose: true,
@@ -492,12 +517,14 @@ pub fn load_projects_shallow(
 }
 
 /// Shallow-expand ONE user-added folder into the flat `ProjectNode`(s) it
-/// contributes (git repo → itself; non-git container → one node per git-repo
-/// child; loose folder → itself). Forks ZERO `git`. Used by "Add Project" to
-/// APPEND the picked folder to `self.projects` in place — no whole-tree reload,
-/// so existing projects' already-filled badges and (project-index-keyed) state
-/// are untouched. The caller then runs a targeted `spawn_git_scan` for the new
-/// paths.
+/// contributes (git repo → itself; container/parent-repo → one node per grouped
+/// repo; loose folder → itself). The grouping pass in `expand_folder` forks
+/// `git` twice per git-container (one `submodule status`, one `check-ignore`) to
+/// decide membership, but skips the per-worktree branch/diff/dirty git calls
+/// (those still fill in later via a targeted `spawn_git_scan`). Used by "Add
+/// Project" to APPEND the picked folder to `self.projects` in place — no
+/// whole-tree reload, so existing projects' already-filled badges and
+/// (project-index-keyed) state are untouched.
 pub fn load_one_shallow(
     added: &crate::warpui::persist::AddedProject,
     removed: &[String],
@@ -544,12 +571,60 @@ fn load_projects_core(
     for folder in folders {
         expand_folder(folder, removed, with_git, &mut projects);
     }
+    // 2b. Fold nested repos that were BOTH discovered as a parent-repo group
+    //     child AND opened independently (see `fold_grouped_duplicates`).
+    fold_grouped_duplicates(&mut projects);
     // 3. Apply per-path tint overrides (git/loose keyed by opened path, child
     //    repos keyed by their own path).
     for p in &mut projects {
         p.tint = tints.get(&p.path).copied();
     }
     projects
+}
+
+/// Resolve the collision between parent-repo grouping and independently-opened
+/// nested repos. A gitignored nested clone (e.g. `qck-cloud/qck-py-sdk`) that the
+/// user ALSO opened on its own is emitted twice: once as a FRESH group child by
+/// its parent repo's `expand_folder` (a default worktree, no tabs) and once as a
+/// STANDALONE node carrying the real session worktrees/tabs. Left as-is the
+/// sidebar shows a duplicate row AND — because the standalone sits between the
+/// group's children — splits the parent's FOLDER header into two (the header is
+/// drawn once per CONTIGUOUS run of a `group_path`).
+///
+/// Fix: keep the standalone (it owns the real state), ADOPT the group by copying
+/// the child's `group_path` onto it, and drop the fresh child. A genuinely
+/// not-separately-opened sibling (no standalone twin) keeps its fresh child node,
+/// so single-container grouping is unaffected.
+fn fold_grouped_duplicates(projects: &mut Vec<ProjectNode>) {
+    // Paths that have an independently-opened (top-level) node.
+    let standalone_paths: std::collections::HashSet<String> = projects
+        .iter()
+        .filter(|p| p.group_path.is_none())
+        .map(|p| p.path.clone())
+        .collect();
+    // Fresh group-CHILD nodes: group_path set AND not the group PARENT (whose
+    // own path equals its group_path). Map child path -> its container group.
+    let child_group: HashMap<String, String> = projects
+        .iter()
+        .filter(|p| p.group_path.as_deref().is_some_and(|g| g != p.path))
+        .map(|p| (p.path.clone(), p.group_path.clone().unwrap()))
+        .collect();
+    if child_group.is_empty() {
+        return;
+    }
+    // Drop the fresh child duplicate wherever a standalone twin exists.
+    projects.retain(|p| {
+        let is_fresh_child = p.group_path.as_deref().is_some_and(|g| g != p.path);
+        !(is_fresh_child && standalone_paths.contains(&p.path))
+    });
+    // Fold each surviving standalone twin into its parent's group.
+    for p in projects.iter_mut() {
+        if p.group_path.is_none() {
+            if let Some(g) = child_group.get(&p.path) {
+                p.group_path = Some(g.clone());
+            }
+        }
+    }
 }
 
 /// Collect the repo/worktree paths under `projects` that warrant a git scan
@@ -573,4 +648,69 @@ pub fn scan_paths(projects: &[ProjectNode]) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(name: &str, path: &str, group: Option<&str>, wt: &str) -> ProjectNode {
+        ProjectNode {
+            name: name.to_string(),
+            path: path.to_string(),
+            worktrees: vec![WorktreeNode {
+                name: wt.to_string(),
+                path: path.to_string(),
+                tabs: Vec::new(),
+                diff_stat: (0, 0),
+                dirty: false,
+            }],
+            tint: None,
+            is_loose: false,
+            group_path: group.map(str::to_string),
+        }
+    }
+
+    // The qck-cloud bug: `qck-cloud` is a repo whose gitignored nested clones
+    // `qck-py-sdk` / `qck-js-sdk` are ALSO opened independently. `expand_folder`
+    // emits each nested clone twice — a fresh group child AND a standalone node
+    // with the real worktree. Fold must collapse each pair to ONE node that
+    // keeps the standalone's worktree and adopts the parent's group.
+    #[test]
+    fn fold_collapses_opened_nested_clone_into_its_group() {
+        let g = "/p/qck-cloud";
+        let mut projects = vec![
+            node("qck-cloud", g, Some(g), "fix/qr"), // group parent (path == group)
+            node("qck-py-sdk", "/p/qck-cloud/qck-py-sdk", Some(g), "qck-py-sdk"), // fresh child
+            node("qck-py-sdk", "/p/qck-cloud/qck-py-sdk", None, "main"), // standalone (real state)
+            node("qck-js-sdk", "/p/qck-cloud/qck-js-sdk", Some(g), "qck-js-sdk"), // fresh child
+            node("qck-js-sdk", "/p/qck-cloud/qck-js-sdk", None, "main"), // standalone (real state)
+        ];
+        fold_grouped_duplicates(&mut projects);
+
+        // One node per path — no duplicates.
+        assert_eq!(projects.len(), 3, "each nested clone collapses to one node");
+        // Every surviving node carries the group; the two clones adopted it.
+        for p in &projects {
+            assert_eq!(p.group_path.as_deref(), Some(g), "node {} lost its group", p.name);
+        }
+        // The SURVIVOR is the standalone (its worktree is the real branch, not
+        // the basename default the fresh child carried).
+        let py = projects.iter().find(|p| p.path.ends_with("qck-py-sdk")).unwrap();
+        assert_eq!(py.worktrees[0].name, "main", "kept the fresh child, lost real state");
+    }
+
+    // A discovered sibling that was NOT opened on its own (e.g. a gitignored
+    // clone the user never added) must keep its fresh child node.
+    #[test]
+    fn fold_preserves_unopened_group_child() {
+        let g = "/p/parent";
+        let mut projects = vec![
+            node("parent", g, Some(g), "main"),
+            node("clone", "/p/parent/clone", Some(g), "clone"), // no standalone twin
+        ];
+        fold_grouped_duplicates(&mut projects);
+        assert_eq!(projects.len(), 2, "unopened sibling must survive");
+        assert_eq!(projects[1].group_path.as_deref(), Some(g));
+    }
 }
