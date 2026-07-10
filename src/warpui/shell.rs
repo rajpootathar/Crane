@@ -6504,27 +6504,35 @@ impl CraneShellView {
             self.worktree_poll_sig.insert(main_path.clone(), sig);
             let listed_paths: HashSet<String> =
                 listed.iter().map(|(p, _)| p.to_string_lossy().to_string()).collect();
-            let existing_paths: HashSet<String> = self
-                .projects
-                .get(pi)
-                .map(|p| p.worktrees.iter().map(|w| w.path.clone()).collect())
-                .unwrap_or_default();
-            // 2a) Append worktrees that git knows about but the UI doesn't. The
-            //     project's own checkout (== main_path) is represented by the
-            //     primary worktree row, so only ADD paths distinct from existing.
+            // 2a) Reconcile each worktree git knows about. NEW paths get a row;
+            //     EXISTING paths whose branch moved (a `git checkout` in the
+            //     worktree's terminal) have their label + diff/dirty refreshed
+            //     in place. The previous code only appended new rows and dropped
+            //     dead ones, so a branch switch left the sidebar showing the
+            //     stale branch forever.
             for (wpath, wbranch) in &listed {
                 let wps = wpath.to_string_lossy().to_string();
-                if existing_paths.contains(&wps) {
-                    continue;
-                }
                 let name = if wbranch == "(detached)" || wbranch.is_empty() {
                     crate::warpui::projects::basename_of(wpath)
                 } else {
                     wbranch.clone()
                 };
-                let diff_stat = crate::warpui::git::diff_numstat(wpath);
-                let dirty = crate::warpui::git::is_dirty(wpath);
-                if let Some(p) = self.projects.get_mut(pi) {
+                // A user-renamed worktree keeps its label from `worktree_names`
+                // (which wins at render); don't clobber `w.name` with the raw
+                // branch here — matches the other two branch-update paths
+                // (`apply_git_scan`, `sync_worktree_branch_label`).
+                let renamed = self.worktree_names.contains_key(&wps);
+                let Some(p) = self.projects.get_mut(pi) else { continue };
+                if let Some(w) = p.worktrees.iter_mut().find(|w| w.path == wps) {
+                    if !renamed && w.name != name {
+                        w.name = name;
+                        w.diff_stat = crate::warpui::git::diff_numstat(wpath);
+                        w.dirty = crate::warpui::git::is_dirty(wpath);
+                        changed = true;
+                    }
+                } else {
+                    let diff_stat = crate::warpui::git::diff_numstat(wpath);
+                    let dirty = crate::warpui::git::is_dirty(wpath);
                     p.worktrees.push(crate::warpui::projects::WorktreeNode {
                         name,
                         path: wps,
@@ -6740,6 +6748,13 @@ impl CraneShellView {
         if active_touched {
             self.refresh_panel(ctx);
             self.invalidate_editor_diffs(&*ctx);
+        }
+        // A ref/HEAD write in the active repo (commit / fetch / branch switch)
+        // also moved a worktree's branch — refresh the sidebar branch labels on
+        // the fast (~250ms) tick instead of waiting for the 1.5s worktree poll,
+        // so a `git checkout` in the terminal shows up near-instantly.
+        if git_refs_touched {
+            self.poll_worktrees(ctx);
         }
         // Auto-reload the Git Log on a ref change while the dock is open,
         // debounced (the watcher already coalesces bursts; this guards against a
