@@ -6748,6 +6748,30 @@ impl CraneShellView {
         if active_touched {
             self.refresh_panel(ctx);
             self.invalidate_editor_diffs(&*ctx);
+            // Also refresh the sidebar +N/-M badge for the active worktree. A
+            // plain working-tree edit changes the diff but not a ref, so the
+            // periodic worktree poll (branch-change only) and the startup scan
+            // would leave the badge stale — the tree keeps changing under the
+            // user with the sidebar frozen at its launch value. Scoped to the
+            // active repo's checkout path(s); async + applied by path so it only
+            // touches the matching node(s), on its own scan generation so it
+            // never cancels the full-tree scan.
+            if let Some(root) = active_canon.as_ref() {
+                let paths: Vec<PathBuf> = self
+                    .projects
+                    .iter()
+                    .flat_map(|p| p.worktrees.iter())
+                    .filter(|w| {
+                        !w.path.is_empty()
+                            && std::fs::canonicalize(&w.path).ok().as_deref()
+                                == Some(root.as_path())
+                    })
+                    .map(|w| PathBuf::from(&w.path))
+                    .collect();
+                if !paths.is_empty() {
+                    self.spawn_git_scan(ctx, "active-diff".to_string(), paths);
+                }
+            }
         }
         // A ref/HEAD write in the active repo (commit / fetch / branch switch)
         // also moved a worktree's branch — refresh the sidebar branch labels on
