@@ -2997,13 +2997,7 @@ impl CraneShellView {
             .with_padding_left(pm.x)
             .finish();
 
-        Box::new(
-            Dismiss::new(positioned)
-                .prevent_interaction_with_other_elements()
-                .on_dismiss(|ctx, _| {
-                    ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
-                }),
-        )
+        self.menu_dismiss(positioned)
     }
 
     /// Wrap a built menu column in the standard 220px popover chrome +
@@ -3023,13 +3017,34 @@ impl CraneShellView {
         // ABOVE the click when the menu would cross the window bottom.
         let positioned =
             Box::new(crate::warpui::rect_probe::Popover::new(menu_box, x, y));
-        Box::new(
-            Dismiss::new(positioned)
-                .prevent_interaction_with_other_elements()
-                .on_dismiss(|ctx, _| {
-                    ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
-                }),
+        self.menu_dismiss(positioned)
+    }
+
+    /// Wrap an already-positioned menu popover in a full-window dismiss backdrop.
+    /// A LEFT click outside the menu closes it and is CONSUMED (StopPropagation),
+    /// so it can't also activate whatever sits behind the menu. A RIGHT click
+    /// outside closes it but PROPAGATES to the row beneath, which opens that
+    /// row's own menu in the SAME click — so right-clicking a different row
+    /// relocates the menu instead of the two-click dance (first click only
+    /// dismisses). Replaces the framework `Dismiss`, whose
+    /// `prevent_interaction_with_other_elements` swallows the right-click.
+    fn menu_dismiss(&self, positioned: Box<dyn Element>) -> Box<dyn Element> {
+        let backdrop = EventHandler::new(
+            Rect::new()
+                .with_background_color(ColorU::new(0, 0, 0, 0))
+                .finish(),
         )
+        .on_left_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+            DispatchEventResult::StopPropagation
+        })
+        .on_right_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+            DispatchEventResult::PropagateToParent
+        })
+        .with_always_handle()
+        .finish();
+        Box::new(Stack::new().with_child(backdrop).with_child(positioned))
     }
 
     /// Right-Panel row context menu (Changes row or Files row).
