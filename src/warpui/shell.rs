@@ -1078,7 +1078,9 @@ impl CraneShellView {
         // UI prefs, restored from warpui-state.json if present.
         let mut show_left = true;
         let mut show_right = true;
-        let mut files_tab = true;
+        // Right Panel defaults to the Changes tab (not Files) on a fresh
+        // install — Changes is the more common thing to check first.
+        let mut files_tab = false;
         let mut expanded_projects: HashSet<usize> = HashSet::from([0]);
         let mut expanded_worktrees: HashSet<(usize, usize)> = HashSet::from([(0, 0)]);
         let mut restored_files_pane: Option<PaneId> = None;
