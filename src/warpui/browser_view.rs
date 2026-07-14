@@ -45,6 +45,11 @@ pub struct WarpBrowserView {
     next_tab_id: u32,
     /// True while the URL field owns typing (shell routes keys here).
     input_active: bool,
+    /// True when Cmd+A has selected the whole URL buffer: the field renders
+    /// highlighted and the next typed char / paste / backspace replaces it.
+    /// Cleared on any edit, blur, or commit. The simplified field has no caret
+    /// model, so "select all" is the only selection state it supports.
+    input_sel_all: bool,
     /// Body rect recorded at paint time by the RectProbe — window-space, the
     /// exact rect the WKWebView should cover. Read by the shell browser tick.
     body_rect: Rc<Cell<RectF>>,
@@ -112,6 +117,7 @@ impl WarpBrowserView {
             // A fresh blank tab wants a URL immediately; a restored session
             // already has pages to show.
             input_active: false,
+            input_sel_all: false,
             body_rect: Rc::new(Cell::new(RectF::new(vec2f(0.0, 0.0), vec2f(0.0, 0.0)))),
             ui_font,
             icon_font,
@@ -198,6 +204,51 @@ impl WarpBrowserView {
         };
         if let Some(a) = action {
             self.handle_action(&a, ctx);
+        }
+    }
+
+    /// Cmd+A on the focused URL field: select the whole buffer (next edit
+    /// replaces it). No-op on an empty buffer.
+    pub fn url_select_all(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.input_active && !self.tabs[self.active].input_buf.is_empty() {
+            self.input_sel_all = true;
+            ctx.notify();
+        }
+    }
+
+    /// Cmd+C on the focused URL field: copy the whole buffer.
+    pub fn url_copy(&self, ctx: &mut ViewContext<Self>) {
+        let buf = self.tabs[self.active].input_buf.clone();
+        if self.input_active && !buf.is_empty() {
+            ctx.clipboard()
+                .write(warpui::clipboard::ClipboardContent::plain_text(buf));
+        }
+    }
+
+    /// Cmd+X on the focused URL field: copy the whole buffer, then clear it.
+    pub fn url_cut(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.input_active {
+            return;
+        }
+        let buf = std::mem::take(&mut self.tabs[self.active].input_buf);
+        self.input_sel_all = false;
+        if !buf.is_empty() {
+            ctx.clipboard()
+                .write(warpui::clipboard::ClipboardContent::plain_text(buf));
+            ctx.notify();
+        }
+    }
+
+    /// Cmd+V on the focused URL field: insert clipboard text (replacing the
+    /// buffer when it is select-all'd), newlines stripped — a URL is one line.
+    pub fn url_paste(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.input_active {
+            return;
+        }
+        let text = ctx.clipboard().read().plain_text;
+        let text: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        if !text.is_empty() {
+            self.handle_action(&BrowserAction::Paste(text), ctx);
         }
     }
 
@@ -333,20 +384,25 @@ impl WarpBrowserView {
         } else {
             tab.input_buf.clone()
         };
-        let mut field = Flex::row().with_child(
-            Text::new(
-                shown,
-                self.ui_font,
-                12.0,
-            )
+        let text_el = Text::new(shown, self.ui_font, 12.0)
             .with_color(if tab.input_buf.is_empty() && !self.input_active {
                 theme::text_muted()
             } else {
                 theme::text()
             })
-            .finish(),
-        );
-        if self.input_active {
+            .finish();
+        // Cmd+A highlights the whole buffer; render it on a selection band and
+        // drop the caret (the entire field is "selected").
+        let sel_all = self.input_active && self.input_sel_all && !tab.input_buf.is_empty();
+        let text_el = if sel_all {
+            Container::new(text_el)
+                .with_background_color(theme::row_active())
+                .finish()
+        } else {
+            text_el
+        };
+        let mut field = Flex::row().with_child(text_el);
+        if self.input_active && !sel_all {
             field = field.with_child(
                 ConstrainedBox::new(Rect::new().with_background_color(theme::accent()).finish())
                     .with_width(2.0)
@@ -550,6 +606,7 @@ impl TypedActionView for WarpBrowserView {
                     }
                 }
                 self.input_active = false;
+                self.input_sel_all = false;
             }
             BrowserAction::Back => {
                 browser::queue_action(self.active_key(), browser::Action::Back);
@@ -566,20 +623,41 @@ impl TypedActionView for WarpBrowserView {
                     let _ = webbrowser::open(url);
                 }
             }
-            BrowserAction::FocusInput => self.input_active = true,
-            BrowserAction::Blur => self.input_active = false,
+            BrowserAction::FocusInput => {
+                self.input_active = true;
+                self.input_sel_all = false;
+            }
+            BrowserAction::Blur => {
+                self.input_active = false;
+                self.input_sel_all = false;
+            }
             BrowserAction::InputChar(s) => {
                 if self.input_active {
+                    // A selected-all buffer is replaced by the first keystroke.
+                    if self.input_sel_all {
+                        self.tabs[self.active].input_buf.clear();
+                        self.input_sel_all = false;
+                    }
                     self.tabs[self.active].input_buf.push_str(s);
                 }
             }
             BrowserAction::InputBackspace => {
                 if self.input_active {
-                    self.tabs[self.active].input_buf.pop();
+                    // Backspace over a full selection clears the whole buffer.
+                    if self.input_sel_all {
+                        self.tabs[self.active].input_buf.clear();
+                        self.input_sel_all = false;
+                    } else {
+                        self.tabs[self.active].input_buf.pop();
+                    }
                 }
             }
             BrowserAction::Paste(s) => {
                 if self.input_active {
+                    if self.input_sel_all {
+                        self.tabs[self.active].input_buf.clear();
+                        self.input_sel_all = false;
+                    }
                     self.tabs[self.active].input_buf.push_str(s);
                 }
             }

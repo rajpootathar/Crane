@@ -12012,6 +12012,8 @@ impl CraneShellView {
                         ctx.clipboard()
                             .write(warpui::clipboard::ClipboardContent::plain_text(text));
                     }
+                } else if let Some(h) = self.active_input_pane().and_then(|id| self.browser_at(id)) {
+                    h.update(ctx, |view, vctx| view.url_copy(vctx));
                 }
             }
             CraneShellAction::CutFocused => {
@@ -12026,6 +12028,8 @@ impl CraneShellView {
                         ctx.clipboard()
                             .write(warpui::clipboard::ClipboardContent::plain_text(text));
                     }
+                } else if let Some(h) = self.active_input_pane().and_then(|id| self.browser_at(id)) {
+                    h.update(ctx, |view, vctx| view.url_cut(vctx));
                 }
             }
             CraneShellAction::FileTabSelect(i) => {
@@ -12102,25 +12106,24 @@ impl CraneShellView {
                     } else if let Some(h) = self.editor_at(id) {
                         h.update(ctx, |view, vctx| view.paste(&content.plain_text, vctx));
                     } else if let Some(h) = self.browser_at(id) {
-                        h.update(ctx, |view, vctx| {
-                            view.handle_action(
-                                &crate::warpui::browser_view::BrowserAction::Paste(
-                                    content.plain_text.clone(),
-                                ),
-                                vctx,
-                            )
-                        });
+                        // Reads the clipboard itself (strips newlines, honors a
+                        // select-all'd buffer) — only acts when the URL field is
+                        // focused, else the WKWebView handles paste natively.
+                        h.update(ctx, |view, vctx| view.url_paste(vctx));
                     }
                 }
             }
             CraneShellAction::SelectAllFocused => {
                 // Terminal panes select the whole grid (old terminal/view.rs
-                // Cmd+A); editor panes select all buffer text.
+                // Cmd+A); editor panes select all buffer text; a focused Browser
+                // URL field selects its whole buffer.
                 if let Some(id) = self.active_input_pane() {
                     if let Some(h) = self.terminal_at(id) {
                         h.update(ctx, |view, _| view.select_all());
                     } else if let Some(h) = self.editor_at(id) {
                         h.update(ctx, |view, vctx| view.select_all(vctx));
+                    } else if let Some(h) = self.browser_at(id) {
+                        h.update(ctx, |view, vctx| view.url_select_all(vctx));
                     }
                 }
             }
