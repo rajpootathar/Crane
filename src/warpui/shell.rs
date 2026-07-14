@@ -9348,6 +9348,33 @@ impl CraneShellView {
     }
 
     /// Open `path` in the dedicated File pane (as a tab). Creates the pane the
+    /// The file pane's id ONLY when it is a live document leaf in the ACTIVE
+    /// tab's layout — the sole case where `open_file` may reuse it by swapping
+    /// content. `self.panes` keeps panes from every tab alive, so a `files_pane`
+    /// that was closed (orphaned in `panes`) or belongs to a background tab
+    /// still matches a bare `panes.get()` check; reusing it would insert content
+    /// into a pane that never renders, so the file pane "won't open". Returns
+    /// None in those cases so the caller splits a fresh pane instead.
+    fn reusable_files_pane(&self) -> Option<PaneId> {
+        let fp = self.files_pane?;
+        let is_doc = matches!(
+            self.panes.get(&fp),
+            Some(PaneContent::Editor(_))
+                | Some(PaneContent::File(_))
+                | Some(PaneContent::Markdown(_))
+        );
+        let in_active = self
+            .active_tab
+            .and_then(|t| self.layouts.get(&t))
+            .map(|n| {
+                let mut leaves = Vec::new();
+                n.leaves(&mut leaves);
+                leaves.contains(&fp)
+            })
+            .unwrap_or(false);
+        (is_doc && in_active).then_some(fp)
+    }
+
     /// first time; thereafter adds/switches a tab inside it (old Crane FilesPane).
     fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
         // Track the tab order + active index.
@@ -9375,22 +9402,17 @@ impl CraneShellView {
                 self.markdown_views.insert(path.clone(), h.clone());
                 h
             };
-            // Reuse the live files_pane (swap content) if it still holds a
-            // document pane; else split a fresh pane on the RIGHT at 0.35.
-            if let Some(fp) = self.files_pane {
-                if matches!(
-                    self.panes.get(&fp),
-                    Some(PaneContent::Editor(_))
-                        | Some(PaneContent::File(_))
-                        | Some(PaneContent::Markdown(_))
-                ) {
-                    self.panes.insert(fp, PaneContent::Markdown(handle));
-                    self.focused = Some(fp);
-                    return;
-                }
-                self.files_pane = None; // pane was closed
+            // Reuse the live files_pane (swap content) only when it's a document
+            // leaf in the ACTIVE tab; else split a fresh pane on the RIGHT at
+            // 0.35 (a closed / background-tab pane can't be reused).
+            if let Some(fp) = self.reusable_files_pane() {
+                self.panes.insert(fp, PaneContent::Markdown(handle));
+                self.focused = Some(fp);
+                return;
             }
+            self.files_pane = None; // stale (closed or on another tab)
             self.files_pane = self.split_with_at(PaneContent::Markdown(handle), false, 0.35);
+            ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
             return;
         }
         // Build the editor for this file once; reuse it on later opens/switches
@@ -9465,19 +9487,16 @@ impl CraneShellView {
             let v0 = handle.read(ctx, |v, app| v.buffer_version(app));
             self.lsp_versions.insert(path.clone(), v0);
         }
-        // Existing editor pane still alive? Swap its content to the active file.
-        if let Some(fp) = self.files_pane {
-            if matches!(
-                self.panes.get(&fp),
-                Some(PaneContent::Editor(_))
-                    | Some(PaneContent::File(_))
-                    | Some(PaneContent::Markdown(_))
-            ) {
-                self.panes.insert(fp, PaneContent::Editor(handle));
-                self.focused = Some(fp);
-                return;
-            }
-            self.files_pane = None; // pane was closed
+        // Reuse the file pane only when it's a live document leaf in the ACTIVE
+        // tab; a closed / background-tab pane can't be reused (swapping content
+        // into it would render nothing — the "file pane won't open" bug).
+        if let Some(fp) = self.reusable_files_pane() {
+            self.panes.insert(fp, PaneContent::Editor(handle));
+            self.focused = Some(fp);
+            return;
+        }
+        if self.files_pane.is_some() {
+            self.files_pane = None; // stale (closed or on another tab)
             self.file_pane_paths = vec![path.clone()];
             self.file_pane_active = 0;
         }
