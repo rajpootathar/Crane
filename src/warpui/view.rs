@@ -828,6 +828,7 @@ impl View for TerminalView {
             color::cursor_color(),
             self.desired.clone(),
         )
+        .with_resize_wake(self.wake.clone())
         .with_selection(sel_range, disp_off)
         .with_cursor_style(cursor_style.shape, cursor_style.blink)
         .on_mouse_report(mouse_report_cb)

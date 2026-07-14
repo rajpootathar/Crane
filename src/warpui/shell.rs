@@ -9504,6 +9504,7 @@ impl CraneShellView {
         // existing pane keeps 35% as the first child). Full height by default;
         // the user can drag the splitter to resize. Backed by Warp's REAL editor.
         self.files_pane = self.split_with_at(PaneContent::Editor(handle), false, 0.35);
+        ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
     }
 
     /// The warp editor view handle for a pane, if it is an Editor pane.
@@ -10608,6 +10609,7 @@ impl CraneShellView {
             )
         });
         self.split_with(PaneContent::Browser(handle));
+        ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
     }
 
     /// Open a read-only unified Diff pane (HEAD vs working copy) for `path` in a
@@ -10619,6 +10621,7 @@ impl CraneShellView {
             crate::warpui::diff_view::WarpDiffView::new(ctx, repo_root, path)
         });
         self.split_with(PaneContent::Diff(handle));
+        ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
     }
 
     /// Open the Welcome / landing pane beside the focused pane. Its action cards
@@ -10640,6 +10643,7 @@ impl CraneShellView {
             WarpWelcomeView::new(vc, ui_font, icon_font, Some(on_action))
         });
         self.split_with(PaneContent::Welcome(handle));
+        ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
     }
 
     /// The live rename buffer for worktree (pi, wi), or None when that row is
@@ -10952,10 +10956,40 @@ impl CraneShellView {
                 self.panes.remove(&new_id);
             }
         }
+        // The sibling that just gave up half its space must reflow now, not on
+        // the next stray event.
+        ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
+    }
+
+    /// Force every leaf in the active tab to re-render at its CURRENT size.
+    /// Terminal/file/editor/browser ChildViews cache their laid-out grid and
+    /// only re-measure when their own view is notified — a plain shell repaint
+    /// isn't enough. Called after any layout change (split add, pane close,
+    /// splitter drag, window resize) so a shrunk/grown terminal reflows (and
+    /// SIGWINCHes its PTY) immediately instead of on the next stray event.
+    fn relayout_panes(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(tab) = self.active_tab {
+            if let Some(node) = self.layouts.get(&tab) {
+                let mut leaves = Vec::new();
+                node.leaves(&mut leaves);
+                for id in leaves {
+                    if let Some(h) = self.terminal_at(id) {
+                        h.update(ctx, |_, vctx| vctx.notify());
+                    } else if let Some(h) = self.file_at(id) {
+                        h.update(ctx, |_, vctx| vctx.notify());
+                    } else if let Some(h) = self.editor_at(id) {
+                        h.update(ctx, |_, vctx| vctx.notify());
+                    } else if let Some(h) = self.browser_at(id) {
+                        h.update(ctx, |_, vctx| vctx.notify());
+                    }
+                }
+            }
+        }
+        ctx.notify();
     }
 
     /// Close the focused pane (and its terminal). Collapses the split tree.
-    fn close_focused(&mut self) {
+    fn close_focused(&mut self, ctx: &mut ViewContext<Self>) {
         let (Some(tab), Some(focused)) = (self.active_tab, self.focused) else {
             return;
         };
@@ -10983,6 +11017,9 @@ impl CraneShellView {
         if self.files_pane == Some(focused) {
             self.files_pane = None;
         }
+        // The sibling that just reclaimed the closed pane's space must reflow
+        // now (SIGWINCH the terminal) rather than on the next stray event.
+        ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
     }
 
     /// Fully tear down the layout at `key`: drop the tab's split tree and every
@@ -11882,7 +11919,7 @@ impl CraneShellView {
                     if running {
                         self.modal = Some(Modal::ConfirmClosePane(self.focused.unwrap()));
                     } else {
-                        self.close_focused();
+                        self.close_focused(ctx);
                     }
                 }
             }
@@ -11895,7 +11932,7 @@ impl CraneShellView {
                 if self.maximized == Some(*id) {
                     self.maximized = None;
                 }
-                self.close_focused();
+                self.close_focused(ctx);
             }
             CraneShellAction::ToggleMaximize(id) => {
                 self.maximized = if self.maximized == Some(*id) {
@@ -12092,7 +12129,7 @@ impl CraneShellView {
                             self.files_pane = None;
                             self.file_pane_active = 0;
                             self.focused = Some(fp);
-                            self.close_focused();
+                            self.close_focused(ctx);
                         } else {
                             if self.file_pane_active >= self.file_pane_paths.len() {
                                 self.file_pane_active = self.file_pane_paths.len() - 1;
@@ -12536,24 +12573,7 @@ impl CraneShellView {
             }
             CraneShellAction::OpenBrowser => self.open_browser(ctx),
             CraneShellAction::RelayoutPanes => {
-                if let Some(tab) = self.active_tab {
-                    if let Some(node) = self.layouts.get(&tab) {
-                        let mut leaves = Vec::new();
-                        node.leaves(&mut leaves);
-                        for id in leaves {
-                            if let Some(h) = self.terminal_at(id) {
-                                h.update(ctx, |_, vctx| vctx.notify());
-                            } else if let Some(h) = self.file_at(id) {
-                                h.update(ctx, |_, vctx| vctx.notify());
-                            } else if let Some(h) = self.editor_at(id) {
-                                h.update(ctx, |_, vctx| vctx.notify());
-                            } else if let Some(h) = self.browser_at(id) {
-                                h.update(ctx, |_, vctx| vctx.notify());
-                            }
-                        }
-                    }
-                }
-                ctx.notify();
+                self.relayout_panes(ctx);
                 // Skip the tail: per-drag-tick save_state / focus churn would
                 // hammer the disk while the splitter moves.
                 return;
@@ -13247,7 +13267,7 @@ impl CraneShellView {
                 if self.maximized == Some(*id) {
                     self.maximized = None;
                 }
-                self.close_focused();
+                self.close_focused(ctx);
             }
             CraneShellAction::OpenFindInFiles => {
                 self.find_in_files = Some(FindInFilesState {

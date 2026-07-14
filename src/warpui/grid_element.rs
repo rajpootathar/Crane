@@ -100,6 +100,12 @@ pub struct GridElement {
     /// Written in layout() with the cols/rows that fit the available
     /// space; the View reads this next frame to drive PTY/grid resize.
     desired: Rc<StdCell<Option<(usize, usize)>>>,
+    /// Repaint waker fired when `desired` CHANGES in layout(). The resize is a
+    /// two-frame dance (layout writes `desired`; the next render applies it), so
+    /// a one-shot size change — a split/close that adds or removes a sibling
+    /// pane — would leave the grid stale until the next incidental event. Waking
+    /// on the change guarantees the follow-up frame that applies it.
+    resize_wake: Option<crate::warpui::controller::Wake>,
     size: Option<Vector2F>,
     origin: Option<Point>,
     /// Paint-time origin in window coords, used in dispatch_event for hit-testing.
@@ -163,6 +169,7 @@ impl GridElement {
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
             desired,
+            resize_wake: None,
             size: None,
             origin: None,
             origin_vec: None,
@@ -184,6 +191,13 @@ impl GridElement {
     /// Attach a scroll-wheel handler that receives `(delta_y_points, precise)`.
     pub fn on_scroll(mut self, cb: Rc<dyn Fn(f32, bool)>) -> Self {
         self.scroll_cb = Some(cb);
+        self
+    }
+
+    /// Repaint waker fired when the fitted grid size changes in layout() — so a
+    /// one-shot resize (split/close) self-completes its two-frame apply.
+    pub fn with_resize_wake(mut self, wake: crate::warpui::controller::Wake) -> Self {
+        self.resize_wake = Some(wake);
         self
     }
 
@@ -263,7 +277,16 @@ impl Element for GridElement {
         let max = constraint.max;
         let fit_cols = (max.x() / self.cell_w).floor().max(1.0) as usize;
         let fit_rows = (max.y() / self.cell_h).floor().max(1.0) as usize;
-        self.desired.set(Some((fit_cols, fit_rows)));
+        let fit = Some((fit_cols, fit_rows));
+        if self.desired.get() != fit {
+            self.desired.set(fit);
+            // The fitted size changed since the last layout — the View applies
+            // it on the NEXT render, so request that frame (a split/close is a
+            // one-shot change with no follow-up event of its own).
+            if let Some(wake) = &self.resize_wake {
+                wake();
+            }
+        }
 
         // Occupy the available area (so the pane fills the window).
         let size = constraint.apply(max);
