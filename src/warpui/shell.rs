@@ -6181,7 +6181,23 @@ impl CraneShellView {
                     all_keys.insert(k);
                 }
                 let (key, rect, url) = v.active_slot();
-                if visible.contains(id) && rect.width() > 1.0 && rect.height() > 1.0 {
+                // The RectProbe records PRE-ZOOM layout coordinates. warpui's GPU
+                // compositor magnifies everything by the global zoom factor when
+                // drawing (so terminals/editors land correctly), but the native
+                // WKWebView is positioned in real window points — so it must be
+                // given the layout rect scaled UP by the zoom, or it renders
+                // shifted + undersized by exactly the zoom factor.
+                let zoom = crate::warpui::fontsize::zoom_level();
+                let rect = if zoom != 1.0 {
+                    warpui::geometry::rect::RectF::new(
+                        rect.origin() * zoom,
+                        vec2f(rect.width() * zoom, rect.height() * zoom),
+                    )
+                } else {
+                    rect
+                };
+                let is_alive = visible.contains(id) && rect.width() > 1.0 && rect.height() > 1.0;
+                if is_alive {
                     bridge.alive.push((key, rect, url));
                 } else {
                     bridge.inactive.push((key, url));

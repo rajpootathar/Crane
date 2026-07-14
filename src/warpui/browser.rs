@@ -240,8 +240,16 @@ pub struct HostWindow(std::ptr::NonNull<std::ffi::c_void>);
 
 #[cfg(target_os = "macos")]
 impl HostWindow {
-    /// The main window's content view, or None while the app is still
-    /// starting up / has no window (sync just skips that tick).
+    /// Content view of Crane's REAL render window, or None while the app is
+    /// still starting up. Deterministically selects the visible main/key window
+    /// (falling back to the largest visible window) rather than trusting
+    /// `NSApp.mainWindow` + `windows.firstObject`: macOS keeps a HIDDEN 500x500
+    /// helper window in the app's window list, and when `mainWindow` is
+    /// transiently nil (app unfocused, or mid-startup) the old `firstObject`
+    /// fallback could hand wry that phantom window — parenting the WKWebView
+    /// into a dead, invisible window so pages never render. The old egui
+    /// frontend never hit this because eframe held one real window handle;
+    /// warpui keeps its window private, so we resolve it ourselves.
     pub fn current() -> Option<Self> {
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};
@@ -250,20 +258,39 @@ impl HostWindow {
             if app.is_null() {
                 return None;
             }
-            let mut win: *mut AnyObject = msg_send![app, mainWindow];
-            if win.is_null() {
-                // App inactive (no main window) — fall back to the first
-                // window in the app's window list.
-                let windows: *mut AnyObject = msg_send![app, windows];
-                if windows.is_null() {
-                    return None;
+            let windows: *mut AnyObject = msg_send![app, windows];
+            if windows.is_null() {
+                return None;
+            }
+            let count: usize = msg_send![windows, count];
+            let mut best: *mut AnyObject = std::ptr::null_mut();
+            let mut best_area = 0.0f64;
+            for i in 0..count {
+                let w: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+                if w.is_null() {
+                    continue;
                 }
-                win = msg_send![windows, firstObject];
-                if win.is_null() {
-                    return None;
+                let visible: bool = msg_send![w, isVisible];
+                if !visible {
+                    continue; // skips the hidden 500x500 phantom window
+                }
+                let is_main: bool = msg_send![w, isMainWindow];
+                let is_key: bool = msg_send![w, isKeyWindow];
+                if is_main || is_key {
+                    best = w;
+                    break; // the focused window is unambiguously ours
+                }
+                let f: objc2_foundation::NSRect = msg_send![w, frame];
+                let area = f.size.width * f.size.height;
+                if area > best_area {
+                    best = w;
+                    best_area = area;
                 }
             }
-            let view: *mut AnyObject = msg_send![win, contentView];
+            if best.is_null() {
+                return None;
+            }
+            let view: *mut AnyObject = msg_send![best, contentView];
             std::ptr::NonNull::new(view as *mut std::ffi::c_void).map(Self)
         }
     }

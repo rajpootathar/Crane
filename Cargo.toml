@@ -125,7 +125,7 @@ objc2-app-kit = { version = "0.2", features = [
     "NSGraphics", "block2",
 ] }
 objc2-foundation = { version = "0.2", features = [
-    "NSArray", "NSString", "NSData", "NSDictionary",
+    "NSArray", "NSString", "NSData", "NSDictionary", "NSGeometry",
 ] }
 block2 = "0.5"
 
