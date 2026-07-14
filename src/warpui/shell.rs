@@ -10955,6 +10955,15 @@ impl CraneShellView {
         self.panes.remove(&focused);
         self.drag_states.remove(&focused);
         self.pane_rects.borrow_mut().remove(&focused);
+        // Closing the File Edit pane via Cmd+W / its × button (as opposed to
+        // the last-File-Tab-closed path, which already resets this) left
+        // `files_pane` pointing at a removed pane id. `open_file` self-heals
+        // that on the next open, but other readers (`is_file_pane`, the tab
+        // strip's close-shortcut gate) compare against it directly — reset it
+        // here so it never dangles.
+        if self.files_pane == Some(focused) {
+            self.files_pane = None;
+        }
     }
 
     /// Fully tear down the layout at `key`: drop the tab's split tree and every
@@ -12415,6 +12424,21 @@ impl CraneShellView {
             CraneShellAction::GitLogDetailFile(fi) => {
                 self.git_log_detail_file = *fi;
                 self.git_log_detail_scroll = 0;
+                // Also open the file's CURRENT working-tree copy in the File
+                // Edit pane (the inline patch above already shows the
+                // commit's historical diff). Repo-relative path from the
+                // commit detail, joined against the log's own repo root —
+                // silently skipped if the file no longer exists on disk
+                // (deleted / renamed since that commit).
+                if let (Some(repo), Some(rel)) = (
+                    self.git_log_repo.clone(),
+                    self.git_log_detail.as_ref().and_then(|d| d.files.get(*fi)).map(|f| f.path.clone()),
+                ) {
+                    let abs = repo.join(&rel);
+                    if abs.is_file() {
+                        self.open_file(abs, ctx);
+                    }
+                }
             }
             CraneShellAction::GitLogBranchPrompt(sha) => {
                 // Keep git_log_menu's (x, y) — the prompt overlay anchors
