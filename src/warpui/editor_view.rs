@@ -195,6 +195,8 @@ pub enum EditAction {
     /// Cmd+LeftClick — place the caret AND fire the goto-definition callback with
     /// the `(line, character)` at the click. Non-mutating.
     GotoDefinitionAt { offset: CharOffset },
+    /// Triple-click — select the whole line under the click point.
+    SelectLineAt { offset: CharOffset },
     SelectionExtend { offset: CharOffset },
     /// Left mouse released — ends an in-editor selection drag.
     EndSelect,
@@ -277,16 +279,20 @@ impl<V> RichTextAction<V> for EditAction {
     fn left_mouse_down(
         l: Location,
         m: ModifiersState,
-        _cc: u32,
+        cc: u32,
         _fm: bool,
         _v: &WeakViewHandle<V>,
         _x: &AppContext,
     ) -> Option<Self> {
         let offset = offset_of(&l);
         // Cmd+Click triggers goto-definition (and still places the caret);
-        // a plain click just places the caret.
+        // a triple click (cc >= 3) selects the whole line, matching the
+        // terminal's own triple-click-selects-line convention; a plain click
+        // just places the caret.
         if m.cmd {
             Some(EditAction::GotoDefinitionAt { offset })
+        } else if cc >= 3 {
+            Some(EditAction::SelectLineAt { offset })
         } else {
             Some(EditAction::CursorPlace { offset })
         }
@@ -1953,6 +1959,23 @@ impl WarpEditorView {
                 model.update(ctx, |m: &mut CodeModel, mctx| {
                     let sel = m.selection.clone();
                     sel.update(mctx, |s, sctx| s.set_cursor(off, sctx));
+                });
+            }
+            EditAction::SelectLineAt { offset } => {
+                // Triple-click: select the whole line under the click, same
+                // line-boundary math + buffer-offset (+1) convention as the
+                // empty-selection whole-line path in `copy`/`cut`.
+                self.selecting.set(true);
+                let text = self.buffer_text(ctx);
+                let (ls, le) = line_char_range(&text, offset.as_usize());
+                let sel_start = CharOffset::from(ls).add_signed(1);
+                let sel_end = CharOffset::from(le).add_signed(1);
+                model.update(ctx, |m: &mut CodeModel, mctx| {
+                    let sel = m.selection.clone();
+                    sel.update(mctx, |s, sctx| {
+                        s.set_cursor(sel_start, sctx);
+                        s.set_last_head(sel_end, sctx);
+                    });
                 });
             }
             EditAction::GotoDefinitionAt { offset } => {
