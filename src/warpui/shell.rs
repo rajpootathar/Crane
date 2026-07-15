@@ -210,6 +210,61 @@ impl ChangeDir {
     }
 }
 
+/// How long a live OSC-0/2 terminal title must hold steady before it is adopted
+/// as a Tab row's label. Agent CLIs (Claude Code &c.) rewrite the title several
+/// times a second with live spinner / token-count text; without this window the
+/// tree row name churns constantly. The FIRST title on a fresh terminal adopts
+/// immediately (see `TitleDebounce::observe`) so a new shell's initial title
+/// isn't held back — churn protection only kicks in once a title is displayed.
+const TITLE_STABLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Per-tab debounce state for the live terminal title. Keyed by tab key in
+/// `CraneShellView::title_debounce`. Pure state machine — see `observe`, which
+/// is unit-tested (`title_debounce_*`).
+#[derive(Default, Clone)]
+struct TitleDebounce {
+    /// The title currently shown in the row. `None` until the first is adopted.
+    displayed: Option<String>,
+    /// The most recent live title seen (the candidate awaiting promotion).
+    candidate: Option<String>,
+    /// When `candidate` was first observed; drives the stability window.
+    candidate_since: Option<std::time::Instant>,
+}
+
+impl TitleDebounce {
+    /// Feed the current live title; returns the stabilized title to display.
+    ///
+    /// - Already displaying `live` → no-op.
+    /// - Nothing displayed yet (fresh terminal still on its "Terminal N"
+    ///   default) → adopt immediately, no wait.
+    /// - Otherwise track how long `live` has held steady; promote it only once
+    ///   it has been unchanged for `window`. A changing `live` keeps resetting
+    ///   the candidate clock, so churning titles never get promoted.
+    fn observe(&mut self, live: &str, now: std::time::Instant, window: std::time::Duration) -> String {
+        if self.displayed.as_deref() == Some(live) {
+            return live.to_string();
+        }
+        if self.displayed.is_none() {
+            // First real title on a fresh shell — adopt without waiting.
+            self.displayed = Some(live.to_string());
+            self.candidate = Some(live.to_string());
+            self.candidate_since = Some(now);
+            return live.to_string();
+        }
+        if self.candidate.as_deref() != Some(live) {
+            // New candidate — (re)start its stability clock.
+            self.candidate = Some(live.to_string());
+            self.candidate_since = Some(now);
+        } else if let Some(since) = self.candidate_since {
+            if now.duration_since(since) >= window {
+                self.displayed = Some(live.to_string());
+            }
+        }
+        // Fall back to whatever we last committed to (never empty here).
+        self.displayed.clone().unwrap_or_else(|| live.to_string())
+    }
+}
+
 pub struct CraneShellView {
     ui_font: FamilyId,
     icon_font: FamilyId,
@@ -428,6 +483,12 @@ pub struct CraneShellView {
     /// `MouseStateHandle` (an `Arc<Mutex<..>>`) has to persist on the view.
     /// `RefCell` because `render` is `&self` and lazily get-or-inserts handles.
     menu_hover: RefCell<HashMap<String, MouseStateHandle>>,
+    /// Per-tab title debounce, keyed by tab key `(pi, wi, tid)`. Smooths the
+    /// live OSC-0/2 terminal title so agent-CLI spinner churn doesn't rename
+    /// the Tab row several times a second (see `TitleDebounce`). `RefCell`
+    /// because `render` is `&self` and updates the state on each paint.
+    /// Entries are dropped when the owning tab is torn down.
+    title_debounce: RefCell<HashMap<(usize, usize, usize), TitleDebounce>>,
     /// Active project context menu, or None when no menu is open.
     context_menu: Option<ProjectContextMenu>,
     /// Hover tooltip currently on-screen: (label text, window-space x, y) —
@@ -1554,6 +1615,7 @@ impl CraneShellView {
             removed_project_paths: init_removed,
             project_tints: init_tints,
             menu_hover: RefCell::new(HashMap::new()),
+            title_debounce: RefCell::new(HashMap::new()),
             context_menu: None,
             hover_tip: None,
             collapsed_groups: HashSet::new(),
@@ -7549,6 +7611,19 @@ impl CraneShellView {
         None
     }
 
+    /// The Tab row's terminal title after debouncing (see `TitleDebounce`).
+    /// Returns `None` for non-terminal tabs / when no title has arrived, so the
+    /// caller falls back to the tab's own "Terminal N" name — identical contract
+    /// to `terminal_tab_title`, but the returned title only changes once the
+    /// live one has held steady for `TITLE_STABLE_WINDOW`. Updates the per-tab
+    /// debounce state as a side effect (hence the `RefCell`; `render` is `&self`).
+    fn stabilized_tab_title(&self, key: (usize, usize, usize), app: &AppContext) -> Option<String> {
+        let live = self.terminal_tab_title(key, app)?;
+        let mut map = self.title_debounce.borrow_mut();
+        let entry = map.entry(key).or_default();
+        Some(entry.observe(&live, std::time::Instant::now(), TITLE_STABLE_WINDOW))
+    }
+
     fn tab_closeable_row(
         &self,
         icon_color: ColorU,
@@ -8115,7 +8190,7 @@ impl CraneShellView {
                         let display_name = if rbuf.is_some() || t.renamed {
                             t.name.clone()
                         } else {
-                            self.terminal_tab_title(tkey, app)
+                            self.stabilized_tab_title(tkey, app)
                                 .unwrap_or_else(|| t.name.clone())
                         };
                         // Double-click → rename; single click → select. Noop while
@@ -11786,6 +11861,9 @@ impl CraneShellView {
                     self.layouts.insert(tab, remaining);
                 }
                 None => {
+                    // Last pane gone → the tab is effectively closed; drop its
+                    // debounce entry so it doesn't linger.
+                    self.title_debounce.borrow_mut().remove(&tab);
                     self.active_tab = None;
                     self.focused = None;
                 }
@@ -11814,6 +11892,7 @@ impl CraneShellView {
     /// uses — call when a project/tab is removed so nothing keeps rendering or
     /// leaks a PTY.
     fn tear_down_layout(&mut self, key: (usize, usize, usize)) {
+        self.title_debounce.borrow_mut().remove(&key);
         if let Some(node) = self.layouts.remove(&key) {
             let mut leaves = Vec::new();
             node.leaves(&mut leaves);
@@ -13504,6 +13583,7 @@ impl CraneShellView {
             }
             CraneShellAction::CloseTabConfirmed((pi, wi, tid)) => {
                 self.modal = None;
+                self.title_debounce.borrow_mut().remove(&(*pi, *wi, *tid));
                 // Drop the tab's layout + every pane it owns.
                 if let Some(node) = self.layouts.remove(&(*pi, *wi, *tid)) {
                     let mut leaves = Vec::new();
@@ -14547,5 +14627,42 @@ mod git_meta_tests {
         assert!(!git_meta_path(Path::new("/r/.git/index")));
         assert!(!git_meta_path(Path::new("/r/.git/FETCH_HEAD")));
         assert!(!git_meta_path(Path::new("/r/src/main.rs")));
+    }
+}
+
+#[cfg(test)]
+mod title_debounce_tests {
+    use super::TitleDebounce;
+    use std::time::{Duration, Instant};
+
+    const WINDOW: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn first_title_adopts_immediately_then_churn_is_held_and_promoted() {
+        let mut d = TitleDebounce::default();
+        let t0 = Instant::now();
+
+        // Fresh terminal: the very first title shows at once, no wait.
+        assert_eq!(d.observe("zsh", t0, WINDOW), "zsh");
+
+        // A new title churns — it must NOT replace the displayed one yet.
+        assert_eq!(d.observe("claude · 1.2k", t0 + Duration::from_millis(100), WINDOW), "zsh");
+        // Still churning before the window elapses: keeps showing "zsh", and
+        // each distinct title resets the stability clock.
+        assert_eq!(d.observe("claude · 1.5k", t0 + Duration::from_millis(600), WINDOW), "zsh");
+        assert_eq!(d.observe("claude · 2.0k", t0 + Duration::from_secs(1), WINDOW), "zsh");
+
+        // Once one title holds steady for the full window it gets promoted.
+        assert_eq!(d.observe("nvim README.md", t0 + Duration::from_secs(2), WINDOW), "zsh");
+        assert_eq!(
+            d.observe("nvim README.md", t0 + Duration::from_secs(6), WINDOW),
+            "nvim README.md"
+        );
+
+        // Re-seeing the already-displayed title is a stable no-op.
+        assert_eq!(
+            d.observe("nvim README.md", t0 + Duration::from_secs(9), WINDOW),
+            "nvim README.md"
+        );
     }
 }
