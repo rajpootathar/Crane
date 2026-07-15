@@ -8196,6 +8196,17 @@ impl CraneShellView {
                             .with_color(fg)
                             .finish(),
                     )
+                    // Expanded filler forces the row to consume the full
+                    // incoming width (same idiom as `header_row`'s trailing
+                    // spacer) so the background/hover wash spans the whole
+                    // panel instead of shrink-wrapping to the label.
+                    .with_child(
+                        Expanded::new(
+                            1.0,
+                            Container::new(Text::new("", ui_font, 11.0).finish()).finish(),
+                        )
+                        .finish(),
+                    )
                     .finish(),
             )
             .with_background_color(bg)
@@ -9135,12 +9146,20 @@ impl CraneShellView {
     }
 
     fn top_bar(&self) -> Box<dyn Element> {
-        let row = Flex::row()
+        let mut row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(Self::spacer(80.0)) // macOS traffic-light inset
             .with_child(self.icon_button("tb-left", icons::SIDEBAR, CraneShellAction::ToggleLeft))
             .with_child(Self::spacer(6.0))
-            .with_child(self.breadcrumb_capsule())
+            .with_child(self.breadcrumb_capsule());
+        // Dirty diff-stat chip, immediately after the capsule (6px gap) — same
+        // visibility rule and click target as before, just relocated from the
+        // status bar into the top bar.
+        if let Some(chip) = self.diff_chip() {
+            row = row.with_child(Self::spacer(6.0));
+            row = row.with_child(chip);
+        }
+        let row = row
             .with_child(Expanded::new(1.0, ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish()).finish())
             .with_child(self.new_pane_button())
             .with_child(Self::spacer(8.0))
@@ -9174,6 +9193,13 @@ impl CraneShellView {
     /// (accent GIT_BRANCH + name). Hover tints the border with `accent_soft()`
     /// and clicking opens the Switch Branch modal. A loose project (no git)
     /// shows its name only and is inert.
+    ///
+    /// Leading position carries the repo-pulse dot (7x7, `success()` clean /
+    /// `warning()` dirty, sourced from `self.changes` — the same set the
+    /// status bar used to read). `self.changes` is only ever populated by a
+    /// git `status --porcelain` scan, so it has no meaning for a loose
+    /// (non-git) project — the dot is shown only when the workspace has a
+    /// branch (i.e. is a git repo), matching the existing `has_branch` gate.
     fn breadcrumb_capsule(&self) -> Box<dyn Element> {
         let (pi, wi, _ti) = self.selected;
         let project = self.projects.get(pi);
@@ -9185,6 +9211,11 @@ impl CraneShellView {
             project.and_then(|p| p.worktrees.get(wi)).map(|w| w.name.clone())
         };
         let has_branch = branch.is_some();
+        let dot_color = if self.changes.is_empty() {
+            theme::success()
+        } else {
+            theme::warning()
+        };
         let ui_font = self.ui_font;
         let icon_font = self.icon_font;
         let state = self.hover_handle("topbar:crumb");
@@ -9195,8 +9226,25 @@ impl CraneShellView {
             } else {
                 theme::border()
             };
-            let mut inner = Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            let mut inner = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+            if has_branch {
+                inner = inner.with_child(
+                    Container::new(
+                        ConstrainedBox::new(
+                            Rect::new()
+                                .with_background_color(dot_color)
+                                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.5)))
+                                .finish(),
+                        )
+                        .with_width(7.0)
+                        .with_height(7.0)
+                        .finish(),
+                    )
+                    .with_padding_right(6.0)
+                    .finish(),
+                );
+            }
+            inner = inner
                 .with_child(
                     Container::new(
                         Text::new(icons::CUBE.to_string(), icon_font, 11.0)
@@ -9422,62 +9470,15 @@ impl CraneShellView {
         self.menu_popover(items, x, y)
     }
 
-    fn status_bar(&self, app: &AppContext) -> Box<dyn Element> {
-        // Branch identity now lives in the top-bar capsule (project ⎇ branch,
-        // click = Switch Branch), so the status bar carries only the op-status
-        // text — no branch name, no ⎇ glyph.
-        let label = "ready".to_string();
-        // Live repo-pulse dot: 7×7 rounded square, success() when the working
-        // tree is clean (no changes), warning() when dirty. Reads the same
-        // `self.changes` set the Right Panel does, so it flips the instant a
-        // file is edited / staged / committed.
-        let dot_color = if self.changes.is_empty() {
-            theme::success()
-        } else {
-            theme::warning()
-        };
-        let dot = Container::new(
-            ConstrainedBox::new(
-                Rect::new()
-                    .with_background_color(dot_color)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.5)))
-                    .finish(),
-            )
-            .with_width(7.0)
-            .with_height(7.0)
-            .finish(),
-        )
-        .with_padding_left(10.0)
-        .with_padding_right(4.0)
-        .finish();
-        // The pulse dot + op-status label. No longer clickable — the top-bar
-        // capsule owns Switch Branch, so this cluster is purely informational
-        // (working-tree health + op state) for every workspace, loose or not.
-        let status_cluster = Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_child(dot)
-            .with_child(
-                Container::new(
-                    Text::new(label, self.ui_font, 11.0)
-                        .with_color(theme::text_muted())
-                        .finish(),
-                )
-                .with_padding_left(2.0)
-                .with_padding_top(7.0)
-                .with_padding_right(6.0)
-                .with_padding_bottom(2.0)
-                .finish(),
-            )
-            .finish();
-        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-        row = row.with_child(status_cluster);
-        // Dirty diff-stat chip, right after the branch cluster: a rounded
-        // `surface()` pill with `+{added}` (success) / `-{deleted}` (error). Data
-        // is the active workspace's cached `git diff --numstat` totals — the SAME
-        // source the Left Panel branch badge uses. Shown only when the tree is
-        // dirty AND numstat reports line changes (untracked-only dirt has no
-        // counts; the warning dot already signals it). Clicking the chip still
-        // opens Switch Branch (the status cluster itself no longer does).
+    /// Dirty diff-stat chip: a rounded `surface()` pill with `+{added}`
+    /// (success) / `-{deleted}` (error). Data is the active workspace's
+    /// cached `git diff --numstat` totals — the SAME source the Left Panel
+    /// branch badge uses. Shown only when the tree is dirty AND numstat
+    /// reports line changes (untracked-only dirt has no counts; the
+    /// breadcrumb dot already signals it). Clicking the chip opens Switch
+    /// Branch, same as the capsule. Lives in the top bar, immediately after
+    /// the breadcrumb capsule (moved out of the status bar).
+    fn diff_chip(&self) -> Option<Box<dyn Element>> {
         let (added, deleted) = self
             .active_cwd
             .as_ref()
@@ -9490,49 +9491,53 @@ impl CraneShellView {
                     .map(|w| w.diff_stat)
             })
             .unwrap_or((0, 0));
-        if !self.changes.is_empty() && (added > 0 || deleted > 0) {
-            let ui_font = self.ui_font;
-            let mut chip_row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-            if added > 0 {
-                chip_row = chip_row.with_child(
-                    Container::new(
-                        Text::new(format!("+{added}"), ui_font, 10.0)
-                            .with_color(theme::success())
-                            .finish(),
-                    )
-                    .with_padding_right(if deleted > 0 { 4.0 } else { 0.0 })
-                    .finish(),
-                );
-            }
-            if deleted > 0 {
-                chip_row = chip_row.with_child(
-                    Text::new(format!("-{deleted}"), ui_font, 10.0)
-                        .with_color(theme::error())
+        if self.changes.is_empty() || (added == 0 && deleted == 0) {
+            return None;
+        }
+        let ui_font = self.ui_font;
+        let mut chip_row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        if added > 0 {
+            chip_row = chip_row.with_child(
+                Container::new(
+                    Text::new(format!("+{added}"), ui_font, 10.0)
+                        .with_color(theme::success())
                         .finish(),
-                );
-            }
-            let chip = ConstrainedBox::new(
-                Container::new(Align::new(chip_row.finish()).finish())
-                    .with_background_color(theme::surface())
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.0)))
-                    .with_padding_left(8.0)
-                    .with_padding_right(8.0)
-                    .finish(),
-            )
-            .with_height(18.0)
-            .finish();
-            let chip = EventHandler::new(chip)
-                .on_left_mouse_down(|ctx, _app, _pos| {
-                    ctx.dispatch_typed_action(CraneShellAction::OpenSwitchBranch);
-                    DispatchEventResult::StopPropagation
-                })
-                .finish();
-            row = row.with_child(
-                Container::new(chip)
-                    .with_padding_left(2.0)
+                )
+                .with_padding_right(if deleted > 0 { 4.0 } else { 0.0 })
+                .finish(),
+            );
+        }
+        if deleted > 0 {
+            chip_row = chip_row.with_child(
+                Text::new(format!("-{deleted}"), ui_font, 10.0)
+                    .with_color(theme::error())
                     .finish(),
             );
         }
+        let chip = ConstrainedBox::new(
+            Container::new(Align::new(chip_row.finish()).finish())
+                .with_background_color(theme::surface())
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.0)))
+                .with_padding_left(8.0)
+                .with_padding_right(8.0)
+                .finish(),
+        )
+        .with_height(18.0)
+        .finish();
+        let chip = EventHandler::new(chip)
+            .on_left_mouse_down(|ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::OpenSwitchBranch);
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+        Some(chip)
+    }
+
+    fn status_bar(&self, app: &AppContext) -> Box<dyn Element> {
+        // Repo state (pulse dot + "ready" + diff-stat chip) now lives in the
+        // top bar (breadcrumb capsule + `diff_chip`, right after it), so the
+        // status bar carries only Ln/Col + the gear button.
+        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
         // Flexible spacer pushes everything after it to the right edge (an empty
         // Flex paints nothing and records no hits).
         row = row.with_child(Expanded::new(1.0, Flex::row().finish()).finish());
