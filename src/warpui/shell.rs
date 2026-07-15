@@ -8110,23 +8110,58 @@ impl CraneShellView {
         self.panel(theme::sidebar_bg(), outer)
     }
 
-    fn tab_label(&self, text: &str, active: bool, action: CraneShellAction) -> Box<dyn Element> {
-        let color = if active { theme::text_hover() } else { theme::text_muted() };
-        let content = Container::new(
-            Text::new(text.to_string(), self.ui_font, 12.0)
-                .with_color(color)
-                .finish(),
-        )
-        .with_background_color(theme::sidebar_bg())
-        .with_padding_top(2.0)
-        .with_padding_bottom(2.0)
-        .finish();
-        EventHandler::new(content)
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(action.clone());
-                DispatchEventResult::StopPropagation
-            })
+    fn tab_label(&self, text: &'static str, active: bool, action: CraneShellAction) -> Box<dyn Element> {
+        let state = self.hover_handle(&format!("rtab:{text}"));
+        let ui_font = self.ui_font;
+        let label_color = if active { theme::text_hover() } else { theme::text_muted() };
+        let chip = Hoverable::new(state, move |ms| {
+            let bg = if active {
+                ColorU::new(0, 0, 0, 0)
+            } else if ms.is_hovered() {
+                theme::hover_wash()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
+            let row = Text::new(text.to_string(), ui_font, 12.0)
+                .with_color(label_color)
+                .finish();
+            // Underline: 2px accent for the active tab, transparent filler otherwise.
+            let underline = ConstrainedBox::new(
+                Rect::new()
+                    .with_background_color(if active {
+                        theme::accent()
+                    } else {
+                        ColorU::new(0, 0, 0, 0)
+                    })
+                    .finish(),
+            )
+            .with_height(2.0)
+            .finish();
+            Container::new(
+                Flex::column()
+                    .with_child(
+                        Expanded::new(
+                            1.0,
+                            Container::new(row)
+                                .with_padding_left(12.0)
+                                .with_padding_right(12.0)
+                                .with_padding_top(6.0)
+                                .finish(),
+                        )
+                        .finish(),
+                    )
+                    .with_child(underline)
+                    .finish(),
+            )
+            .with_background_color(bg)
             .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(action.clone());
+        })
+        .finish();
+        ConstrainedBox::new(chip).with_height(theme::TAB_H).finish()
     }
 
     /// Colour for a single-char git porcelain status. Mirrors old egui
@@ -8315,17 +8350,21 @@ impl CraneShellView {
         let show_changes = !self.files_tab && !loose;
         let tabs = Flex::row()
             .with_child(self.changes_tab_label(!self.files_tab && !loose, loose))
-            .with_child(Self::spacer(12.0))
             .with_child(self.tab_label(
                 "Files",
                 self.files_tab || loose,
                 CraneShellAction::SetTab { files: true },
             ))
             .finish();
-        let tabs = Container::new(tabs)
-            .with_padding_left(10.0)
-            .with_padding_top(8.0)
-            .with_padding_bottom(6.0)
+        let tabs = Flex::column()
+            .with_child(tabs)
+            .with_child(
+                ConstrainedBox::new(
+                    Rect::new().with_background_color(theme::divider()).finish(),
+                )
+                .with_height(1.0)
+                .finish(),
+            )
             .finish();
 
         let mut col = Flex::column().with_child(tabs);
@@ -8417,15 +8456,16 @@ impl CraneShellView {
     /// and inert (dispatches Noop) so it can't be selected.
     fn changes_tab_label(&self, active: bool, loose: bool) -> Box<dyn Element> {
         if loose {
-            return Container::new(
+            let label = Container::new(
                 Text::new("Changes".to_string(), self.ui_font, 12.0)
                     .with_color(theme::pane_dim())
                     .finish(),
             )
-            .with_background_color(theme::sidebar_bg())
-            .with_padding_top(2.0)
-            .with_padding_bottom(2.0)
+            .with_padding_left(12.0)
+            .with_padding_right(12.0)
+            .with_padding_top(6.0)
             .finish();
+            return ConstrainedBox::new(label).with_height(theme::TAB_H).finish();
         }
         self.tab_label("Changes", active, CraneShellAction::SetTab { files: false })
     }
