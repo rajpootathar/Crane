@@ -2916,14 +2916,20 @@ impl CraneShellView {
                 Some(rgb) => ColorU::new(rgb[0], rgb[1], rgb[2], 255),
                 None => ColorU::new(0, 0, 0, 0),
             };
-            let ring = if active || hovered {
-                theme::text_hover()
+            // Distinct state rings: ACTIVE (this tint is applied) = strong 2px
+            // text_hover ring and it wins over hover; HOVER = lighter 1px
+            // text_muted preview ring. The hollow "none" swatch's resting body
+            // outline (2px border()) is REPLACED by the state ring so the two
+            // strokes never visually merge. Idle colored dots keep a
+            // transparent ring so the row never jitters.
+            let (ring_w, ring) = if active {
+                (2.0, theme::text_hover())
+            } else if hovered {
+                (1.0, theme::text_muted())
             } else if color.is_none() {
-                theme::border()
+                (2.0, theme::border())
             } else {
-                // Transparent ring keeps every swatch a constant 18×18 so the
-                // palette row doesn't jitter when a border appears on hover.
-                ColorU::new(0, 0, 0, 0)
+                (2.0, ColorU::new(0, 0, 0, 0))
             };
             let dot = Container::new(
                 ConstrainedBox::new(Rect::new().finish())
@@ -2933,7 +2939,7 @@ impl CraneShellView {
             )
             .with_background_color(bg)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.0)))
-            .with_border(Border::all(2.0).with_border_color(ring))
+            .with_border(Border::all(ring_w).with_border_color(ring))
             .finish();
             Container::new(dot).with_uniform_padding(3.0).finish()
         })
