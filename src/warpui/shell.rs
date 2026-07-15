@@ -479,6 +479,10 @@ pub struct CraneShellView {
     /// button at render time (fixed offset from the right edge — the top bar
     /// doesn't expose its own button rect), dismissed like any context menu.
     new_pane_menu_open: bool,
+    /// Whether the status-bar ⚙ gear menu (theme picker + Keyboard Shortcuts) is
+    /// open. Anchored bottom-right near the gear button; dismissed like any
+    /// context menu (CloseContextMenu clears it).
+    gear_menu_open: bool,
     /// Per folder-group tint overrides keyed by the container folder's own path
     /// (`ProjectNode::group_path`). Painted on the FOLDER header icon + label.
     group_tints: HashMap<String, [u8; 3]>,
@@ -1537,6 +1541,7 @@ impl CraneShellView {
             tab_menu: None,
             folder_menu: None,
             new_pane_menu_open: false,
+            gear_menu_open: false,
             group_tints: init_group_tints,
             renaming: None,
             worktree_names: init_wt_names,
@@ -6241,6 +6246,7 @@ impl CraneShellView {
             || self.folder_menu.is_some()
             || self.branch_picker.is_some()
             || self.new_pane_menu_open
+            || self.gear_menu_open
             || self.drop_preview.borrow().is_some();
         let Some(win) = crate::warpui::browser::HostWindow::current() else {
             return;
@@ -7053,23 +7059,6 @@ impl CraneShellView {
             ctx.dispatch_typed_action(action.clone());
         })
         .finish()
-    }
-
-    /// A small status-bar icon button (muted glyph, click dispatches `action`).
-    /// Sized for the 28px status strip.
-    fn status_icon_button(&self, glyph: &str, action: CraneShellAction) -> Box<dyn Element> {
-        let content = Container::new(self.icon(glyph, 13.0, theme::text_muted()))
-            .with_padding_left(5.0)
-            .with_padding_right(5.0)
-            .with_padding_top(6.0)
-            .with_padding_bottom(6.0)
-            .finish();
-        EventHandler::new(content)
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(action.clone());
-                DispatchEventResult::StopPropagation
-            })
-            .finish()
     }
 
 
@@ -9250,20 +9239,84 @@ impl CraneShellView {
         self.menu_popover(items, x, y)
     }
 
+    /// The status-bar ⚙ gear menu: a THEME section listing every installed theme
+    /// (active one marked with an "active" hint), then Settings + Keyboard
+    /// Shortcuts. This is where theme switching lives now that the top-bar cycle
+    /// pill is gone.
+    fn gear_menu_overlay(&self, x: f32, y: f32) -> Box<dyn Element> {
+        let active = crate::theme::current().name;
+        let mut col = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.menu_label("THEME"));
+        for t in crate::theme::load_all() {
+            let is_active = t.name == active;
+            col = col.with_child(self.menu_item_hint(
+                icons::PAINT_BRUSH,
+                &t.name,
+                if is_active { Some("active") } else { None },
+                false,
+                CraneShellAction::SetTheme(t.name.clone()),
+            ));
+        }
+        let items = col
+            .with_child(self.menu_separator())
+            .with_child(self.menu_item_hint(
+                icons::GEAR,
+                "Settings",
+                None,
+                false,
+                CraneShellAction::OpenSettings,
+            ))
+            .with_child(self.menu_item_hint(
+                icons::KEYBOARD,
+                "Keyboard Shortcuts",
+                None,
+                false,
+                CraneShellAction::OpenHelp,
+            ))
+            .finish();
+        self.menu_popover(items, x, y)
+    }
+
     fn status_bar(&self, app: &AppContext) -> Box<dyn Element> {
         let label = if self.branch.is_empty() {
             "ready".to_string()
         } else {
             format!("{}  -  ready", self.branch)
         };
-        // The branch icon + label. When a git branch is present, the whole cluster
-        // is clickable → opens the Switch Branch modal (matches old Crane's
-        // status-bar branch click). A loose/no-repo workspace shows a plain label.
+        // Live repo-pulse dot: 7×7 rounded square, success() when the working
+        // tree is clean (no changes), warning() when dirty. Reads the same
+        // `self.changes` set the Right Panel does, so it flips the instant a
+        // file is edited / staged / committed.
+        let dot_color = if self.changes.is_empty() {
+            theme::success()
+        } else {
+            theme::warning()
+        };
+        let dot = Container::new(
+            ConstrainedBox::new(
+                Rect::new()
+                    .with_background_color(dot_color)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.5)))
+                    .finish(),
+            )
+            .with_width(7.0)
+            .with_height(7.0)
+            .finish(),
+        )
+        .with_padding_left(10.0)
+        .with_padding_right(4.0)
+        .finish();
+        // The pulse dot + branch icon + label. When a git branch is present, the
+        // whole cluster is clickable → opens the Switch Branch modal (matches old
+        // Crane's status-bar branch click). A loose/no-repo workspace shows the
+        // dot + a plain label.
         let branch_cluster = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(dot)
             .with_child(
                 Container::new(self.icon(icons::GIT_BRANCH, 11.0, theme::text_muted()))
-                    .with_padding_left(10.0)
+                    .with_padding_left(2.0)
                     .with_padding_right(5.0)
                     .with_padding_top(7.0)
                     .finish(),
@@ -9294,6 +9347,68 @@ impl CraneShellView {
                     .finish(),
             );
         }
+        // Dirty diff-stat chip, right after the branch cluster: a rounded
+        // `surface()` pill with `+{added}` (success) / `-{deleted}` (error). Data
+        // is the active workspace's cached `git diff --numstat` totals — the SAME
+        // source the Left Panel branch badge uses. Shown only when the tree is
+        // dirty AND numstat reports line changes (untracked-only dirt has no
+        // counts; the warning dot already signals it). The chip carries the same
+        // OpenSwitchBranch click as the cluster.
+        let (added, deleted) = self
+            .active_cwd
+            .as_ref()
+            .map(|cwd| cwd.to_string_lossy().to_string())
+            .and_then(|s| {
+                self.projects
+                    .iter()
+                    .flat_map(|p| p.worktrees.iter())
+                    .find(|w| w.path == s)
+                    .map(|w| w.diff_stat)
+            })
+            .unwrap_or((0, 0));
+        if !self.changes.is_empty() && (added > 0 || deleted > 0) {
+            let ui_font = self.ui_font;
+            let mut chip_row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+            if added > 0 {
+                chip_row = chip_row.with_child(
+                    Container::new(
+                        Text::new(format!("+{added}"), ui_font, 10.0)
+                            .with_color(theme::success())
+                            .finish(),
+                    )
+                    .with_padding_right(if deleted > 0 { 4.0 } else { 0.0 })
+                    .finish(),
+                );
+            }
+            if deleted > 0 {
+                chip_row = chip_row.with_child(
+                    Text::new(format!("-{deleted}"), ui_font, 10.0)
+                        .with_color(theme::error())
+                        .finish(),
+                );
+            }
+            let chip = ConstrainedBox::new(
+                Container::new(Align::new(chip_row.finish()).finish())
+                    .with_background_color(theme::surface())
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.0)))
+                    .with_padding_left(8.0)
+                    .with_padding_right(8.0)
+                    .finish(),
+            )
+            .with_height(18.0)
+            .finish();
+            let chip = EventHandler::new(chip)
+                .on_left_mouse_down(|ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::OpenSwitchBranch);
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
+            row = row.with_child(
+                Container::new(chip)
+                    .with_padding_left(2.0)
+                    .finish(),
+            );
+        }
         // Flexible spacer pushes everything after it to the right edge (an empty
         // Flex paints nothing and records no hits).
         row = row.with_child(Expanded::new(1.0, Flex::row().finish()).finish());
@@ -9317,22 +9432,45 @@ impl CraneShellView {
                     text.push_str(&format!("   ({chars} chars)"));
                 }
             }
+            // Subtle hover wash on the Ln/Col cluster to match the gear button's
+            // affordance (it isn't clickable, but the wash keeps the far-right
+            // controls visually consistent).
+            let lc_state = self.hover_handle("sb-lncol");
+            let ui_font = self.ui_font;
             row = row.with_child(
                 Container::new(
-                    Text::new(text, self.ui_font, 11.0)
-                        .with_color(theme::text_muted())
-                        .finish(),
+                    Hoverable::new(lc_state, move |ms| {
+                        let bg = if ms.is_hovered() {
+                            theme::selection_wash()
+                        } else {
+                            ColorU::new(0, 0, 0, 0)
+                        };
+                        Container::new(
+                            Text::new(text.clone(), ui_font, 11.0)
+                                .with_color(theme::text_muted())
+                                .finish(),
+                        )
+                        .with_background_color(bg)
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                        .with_padding_left(6.0)
+                        .with_padding_right(6.0)
+                        .with_padding_top(4.0)
+                        .with_padding_bottom(4.0)
+                        .finish()
+                    })
+                    .finish(),
                 )
-                .with_padding_right(12.0)
-                .with_padding_top(7.0)
+                .with_padding_right(6.0)
                 .finish(),
             );
         }
-        // Settings (gear) + Help (keyboard) buttons, pinned far right. Trigger the
-        // Settings / Help modals. (Chosen over a Cmd+? / F1 key so the entry point
-        // is always discoverable in the status bar.)
-        row = row.with_child(self.status_icon_button(icons::GEAR, CraneShellAction::OpenSettings));
-        row = row.with_child(self.status_icon_button(icons::KEYBOARD, CraneShellAction::OpenHelp));
+        // The ⚙ gear button, pinned far right, opens the gear menu (theme picker +
+        // Settings + Keyboard Shortcuts). `icon_button` supplies the hover wash.
+        row = row.with_child(self.icon_button(
+            "sb-gear",
+            icons::GEAR,
+            CraneShellAction::ToggleGearMenu,
+        ));
         row = row.with_child(Self::spacer(6.0));
         let content = row.finish();
         ConstrainedBox::new(self.panel(theme::topbar_bg(), content))
@@ -11698,6 +11836,17 @@ impl View for CraneShellView {
             let x = if win_w > 0.0 { (win_w - 220.0 - 8.0).max(8.0) } else { 8.0 };
             root_stack = root_stack.with_child(self.new_pane_menu_overlay(x, theme::TOPBAR_H));
         }
+        // The status-bar ⚙ gear menu, anchored bottom-right near the gear button.
+        // The gear sits at the far-right of the status strip; the menu (220px)
+        // is pulled in from the right edge and `menu_popover`'s Popover flips it
+        // ABOVE the click when it would cross the window bottom (which it always
+        // does here, at the very bottom of the window).
+        if self.gear_menu_open {
+            let (win_w, win_h) = self.window_size(app);
+            let x = if win_w > 0.0 { (win_w - 220.0 - 8.0).max(8.0) } else { 8.0 };
+            let y = if win_h > 0.0 { win_h - theme::STATUS_H } else { 0.0 };
+            root_stack = root_stack.with_child(self.gear_menu_overlay(x, y));
+        }
         // Sidebar drag: 2px accent drop-line at the gap nearest the cursor.
         if let Some(line) = self.tree_drop_line_overlay() {
             root_stack = root_stack.with_child(line);
@@ -12251,6 +12400,7 @@ pub enum CraneShellAction {
     CloseContextMenu,
     /// Toggle the top-bar ＋ New Pane dropdown open/closed.
     ToggleNewPaneMenu,
+    ToggleGearMenu,
     /// Reveal the project folder in the system file manager.
     RevealProjectInFinder(usize),
     /// Copy the project path to the clipboard.
@@ -13728,9 +13878,13 @@ impl CraneShellView {
                 self.git_log_menu = None;
                 self.git_log_branch_prompt = None;
                 self.new_pane_menu_open = false;
+                self.gear_menu_open = false;
             }
             CraneShellAction::ToggleNewPaneMenu => {
                 self.new_pane_menu_open = !self.new_pane_menu_open;
+            }
+            CraneShellAction::ToggleGearMenu => {
+                self.gear_menu_open = !self.gear_menu_open;
             }
             CraneShellAction::RevealProjectInFinder(i) => {
                 self.context_menu = None;
