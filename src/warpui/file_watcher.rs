@@ -406,6 +406,88 @@ mod tests {
         assert!(ev.created || ev.modified);
     }
 
+    /// Records where filesystem events land for a *linked* git worktree.
+    /// This is the crux of the sidebar-badge live-refresh bug: a linked
+    /// worktree's `.git` is a FILE pointing at `<main>/.git/worktrees/<name>`,
+    /// so a `git commit` inside the worktree writes refs/index/logs under the
+    /// MAIN repo's `.git` — the worktree *checkout* dir sees ZERO events. A
+    /// plain working-tree edit, by contrast, does land under the checkout.
+    #[test]
+    fn linked_worktree_commit_lands_under_main_not_checkout() {
+        fn git(dir: &Path, args: &[&str]) {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .status()
+                .expect("git")
+                .success();
+            assert!(ok, "git {:?} failed in {}", args, dir.display());
+        }
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let main = base.path().join("main");
+        let wt = base.path().join("wt");
+        fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@t.co"]);
+        git(&main, &["config", "user.name", "t"]);
+        fs::write(main.join("f.txt"), "a\n").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "init"]);
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feature"],
+        );
+
+        let (watcher, rx) = FileWatcher::new();
+        let main_root = std::fs::canonicalize(&main).unwrap();
+        let wt_root = std::fs::canonicalize(&wt).unwrap();
+        watcher.watch_project(&main).expect("watch main");
+        watcher.watch_path(&wt).expect("watch wt");
+        thread::sleep(Duration::from_millis(80));
+
+        // (1) A working-tree edit in the linked worktree DOES reach the
+        //     checkout root — the badge-refresh path can see this.
+        fs::write(wt.join("f.txt"), "a\nb\n").unwrap();
+        let mut saw_edit_on_wt = false;
+        while let Some(ev) = drain(&rx, Duration::from_millis(400)) {
+            if ev.root == wt_root {
+                saw_edit_on_wt = true;
+            }
+        }
+        assert!(
+            saw_edit_on_wt,
+            "working-tree edit should emit an event on the worktree checkout root"
+        );
+
+        // (2) A COMMIT in the linked worktree emits NOTHING on the checkout
+        //     root — every ref/index/log write lands under the MAIN repo.
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "second"]);
+        let mut commit_hit_wt = false;
+        let mut commit_hit_main = false;
+        while let Some(ev) = drain(&rx, Duration::from_millis(500)) {
+            if ev.root == wt_root {
+                commit_hit_wt = true;
+            }
+            if ev.root == main_root {
+                commit_hit_main = true;
+            }
+        }
+        assert!(
+            !commit_hit_wt,
+            "commit in a linked worktree must NOT emit on its checkout root \
+             (proves why the badge can't clear from a checkout-scoped watch)"
+        );
+        assert!(
+            commit_hit_main,
+            "commit in a linked worktree writes refs under the MAIN repo, so \
+             the main root is where the event surfaces"
+        );
+    }
+
     #[test]
     fn unwatch_stops_emission() {
         let dir = tempfile::tempdir().expect("tempdir");

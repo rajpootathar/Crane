@@ -6811,6 +6811,33 @@ impl CraneShellView {
         }
     }
 
+    /// Canonicalized checkout roots of every worktree in the project that owns
+    /// `root` — where `root` is a watched root that saw a git-internal write.
+    /// A project "owns" `root` when its primary checkout (`p.path`) OR any of
+    /// its worktree checkouts canonicalizes to `root`. Used to fan a commit's
+    /// ref write (which lands under the main repo, not the committed linked
+    /// worktree's checkout) out to all sibling worktree badges so the right one
+    /// refreshes. Returns canonical paths so they match the bg-scan mapping,
+    /// which keys on `canonicalize(w.path)`.
+    fn project_worktree_checkout_roots(&self, root: &std::path::Path) -> Vec<PathBuf> {
+        for p in &self.projects {
+            let owns = std::fs::canonicalize(&p.path).ok().as_deref() == Some(root)
+                || p.worktrees.iter().any(|w| {
+                    !w.path.is_empty()
+                        && std::fs::canonicalize(&w.path).ok().as_deref() == Some(root)
+                });
+            if owns {
+                return p
+                    .worktrees
+                    .iter()
+                    .filter(|w| !w.path.is_empty())
+                    .filter_map(|w| std::fs::canonicalize(&w.path).ok())
+                    .collect();
+            }
+        }
+        Vec::new()
+    }
+
     /// Drain coalesced filesystem change events. Always empties the receiver
     /// (keeps the mpsc bounded) and, if any batch belongs to the ACTIVE repo,
     /// refreshes its Changes/Files panel + marks editor diffs dirty — so
@@ -6831,22 +6858,59 @@ impl CraneShellView {
         // `pending_bg_roots` below so background repos' sidebar badges refresh
         // live too (see the block after the active-repo one).
         let mut bg_touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        // Roots under which a git-internal ref/HEAD/worktrees write landed this
+        // tick. A commit / fetch / checkout in a LINKED worktree writes its
+        // refs + index + logs under the MAIN repo's `.git` (the worktree's own
+        // `.git` is just a file pointing there) — the worktree *checkout* dir
+        // sees no event at all, so its badge could never clear from a
+        // checkout-scoped watch. We collect the roots that saw such writes and,
+        // below, rescan EVERY worktree of the owning project so whichever
+        // linked worktree was committed to gets its +N/-M refreshed.
+        let mut git_meta_roots: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        let is_git_meta = |paths: &[PathBuf]| {
+            paths.iter().any(|p| {
+                let s = p.to_string_lossy();
+                s.contains("/.git/refs/")
+                    || s.ends_with("/.git/HEAD")
+                    || s.ends_with("/.git/packed-refs")
+                    || s.contains("/.git/worktrees/")
+            })
+        };
         while let Ok(ev) = self.fs_events.try_recv() {
+            if is_git_meta(&ev.paths) {
+                git_meta_roots.insert(ev.root.clone());
+            }
             if let Some(ac) = active_canon.as_ref() {
                 if &ev.root == ac {
                     active_touched = true;
-                    if ev.paths.iter().any(|p| {
-                        let s = p.to_string_lossy();
-                        s.contains("/.git/refs/")
-                            || s.ends_with("/.git/HEAD")
-                            || s.ends_with("/.git/packed-refs")
-                    }) {
+                    if is_git_meta(&ev.paths) {
                         git_refs_touched = true;
                     }
                     continue;
                 }
             }
             bg_touched.insert(ev.root);
+        }
+        // Expand each git-meta root to every worktree checkout of its owning
+        // project and fold those into the bg badge rescan set. This is the only
+        // path that clears a LINKED worktree's badge after a commit, since the
+        // triggering event surfaced under the main repo, not the checkout.
+        if !git_meta_roots.is_empty() {
+            git_refs_touched = true;
+            for root in &git_meta_roots {
+                for wp in self.project_worktree_checkout_roots(root) {
+                    bg_touched.insert(wp);
+                }
+            }
+            // If the ACTIVE repo is a linked worktree that was just committed
+            // to, its checkout saw no event, so `active_touched` is still false
+            // — but its Changes/Files panel must refresh too. Promote it.
+            if let Some(ac) = active_canon.as_ref()
+                && bg_touched.contains(ac)
+            {
+                active_touched = true;
+            }
         }
         if active_touched {
             self.refresh_panel(ctx);
