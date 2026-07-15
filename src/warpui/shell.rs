@@ -3162,6 +3162,11 @@ impl CraneShellView {
             ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
             DispatchEventResult::PropagateToParent
         })
+        // Absorb scroll so a wheel over the dim area (outside the menu popover)
+        // can't bleed through to the pane underneath. The menu's own scrollable
+        // content still scrolls: the positioned popover is the higher Stack child
+        // and consumes the wheel first (Waterfall dispatches top child first).
+        .on_scroll_wheel(|_ctx, _app, _delta, _mods| DispatchEventResult::StopPropagation)
         .with_always_handle()
         .finish();
         Box::new(Stack::new().with_child(backdrop).with_child(positioned))
@@ -3785,6 +3790,12 @@ impl CraneShellView {
             ctx.dispatch_typed_action(CraneShellAction::CloseModal);
             DispatchEventResult::StopPropagation
         })
+        // Absorb scroll so a wheel over the dim backdrop (in the margins around
+        // the card) can't bleed through to the panes behind the modal. The
+        // card's own scrollable list still scrolls: the centered card is the
+        // higher Stack child and consumes the wheel first (Waterfall dispatches
+        // the top child first, so this backdrop only sees wheels the card missed).
+        .on_scroll_wheel(|_ctx, _app, _delta, _mods| DispatchEventResult::StopPropagation)
         .with_always_handle()
         .finish();
         Box::new(Stack::new().with_child(backdrop).with_child(centered))
