@@ -476,6 +476,9 @@ pub struct CraneShellView {
     right_scroll: ClippedScrollStateHandle,
     /// Scroll state for the branch-picker overlay list.
     branch_scroll: ClippedScrollStateHandle,
+    /// Scroll state for the gear-menu THEME list (capped, scrollable so a long
+    /// theme list doesn't push Settings / Keyboard Shortcuts off-screen).
+    gear_scroll: ClippedScrollStateHandle,
     /// Active worktree/branch row context menu (pi, wi, x, y), or None.
     worktree_menu: Option<(usize, usize, f32, f32)>,
     /// Active Tab row context menu ((pi, wi, tid), x, y), or None.
@@ -1565,6 +1568,7 @@ impl CraneShellView {
             branch_list: Vec::new(),
             right_scroll: ClippedScrollStateHandle::new(),
             branch_scroll: ClippedScrollStateHandle::new(),
+            gear_scroll: ClippedScrollStateHandle::new(),
             worktree_menu: None,
             tab_menu: None,
             folder_menu: None,
@@ -9286,12 +9290,16 @@ impl CraneShellView {
     /// pill is gone.
     fn gear_menu_overlay(&self, x: f32, y: f32) -> Box<dyn Element> {
         let active = crate::theme::current().name;
-        let mut col = Flex::column()
-            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(self.menu_label("THEME"));
-        for t in crate::theme::load_all() {
+        // THEME list: one `menu_item_hint` per installed theme. With ~19 themes
+        // this overflows the popover past the screen edge and pushes Settings /
+        // Keyboard Shortcuts out of reach, so the list is height-capped and
+        // scrolled (same idiom as the branch picker), while the pinned items
+        // below stay outside the scroll region and always visible.
+        let themes = crate::theme::load_all();
+        let mut theme_col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        for t in &themes {
             let is_active = t.name == active;
-            col = col.with_child(self.menu_item_hint(
+            theme_col = theme_col.with_child(self.menu_item_hint(
                 icons::PAINT_BRUSH,
                 &t.name,
                 if is_active { Some("active") } else { None },
@@ -9299,7 +9307,32 @@ impl CraneShellView {
                 CraneShellAction::SetTheme(t.name.clone()),
             ));
         }
-        let items = col
+        // ~29px per row (12px text + 6px top/bottom padding). Cap at 8 rows.
+        const ROW_H: f32 = 29.0;
+        const MAX_ROWS: f32 = 8.0;
+        let max_h = ROW_H * MAX_ROWS;
+        let content_h = (themes.len().max(1) as f32) * ROW_H;
+        let theme_body: Box<dyn Element> = if content_h > max_h {
+            ConstrainedBox::new(
+                ClippedScrollable::vertical(
+                    self.gear_scroll.clone(),
+                    theme_col.finish(),
+                    ScrollbarWidth::Auto,
+                    Fill::Solid(theme::border()),
+                    Fill::Solid(theme::text_muted()),
+                    Fill::None,
+                )
+                .finish(),
+            )
+            .with_height(max_h)
+            .finish()
+        } else {
+            theme_col.finish()
+        };
+        let items = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.menu_label("THEME"))
+            .with_child(theme_body)
             .with_child(self.menu_separator())
             .with_child(self.menu_item_hint(
                 icons::GEAR,
@@ -9320,11 +9353,10 @@ impl CraneShellView {
     }
 
     fn status_bar(&self, app: &AppContext) -> Box<dyn Element> {
-        let label = if self.branch.is_empty() {
-            "ready".to_string()
-        } else {
-            format!("{}  -  ready", self.branch)
-        };
+        // Branch identity now lives in the top-bar capsule (project ⎇ branch,
+        // click = Switch Branch), so the status bar carries only the op-status
+        // text — no branch name, no ⎇ glyph.
+        let label = "ready".to_string();
         // Live repo-pulse dot: 7×7 rounded square, success() when the working
         // tree is clean (no changes), warning() when dirty. Reads the same
         // `self.changes` set the Right Panel does, so it flips the instant a
@@ -9348,26 +9380,19 @@ impl CraneShellView {
         .with_padding_left(10.0)
         .with_padding_right(4.0)
         .finish();
-        // The pulse dot + branch icon + label. When a git branch is present, the
-        // whole cluster is clickable → opens the Switch Branch modal (matches old
-        // Crane's status-bar branch click). A loose/no-repo workspace shows the
-        // dot + a plain label.
-        let branch_cluster = Flex::row()
+        // The pulse dot + op-status label. No longer clickable — the top-bar
+        // capsule owns Switch Branch, so this cluster is purely informational
+        // (working-tree health + op state) for every workspace, loose or not.
+        let status_cluster = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(dot)
-            .with_child(
-                Container::new(self.icon(icons::GIT_BRANCH, 11.0, theme::text_muted()))
-                    .with_padding_left(2.0)
-                    .with_padding_right(5.0)
-                    .with_padding_top(7.0)
-                    .finish(),
-            )
             .with_child(
                 Container::new(
                     Text::new(label, self.ui_font, 11.0)
                         .with_color(theme::text_muted())
                         .finish(),
                 )
+                .with_padding_left(2.0)
                 .with_padding_top(7.0)
                 .with_padding_right(6.0)
                 .with_padding_bottom(2.0)
@@ -9375,26 +9400,14 @@ impl CraneShellView {
             )
             .finish();
         let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-        if self.branch.is_empty() {
-            row = row.with_child(branch_cluster);
-        } else {
-            let state = self.hover_handle("statusbar:branch");
-            row = row.with_child(
-                Hoverable::new(state, move |_ms| branch_cluster)
-                    .with_cursor(Cursor::PointingHand)
-                    .on_mouse_down(|ctx, _app, _pos| {
-                        ctx.dispatch_typed_action(CraneShellAction::OpenSwitchBranch);
-                    })
-                    .finish(),
-            );
-        }
+        row = row.with_child(status_cluster);
         // Dirty diff-stat chip, right after the branch cluster: a rounded
         // `surface()` pill with `+{added}` (success) / `-{deleted}` (error). Data
         // is the active workspace's cached `git diff --numstat` totals — the SAME
         // source the Left Panel branch badge uses. Shown only when the tree is
         // dirty AND numstat reports line changes (untracked-only dirt has no
-        // counts; the warning dot already signals it). The chip carries the same
-        // OpenSwitchBranch click as the cluster.
+        // counts; the warning dot already signals it). Clicking the chip still
+        // opens Switch Branch (the status cluster itself no longer does).
         let (added, deleted) = self
             .active_cwd
             .as_ref()
@@ -9768,10 +9781,17 @@ impl CraneShellView {
             // the row's path string).
             let path_key = path.to_string_lossy();
             let state = self.hover_handle(&format!("ftab:{path_key}"));
+            let xstate = self.hover_handle(&format!("ftabx:{path_key}"));
             let ui_font = self.ui_font;
             let icon_font = self.icon_font;
             let label_color = if active { theme::text() } else { theme::text_muted() };
             let name_cl = name.clone();
+            // The whole chip is one visual unit: label (+ dirty dot) and the ✕
+            // share the chip's background, hover wash, and active underline. The
+            // ✕ lives INSIDE the chip and keeps its own 16×16 selection_wash
+            // hover box; its EventHandler returns StopPropagation so a ✕ click
+            // closes the tab WITHOUT also triggering the chip's select handler
+            // (same nested-handler idiom as `tab_closeable_row`).
             let chip = Hoverable::new(state, move |ms| {
                 let bg = if active {
                     theme::surface()
@@ -9780,6 +9800,36 @@ impl CraneShellView {
                 } else {
                     ColorU::new(0, 0, 0, 0)
                 };
+                let close = EventHandler::new(
+                    Hoverable::new(xstate, move |xs| {
+                        let (xbg, xfg) = if xs.is_hovered() {
+                            (theme::selection_wash(), theme::text_hover())
+                        } else {
+                            (ColorU::new(0, 0, 0, 0), theme::text_muted())
+                        };
+                        ConstrainedBox::new(
+                            Container::new(
+                                Text::new(icons::X.to_string(), icon_font, 10.0)
+                                    .with_color(xfg)
+                                    .finish(),
+                            )
+                            .with_background_color(xbg)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                            .with_padding_left(3.0)
+                            .with_padding_top(3.0)
+                            .finish(),
+                        )
+                        .with_width(16.0)
+                        .with_height(16.0)
+                        .finish()
+                    })
+                    .finish(),
+                )
+                .on_left_mouse_down(move |ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::FileTabClose(i));
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
                 let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
                 if dirty {
                     row = row.with_child(
@@ -9797,7 +9847,10 @@ impl CraneShellView {
                         .with_color(label_color)
                         .finish(),
                 );
-                // Underline: 2px accent for the active tab, transparent filler otherwise.
+                // ✕ sits to the right of the label, inside the chip bounds.
+                row = row.with_child(Container::new(close).with_padding_left(6.0).finish());
+                // Underline: 2px accent for the active tab, transparent filler
+                // otherwise. Spans the full chip width, ✕ region included.
                 let underline = ConstrainedBox::new(
                     Rect::new()
                         .with_background_color(if active {
@@ -9809,67 +9862,35 @@ impl CraneShellView {
                 )
                 .with_height(2.0)
                 .finish();
-                Container::new(
-                    Flex::column()
-                        .with_child(
-                            Expanded::new(
-                                1.0,
-                                Container::new(row.finish())
-                                    .with_padding_left(12.0)
-                                    .with_padding_right(4.0)
-                                    .with_padding_top(6.0)
-                                    .finish(),
-                            )
-                            .finish(),
-                        )
-                        .with_child(underline)
-                        .finish(),
-                )
-                .with_background_color(bg)
-                .finish()
-            })
-            .with_cursor(Cursor::PointingHand)
-            .on_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(CraneShellAction::FileTabSelect(i));
-            })
-            .finish();
-            // Per-tab close — 16×16 hover box.
-            let xstate = self.hover_handle(&format!("ftabx:{path_key}"));
-            let icon_font2 = self.icon_font;
-            let close = Hoverable::new(xstate, move |ms| {
-                let (bg, fg) = if ms.is_hovered() {
-                    (theme::selection_wash(), theme::text_hover())
-                } else {
-                    (ColorU::new(0, 0, 0, 0), theme::text_muted())
-                };
-                ConstrainedBox::new(
+                EventHandler::new(
                     Container::new(
-                        Text::new(icons::X.to_string(), icon_font2, 10.0)
-                            .with_color(fg)
+                        Flex::column()
+                            .with_child(
+                                Expanded::new(
+                                    1.0,
+                                    Container::new(row.finish())
+                                        .with_padding_left(12.0)
+                                        .with_padding_right(6.0)
+                                        .with_padding_top(6.0)
+                                        .finish(),
+                                )
+                                .finish(),
+                            )
+                            .with_child(underline)
                             .finish(),
                     )
                     .with_background_color(bg)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
-                    .with_padding_left(3.0)
-                    .with_padding_top(3.0)
                     .finish(),
                 )
-                .with_width(16.0)
-                .with_height(16.0)
+                .on_left_mouse_down(move |ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::FileTabSelect(i));
+                    DispatchEventResult::StopPropagation
+                })
                 .finish()
             })
             .with_cursor(Cursor::PointingHand)
-            .on_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(CraneShellAction::FileTabClose(i));
-            })
             .finish();
-            strip = strip.with_child(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(chip)
-                    .with_child(Container::new(close).with_padding_right(6.0).finish())
-                    .finish(),
-            );
+            strip = strip.with_child(chip);
         }
         ConstrainedBox::new(
             Flex::column()
