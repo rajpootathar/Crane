@@ -47,6 +47,17 @@ pub fn drop_zone() -> ColorU {
     ColorU { r: c.r, g: c.g, b: c.b, a: 70 }
 }
 
+/// Accent at ~40% alpha — a soft accent tint for hover borders (e.g. the
+/// breadcrumb capsule) that hints interactivity without a full accent frame.
+pub fn accent_soft() -> ColorU {
+    let c = crate::theme::current().accent;
+    ColorU { r: c.r, g: c.g, b: c.b, a: 102 }
+}
+
+/// A 1px top-edge sheen for the top bar: white at ~4% alpha. Faked top-lit
+/// gradient stand-in (no gradient primitive in the scene graph).
+pub fn topbar_sheen() -> ColorU { ColorU { r: 255, g: 255, b: 255, a: 10 } }
+
 /// Translucent dim over inactive panes (currently unused — no dim mode).
 pub fn pane_dim() -> ColorU {
     let c = crate::theme::current().bg;

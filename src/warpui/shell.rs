@@ -475,6 +475,10 @@ pub struct CraneShellView {
     /// Opened by right-clicking a container-folder header; offers the tint
     /// palette + "Remove folder group" (removes every member project atomically).
     folder_menu: Option<(String, f32, f32)>,
+    /// Whether the top-bar ＋ New Pane dropdown is open. Anchored under the
+    /// button at render time (fixed offset from the right edge — the top bar
+    /// doesn't expose its own button rect), dismissed like any context menu.
+    new_pane_menu_open: bool,
     /// Per folder-group tint overrides keyed by the container folder's own path
     /// (`ProjectNode::group_path`). Painted on the FOLDER header icon + label.
     group_tints: HashMap<String, [u8; 3]>,
@@ -1532,6 +1536,7 @@ impl CraneShellView {
             worktree_menu: None,
             tab_menu: None,
             folder_menu: None,
+            new_pane_menu_open: false,
             group_tints: init_group_tints,
             renaming: None,
             worktree_names: init_wt_names,
@@ -6233,6 +6238,7 @@ impl CraneShellView {
             || self.tab_menu.is_some()
             || self.folder_menu.is_some()
             || self.branch_picker.is_some()
+            || self.new_pane_menu_open
             || self.drop_preview.borrow().is_some();
         let Some(win) = crate::warpui::browser::HostWindow::current() else {
             return;
@@ -7064,34 +7070,6 @@ impl CraneShellView {
             .finish()
     }
 
-    /// A labelled pill button (icon + text on a surface pill).
-    fn pill_button(&self, glyph: &str, label: &str, action: CraneShellAction) -> Box<dyn Element> {
-        let inner = Flex::row()
-            .with_child(
-                Container::new(self.icon(glyph, 12.0, theme::text_muted()))
-                    .with_padding_right(5.0)
-                    .finish(),
-            )
-            .with_child(
-                Text::new(label.to_string(), self.ui_font, 12.0)
-                    .with_color(theme::text_muted())
-                    .finish(),
-            )
-            .finish();
-        let content = Container::new(inner)
-            .with_background_color(theme::surface())
-            .with_padding_left(10.0)
-            .with_padding_right(10.0)
-            .with_padding_top(4.0)
-            .with_padding_bottom(4.0)
-            .finish();
-        EventHandler::new(content)
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(action.clone());
-                DispatchEventResult::StopPropagation
-            })
-            .finish()
-    }
 
     #[allow(clippy::too_many_arguments)]
     /// A left-tree row. `caret` = Some(expanded) draws a disclosure chevron;
@@ -9051,52 +9029,223 @@ impl CraneShellView {
     }
 
     fn top_bar(&self) -> Box<dyn Element> {
-        let crumb = Container::new(
-            Text::new(self.breadcrumb(), self.ui_font, 12.0)
-                .with_color(theme::text_muted())
-                .finish(),
-        )
-        .with_padding_left(6.0)
-        .with_padding_top(9.0)
-        .finish();
-
-        // Theme-cycle button: shows the active theme name; click advances to
-        // the next theme in alphabetical order from load_all().
-        let current_name = crate::theme::current().name;
-        let next_theme = {
-            let all = crate::theme::load_all();
-            let pos = all.iter().position(|t| t.name == current_name);
-            let next_pos = pos.map(|p| (p + 1) % all.len()).unwrap_or(0);
-            all.into_iter().nth(next_pos).map(|t| t.name).unwrap_or_default()
-        };
-        let theme_btn = self.pill_button(
-            icons::PAINT_BRUSH,
-            &current_name,
-            CraneShellAction::SetTheme(next_theme),
-        );
-
         let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(Self::spacer(80.0)) // macOS traffic-light inset
             .with_child(self.icon_button("tb-left", icons::SIDEBAR, CraneShellAction::ToggleLeft))
-            .with_child(crumb)
+            .with_child(Self::spacer(6.0))
+            .with_child(self.breadcrumb_capsule())
             .with_child(Expanded::new(1.0, ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish()).finish())
-            .with_child(self.pill_button(
-                icons::TERMINAL_WINDOW,
-                "Terminal",
-                CraneShellAction::SplitFocused(Dir::Horizontal),
-            ))
-            .with_child(Self::spacer(6.0))
-            .with_child(self.pill_button(icons::GLOBE, "Browser", CraneShellAction::OpenBrowser))
-            .with_child(Self::spacer(6.0))
-            .with_child(theme_btn)
+            .with_child(self.new_pane_button())
             .with_child(Self::spacer(8.0))
             .with_child(self.icon_button("tb-gitlog", icons::GIT_BRANCH, CraneShellAction::OpenGitLog))
             .with_child(self.icon_button("tb-right", icons::SIDEBAR, CraneShellAction::ToggleRight))
             .with_child(Self::spacer(8.0))
             .finish();
-        ConstrainedBox::new(self.panel(theme::topbar_bg(), row))
+        // Top-lit sheen: a 1px white-a10 rect pinned to the bar's top edge
+        // (the scene graph has no gradient primitive), over the flat topbar_bg.
+        let sheen = Flex::column()
+            .with_child(
+                ConstrainedBox::new(
+                    Rect::new().with_background_color(theme::topbar_sheen()).finish(),
+                )
+                .with_height(1.0)
+                .finish(),
+            )
+            .finish();
+        let stacked = Stack::new()
+            .with_child(Rect::new().with_background_color(theme::topbar_bg()).finish())
+            .with_child(sheen)
+            .with_child(row)
+            .finish();
+        ConstrainedBox::new(stacked)
             .with_height(theme::TOPBAR_H)
             .finish()
+    }
+
+    /// The top-bar breadcrumb capsule: a rounded 24px pill showing the active
+    /// project (CUBE + name) and, when the project is a git repo, its branch
+    /// (accent GIT_BRANCH + name). Hover tints the border with `accent_soft()`
+    /// and clicking opens the Switch Branch modal. A loose project (no git)
+    /// shows its name only and is inert.
+    fn breadcrumb_capsule(&self) -> Box<dyn Element> {
+        let (pi, wi, _ti) = self.selected;
+        let project = self.projects.get(pi);
+        let is_loose = project.map(|p| p.is_loose).unwrap_or(false);
+        let proj_name = project.map(|p| p.name.clone()).unwrap_or_else(|| "Crane".to_string());
+        let branch = if is_loose {
+            None
+        } else {
+            project.and_then(|p| p.worktrees.get(wi)).map(|w| w.name.clone())
+        };
+        let has_branch = branch.is_some();
+        let ui_font = self.ui_font;
+        let icon_font = self.icon_font;
+        let state = self.hover_handle("topbar:crumb");
+        let capsule = Hoverable::new(state, move |ms| {
+            let hovered = ms.is_hovered();
+            let border_color = if has_branch && hovered {
+                theme::accent_soft()
+            } else {
+                theme::border()
+            };
+            let mut inner = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Container::new(
+                        Text::new(icons::CUBE.to_string(), icon_font, 11.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    )
+                    .with_padding_right(5.0)
+                    .finish(),
+                )
+                .with_child(
+                    Text::new(proj_name.clone(), ui_font, 11.0)
+                        .with_color(theme::text())
+                        .finish(),
+                );
+            if let Some(b) = &branch {
+                inner = inner
+                    .with_child(
+                        Container::new(
+                            Text::new(icons::GIT_BRANCH.to_string(), icon_font, 11.0)
+                                .with_color(theme::accent())
+                                .finish(),
+                        )
+                        .with_padding_left(8.0)
+                        .with_padding_right(5.0)
+                        .finish(),
+                    )
+                    .with_child(
+                        Text::new(b.clone(), ui_font, 11.0)
+                            .with_color(theme::text_hover())
+                            .finish(),
+                    );
+            }
+            ConstrainedBox::new(
+                Container::new(inner.finish())
+                    .with_background_color(theme::sidebar_bg())
+                    .with_border(Border::all(1.0).with_border_color(border_color))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.0)))
+                    .with_padding_left(10.0)
+                    .with_padding_right(10.0)
+                    .finish(),
+            )
+            .with_height(24.0)
+            .finish()
+        });
+        // A loose project's capsule is inert — no click target, no pointer cursor.
+        if has_branch {
+            capsule
+                .with_cursor(Cursor::PointingHand)
+                .on_mouse_down(|ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::OpenSwitchBranch);
+                })
+                .finish()
+        } else {
+            capsule.finish()
+        }
+    }
+
+    /// The ＋ New Pane button: a bordered 24px pill (PLUS + label + CARET_DOWN)
+    /// that toggles the New Pane dropdown.
+    fn new_pane_button(&self) -> Box<dyn Element> {
+        let state = self.hover_handle("topbar:newpane");
+        let ui_font = self.ui_font;
+        let icon_font = self.icon_font;
+        Hoverable::new(state, move |ms| {
+            let hovered = ms.is_hovered();
+            let bg = if hovered { theme::selection_wash() } else { theme::sidebar_bg() };
+            let inner = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Container::new(
+                        Text::new(icons::PLUS.to_string(), icon_font, 11.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    )
+                    .with_padding_right(5.0)
+                    .finish(),
+                )
+                .with_child(
+                    Text::new("New Pane".to_string(), ui_font, 11.0)
+                        .with_color(theme::text())
+                        .finish(),
+                )
+                .with_child(
+                    Container::new(
+                        Text::new(icons::CARET_DOWN.to_string(), icon_font, 9.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    )
+                    .with_padding_left(6.0)
+                    .finish(),
+                )
+                .finish();
+            ConstrainedBox::new(
+                Container::new(inner)
+                    .with_background_color(bg)
+                    .with_border(Border::all(1.0).with_border_color(theme::border()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
+                    .with_padding_left(10.0)
+                    .with_padding_right(10.0)
+                    .finish(),
+            )
+            .with_height(24.0)
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(|ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::ToggleNewPaneMenu);
+        })
+        .finish()
+    }
+
+    /// The ＋ New Pane dropdown contents, rendered through the shared
+    /// `menu_popover` overlay chrome so it dismisses like any context menu.
+    fn new_pane_menu_overlay(&self, x: f32, y: f32) -> Box<dyn Element> {
+        let items = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.menu_item_hint(
+                icons::TERMINAL_WINDOW,
+                "Terminal",
+                Some("⌘T"),
+                false,
+                CraneShellAction::SplitFocused(Dir::Horizontal),
+            ))
+            .with_child(self.menu_item_hint(
+                icons::GLOBE,
+                "Browser",
+                None,
+                false,
+                CraneShellAction::OpenBrowser,
+            ))
+            .with_child(self.menu_item_hint(
+                icons::FILE,
+                "File…",
+                Some("⌘O"),
+                false,
+                CraneShellAction::OpenExternalFile,
+            ))
+            .with_child(self.menu_separator())
+            .with_child(self.menu_label("SPLIT"))
+            .with_child(self.menu_item_hint(
+                icons::ARROW_RIGHT,
+                "Split right",
+                Some("⌘D"),
+                false,
+                CraneShellAction::SplitFocused(Dir::Horizontal),
+            ))
+            .with_child(self.menu_item_hint(
+                icons::ARROW_DOWN,
+                "Split down",
+                Some("⌘⇧D"),
+                false,
+                CraneShellAction::SplitFocused(Dir::Vertical),
+            ))
+            .finish();
+        self.menu_popover(items, x, y)
     }
 
     fn status_bar(&self, app: &AppContext) -> Box<dyn Element> {
@@ -11539,6 +11688,14 @@ impl View for CraneShellView {
         if let Some((group, x, y)) = &self.folder_menu {
             root_stack = root_stack.with_child(self.folder_menu_overlay(group, *x, *y));
         }
+        // The ＋ New Pane dropdown, anchored under the top-bar button. The button
+        // rect isn't exposed here, so anchor a fixed offset in from the right edge
+        // (menu is 220px wide); `menu_popover`'s Popover clamps it on-screen.
+        if self.new_pane_menu_open {
+            let (win_w, _win_h) = self.window_size(app);
+            let x = if win_w > 0.0 { (win_w - 220.0 - 8.0).max(8.0) } else { 8.0 };
+            root_stack = root_stack.with_child(self.new_pane_menu_overlay(x, theme::TOPBAR_H));
+        }
         // Sidebar drag: 2px accent drop-line at the gap nearest the cursor.
         if let Some(line) = self.tree_drop_line_overlay() {
             root_stack = root_stack.with_child(line);
@@ -12090,6 +12247,8 @@ pub enum CraneShellAction {
     },
     /// Dismiss the active project context menu.
     CloseContextMenu,
+    /// Toggle the top-bar ＋ New Pane dropdown open/closed.
+    ToggleNewPaneMenu,
     /// Reveal the project folder in the system file manager.
     RevealProjectInFinder(usize),
     /// Copy the project path to the clipboard.
@@ -13566,6 +13725,10 @@ impl CraneShellView {
                 self.folder_menu = None;
                 self.git_log_menu = None;
                 self.git_log_branch_prompt = None;
+                self.new_pane_menu_open = false;
+            }
+            CraneShellAction::ToggleNewPaneMenu => {
+                self.new_pane_menu_open = !self.new_pane_menu_open;
             }
             CraneShellAction::RevealProjectInFinder(i) => {
                 self.context_menu = None;
