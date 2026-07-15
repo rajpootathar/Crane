@@ -4144,6 +4144,7 @@ impl CraneShellView {
             ("Cmd+O", "Open external file"),
             ("Cmd+Shift+O", "Add project folder"),
             ("Cmd+T", "Split active pane with a terminal"),
+            ("Cmd+Shift+U", "Split active pane with a browser"),
             ("Cmd+Shift+T", "New tab in active workspace"),
             ("Cmd+D", "Split pane side-by-side"),
             ("Cmd+Shift+D", "Split pane stacked"),
@@ -4691,6 +4692,7 @@ impl CraneShellView {
     fn settings_shortcuts(&self) -> Box<dyn Element> {
         const ROWS: &[(&str, &str)] = &[
             ("Cmd+T", "Split active Pane with new terminal"),
+            ("Cmd+Shift+U", "Split active pane with a browser"),
             ("Cmd+Shift+T", "New Tab in active Workspace"),
             ("Cmd+D / Cmd+Shift+D", "Split Pane side-by-side / stacked"),
             ("Cmd+W / Cmd+Shift+W", "Close focused Pane / active Tab"),
@@ -9277,7 +9279,7 @@ impl CraneShellView {
             .with_child(self.menu_item_hint(
                 icons::GLOBE,
                 "Browser",
-                None,
+                Some("⌘⇧U"),
                 false,
                 CraneShellAction::OpenBrowser,
             ))
@@ -12141,6 +12143,10 @@ impl View for CraneShellView {
                         // an external file (file picker). Matches old shortcuts.rs.
                         "o" if ks.shift => Some(CraneShellAction::AddProject),
                         "o" => Some(CraneShellAction::OpenExternalFile),
+                        // Cmd+Shift+U opens a Browser pane. Cmd+Shift+B is already
+                        // Switch Branch, so U is the free chord (mirrors the T/D
+                        // shift-checked-first pattern; "u" has no plain-Cmd arm).
+                        "u" if ks.shift => Some(CraneShellAction::OpenBrowser),
                         // Cmd+[ / Cmd+] cycle focus across panes in the active tab.
                         "[" => Some(CraneShellAction::FocusPrevPane),
                         "]" => Some(CraneShellAction::FocusNextPane),
