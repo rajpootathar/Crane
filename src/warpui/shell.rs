@@ -128,6 +128,17 @@ enum RowMenu {
     File { path: PathBuf, is_dir: bool, x: f32, y: f32 },
 }
 
+/// Visual tier of a Left-Panel row. `Selected` = the single active leaf (the
+/// selected tab, or its deepest visible ancestor when the leaf is collapsed
+/// out of view); `Ancestor` = the project/workspace chain that contains the
+/// selection (context, not selection); `Plain` = everything else.
+#[derive(Clone, Copy, PartialEq)]
+enum RowTier {
+    Plain,
+    Ancestor,
+    Selected,
+}
+
 /// Inline "new file / new folder" editor pending in the Files tree. Text is
 /// entered via the same keystroke route as the commit box (`SendKeys` →
 /// `edit_new_entry`). Ported from old egui `PendingNewEntry`.
@@ -2738,22 +2749,6 @@ impl CraneShellView {
                 if self.active_tab.is_none() {
                     self.refresh_panel(ctx);
                 }
-    }
-
-    /// A 2px-wide accent vertical bar pinned to the left edge of a row, inset
-    /// ~3px vertically. Layered ON TOP of the `row_active()` bg for the active /
-    /// selected branch of a nav row — mirrors old egui `draw_row`'s `active_bar`
-    /// (`Rect x+4, y+3, w=2, h=row_h-6`, accent).
-    fn active_bar(&self, row_h: f32) -> Box<dyn Element> {
-        Container::new(
-            ConstrainedBox::new(Rect::new().with_background_color(theme::accent()).finish())
-                .with_width(2.0)
-                .with_height((row_h - 6.0).max(0.0))
-                .finish(),
-        )
-        .with_padding_left(4.0)
-        .with_padding_top(3.0)
-        .finish()
     }
 
     /// A single row inside the context menu (icon + label). Dispatches
@@ -7093,12 +7088,12 @@ impl CraneShellView {
         selected: bool,
         action: CraneShellAction,
     ) -> Box<dyn Element> {
-        let row_h = size + 8.0;
-        let mut bg = Rect::new();
-        if selected {
-            bg = bg.with_background_color(theme::row_active());
-        }
-        let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
+        // Row chrome (background wash + selection highlight) is now supplied by
+        // `row_shell`; the row itself only lays out its content over a 24px-tall
+        // transparent hit surface. `selected` no longer paints a bg here.
+        let _ = selected;
+        let row_h = 24.0;
+        let bg_layer = ConstrainedBox::new(Rect::new().finish()).with_height(row_h).finish();
 
         let mut label_inner = Flex::row();
         if let Some(expanded) = caret {
@@ -7131,11 +7126,11 @@ impl CraneShellView {
         let hit_layer = ConstrainedBox::new(Rect::new().finish())
             .with_height(row_h)
             .finish();
-        let mut row = Stack::new().with_child(bg_layer);
-        if selected {
-            row = row.with_child(self.active_bar(row_h));
-        }
-        let row = row.with_child(label).with_child(hit_layer).finish();
+        let row = Stack::new()
+            .with_child(bg_layer)
+            .with_child(label)
+            .with_child(hit_layer)
+            .finish();
 
         EventHandler::new(row)
             .on_left_mouse_down(move |ctx, _app, _pos| {
@@ -7163,12 +7158,11 @@ impl CraneShellView {
         plus_action: Option<CraneShellAction>,
     ) -> Box<dyn Element> {
         let size = 12.0_f32;
-        let row_h = size + 8.0;
-        let mut bg = Rect::new();
-        if selected {
-            bg = bg.with_background_color(theme::row_active());
-        }
-        let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
+        // Row chrome (background wash + selection highlight) is supplied by
+        // `row_shell`; `selected` no longer paints a bg here.
+        let _ = selected;
+        let row_h = 24.0;
+        let bg_layer = ConstrainedBox::new(Rect::new().finish()).with_height(row_h).finish();
 
         let caret_glyph = if expanded {
             icons::CARET_DOWN
@@ -7273,11 +7267,11 @@ impl CraneShellView {
         let hit_layer = ConstrainedBox::new(Rect::new().finish())
             .with_height(row_h)
             .finish();
-        let mut stack = Stack::new().with_child(bg_layer);
-        if selected {
-            stack = stack.with_child(self.active_bar(row_h));
-        }
-        let stack = stack.with_child(label).with_child(hit_layer).finish();
+        let stack = Stack::new()
+            .with_child(bg_layer)
+            .with_child(label)
+            .with_child(hit_layer)
+            .finish();
         let base = EventHandler::new(stack)
             .on_left_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(action.clone());
@@ -7370,12 +7364,11 @@ impl CraneShellView {
         close_action: CraneShellAction,
     ) -> Box<dyn Element> {
         let size = 11.0_f32;
-        let row_h = size + 8.0;
-        let mut bg = Rect::new();
-        if selected {
-            bg = bg.with_background_color(theme::row_active());
-        }
-        let bg_layer = ConstrainedBox::new(bg.finish()).with_height(row_h).finish();
+        // Row chrome (background wash + selection highlight) is supplied by
+        // `row_shell`; `selected` no longer paints a bg here.
+        let _ = selected;
+        let row_h = 24.0;
+        let bg_layer = ConstrainedBox::new(Rect::new().finish()).with_height(row_h).finish();
 
         // Label: icon + text (no caret for tab leaves). While renaming, the text
         // becomes an editable field (buffer + caret) on a highlighted bg.
@@ -7425,19 +7418,16 @@ impl CraneShellView {
 
         // Compose inside a Hoverable: the × only joins the row while the
         // pointer is over it (old Crane's hover-revealed affordance).
-        let active_bar: Option<Box<dyn Element>> =
-            selected.then(|| self.active_bar(row_h));
         let state = self.hover_handle(&hover_key);
         Box::new(Hoverable::new(state, move |ms| {
             let mut row = Flex::row().with_child(Expanded::new(1.0, label).finish());
             if ms.is_hovered() {
                 row = row.with_child(close_btn);
             }
-            let mut stack = Stack::new().with_child(bg_layer);
-            if let Some(bar) = active_bar {
-                stack = stack.with_child(bar);
-            }
-            let stack = stack.with_child(row.finish()).finish();
+            let stack = Stack::new()
+                .with_child(bg_layer)
+                .with_child(row.finish())
+                .finish();
             EventHandler::new(stack)
                 .on_left_mouse_down(move |ctx, _app, _pos| {
                     ctx.dispatch_typed_action(select_action.clone());
@@ -7485,6 +7475,32 @@ impl CraneShellView {
         .finish()
     }
 
+    /// Shared Left-Panel row chrome: a rounded highlight with 4px side margins
+    /// that washes on hover and stays lit for the selection tier. The pre-built
+    /// row `inner` (with its own click / right-click handlers and hover-revealed
+    /// overlays) is wrapped directly by a single `Hoverable` — the same outer
+    /// idiom as `menu_item` / `trailing_plus_overlay`, so hover is detected
+    /// reliably regardless of the enclosing Stack's event-dispatch mode. The
+    /// closure runs once per frame-rebuild, reading the live hover state.
+    fn row_shell(&self, key: &str, tier: RowTier, inner: Box<dyn Element>) -> Box<dyn Element> {
+        let state = self.hover_handle(&format!("lrow:{key}"));
+        Hoverable::new(state, move |ms| {
+            let bg = match (tier, ms.is_hovered()) {
+                (RowTier::Selected, _) => theme::selection_wash(),
+                (_, true) => theme::hover_wash(),
+                (RowTier::Ancestor, false) => theme::context_wash(),
+                (RowTier::Plain, false) => ColorU::new(0, 0, 0, 0),
+            };
+            Container::new(inner)
+                .with_background_color(bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_margin_left(4.0)
+                .with_margin_right(4.0)
+                .finish()
+        })
+        .finish()
+    }
+
     fn divider(&self) -> Box<dyn Element> {
         ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
             .with_width(1.0)
@@ -7492,14 +7508,32 @@ impl CraneShellView {
     }
 
     fn left_sidebar(&self, app: &AppContext) -> Box<dyn Element> {
-        // Header row: just the "PROJECTS" label. The Add Project affordance is a
-        // prominent accent pill pinned at the bottom of the panel (below).
+        // Header row: "PROJECTS" label with a trailing ＋ that opens Add Project
+        // (mirrors the quiet footer row below). The Expanded spacer pushes the
+        // button to the far right edge.
         let header_row = Container::new(
-            Text::new("PROJECTS", self.ui_font, 11.0)
-                .with_color(theme::text_header())
+            Flex::row()
+                .with_child(
+                    Text::new("PROJECTS", self.ui_font, 11.0)
+                        .with_color(theme::text_header())
+                        .finish(),
+                )
+                .with_child(
+                    Expanded::new(
+                        1.0,
+                        Container::new(Text::new("", self.ui_font, 11.0).finish()).finish(),
+                    )
+                    .finish(),
+                )
+                .with_child(self.icon_button(
+                    "projects-add",
+                    icons::FOLDER_PLUS,
+                    CraneShellAction::AddProject,
+                ))
                 .finish(),
         )
         .with_padding_left(8.0)
+        .with_padding_right(6.0)
         .with_padding_top(8.0)
         .with_padding_bottom(8.0)
         .finish();
@@ -7571,6 +7605,10 @@ impl CraneShellView {
                     false,
                     CraneShellAction::ToggleGroup(gp.clone()),
                 );
+                // Container-folder headers are not part of the selection chain, so
+                // they take the `Plain` tier (hover-only wash); their own group
+                // tint still colours the folder glyph + label above.
+                let folder_base = self.row_shell(&format!("group:{gp}"), RowTier::Plain, folder_base);
                 // Right-click the header → folder-group context menu (tint /
                 // remove whole group). Left-click still toggles collapse.
                 let gp_menu = gp.clone();
@@ -7609,24 +7647,36 @@ impl CraneShellView {
             // from `active_tab` — like the worktree row's `w_active` — is what
             // actually lights the row up). Mirrors old egui's active-project tint.
             let psel = self.active_tab.map(|(api, _, _)| api == pi).unwrap_or(false);
+            // Two-tier selection: the project is `Selected` only when it is the
+            // selection's chain root AND collapsed (so it is the deepest visible
+            // row); when expanded it is an `Ancestor` (context) of the selected
+            // tab below it. Everything else is `Plain`.
+            let p_tier = match self.active_tab {
+                Some((api, _, _)) if api == pi => {
+                    if p_expanded { RowTier::Ancestor } else { RowTier::Selected }
+                }
+                _ => RowTier::Plain,
+            };
             let tint = self.project_color_for(pi);
-            // Feature 3: when the user has set an explicit tint, also apply it to the
-            // project name text (not just the CUBE icon). Fall back to the normal
-            // text color when no explicit tint is set, mirroring old egui projects.rs.
-            let has_explicit_tint = self.projects.get(pi).and_then(|p| p.tint).is_some();
-            let pcol = if psel {
+            // Label follows the tier; a `Selected` row also brightens its icon,
+            // while `Ancestor`/`Plain` rows keep any explicit project tint on the
+            // icon (the coloured CUBE stays recognisable in the chain).
+            let pcol = match p_tier {
+                RowTier::Selected => theme::text_hover(),
+                RowTier::Ancestor => theme::text(),
+                RowTier::Plain => theme::text_muted(),
+            };
+            let picon = if p_tier == RowTier::Selected {
                 theme::text_hover()
-            } else if has_explicit_tint {
-                tint
             } else {
-                theme::text()
+                tint
             };
             // Loose projects (non-git folders) use a FOLDER icon; git projects use CUBE.
             let project_icon = if p.is_loose { icons::FOLDER } else { icons::CUBE };
             let base_row = self.nav_row(
                 Some(p_expanded),
                 project_icon,
-                tint,
+                picon,
                 &p.name,
                 13.0,
                 pcol,
@@ -7634,6 +7684,7 @@ impl CraneShellView {
                 psel,
                 CraneShellAction::ToggleProject(pi),
             );
+            let base_row = self.row_shell(&format!("proj:{pi}"), p_tier, base_row);
             // Wrap in a second EventHandler to capture right-click for the
             // context menu without interfering with the left-click toggle.
             let project_row = EventHandler::new(base_row)
@@ -7701,11 +7752,18 @@ impl CraneShellView {
                         for t in tabs {
                             let tkey = (pi, wi, t.id);
                             let tsel = sel == tkey;
+                            // A tab is a leaf: it is either the `Selected` row or
+                            // `Plain`. Selection follows the active tab.
+                            let t_tier = if self.active_tab == Some(tkey) {
+                                RowTier::Selected
+                            } else {
+                                RowTier::Plain
+                            };
                             let tab_tint = self.tab_tints.get(&(w.path.clone(), t.id)).copied();
-                            let tcol = if let Some([r, g, b]) = tab_tint {
-                                ColorU::new(r, g, b, 255)
-                            } else if tsel {
+                            let tcol = if t_tier == RowTier::Selected {
                                 theme::text_hover()
+                            } else if let Some([r, g, b]) = tab_tint {
+                                ColorU::new(r, g, b, 255)
                             } else {
                                 theme::text_muted()
                             };
@@ -7727,6 +7785,8 @@ impl CraneShellView {
                                 select,
                                 CraneShellAction::CloseTab(tkey),
                             );
+                            let tab_base =
+                                self.row_shell(&format!("term:{pi}:{wi}:{}", t.id), t_tier, tab_base);
                             let tab_row = self.tab_right_click(tab_base, tkey);
                             col = col.with_child(self.tree_zone(
                                 TreeScope::Tab {
@@ -7756,16 +7816,29 @@ impl CraneShellView {
                     .map(|(api, awi, _)| api == pi && awi == wi)
                     .unwrap_or(false);
                 let wsel = sel == (pi, wi, usize::MAX) || w_active;
-                // Tint priority: explicit per-worktree tint wins over the
-                // active-branch accent so a user-tinted active worktree shows its
-                // tint (icon + name), not the accent.
-                let wt_tint = self.worktree_tints.get(&w.path).copied();
-                let wcol = if let Some([r, g, b]) = wt_tint {
-                    ColorU::new(r, g, b, 255)
-                } else if wsel {
-                    theme::accent()
+                // Two-tier: the workspace is `Selected` only when it hosts the
+                // active tab AND is collapsed (deepest visible row); expanded it
+                // is an `Ancestor` of the selected tab below. Else `Plain`.
+                let w_tier = if w_active {
+                    if w_expanded { RowTier::Ancestor } else { RowTier::Selected }
                 } else {
-                    theme::text_muted()
+                    RowTier::Plain
+                };
+                // Tint priority: explicit per-worktree tint keeps colouring the
+                // icon in the `Ancestor`/`Plain` tiers; the `Selected` row brightens
+                // both icon and label to `text_hover`.
+                let wt_tint = self.worktree_tints.get(&w.path).copied();
+                let wcol = match w_tier {
+                    RowTier::Selected => theme::text_hover(),
+                    RowTier::Ancestor => theme::text(),
+                    RowTier::Plain => theme::text_muted(),
+                };
+                let wicon = if w_tier == RowTier::Selected {
+                    theme::text_hover()
+                } else if let Some([r, g, b]) = wt_tint {
+                    ColorU::new(r, g, b, 255)
+                } else {
+                    wcol
                 };
                 // Display-name override (per-path) wins over the branch name.
                 let display = self
@@ -7785,7 +7858,7 @@ impl CraneShellView {
                 let wt_base = self.worktree_nav_row(
                     w_expanded,
                     &display,
-                    wcol,
+                    wicon,
                     wcol,
                     wsel,
                     w.diff_stat,
@@ -7795,6 +7868,7 @@ impl CraneShellView {
                     wt_action,
                     Some(CraneShellAction::NewTabIn(pi, wi)),
                 );
+                let wt_base = self.row_shell(&format!("wt:{pi}:{wi}"), w_tier, wt_base);
                 // Right-click opens the worktree/branch context menu (mirrors the
                 // project row) without disturbing the left-click toggle.
                 let wt_row = EventHandler::new(wt_base)
@@ -7831,11 +7905,18 @@ impl CraneShellView {
                     for t in tabs {
                         let tkey = (pi, wi, t.id);
                         let tsel = sel == tkey;
+                        // Leaf tab row: `Selected` when it is the active tab, else
+                        // `Plain`.
+                        let t_tier = if self.active_tab == Some(tkey) {
+                            RowTier::Selected
+                        } else {
+                            RowTier::Plain
+                        };
                         let tab_tint = self.tab_tints.get(&(w.path.clone(), t.id)).copied();
-                        let tcol = if let Some([r, g, b]) = tab_tint {
-                            ColorU::new(r, g, b, 255)
-                        } else if tsel {
+                        let tcol = if t_tier == RowTier::Selected {
                             theme::text_hover()
+                        } else if let Some([r, g, b]) = tab_tint {
+                            ColorU::new(r, g, b, 255)
                         } else {
                             theme::text_muted()
                         };
@@ -7873,6 +7954,8 @@ impl CraneShellView {
                             select,
                             CraneShellAction::CloseTab(tkey),
                         );
+                        let tab_base =
+                            self.row_shell(&format!("term:{pi}:{wi}:{}", t.id), t_tier, tab_base);
                         // Feature B: the leaf Tab row carries its own attention
                         // pulse directly (cleared when the user opens the tab).
                         let tab_row = self.tab_right_click(tab_base, tkey);
@@ -7895,55 +7978,68 @@ impl CraneShellView {
                 }
             }
         }
-        // Prominent "Add Project" pill, pinned at the bottom: accent border +
-        // accent icon on a surface bg so it stands out from the dark sidebar.
-        let add_inner = Flex::row()
-            .with_child(self.icon(icons::FOLDER_PLUS, 13.0, theme::accent()))
-            .with_child(
-                Container::new(
-                    Text::new("Add Project", self.ui_font, 12.0)
-                        .with_color(theme::text())
-                        .finish(),
-                )
-                .with_padding_left(8.0)
-                .finish(),
-            )
-            .with_child(
-                Expanded::new(
-                    1.0,
-                    Container::new(Text::new("", self.ui_font, 12.0).finish()).finish(),
-                )
-                .finish(),
-            )
-            .finish();
-        let add_pill = EventHandler::new(
+        // Quiet "Add Project" footer, pinned at the bottom: a 1px divider on top
+        // then a low-key PLUS + label that washes on hover — no boxed accent
+        // pill. Same dispatch action as the header ＋.
+        let icon_font = self.icon_font;
+        let ui_font = self.ui_font;
+        let add_state = self.hover_handle("footer-add-project");
+        let add_body = Hoverable::new(add_state, move |ms| {
+            let fg = if ms.is_hovered() {
+                theme::text_hover()
+            } else {
+                theme::text_muted()
+            };
+            let bg = if ms.is_hovered() {
+                theme::hover_wash()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            };
             Container::new(
-                Container::new(add_inner)
-                    .with_background_color(theme::surface())
-                    .with_border(Border::all(1.0).with_border_color(theme::accent()))
-                    .with_padding_left(10.0)
-                    .with_padding_right(10.0)
-                    .with_padding_top(8.0)
-                    .with_padding_bottom(8.0)
+                Flex::row()
+                    .with_child(
+                        Container::new(
+                            Text::new(icons::PLUS.to_string(), icon_font, 11.0)
+                                .with_color(fg)
+                                .finish(),
+                        )
+                        .with_padding_right(6.0)
+                        .finish(),
+                    )
+                    .with_child(
+                        Text::new("Add Project", ui_font, 11.0)
+                            .with_color(fg)
+                            .finish(),
+                    )
                     .finish(),
             )
+            .with_background_color(bg)
             .with_padding_left(8.0)
-            .with_padding_right(8.0)
-            .with_padding_top(6.0)
-            .with_padding_bottom(8.0)
-            .finish(),
-        )
-        .on_left_mouse_down(|ctx, _, _| {
+            .with_padding_top(7.0)
+            .with_padding_bottom(7.0)
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(|ctx, _, _| {
             ctx.dispatch_typed_action(CraneShellAction::AddProject);
-            DispatchEventResult::StopPropagation
         })
         .finish();
+        let add_footer = Flex::column()
+            .with_child(
+                ConstrainedBox::new(
+                    Rect::new().with_background_color(theme::divider()).finish(),
+                )
+                .with_height(1.0)
+                .finish(),
+            )
+            .with_child(add_body)
+            .finish();
 
-        // Header, then the project list (fills), then the pinned Add Project pill.
+        // Header, then the project list (fills), then the quiet Add Project footer.
         let outer = Flex::column()
             .with_child(header_row)
             .with_child(Expanded::new(1.0, col.finish()).finish())
-            .with_child(add_pill)
+            .with_child(add_footer)
             .finish();
         // No fixed width — the enclosing SplitBox sizes it (draggable).
         self.panel(theme::sidebar_bg(), outer)
