@@ -9198,7 +9198,6 @@ impl CraneShellView {
 
     /// Pane header: title (click to focus) + expand-to-full + close.
     fn pane_header(&self, id: PaneId, app: &AppContext) -> Box<dyn Element> {
-        const H: f32 = 26.0;
         let focused = self.focused == Some(id);
         let bg = if focused { theme::surface() } else { theme::topbar_bg() };
         // Selected pane's heading is painted in the accent — the same colour that
@@ -9246,8 +9245,8 @@ impl CraneShellView {
                     .with_background_color(tbg)
                     .with_padding_left(if dirty { 2.0 } else { 10.0 })
                     .with_padding_right(4.0)
-                    .with_padding_top(6.0)
-                    .with_padding_bottom(6.0)
+                    .with_padding_top(4.0)
+                    .with_padding_bottom(4.0)
                     .finish(),
                 )
                 .on_left_mouse_down(move |ctx, _app, _pos| {
@@ -9259,8 +9258,8 @@ impl CraneShellView {
                     Container::new(self.icon(icons::X, 10.0, theme::text_muted()))
                         .with_background_color(tbg)
                         .with_padding_right(8.0)
-                        .with_padding_top(6.0)
-                        .with_padding_bottom(6.0)
+                        .with_padding_top(4.0)
+                        .with_padding_bottom(4.0)
                         .finish(),
                 )
                 .on_left_mouse_down(move |ctx, _app, _pos| {
@@ -9301,7 +9300,7 @@ impl CraneShellView {
                         .finish(),
                 )
                 .with_padding_left(8.0)
-                .with_padding_top(6.0)
+                .with_padding_top(4.0)
                 .finish(),
             )
             .on_left_mouse_down(move |ctx, _app, _pos| {
@@ -9312,22 +9311,42 @@ impl CraneShellView {
         };
 
         // The Expanded title fills the row, pushing these to the right edge.
-        let buttons = Flex::row()
-            .with_child(self.icon_button(&format!("pane-max:{id}"), icons::ARROWS_OUT, CraneShellAction::ToggleMaximize(id)))
-            .with_child(self.icon_button(&format!("pane-close:{id}"), icons::X, CraneShellAction::ClosePane(id)))
-            .finish();
+        let buttons = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(self.icon_button(&format!("pane-max:{id}"), icons::ARROWS_OUT, CraneShellAction::ToggleMaximize(id)))
+                .with_child(Self::spacer(2.0))
+                .with_child(self.icon_button(&format!("pane-close:{id}"), icons::X, CraneShellAction::ClosePane(id)))
+                .finish(),
+        )
+        .with_padding_right(4.0)
+        .with_padding_top(2.0)
+        .finish();
 
         let row = Flex::row()
             .with_child(Expanded::new(1.0, title).finish())
             .with_child(buttons)
             .finish();
         ConstrainedBox::new(
-            Stack::new()
-                .with_child(Rect::new().with_background_color(bg).finish())
-                .with_child(row)
+            Flex::column()
+                .with_child(
+                    Expanded::new(
+                        1.0,
+                        Stack::new()
+                            .with_child(Rect::new().with_background_color(bg).finish())
+                            .with_child(row)
+                            .finish(),
+                    )
+                    .finish(),
+                )
+                .with_child(
+                    ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
+                        .with_height(1.0)
+                        .finish(),
+                )
                 .finish(),
         )
-        .with_height(H)
+        .with_height(theme::HEADER_H)
         .finish()
     }
 
