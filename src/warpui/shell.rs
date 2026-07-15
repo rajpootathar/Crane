@@ -22,7 +22,8 @@ use warpui::color::ColorU;
 use warpui::elements::{
     Align, Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
     Container, CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, Draggable,
-    DraggableState, Empty, EventHandler, Expanded, Fill, Flex, Hoverable, MouseStateHandle,
+    DraggableState, DropShadow, Empty, EventHandler, Expanded, Fill, Flex, Hoverable,
+    MouseStateHandle,
     ParentElement, Radius, Rect, ScrollbarWidth, Stack, Text,
 };
 use warpui::platform::Cursor;
@@ -2773,25 +2774,59 @@ impl CraneShellView {
         h
     }
 
+    /// Thin wrapper: a plain menu row with no shortcut hint and no danger accent.
     fn menu_item(&self, glyph: &str, label: &str, action: CraneShellAction) -> Box<dyn Element> {
+        self.menu_item_hint(glyph, label, None, false, action)
+    }
+
+    /// A menu row with an optional right-aligned shortcut `hint` and a `danger`
+    /// accent (destructive actions). Hover paints `selection_wash()` with
+    /// `text_hover()` text — or `danger_wash()` with `error()` text when danger.
+    /// Dispatches CloseContextMenu then the real `action` when clicked.
+    fn menu_item_hint(
+        &self,
+        glyph: &str,
+        label: &str,
+        hint: Option<&str>,
+        danger: bool,
+        action: CraneShellAction,
+    ) -> Box<dyn Element> {
         // Key the hover state by the row label. Only one context menu is open at
         // a time and labels are unique within a menu, so this is a stable key.
         let state = self.hover_handle(&format!("mi:{label}"));
         let glyph = glyph.to_string();
         let label = label.to_string();
+        let hint = hint.map(|h| h.to_string());
         let ui_font = self.ui_font;
         let icon_font = self.icon_font;
         Hoverable::new(state, move |ms| {
-            let bg = if ms.is_hovered() {
-                theme::row_hover()
+            let hovered = ms.is_hovered();
+            let bg = if hovered {
+                if danger {
+                    theme::danger_wash()
+                } else {
+                    theme::selection_wash()
+                }
             } else {
                 ColorU::new(0, 0, 0, 0)
             };
-            let row = Flex::row()
+            let text_color = if danger {
+                theme::error()
+            } else if hovered {
+                theme::text_hover()
+            } else {
+                theme::text()
+            };
+            let glyph_color = if danger {
+                theme::error()
+            } else {
+                theme::text_muted()
+            };
+            let mut row = Flex::row()
                 .with_child(
                     Container::new(
                         Text::new(glyph.clone(), icon_font, 12.0)
-                            .with_color(theme::text_muted())
+                            .with_color(glyph_color)
                             .finish(),
                     )
                     .with_padding_right(8.0)
@@ -2799,12 +2834,30 @@ impl CraneShellView {
                 )
                 .with_child(
                     Text::new(label.clone(), ui_font, 12.0)
-                        .with_color(theme::text())
+                        .with_color(text_color)
                         .finish(),
-                )
-                .finish();
-            Container::new(row)
+                );
+            if let Some(h) = &hint {
+                // Expanded spacer pushes the muted hint to the row's right edge.
+                row = row
+                    .with_child(
+                        Expanded::new(
+                            1.0,
+                            ConstrainedBox::new(Rect::new().finish())
+                                .with_height(1.0)
+                                .finish(),
+                        )
+                        .finish(),
+                    )
+                    .with_child(
+                        Text::new(h.clone(), ui_font, 10.0)
+                            .with_color(theme::text_muted())
+                            .finish(),
+                    );
+            }
+            Container::new(row.finish())
                 .with_background_color(bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.0)))
                 .with_padding_left(10.0)
                 .with_padding_right(20.0)
                 .with_padding_top(6.0)
@@ -2816,6 +2869,19 @@ impl CraneShellView {
             ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
             ctx.dispatch_typed_action(action.clone());
         })
+        .finish()
+    }
+
+    /// A small-caps muted section label (e.g. "HIGHLIGHT") for grouping menu rows.
+    fn menu_label(&self, text: &'static str) -> Box<dyn Element> {
+        Container::new(
+            Text::new(text.to_string(), self.ui_font, 10.0)
+                .with_color(theme::text_muted())
+                .finish(),
+        )
+        .with_padding_left(9.0)
+        .with_padding_top(6.0)
+        .with_padding_bottom(3.0)
         .finish()
     }
 
@@ -2831,12 +2897,65 @@ impl CraneShellView {
         .finish()
     }
 
-    /// A single-row palette of 8 coloured tint swatches for a context menu, each
-    /// drawn with `glyph` so the palette echoes what it tints — `GIT_BRANCH` for
-    /// the worktree row, `TERMINAL_WINDOW` for the tab row (the folder-group row
-    /// has its own `folder_tint_palette_row`). `on_pick` maps a chosen RGB to the
-    /// action dispatched (after closing the menu).
-    fn tint_palette_row<F>(&self, glyph: &'static str, on_pick: F) -> Box<dyn Element>
+    /// One circular tint swatch (18×18, radius 9). `color = None` renders the
+    /// hollow "none"/clear swatch (transparent fill, muted border). `active`
+    /// (this tint is the current one) draws a `text_hover()` ring, as does hover;
+    /// a colored swatch at rest has a transparent ring so the row never reflows.
+    /// Dispatches CloseContextMenu then `action` on click.
+    fn tint_swatch(
+        &self,
+        key: &str,
+        color: Option<[u8; 3]>,
+        active: bool,
+        action: CraneShellAction,
+    ) -> Box<dyn Element> {
+        let state = self.hover_handle(key);
+        Hoverable::new(state, move |ms| {
+            let hovered = ms.is_hovered();
+            let bg = match color {
+                Some(rgb) => ColorU::new(rgb[0], rgb[1], rgb[2], 255),
+                None => ColorU::new(0, 0, 0, 0),
+            };
+            let ring = if active || hovered {
+                theme::text_hover()
+            } else if color.is_none() {
+                theme::border()
+            } else {
+                // Transparent ring keeps every swatch a constant 18×18 so the
+                // palette row doesn't jitter when a border appears on hover.
+                ColorU::new(0, 0, 0, 0)
+            };
+            let dot = Container::new(
+                ConstrainedBox::new(Rect::new().finish())
+                    .with_width(18.0)
+                    .with_height(18.0)
+                    .finish(),
+            )
+            .with_background_color(bg)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.0)))
+            .with_border(Border::all(2.0).with_border_color(ring))
+            .finish();
+            Container::new(dot).with_uniform_padding(3.0).finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(move |ctx, _, _| {
+            ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
+            ctx.dispatch_typed_action(action.clone());
+        })
+        .finish()
+    }
+
+    /// A single row of circular tint swatches: a leading hollow "none" swatch
+    /// wired to `clear`, then 8 colored dots. `current` marks the active dot.
+    /// `prefix` keeps hover-state keys distinct per menu. `on_pick` maps a chosen
+    /// RGB to the action dispatched (after closing the menu).
+    fn tint_palette_row<F>(
+        &self,
+        prefix: &str,
+        current: Option<[u8; 3]>,
+        clear: CraneShellAction,
+        on_pick: F,
+    ) -> Box<dyn Element>
     where
         F: Fn([u8; 3]) -> CraneShellAction,
     {
@@ -2850,41 +2969,25 @@ impl CraneShellView {
             [171, 71, 188],
             [236, 64, 122],
         ];
-        let icon_font = self.icon_font;
-        let mut swatches = Flex::row();
+        let mut swatches = Flex::row().with_child(self.tint_swatch(
+            &format!("{prefix}:none"),
+            None,
+            current.is_none(),
+            clear,
+        ));
         for rgb in PALETTE {
-            let color = ColorU::new(rgb[0], rgb[1], rgb[2], 255);
-            let action = on_pick(rgb);
-            let state = self.hover_handle(&format!("sw:{}:{}:{}", rgb[0], rgb[1], rgb[2]));
-            let swatch = Hoverable::new(state, move |ms| {
-                let bg = if ms.is_hovered() {
-                    theme::row_hover()
-                } else {
-                    ColorU::new(0, 0, 0, 0)
-                };
-                Container::new(
-                    Text::new(glyph.to_string(), icon_font, 14.0)
-                        .with_color(color)
-                        .finish(),
-                )
-                .with_background_color(bg)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
-                .with_uniform_padding(4.0)
-                .finish()
-            })
-            .with_cursor(Cursor::PointingHand)
-            .on_mouse_down(move |ctx, _, _| {
-                ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
-                ctx.dispatch_typed_action(action.clone());
-            })
-            .finish();
-            swatches = swatches.with_child(swatch);
+            swatches = swatches.with_child(self.tint_swatch(
+                &format!("{prefix}:{}:{}:{}", rgb[0], rgb[1], rgb[2]),
+                Some(rgb),
+                current == Some(rgb),
+                on_pick(rgb),
+            ));
         }
         Container::new(swatches.finish())
             .with_padding_left(6.0)
             .with_padding_right(6.0)
-            .with_padding_top(4.0)
-            .with_padding_bottom(2.0)
+            .with_padding_top(2.0)
+            .with_padding_bottom(4.0)
             .finish()
     }
 
@@ -2917,59 +3020,15 @@ impl CraneShellView {
             items = items.with_child(self.menu_separator());
         }
 
-        // Tint palette — 8 colored CUBE swatches in a single row.
-        const PALETTE: [(&str, [u8; 3]); 8] = [
-            ("Red",    [239,  83,  80]),
-            ("Orange", [255, 152,   0]),
-            ("Yellow", [255, 202,  40]),
-            ("Green",  [102, 187, 106]),
-            ("Teal",   [ 38, 166, 154]),
-            ("Blue",   [ 66, 165, 245]),
-            ("Purple", [171,  71, 188]),
-            ("Pink",   [236,  64, 122]),
-        ];
-        let icon_font = self.icon_font;
-        let mut swatches = Flex::row();
-        for (_name, rgb) in &PALETTE {
-            let color = ColorU::new(rgb[0], rgb[1], rgb[2], 255);
-            let rgb_copy = *rgb;
-            let state = self.hover_handle(&format!("sw:{}:{}:{}", rgb[0], rgb[1], rgb[2]));
-            let swatch = Hoverable::new(state, move |ms| {
-                let bg = if ms.is_hovered() {
-                    theme::row_hover()
-                } else {
-                    ColorU::new(0, 0, 0, 0)
-                };
-                Container::new(
-                    Text::new(icons::CUBE.to_string(), icon_font, 14.0)
-                        .with_color(color)
-                        .finish(),
-                )
-                .with_background_color(bg)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
-                .with_uniform_padding(4.0)
-                .finish()
-            })
-            .with_cursor(Cursor::PointingHand)
-            .on_mouse_down(move |ctx, _, _| {
-                ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
-                ctx.dispatch_typed_action(CraneShellAction::SetProjectTint(pi, Some(rgb_copy)));
-            })
-            .finish();
-            swatches = swatches.with_child(swatch);
-        }
-        let palette_row = Container::new(swatches.finish())
-            .with_padding_left(6.0)
-            .with_padding_right(6.0)
-            .with_padding_top(4.0)
-            .with_padding_bottom(2.0)
-            .finish();
-        items = items.with_child(palette_row);
-
-        items = items.with_child(self.menu_item(
-            icons::ARROW_COUNTER_CLOCKWISE,
-            "Default color",
+        // Highlight: a leading hollow "none" swatch + 8 circular tint dots,
+        // grouped under a small-caps section label. The current tint is ringed.
+        let current = self.projects.get(pi).and_then(|p| p.tint);
+        items = items.with_child(self.menu_label("HIGHLIGHT"));
+        items = items.with_child(self.tint_palette_row(
+            "psw",
+            current,
             CraneShellAction::SetProjectTint(pi, None),
+            move |rgb| CraneShellAction::SetProjectTint(pi, Some(rgb)),
         ));
         // Atomic-group rule: when this project is one of MULTIPLE members of a
         // folder group, hide its individual "Remove Project" — the group is
@@ -2977,9 +3036,11 @@ impl CraneShellView {
         // member group (or a standalone project) keeps the individual remove.
         if !self.in_multi_group(pi) {
             items = items.with_child(self.menu_separator());
-            items = items.with_child(self.menu_item(
+            items = items.with_child(self.menu_item_hint(
                 icons::TRASH,
                 "Remove Project",
+                None,
+                true,
                 CraneShellAction::RemoveProject(pi),
             ));
         }
@@ -2988,8 +3049,11 @@ impl CraneShellView {
             Container::new(items.finish())
                 .with_background_color(theme::surface())
                 .with_border(Border::all(1.0).with_border_color(theme::border()))
-                .with_padding_top(4.0)
-                .with_padding_bottom(4.0)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.0)))
+                .with_drop_shadow(DropShadow::new_with_standard_offset_and_spread(
+                    theme::menu_shadow(),
+                ))
+                .with_uniform_padding(5.0)
                 .finish(),
         )
         // FIX: fixed 220px width so the menu is a compact popover anchored at
@@ -3013,8 +3077,11 @@ impl CraneShellView {
             Container::new(items)
                 .with_background_color(theme::surface())
                 .with_border(Border::all(1.0).with_border_color(theme::border()))
-                .with_padding_top(4.0)
-                .with_padding_bottom(4.0)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.0)))
+                .with_drop_shadow(DropShadow::new_with_standard_offset_and_spread(
+                    theme::menu_shadow(),
+                ))
+                .with_uniform_padding(5.0)
                 .finish(),
         )
         .with_width(220.0)
@@ -3138,9 +3205,11 @@ impl CraneShellView {
                     CraneShellAction::NewEntry { parent, is_folder: true },
                 ));
                 items = items.with_child(self.menu_separator());
-                items = items.with_child(self.menu_item(
+                items = items.with_child(self.menu_item_hint(
                     icons::TRASH,
                     "Delete",
+                    None,
+                    true,
                     CraneShellAction::RequestDelete(path.clone()),
                 ));
                 self.menu_popover(items.finish(), *x, *y)
@@ -3288,17 +3357,15 @@ impl CraneShellView {
             "Rename",
             CraneShellAction::StartRenameWorktree { pi, wi },
         ));
-        // Highlight: an 8-swatch tint palette + a Default-color reset. Keyed by
-        // the worktree path so it survives index shifts on reload.
-        items = items.with_child(
-            self.tint_palette_row(icons::GIT_BRANCH, move |rgb| {
-                CraneShellAction::SetWorktreeTint { pi, wi, tint: Some(rgb) }
-            }),
-        );
-        items = items.with_child(self.menu_item(
-            icons::ARROW_COUNTER_CLOCKWISE,
-            "Default color",
+        // Highlight: hollow "none" reset + circular tint dots, ringed on the
+        // current tint. Keyed by the worktree path so it survives reload shifts.
+        let current = self.worktree_tints.get(&wt_path).copied();
+        items = items.with_child(self.menu_label("HIGHLIGHT"));
+        items = items.with_child(self.tint_palette_row(
+            "wsw",
+            current,
             CraneShellAction::SetWorktreeTint { pi, wi, tint: None },
+            move |rgb| CraneShellAction::SetWorktreeTint { pi, wi, tint: Some(rgb) },
         ));
         // Remove Worktree runs `git worktree remove --force` after a confirm.
         // The primary working tree can't be detached (the handler would no-op),
@@ -3311,9 +3378,11 @@ impl CraneShellView {
             .unwrap_or(true);
         if !is_main {
             items = items.with_child(self.menu_separator());
-            items = items.with_child(self.menu_item(
+            items = items.with_child(self.menu_item_hint(
                 icons::TRASH,
                 "Remove Worktree",
+                None,
+                true,
                 CraneShellAction::RemoveWorktree { pi, wi },
             ));
         }
@@ -3346,106 +3415,46 @@ impl CraneShellView {
             "Rename",
             CraneShellAction::StartRenameTab { key },
         ));
-        // Highlight: tint palette keyed by (worktree_path, tab_id) + reset.
-        items = items.with_child(
-            self.tint_palette_row(icons::TERMINAL_WINDOW, move |rgb| {
-                CraneShellAction::SetTabTint { key, tint: Some(rgb) }
-            }),
-        );
-        items = items.with_child(self.menu_item(
-            icons::ARROW_COUNTER_CLOCKWISE,
-            "Default color",
+        // Highlight: hollow "none" reset + circular tint dots, keyed by
+        // (worktree_path, tab_id) and ringed on the current tint.
+        let (pi, wi, tid) = key;
+        let current = self
+            .projects
+            .get(pi)
+            .and_then(|p| p.worktrees.get(wi))
+            .and_then(|w| self.tab_tints.get(&(w.path.clone(), tid)).copied());
+        items = items.with_child(self.menu_label("HIGHLIGHT"));
+        items = items.with_child(self.tint_palette_row(
+            "tsw",
+            current,
             CraneShellAction::SetTabTint { key, tint: None },
+            move |rgb| CraneShellAction::SetTabTint { key, tint: Some(rgb) },
         ));
         self.menu_popover(items.finish(), x, y)
     }
 
-    /// A single row of 8 FOLDER-glyph tint swatches for the folder-group menu.
-    /// Mirrors `tint_palette_row` but paints the FOLDER icon (a group is a
-    /// container folder). `on_pick` maps the chosen RGB to the dispatched action.
-    fn folder_tint_palette_row<F>(&self, on_pick: F) -> Box<dyn Element>
-    where
-        F: Fn([u8; 3]) -> CraneShellAction,
-    {
-        const PALETTE: [[u8; 3]; 8] = [
-            [239, 83, 80],
-            [255, 152, 0],
-            [255, 202, 40],
-            [102, 187, 106],
-            [38, 166, 154],
-            [66, 165, 245],
-            [171, 71, 188],
-            [236, 64, 122],
-        ];
-        let icon_font = self.icon_font;
-        let mut swatches = Flex::row();
-        for rgb in PALETTE {
-            let color = ColorU::new(rgb[0], rgb[1], rgb[2], 255);
-            let action = on_pick(rgb);
-            let state = self.hover_handle(&format!("gsw:{}:{}:{}", rgb[0], rgb[1], rgb[2]));
-            let swatch = Hoverable::new(state, move |ms| {
-                let bg = if ms.is_hovered() {
-                    theme::row_hover()
-                } else {
-                    ColorU::new(0, 0, 0, 0)
-                };
-                Container::new(
-                    Text::new(icons::FOLDER.to_string(), icon_font, 14.0)
-                        .with_color(color)
-                        .finish(),
-                )
-                .with_background_color(bg)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
-                .with_uniform_padding(4.0)
-                .finish()
-            })
-            .with_cursor(Cursor::PointingHand)
-            .on_mouse_down(move |ctx, _, _| {
-                ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
-                ctx.dispatch_typed_action(action.clone());
-            })
-            .finish();
-            swatches = swatches.with_child(swatch);
-        }
-        Container::new(swatches.finish())
-            .with_padding_left(6.0)
-            .with_padding_right(6.0)
-            .with_padding_top(4.0)
-            .with_padding_bottom(2.0)
-            .finish()
-    }
-
-    /// The folder-group header context menu: a "Highlight color" label, an
-    /// 8-swatch FOLDER-glyph tint palette, a "Default color" reset, a separator,
-    /// and "Remove folder group" (removes every member project atomically).
+    /// The folder-group header context menu: a "HIGHLIGHT" section label, a
+    /// circular tint palette (hollow "none" reset + 8 dots, ringed on the current
+    /// tint), a separator, and a destructive "Remove folder group" (removes every
+    /// member project atomically).
     fn folder_menu_overlay(&self, group: &str, x: f32, y: f32) -> Box<dyn Element> {
         let mut items = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-        // Small muted "Highlight color" heading above the palette.
-        items = items.with_child(
-            Container::new(
-                Text::new("Highlight color".to_string(), self.ui_font, 11.0)
-                    .with_color(theme::text_muted())
-                    .finish(),
-            )
-            .with_padding_left(10.0)
-            .with_padding_right(10.0)
-            .with_padding_top(6.0)
-            .with_padding_bottom(2.0)
-            .finish(),
-        );
+        let current = self.group_tints.get(group).copied();
+        items = items.with_child(self.menu_label("HIGHLIGHT"));
         let g_pick = group.to_string();
-        items = items.with_child(self.folder_tint_palette_row(move |rgb| {
-            CraneShellAction::SetGroupTint { group: g_pick.clone(), tint: Some(rgb) }
-        }));
-        items = items.with_child(self.menu_item(
-            icons::ARROW_COUNTER_CLOCKWISE,
-            "Default color",
-            CraneShellAction::SetGroupTint { group: group.to_string(), tint: None },
+        let g_clear = group.to_string();
+        items = items.with_child(self.tint_palette_row(
+            "gsw",
+            current,
+            CraneShellAction::SetGroupTint { group: g_clear, tint: None },
+            move |rgb| CraneShellAction::SetGroupTint { group: g_pick.clone(), tint: Some(rgb) },
         ));
         items = items.with_child(self.menu_separator());
-        items = items.with_child(self.menu_item(
-            icons::X,
+        items = items.with_child(self.menu_item_hint(
+            icons::TRASH,
             "Remove folder group",
+            None,
+            true,
             CraneShellAction::RemoveGroup(group.to_string()),
         ));
         self.menu_popover(items.finish(), x, y)
