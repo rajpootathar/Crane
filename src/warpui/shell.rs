@@ -20,10 +20,10 @@ use crate::warpui::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
 use crate::warpui::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
-    Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, Draggable, DraggableState,
-    Empty, EventHandler, Expanded, Fill, Flex, Hoverable, MouseStateHandle, ParentElement, Radius,
-    Rect, ScrollbarWidth, Stack, Text,
+    Align, Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
+    Container, CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, Draggable,
+    DraggableState, Empty, EventHandler, Expanded, Fill, Flex, Hoverable, MouseStateHandle,
+    ParentElement, Radius, Rect, ScrollbarWidth, Stack, Text,
 };
 use warpui::platform::Cursor;
 use warpui::geometry::rect::RectF;
@@ -6995,18 +6995,39 @@ impl CraneShellView {
             .finish()
     }
 
-    /// A bare icon button — Container records the hit + sizes to content.
-    fn icon_button(&self, glyph: &str, action: CraneShellAction) -> Box<dyn Element> {
-        let content = Container::new(self.icon(glyph, 15.0, theme::text_muted()))
-            .with_background_color(theme::topbar_bg())
-            .with_uniform_padding(5.0)
-            .finish();
-        EventHandler::new(content)
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(action.clone());
-                DispatchEventResult::StopPropagation
-            })
+    /// A 20×20 hover-lit icon button (12px glyph). `key` must be unique per
+    /// on-screen instance — it keys the persistent hover state.
+    fn icon_button(&self, key: &str, glyph: &'static str, action: CraneShellAction) -> Box<dyn Element> {
+        let state = self.hover_handle(&format!("ibtn:{key}"));
+        let icon_font = self.icon_font;
+        Hoverable::new(state, move |ms| {
+            let (bg, fg) = if ms.is_hovered() {
+                (theme::selection_wash(), theme::text_hover())
+            } else {
+                (ColorU::new(0, 0, 0, 0), theme::text_muted())
+            };
+            ConstrainedBox::new(
+                Container::new(
+                    Align::new(
+                        Text::new(glyph.to_string(), icon_font, 12.0)
+                            .with_color(fg)
+                            .finish(),
+                    )
+                    .finish(),
+                )
+                .with_background_color(bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .finish(),
+            )
+            .with_width(20.0)
+            .with_height(20.0)
             .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(action.clone());
+        })
+        .finish()
     }
 
     /// A small status-bar icon button (muted glyph, click dispatches `action`).
@@ -8840,7 +8861,7 @@ impl CraneShellView {
 
         let row = Flex::row()
             .with_child(Self::spacer(80.0)) // macOS traffic-light inset
-            .with_child(self.icon_button(icons::SIDEBAR, CraneShellAction::ToggleLeft))
+            .with_child(self.icon_button("tb-left", icons::SIDEBAR, CraneShellAction::ToggleLeft))
             .with_child(crumb)
             .with_child(Expanded::new(1.0, ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish()).finish())
             .with_child(self.pill_button(
@@ -8853,8 +8874,8 @@ impl CraneShellView {
             .with_child(Self::spacer(6.0))
             .with_child(theme_btn)
             .with_child(Self::spacer(8.0))
-            .with_child(self.icon_button(icons::GIT_BRANCH, CraneShellAction::OpenGitLog))
-            .with_child(self.icon_button(icons::SIDEBAR, CraneShellAction::ToggleRight))
+            .with_child(self.icon_button("tb-gitlog", icons::GIT_BRANCH, CraneShellAction::OpenGitLog))
+            .with_child(self.icon_button("tb-right", icons::SIDEBAR, CraneShellAction::ToggleRight))
             .with_child(Self::spacer(8.0))
             .finish();
         ConstrainedBox::new(self.panel(theme::topbar_bg(), row))
@@ -9292,8 +9313,8 @@ impl CraneShellView {
 
         // The Expanded title fills the row, pushing these to the right edge.
         let buttons = Flex::row()
-            .with_child(self.icon_button(icons::ARROWS_OUT, CraneShellAction::ToggleMaximize(id)))
-            .with_child(self.icon_button(icons::X, CraneShellAction::ClosePane(id)))
+            .with_child(self.icon_button(&format!("pane-max:{id}"), icons::ARROWS_OUT, CraneShellAction::ToggleMaximize(id)))
+            .with_child(self.icon_button(&format!("pane-close:{id}"), icons::X, CraneShellAction::ClosePane(id)))
             .finish();
 
         let row = Flex::row()
@@ -9964,11 +9985,12 @@ impl CraneShellView {
                         )
                         .with_child(
                             self.icon_button(
+                                "gitlog-refresh",
                                 icons::ARROW_COUNTER_CLOCKWISE,
                                 CraneShellAction::GitLogFetchAll,
                             ),
                         )
-                        .with_child(self.icon_button(icons::X, CraneShellAction::OpenGitLog))
+                        .with_child(self.icon_button("gitlog-close", icons::X, CraneShellAction::OpenGitLog))
                         .finish(),
                 )
                 .finish(),

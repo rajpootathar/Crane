@@ -53,8 +53,22 @@ pub fn pane_dim() -> ColorU {
     ColorU { r: c.r, g: c.g, b: c.b, a: 120 }
 }
 
+/// White-alpha overlay washes — the app-wide hover/selection language.
+/// Alphas are on-white overlays so they read identically on every theme.
+pub fn hover_wash() -> ColorU     { ColorU { r: 255, g: 255, b: 255, a: 9 }  }
+pub fn selection_wash() -> ColorU { ColorU { r: 255, g: 255, b: 255, a: 18 } }
+pub fn context_wash() -> ColorU   { ColorU { r: 255, g: 255, b: 255, a: 6 }  }
+/// Destructive menu-item hover: error() at ~15% alpha.
+pub fn danger_wash() -> ColorU {
+    let e = crate::theme::current().error;
+    ColorU { r: e.r, g: e.g, b: e.b, a: 38 }
+}
+pub fn menu_shadow() -> ColorU    { ColorU { r: 0, g: 0, b: 0, a: 128 } }
+
 // Panel dimensions — not colours, never change with themes.
-pub const TOPBAR_H: f32 = 34.0;
-pub const STATUS_H: f32 = 28.0;
+pub const TOPBAR_H: f32 = 36.0;
+pub const STATUS_H: f32 = 26.0;
+pub const HEADER_H: f32 = 24.0;
+pub const TAB_H: f32    = 26.0;
 pub const LEFT_W: f32   = 240.0;
 pub const RIGHT_W: f32  = 300.0;
