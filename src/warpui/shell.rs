@@ -1957,7 +1957,7 @@ impl CraneShellView {
     }
 
     /// True while ANY tab still has pending attention — keeps the pulse repaint
-    /// stream alive (fast tick) so the glow breathes + decays without input.
+    /// stream alive (33ms anim tick) so the glow breathes + decays without input.
     fn any_attention_active(&self) -> bool {
         self.worktree_tabs
             .values()
@@ -7147,13 +7147,11 @@ impl CraneShellView {
         size: f32,
         color: ColorU,
         pad: f32,
-        selected: bool,
         action: CraneShellAction,
     ) -> Box<dyn Element> {
         // Row chrome (background wash + selection highlight) is now supplied by
         // `row_shell`; the row itself only lays out its content over a 24px-tall
-        // transparent hit surface. `selected` no longer paints a bg here.
-        let _ = selected;
+        // transparent hit surface.
         let row_h = 24.0;
         let bg_layer = ConstrainedBox::new(Rect::new().finish()).with_height(row_h).finish();
 
@@ -7211,7 +7209,6 @@ impl CraneShellView {
         name: &str,
         icon_color: ColorU,
         label_color: ColorU,
-        selected: bool,
         diff_stat: (u32, u32),
         dirty: bool,
         indent: f32,
@@ -7221,8 +7218,7 @@ impl CraneShellView {
     ) -> Box<dyn Element> {
         let size = 12.0_f32;
         // Row chrome (background wash + selection highlight) is supplied by
-        // `row_shell`; `selected` no longer paints a bg here.
-        let _ = selected;
+        // `row_shell`.
         let row_h = 24.0;
         let bg_layer = ConstrainedBox::new(Rect::new().finish()).with_height(row_h).finish();
 
@@ -7472,7 +7468,6 @@ impl CraneShellView {
         &self,
         icon_color: ColorU,
         name: &str,
-        selected: bool,
         indent: f32,
         rename_buf: Option<String>,
         select_action: CraneShellAction,
@@ -7480,8 +7475,7 @@ impl CraneShellView {
     ) -> Box<dyn Element> {
         let size = 11.0_f32;
         // Row chrome (background wash + selection highlight) is supplied by
-        // `row_shell`; `selected` no longer paints a bg here.
-        let _ = selected;
+        // `row_shell`.
         let row_h = 24.0;
         let bg_layer = ConstrainedBox::new(Rect::new().finish()).with_height(row_h).finish();
 
@@ -7673,7 +7667,6 @@ impl CraneShellView {
                 12.0,
             ));
         }
-        let sel = self.selected;
         // Tracks the group_path of the previous project so a FOLDER header is
         // emitted exactly once per contiguous run of same-group projects.
         let mut last_group: Option<String> = None;
@@ -7721,7 +7714,6 @@ impl CraneShellView {
                     13.0,
                     gcolor,
                     10.0,
-                    false,
                     CraneShellAction::ToggleGroup(gp.clone()),
                 );
                 // Container-folder headers are not part of the selection chain, so
@@ -7761,11 +7753,6 @@ impl CraneShellView {
             let group_offset = if in_group { 14.0 } else { 0.0 };
 
             let p_expanded = self.expanded_projects.contains(&pi);
-            // Highlight the project row when any of its tabs is the active tab
-            // (the `selected` tuple is never assigned (pi, MAX, MAX), so deriving
-            // from `active_tab` — like the worktree row's `w_active` — is what
-            // actually lights the row up). Mirrors old egui's active-project tint.
-            let psel = self.active_tab.map(|(api, _, _)| api == pi).unwrap_or(false);
             // Two-tier selection: the project is `Selected` only when it is the
             // selection's chain root AND collapsed (so it is the deepest visible
             // row); when expanded it is an `Ancestor` (context) of the selected
@@ -7800,7 +7787,6 @@ impl CraneShellView {
                 13.0,
                 pcol,
                 10.0 + group_offset,
-                psel,
                 CraneShellAction::ToggleProject(pi),
             );
             let base_row = self.row_shell(&format!("proj:{pi}"), p_tier, base_row);
@@ -7871,7 +7857,6 @@ impl CraneShellView {
                     if let Some(tabs) = self.worktree_tabs.get(&(pi, wi)) {
                         for t in tabs {
                             let tkey = (pi, wi, t.id);
-                            let tsel = sel == tkey;
                             // A tab is a leaf: it is either the `Selected` row or
                             // `Plain`. Selection follows the active tab.
                             let t_tier = if self.active_tab == Some(tkey) {
@@ -7899,7 +7884,6 @@ impl CraneShellView {
                             let tab_base = self.tab_closeable_row(
                                 tcol,
                                 &t.name,
-                                tsel,
                                 24.0 + group_offset,
                                 rbuf,
                                 select,
@@ -7935,7 +7919,6 @@ impl CraneShellView {
                     .active_tab
                     .map(|(api, awi, _)| api == pi && awi == wi)
                     .unwrap_or(false);
-                let wsel = sel == (pi, wi, usize::MAX) || w_active;
                 // Two-tier: the workspace is `Selected` only when it hosts the
                 // active tab AND is collapsed (deepest visible row); expanded it
                 // is an `Ancestor` of the selected tab below. Else `Plain`.
@@ -7980,7 +7963,6 @@ impl CraneShellView {
                     &display,
                     wicon,
                     wcol,
-                    wsel,
                     w.diff_stat,
                     w.dirty,
                     24.0 + group_offset,
@@ -8024,7 +8006,6 @@ impl CraneShellView {
                 if let Some(tabs) = self.worktree_tabs.get(&(pi, wi)) {
                     for t in tabs {
                         let tkey = (pi, wi, t.id);
-                        let tsel = sel == tkey;
                         // Leaf tab row: `Selected` when it is the active tab, else
                         // `Plain`.
                         let t_tier = if self.active_tab == Some(tkey) {
@@ -8068,7 +8049,6 @@ impl CraneShellView {
                         let tab_base = self.tab_closeable_row(
                             tcol,
                             &display_name,
-                            tsel,
                             42.0 + group_offset,
                             rbuf,
                             select,
@@ -9059,27 +9039,6 @@ impl CraneShellView {
     /// Unified full-width top bar that doubles as the macOS titlebar: the
     /// left ~84px is left empty so the traffic-light buttons have room
     /// (this region is the draggable titlebar), the breadcrumb follows.
-    fn breadcrumb(&self) -> String {
-        let (pi, wi, ti) = self.selected;
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(p) = self.projects.get(pi) {
-            parts.push(p.name.clone());
-            if let Some(w) = p.worktrees.get(wi) {
-                parts.push(w.name.clone());
-                if ti != usize::MAX {
-                    if let Some(t) = w.tabs.get(ti) {
-                        parts.push(t.clone());
-                    }
-                }
-            }
-        }
-        if parts.is_empty() {
-            "Crane".to_string()
-        } else {
-            parts.join("  /  ")
-        }
-    }
-
     /// A fixed-width horizontal gap. MUST bound height too — a width-only
     /// ConstrainedBox lets the inner Rect fill to infinite height in an
     /// unbounded-height row (warpui panics in validate_rect).
