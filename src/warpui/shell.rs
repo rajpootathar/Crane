@@ -22,7 +22,8 @@ use warpui::color::ColorU;
 use warpui::elements::{
     Align, Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
     Container, CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, Draggable,
-    DraggableState, DropShadow, Empty, EventHandler, Expanded, Fill, Flex, Hoverable,
+    DraggableState, DropShadow, Empty, EventDispatchMode, EventHandler, Expanded, Fill, Flex,
+    Hoverable,
     MouseStateHandle,
     ParentElement, Radius, Rect, ScrollbarWidth, Stack, Text,
 };
@@ -3831,9 +3832,20 @@ impl CraneShellView {
     /// record no hits so an outside click falls through to the backdrop. The card
     /// itself swallows clicks so interacting inside never dismisses it.
     fn modal_scaffold(&self, card: Box<dyn Element>) -> Box<dyn Element> {
-        // The card absorbs clicks (so clicking its chrome doesn't close the modal).
+        // The card absorbs clicks (so clicking its chrome doesn't close the modal)
+        // AND scroll wheels. The scroll seal is load-bearing: the dim backdrop
+        // below is a full-window hit region, but its own scroll handler is
+        // coverage-gated (`DispatchedEvent::at_z_index` → `is_covered`), so over
+        // the card the backdrop is masked by the card's higher paint layer and
+        // never fires. Without a consumer here, a wheel over any NON-scrollable
+        // card region (e.g. the Settings nav rail / header) falls straight past
+        // the card and the masked backdrop to the terminal grid behind — the grid
+        // reads scroll off the raw event, bounds-gated only, ignoring coverage.
+        // The card's own inner Scrollable still scrolls: it is this EventHandler's
+        // child and is dispatched first, consuming the wheel before this seal.
         let card = EventHandler::new(card)
             .on_left_mouse_down(|_ctx, _app, _pos| DispatchEventResult::StopPropagation)
+            .on_scroll_wheel(|_ctx, _app, _delta, _mods| DispatchEventResult::StopPropagation)
             .with_always_handle()
             .finish();
         // Centre the card with flexible empty-Flex spacers (no hit recording, so
@@ -3867,7 +3879,17 @@ impl CraneShellView {
         .on_scroll_wheel(|_ctx, _app, _delta, _mods| DispatchEventResult::StopPropagation)
         .with_always_handle()
         .finish();
-        Box::new(Stack::new().with_child(backdrop).with_child(centered))
+        // Waterfall so the card (top child) is dispatched first and STOPS once it
+        // consumes: in release builds `Stack::new()` defaults to Broadcast, which
+        // would deliver the wheel to the backdrop AND the card regardless of
+        // handling. Debug already runs Waterfall; pin it here so both builds behave
+        // identically.
+        Box::new(
+            Stack::new()
+                .with_event_dispatch_mode(EventDispatchMode::Waterfall)
+                .with_child(backdrop)
+                .with_child(centered),
+        )
     }
 
     /// Render the active modal as the topmost root-stack child.
@@ -4507,10 +4529,13 @@ impl CraneShellView {
             .finish()
     }
 
-    /// Muted section heading inside a Settings body.
+    /// Muted section heading inside a Settings body — matches the shared
+    /// `menu_label` treatment (10px muted) so sub-section labels read the same
+    /// as the small-caps labels used in menus, with extra top padding for the
+    /// inter-section rhythm.
     fn settings_heading(&self, label: &'static str) -> Box<dyn Element> {
         Container::new(
-            Text::new(label.to_string(), self.ui_font, 11.0)
+            Text::new(label.to_string(), self.ui_font, 10.0)
                 .with_color(theme::text_muted())
                 .finish(),
         )
@@ -4529,52 +4554,69 @@ impl CraneShellView {
         for t in crate::theme::load_all() {
             let is_active = t.name == current_theme;
             let name = t.name.clone();
-            // Five color swatches preview the theme (old settings.rs swatch row).
-            let mut swatches = Flex::row();
-            for c in [t.bg, t.surface, t.accent, t.text, t.surface_hi] {
-                swatches = swatches.with_child(
-                    Container::new(
-                        ConstrainedBox::new(
-                            Rect::new().with_background_color(c.to_warp()).finish(),
+            let click_name = t.name.clone();
+            let swatch_colors = [t.bg, t.surface, t.accent, t.text, t.surface_hi];
+            let ui_font = self.ui_font;
+            let icon_font = self.icon_font;
+            // Switch-Branch row idiom: hover wash + 4px radius; the active theme is
+            // accent-checked with accent label text.
+            let state = self.hover_handle(&format!("settings-theme:{name}"));
+            let row = Hoverable::new(state, move |ms| {
+                let hovered = ms.is_hovered();
+                let bg = if is_active || hovered {
+                    theme::hover_wash()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                };
+                // Five color swatches preview the theme (old settings.rs swatch row).
+                let mut swatches = Flex::row();
+                for c in swatch_colors {
+                    swatches = swatches.with_child(
+                        Container::new(
+                            ConstrainedBox::new(
+                                Rect::new().with_background_color(c.to_warp()).finish(),
+                            )
+                            .with_width(12.0)
+                            .with_height(12.0)
+                            .finish(),
                         )
-                        .with_width(12.0)
-                        .with_height(12.0)
+                        .with_padding_right(4.0)
                         .finish(),
-                    )
-                    .with_padding_right(4.0)
-                    .finish(),
-                );
-            }
-            let mut row = Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(swatches.finish())
-                .with_child(Self::spacer(8.0))
-                .with_child(
-                    Text::new(name.clone(), self.ui_font, 12.5)
-                        .with_color(if is_active { theme::text() } else { theme::text_muted() })
-                        .finish(),
-                );
-            row = row.with_child(Expanded::new(1.0, Flex::row().finish()).finish());
-            if is_active {
-                row = row.with_child(self.icon(icons::CHECK, 12.0, theme::accent()));
-            }
-            let row = EventHandler::new(
+                    );
+                }
+                let mut row = Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(swatches.finish())
+                    .with_child(Self::spacer(8.0))
+                    .with_child(
+                        Text::new(name.clone(), ui_font, 12.5)
+                            .with_color(if is_active {
+                                theme::accent()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .finish(),
+                    );
+                row = row.with_child(Expanded::new(1.0, Flex::row().finish()).finish());
+                if is_active {
+                    row = row.with_child(
+                        Text::new(icons::CHECK.to_string(), icon_font, 12.0)
+                            .with_color(theme::accent())
+                            .finish(),
+                    );
+                }
                 Container::new(row.finish())
-                    .with_background_color(if is_active {
-                        theme::row_active()
-                    } else {
-                        ColorU::new(0, 0, 0, 0)
-                    })
+                    .with_background_color(bg)
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
                     .with_padding_left(8.0)
                     .with_padding_right(8.0)
                     .with_padding_top(6.0)
                     .with_padding_bottom(6.0)
-                    .finish(),
-            )
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(CraneShellAction::SetTheme(name.clone()));
-                DispatchEventResult::StopPropagation
+                    .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::SetTheme(click_name.clone()));
             })
             .finish();
             col = col.with_child(row);
@@ -4932,7 +4974,7 @@ impl CraneShellView {
         let mut side = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         side = side.with_child(
             Container::new(
-                Text::new("Settings".to_string(), self.ui_font, 15.0)
+                Text::new("Settings".to_string(), self.ui_font, 13.0)
                     .with_color(theme::text_header())
                     .finish(),
             )
@@ -4941,26 +4983,45 @@ impl CraneShellView {
         );
         for section in SettingsSection::ALL {
             let active = section == self.settings_section;
-            let row = EventHandler::new(
-                Container::new(
-                    Text::new(section.title().to_string(), self.ui_font, 12.0)
-                        .with_color(if active { theme::text() } else { theme::text_muted() })
-                        .finish(),
-                )
-                .with_background_color(if active {
-                    theme::row_active()
+            let title = section.title();
+            let ui_font = self.ui_font;
+            // Left-panel row idiom: 26px, 4px radius, hover wash; the active
+            // section reads as a selection (selection_wash + bright text) while
+            // the rest stay muted until hovered.
+            let state = self.hover_handle(&format!("settings-nav:{title}"));
+            let row = Hoverable::new(state, move |ms| {
+                let hovered = ms.is_hovered();
+                let bg = if active {
+                    theme::selection_wash()
+                } else if hovered {
+                    theme::hover_wash()
                 } else {
                     ColorU::new(0, 0, 0, 0)
-                })
+                };
+                Container::new(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Text::new(title.to_string(), ui_font, 12.0)
+                                .with_color(if active {
+                                    theme::text_hover()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .finish(),
+                        )
+                        .finish(),
+                )
+                .with_background_color(bg)
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
                 .with_padding_left(8.0)
-                .with_padding_top(5.0)
-                .with_padding_bottom(5.0)
-                .finish(),
-            )
-            .on_left_mouse_down(move |ctx, _app, _pos| {
+                .with_padding_top(6.0)
+                .with_padding_bottom(6.0)
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(CraneShellAction::SettingsGoto(section));
-                DispatchEventResult::StopPropagation
             })
             .finish();
             side = side.with_child(Container::new(row).with_padding_bottom(2.0).finish());
@@ -11998,7 +12059,16 @@ impl View for CraneShellView {
             .with_child(Expanded::new(1.0, body).finish())
             .finish();
 
+        // Waterfall dispatch: the topmost child that handles an event stops it.
+        // This is what makes the blocking modal / menus actually block the panes
+        // behind them — when the modal overlay (last, top child) consumes a scroll
+        // or click, propagation halts and the terminal grid below never sees it.
+        // In debug `Stack::new()` already defaults to Waterfall, but release builds
+        // default to Broadcast (deliver to every child regardless of handling),
+        // which let wheels leak through to the panes behind an open modal. Pin
+        // Waterfall so both builds route events the same, well-tested way.
         let mut root_stack = Stack::new()
+            .with_event_dispatch_mode(EventDispatchMode::Waterfall)
             .with_child(Rect::new().with_background_color(theme::bg()).finish())
             .with_child(column);
 
