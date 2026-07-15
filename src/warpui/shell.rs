@@ -241,15 +241,16 @@ impl TitleDebounce {
     ///   it has been unchanged for `window`. A changing `live` keeps resetting
     ///   the candidate clock, so churning titles never get promoted.
     fn observe(&mut self, live: &str, now: std::time::Instant, window: std::time::Duration) -> String {
-        if self.displayed.as_deref() == Some(live) {
-            return live.to_string();
-        }
-        if self.displayed.is_none() {
-            // First real title on a fresh shell — adopt without waiting.
+        // `shown` is what the row currently displays; if nothing has ever been
+        // adopted (fresh shell still on its default label), adopt immediately.
+        let Some(shown) = self.displayed.clone() else {
             self.displayed = Some(live.to_string());
             self.candidate = Some(live.to_string());
             self.candidate_since = Some(now);
             return live.to_string();
+        };
+        if shown == live {
+            return shown;
         }
         if self.candidate.as_deref() != Some(live) {
             // New candidate — (re)start its stability clock.
@@ -257,11 +258,13 @@ impl TitleDebounce {
             self.candidate_since = Some(now);
         } else if let Some(since) = self.candidate_since {
             if now.duration_since(since) >= window {
+                // Held steady for the full window — promote.
                 self.displayed = Some(live.to_string());
+                return live.to_string();
             }
         }
-        // Fall back to whatever we last committed to (never empty here).
-        self.displayed.clone().unwrap_or_else(|| live.to_string())
+        // Not (yet) promoted — keep showing the committed title.
+        shown
     }
 }
 
@@ -483,12 +486,15 @@ pub struct CraneShellView {
     /// `MouseStateHandle` (an `Arc<Mutex<..>>`) has to persist on the view.
     /// `RefCell` because `render` is `&self` and lazily get-or-inserts handles.
     menu_hover: RefCell<HashMap<String, MouseStateHandle>>,
-    /// Per-tab title debounce, keyed by tab key `(pi, wi, tid)`. Smooths the
+    /// Per-tab title debounce, keyed by tab id (`TabMeta::id`). Smooths the
     /// live OSC-0/2 terminal title so agent-CLI spinner churn doesn't rename
-    /// the Tab row several times a second (see `TitleDebounce`). `RefCell`
-    /// because `render` is `&self` and updates the state on each paint.
-    /// Entries are dropped when the owning tab is torn down.
-    title_debounce: RefCell<HashMap<(usize, usize, usize), TitleDebounce>>,
+    /// the Tab row several times a second (see `TitleDebounce`). Keyed by the
+    /// globally-unique tab id — NOT the positional `(pi, wi, tid)` tuple —
+    /// so it survives project drag-reorder / removal index remaps without
+    /// joining `rekey_after_reorder`. `RefCell` because `render` is `&self`
+    /// and updates the state on each paint. Entries are dropped when the
+    /// owning tab is torn down.
+    title_debounce: RefCell<HashMap<usize, TitleDebounce>>,
     /// Active project context menu, or None when no menu is open.
     context_menu: Option<ProjectContextMenu>,
     /// Hover tooltip currently on-screen: (label text, window-space x, y) —
@@ -7617,10 +7623,14 @@ impl CraneShellView {
     /// to `terminal_tab_title`, but the returned title only changes once the
     /// live one has held steady for `TITLE_STABLE_WINDOW`. Updates the per-tab
     /// debounce state as a side effect (hence the `RefCell`; `render` is `&self`).
+    /// Debounce state is keyed by the tab id (`key.2`) alone: tab ids come from
+    /// the single persisted `next_tab_id` counter so they are globally unique,
+    /// and unlike the positional `(pi, wi)` prefix they never shift when
+    /// projects are reordered or removed.
     fn stabilized_tab_title(&self, key: (usize, usize, usize), app: &AppContext) -> Option<String> {
         let live = self.terminal_tab_title(key, app)?;
         let mut map = self.title_debounce.borrow_mut();
-        let entry = map.entry(key).or_default();
+        let entry = map.entry(key.2).or_default();
         Some(entry.observe(&live, std::time::Instant::now(), TITLE_STABLE_WINDOW))
     }
 
@@ -11861,9 +11871,13 @@ impl CraneShellView {
                     self.layouts.insert(tab, remaining);
                 }
                 None => {
-                    // Last pane gone → the tab is effectively closed; drop its
-                    // debounce entry so it doesn't linger.
-                    self.title_debounce.borrow_mut().remove(&tab);
+                    // Last pane of the layout closed. The TabMeta itself stays
+                    // in `worktree_tabs` (its row falls back to the stored
+                    // name), so drop the debounce entry now: if a new layout
+                    // is later seeded under this tab id, its first title
+                    // should adopt immediately rather than inherit a stale
+                    // 3s hold from the old terminal.
+                    self.title_debounce.borrow_mut().remove(&tab.2);
                     self.active_tab = None;
                     self.focused = None;
                 }
@@ -11892,7 +11906,7 @@ impl CraneShellView {
     /// uses — call when a project/tab is removed so nothing keeps rendering or
     /// leaks a PTY.
     fn tear_down_layout(&mut self, key: (usize, usize, usize)) {
-        self.title_debounce.borrow_mut().remove(&key);
+        self.title_debounce.borrow_mut().remove(&key.2);
         if let Some(node) = self.layouts.remove(&key) {
             let mut leaves = Vec::new();
             node.leaves(&mut leaves);
@@ -13583,7 +13597,7 @@ impl CraneShellView {
             }
             CraneShellAction::CloseTabConfirmed((pi, wi, tid)) => {
                 self.modal = None;
-                self.title_debounce.borrow_mut().remove(&(*pi, *wi, *tid));
+                self.title_debounce.borrow_mut().remove(tid);
                 // Drop the tab's layout + every pane it owns.
                 if let Some(node) = self.layouts.remove(&(*pi, *wi, *tid)) {
                     let mut leaves = Vec::new();
@@ -14664,5 +14678,36 @@ mod title_debounce_tests {
             d.observe("nvim README.md", t0 + Duration::from_secs(9), WINDOW),
             "nvim README.md"
         );
+    }
+
+    #[test]
+    fn stable_tab_ids_keep_entries_apart_across_position_shifts() {
+        // The shell keys debounce state by the globally-unique tab id, not the
+        // positional (pi, wi, tid) tuple — so when a project reorder/removal
+        // shifts pi/wi, each tab keeps ITS OWN entry and never reads another
+        // tab's state. Model two tabs (ids 7 and 42) whose tree positions swap.
+        let mut map: std::collections::HashMap<usize, TitleDebounce> =
+            std::collections::HashMap::new();
+        let t0 = Instant::now();
+
+        // Both tabs adopt their first title immediately.
+        assert_eq!(map.entry(7).or_default().observe("zsh", t0, WINDOW), "zsh");
+        assert_eq!(map.entry(42).or_default().observe("cargo build", t0, WINDOW), "cargo build");
+
+        // Tab 42 starts churning; tab 7 stays put. (Positions may have swapped
+        // in the tree — irrelevant: lookups go by id.)
+        let t1 = t0 + Duration::from_millis(500);
+        assert_eq!(map.entry(42).or_default().observe("claude · 3k", t1, WINDOW), "cargo build");
+        assert_eq!(map.entry(7).or_default().observe("zsh", t1, WINDOW), "zsh");
+
+        // No cross-talk: tab 7 seeing tab 42's old title is a fresh candidate
+        // for tab 7, held back by the window — not instantly shown.
+        let t2 = t0 + Duration::from_secs(1);
+        assert_eq!(map.entry(7).or_default().observe("cargo build", t2, WINDOW), "zsh");
+
+        // And each promotes independently once its own candidate holds steady.
+        let t3 = t0 + Duration::from_secs(5);
+        assert_eq!(map.entry(42).or_default().observe("claude · 3k", t3, WINDOW), "claude · 3k");
+        assert_eq!(map.entry(7).or_default().observe("cargo build", t3, WINDOW), "cargo build");
     }
 }
