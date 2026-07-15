@@ -415,6 +415,12 @@ pub struct CraneShellView {
     menu_hover: RefCell<HashMap<String, MouseStateHandle>>,
     /// Active project context menu, or None when no menu is open.
     context_menu: Option<ProjectContextMenu>,
+    /// Hover tooltip currently on-screen: (label text, window-space x, y) —
+    /// set by `CraneShellAction::ShowTooltip` / cleared by `HideTooltip`,
+    /// dispatched from a button's `Hoverable::on_hover`. Rendered by
+    /// `tooltip_overlay` in `render()`, positioned via the same `Popover`
+    /// on-screen clamp used by the context-menu popovers.
+    hover_tip: Option<(String, f32, f32)>,
     /// Collapsed folder groups, keyed by `ProjectNode::group_path`. Absent →
     /// expanded (members visible). Toggled via `CraneShellAction::ToggleGroup`.
     collapsed_groups: HashSet<String>,
@@ -1503,6 +1509,7 @@ impl CraneShellView {
             project_tints: init_tints,
             menu_hover: RefCell::new(HashMap::new()),
             context_menu: None,
+            hover_tip: None,
             collapsed_groups: HashSet::new(),
             collapsed_change_dirs: HashSet::new(),
             commit_error: None,
@@ -7285,7 +7292,8 @@ impl CraneShellView {
                 // (old Crane's hover affordance) — the overlay only joins the
                 // stack while the pointer is over the row.
                 let state = self.hover_handle(&format!("wtplus:{pa:?}"));
-                let overlay = self.trailing_plus_overlay(row_h, pa);
+                let tip_key = format!("wtplus:{pa:?}");
+                let overlay = self.trailing_plus_overlay(row_h, pa, &tip_key, "New Tab");
                 Box::new(Hoverable::new(state, move |ms| {
                     if ms.is_hovered() {
                         Stack::new().with_child(base).with_child(overlay).finish()
@@ -7300,7 +7308,13 @@ impl CraneShellView {
     /// A right-aligned "+" button layered over a tree row (topmost, so it wins
     /// the click against the row's hit layer). The row-item "New tab" / "New
     /// workspace" entries this replaces cost a full row of height each.
-    fn trailing_plus_overlay(&self, row_h: f32, action: CraneShellAction) -> Box<dyn Element> {
+    fn trailing_plus_overlay(
+        &self,
+        row_h: f32,
+        action: CraneShellAction,
+        tooltip_key: &str,
+        tooltip: &'static str,
+    ) -> Box<dyn Element> {
         let plus = EventHandler::new(
             Container::new(self.icon(icons::PLUS, 10.0, theme::text_muted()))
                 .with_padding_left(6.0)
@@ -7313,6 +7327,7 @@ impl CraneShellView {
             DispatchEventResult::StopPropagation
         })
         .finish();
+        let plus = self.with_tooltip(tooltip_key, tooltip, plus);
         Flex::row()
             .with_child(
                 Expanded::new(
@@ -7323,6 +7338,51 @@ impl CraneShellView {
             )
             .with_child(plus)
             .finish()
+    }
+
+    /// Wrap `inner` in an outer `Hoverable` that dispatches
+    /// `ShowTooltip` / `HideTooltip` on hover-in / hover-out — purely for the
+    /// tooltip side effect, so it doesn't alter `inner`'s own click/hover
+    /// visuals (those stay owned by whatever `Hoverable`/`EventHandler`
+    /// `inner` already wraps itself in). `key` must be stable and unique
+    /// among tooltip-wrapped elements on screen at once (backs the
+    /// persistent `MouseStateHandle`, keyed like every other hover row).
+    fn with_tooltip(&self, key: &str, tooltip: &'static str, inner: Box<dyn Element>) -> Box<dyn Element> {
+        let state = self.hover_handle(&format!("tip:{key}"));
+        Hoverable::new(state, move |_ms| inner)
+            .on_hover(move |is_hovered, ctx, _app, pos| {
+                if is_hovered {
+                    ctx.dispatch_typed_action(CraneShellAction::ShowTooltip {
+                        text: tooltip.to_string(),
+                        x: pos.x(),
+                        y: pos.y(),
+                    });
+                } else {
+                    ctx.dispatch_typed_action(CraneShellAction::HideTooltip);
+                }
+            })
+            .finish()
+    }
+
+    /// The hover-tooltip label itself: a small `surface()`-bg,
+    /// `border()`-bordered, 4px-radius card, positioned near the cursor via
+    /// the same `Popover` on-screen clamp used by the context-menu popovers.
+    /// Purely decorative (no event handlers), so it never intercepts clicks.
+    fn tooltip_overlay(&self, text: &str, x: f32, y: f32) -> Box<dyn Element> {
+        let label = Container::new(
+            Text::new(text.to_string(), self.ui_font, 10.0)
+                .with_color(theme::text())
+                .finish(),
+        )
+        .with_background_color(theme::surface())
+        .with_border(Border::all(1.0).with_border_color(theme::border()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+        .with_padding_left(6.0)
+        .with_padding_right(6.0)
+        .with_padding_top(3.0)
+        .with_padding_bottom(3.0)
+        .finish();
+        Box::new(crate::warpui::rect_probe::Popover::new(label, x + 14.0, y + 18.0))
     }
 
     /// A tab row with a trailing close button. The close button's EventHandler returns
@@ -7525,10 +7585,14 @@ impl CraneShellView {
                     )
                     .finish(),
                 )
-                .with_child(self.icon_button(
+                .with_child(self.with_tooltip(
                     "projects-add",
-                    icons::FOLDER_PLUS,
-                    CraneShellAction::AddProject,
+                    "Add Project",
+                    self.icon_button(
+                        "projects-add",
+                        icons::FOLDER_PLUS,
+                        CraneShellAction::AddProject,
+                    ),
                 ))
                 .finish(),
         )
@@ -7704,13 +7768,14 @@ impl CraneShellView {
             // the New Workspace modal; loose folders add a tab directly. This
             // replaces the old full-height "New workspace" / "New tab" row
             // items (user feedback: reduce tree height, plus lives on the row).
-            let plus_action = if p.is_loose {
-                CraneShellAction::NewTabIn(pi, 0)
+            let (plus_action, plus_tip) = if p.is_loose {
+                (CraneShellAction::NewTabIn(pi, 0), "New Tab")
             } else {
-                CraneShellAction::OpenNewWorkspace { pi, branch: None }
+                (CraneShellAction::OpenNewWorkspace { pi, branch: None }, "New Workspace")
             };
             let plus_state = self.hover_handle(&format!("pplus:{}", p.path));
-            let plus_overlay = self.trailing_plus_overlay(21.0, plus_action);
+            let plus_tip_key = format!("pplus:{}", p.path);
+            let plus_overlay = self.trailing_plus_overlay(21.0, plus_action, &plus_tip_key, plus_tip);
             let project_row = Box::new(Hoverable::new(plus_state, move |ms| {
                 if ms.is_hovered() {
                     Stack::new()
@@ -11479,6 +11544,12 @@ impl View for CraneShellView {
                     .finish(),
             );
         }
+        // Hover tooltip: above menus/toasts, below the blocking modal. Purely
+        // decorative and click-through (see `tooltip_overlay`), so it never
+        // steals events from whatever's underneath.
+        if let Some((text, x, y)) = &self.hover_tip {
+            root_stack = root_stack.with_child(self.tooltip_overlay(text, *x, *y));
+        }
         // The blocking modal renders LAST — topmost, over every other overlay.
         if let Some(m) = &self.modal {
             root_stack = root_stack.with_child(self.modal_overlay(m, app));
@@ -11908,6 +11979,10 @@ pub enum CraneShellAction {
     SetTheme(String),
     /// Open a native folder picker and add the chosen directory as a new project.
     AddProject,
+    /// Show a hover tooltip label anchored near the cursor at (x, y).
+    ShowTooltip { text: String, x: f32, y: f32 },
+    /// Hide the hover tooltip (mouse left the anchoring element).
+    HideTooltip,
     /// Open a native file picker and open the chosen file into the Files pane.
     OpenExternalFile,
     /// Remove the project at index `i` from the project list and persist.
@@ -12993,6 +13068,12 @@ impl CraneShellView {
                 if let Some(t) = crate::theme::find_by_name(name) {
                     crate::theme::set(t);
                 }
+            }
+            CraneShellAction::ShowTooltip { text, x, y } => {
+                self.hover_tip = Some((text.clone(), *x, *y));
+            }
+            CraneShellAction::HideTooltip => {
+                self.hover_tip = None;
             }
             CraneShellAction::AddProject => {
                 // Run the native folder picker as an ASYNC future so it does NOT
