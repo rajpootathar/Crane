@@ -54,9 +54,21 @@ pub fn accent_soft() -> ColorU {
     ColorU { r: c.r, g: c.g, b: c.b, a: 102 }
 }
 
-/// A 1px top-edge sheen for the top bar: white at ~4% alpha. Faked top-lit
+/// Overlay wash base colour, chosen by theme luminance so the wash always
+/// *contrasts* with the background: white (255) on dark themes, black (0) on
+/// light themes. Without this, the hardcoded white washes vanish on the light
+/// bundled themes (crane-light bg ≈ 244,246,250; vscode-light bg = 255,255,255)
+/// where white-on-white is invisible. Luminance uses the standard perceptual
+/// weights; > 128 means a light background, so paint dark washes on it.
+fn wash_base() -> u8 {
+    let c = crate::theme::current().bg;
+    let lum = 0.299 * c.r as f32 + 0.587 * c.g as f32 + 0.114 * c.b as f32;
+    if lum > 128.0 { 0 } else { 255 }
+}
+
+/// A 1px top-edge sheen for the top bar: base at ~4% alpha. Faked top-lit
 /// gradient stand-in (no gradient primitive in the scene graph).
-pub fn topbar_sheen() -> ColorU { ColorU { r: 255, g: 255, b: 255, a: 10 } }
+pub fn topbar_sheen() -> ColorU { let b = wash_base(); ColorU { r: b, g: b, b, a: 10 } }
 
 /// Translucent dim over inactive panes (currently unused — no dim mode).
 pub fn pane_dim() -> ColorU {
@@ -64,11 +76,13 @@ pub fn pane_dim() -> ColorU {
     ColorU { r: c.r, g: c.g, b: c.b, a: 120 }
 }
 
-/// White-alpha overlay washes — the app-wide hover/selection language.
-/// Alphas are on-white overlays so they read identically on every theme.
-pub fn hover_wash() -> ColorU     { ColorU { r: 255, g: 255, b: 255, a: 9 }  }
-pub fn selection_wash() -> ColorU { ColorU { r: 255, g: 255, b: 255, a: 18 } }
-pub fn context_wash() -> ColorU   { ColorU { r: 255, g: 255, b: 255, a: 6 }  }
+/// Overlay washes — the app-wide hover/selection language. Polarity follows
+/// `wash_base()` so the wash contrasts with the bg in both light and dark
+/// themes (must contrast — a same-colour wash is invisible). Same alphas as
+/// before (9/18/6); only the base colour flips with theme luminance.
+pub fn hover_wash() -> ColorU     { let b = wash_base(); ColorU { r: b, g: b, b, a: 9 }  }
+pub fn selection_wash() -> ColorU { let b = wash_base(); ColorU { r: b, g: b, b, a: 18 } }
+pub fn context_wash() -> ColorU   { let b = wash_base(); ColorU { r: b, g: b, b, a: 6 }  }
 /// Destructive menu-item hover: error() at ~15% alpha.
 pub fn danger_wash() -> ColorU {
     let e = crate::theme::current().error;

@@ -4709,7 +4709,7 @@ impl CraneShellView {
             ("Cmd+Opt+T", "Browser: new tab (opens a Browser Pane)"),
             ("Shift+Tab", "Terminal: back-tab (CSI Z) for TUIs"),
             ("F12", "LSP goto definition at caret"),
-            ("Escape", "Close modal / restore maximized pane"),
+            ("Escape", "Close modal / menu / restore maximized pane"),
         ];
         let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         for (chord, desc) in ROWS {
@@ -7816,7 +7816,7 @@ impl CraneShellView {
             };
             let plus_key = format!("pplus:{}", p.path);
             let plus_state = self.hover_handle(&plus_key);
-            let plus_overlay = self.trailing_plus_overlay(21.0, plus_action, &plus_key, plus_tip);
+            let plus_overlay = self.trailing_plus_overlay(24.0, plus_action, &plus_key, plus_tip);
             let project_row = Box::new(Hoverable::new(plus_state, move |ms| {
                 if ms.is_hovered() {
                     Stack::new()
@@ -9751,7 +9751,12 @@ impl CraneShellView {
                 .get(path)
                 .map(|h| h.as_ref(app).is_dirty(app))
                 .unwrap_or(false);
-            let state = self.hover_handle(&format!("ftab:{i}"));
+            // Key hover state by the tab's path, not its index — otherwise a
+            // close/reorder shifts indices and hover state migrates onto whatever
+            // tab now sits at that index for a frame (same reason `lrow:` keys use
+            // the row's path string).
+            let path_key = path.to_string_lossy();
+            let state = self.hover_handle(&format!("ftab:{path_key}"));
             let ui_font = self.ui_font;
             let icon_font = self.icon_font;
             let label_color = if active { theme::text() } else { theme::text_muted() };
@@ -9818,7 +9823,7 @@ impl CraneShellView {
             })
             .finish();
             // Per-tab close — 16×16 hover box.
-            let xstate = self.hover_handle(&format!("ftabx:{i}"));
+            let xstate = self.hover_handle(&format!("ftabx:{path_key}"));
             let icon_font2 = self.icon_font;
             let close = Hoverable::new(xstate, move |ms| {
                 let (bg, fg) = if ms.is_hovered() {
@@ -11981,6 +11986,20 @@ impl View for CraneShellView {
         let modal_is_switcher = matches!(self.modal, Some(Modal::TabSwitcher));
         let modal_is_switch_branch = matches!(self.modal, Some(Modal::SwitchBranch));
         let modal_is_new_workspace = matches!(self.modal, Some(Modal::NewWorkspace));
+        // Any dropdown / popover menu open (mirrors exactly what CloseContextMenu
+        // clears): a non-modal Escape should dismiss these before falling through
+        // to the terminal. Captured now like `modal_open`; the view rebuilds every
+        // frame so this reflects live state when a key arrives.
+        let any_menu_open = self.context_menu.is_some()
+            || self.row_menu.is_some()
+            || self.branch_picker.is_some()
+            || self.worktree_menu.is_some()
+            || self.tab_menu.is_some()
+            || self.folder_menu.is_some()
+            || self.git_log_menu.is_some()
+            || self.git_log_branch_prompt.is_some()
+            || self.new_pane_menu_open
+            || self.gear_menu_open;
         // App-level keyboard shortcuts. The terminal pane propagates Cmd combos
         // up to here (its own on_keydown returns PropagateToParent for cmd).
         EventHandler::new(root)
@@ -12060,6 +12079,19 @@ impl View for CraneShellView {
                     } else if modal_is_new_workspace {
                         ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceKey(ks.clone()));
                     }
+                    return DispatchEventResult::StopPropagation;
+                }
+                // No modal, but a dropdown / popover menu is open: Escape closes it
+                // (same clearing as clicking away) and is consumed so it does not
+                // also reach the terminal. Falls through to the normal Escape path
+                // (restore maximized pane / SendKeys) when no menu is open.
+                if any_menu_open
+                    && ks.key.to_ascii_lowercase() == "escape"
+                    && !ks.cmd
+                    && !ks.ctrl
+                    && !ks.alt
+                {
+                    ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
                     return DispatchEventResult::StopPropagation;
                 }
                 if ks.cmd && !ks.ctrl && !ks.alt {
@@ -13683,6 +13715,8 @@ impl CraneShellView {
             }
             CraneShellAction::RemoveWorktree { pi, wi } => {
                 self.worktree_menu = None;
+                // Member rows (and their tooltip-owning ＋s) unmount without a hover-out.
+                self.hover_tip = None;
                 let pi = *pi;
                 let wi = *wi;
                 let Some(main_path) = self.projects.get(pi).map(|p| p.path.clone()) else {
