@@ -3890,34 +3890,38 @@ impl CraneShellView {
         self.modal_scaffold(card)
     }
 
-    /// Standard modal card chrome: surface background, border, padding, fixed width.
+    /// Standard modal card chrome: the premium popover treatment shared with
+    /// menus — surface background, 1px border, 10px corners, drop shadow, and a
+    /// consistent 16px inner inset. Fixed width; height fits its body.
     fn modal_card(&self, width: f32, body: Box<dyn Element>) -> Box<dyn Element> {
         ConstrainedBox::new(
             Container::new(body)
                 .with_background_color(theme::surface())
                 .with_border(Border::all(1.0).with_border_color(theme::border()))
-                .with_uniform_padding(18.0)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.0)))
+                .with_drop_shadow(DropShadow::new_with_standard_offset_and_spread(
+                    theme::menu_shadow(),
+                ))
+                .with_uniform_padding(16.0)
                 .finish(),
         )
         .with_width(width)
         .finish()
     }
 
-    /// A modal heading with a close (×) button pinned to the far right.
+    /// A modal heading with a close (×) button pinned to the far right. The
+    /// close reuses the shared 20×20 hover-lit `icon_button`; its hover key is
+    /// derived from the title so each modal's close has an independent state.
     fn modal_header(&self, title: &str) -> Box<dyn Element> {
-        let close = EventHandler::new(
-            Container::new(self.icon(icons::X, 13.0, theme::text_muted()))
-                .with_uniform_padding(4.0)
-                .finish(),
-        )
-        .on_left_mouse_down(|ctx, _app, _pos| {
-            ctx.dispatch_typed_action(CraneShellAction::CloseModal);
-            DispatchEventResult::StopPropagation
-        })
-        .finish();
+        let close = self.icon_button(
+            &format!("modalclose:{title}"),
+            icons::X,
+            CraneShellAction::CloseModal,
+        );
         Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(
-                Text::new(title.to_string(), self.ui_font, 15.0)
+                Text::new(title.to_string(), self.ui_font, 13.0)
                     .with_color(theme::text_header())
                     .finish(),
             )
@@ -5274,21 +5278,29 @@ impl CraneShellView {
         };
         let query_field = Container::new(
             Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_child(self.icon(icons::MAGNIFYING_GLASS, 13.0, theme::text_muted()))
                 .with_child(Self::spacer(8.0))
                 .with_child(Text::new(qtext, self.ui_font, 13.0).with_color(qcolor).finish())
                 .finish(),
         )
-        .with_background_color(theme::row_active())
+        .with_background_color(theme::sidebar_bg())
         .with_border(Border::all(1.0).with_border_color(theme::border()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
         .with_padding_left(8.0)
         .with_padding_right(8.0)
-        .with_padding_top(7.0)
-        .with_padding_bottom(7.0)
+        .with_padding_top(5.5)
+        .with_padding_bottom(5.5)
         .finish();
 
         let pi = st.project_idx;
+        // Row height + how many rows before the list starts scrolling. The body
+        // is min(content, cap): short lists draw their natural height (no dead
+        // space), long lists cap at ROW_CAP rows and scroll.
+        const ROW_H: f32 = 30.0;
+        const ROW_CAP: usize = 12;
         let mut list = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        let mut row_count = 0usize;
         for (i, b) in filtered.iter().enumerate() {
             let is_current = *b == self.branch;
             let is_sel = i == st.selected;
@@ -5297,17 +5309,22 @@ impl CraneShellView {
             let color = if is_current { theme::accent() } else { theme::text() };
             let branch = b.clone();
             let label = b.clone();
+            let wt_branch = b.clone();
             let ui_font = self.ui_font;
             let icon_font = self.icon_font;
             let state = self.hover_handle(&format!("sb:{b}"));
-            // Left region: icon + name (+ a muted "remote" tag) — click = checkout.
-            let name_region = Hoverable::new(state, move |ms| {
-                let bg = if ms.is_hovered() || is_sel {
-                    theme::row_hover()
+            // The WHOLE row is one Hoverable: click = checkout; the "+ worktree"
+            // affordance is rendered ONLY while the row is hovered (a nested
+            // EventHandler that stops propagation so it never triggers checkout).
+            // Keyboard users reach worktrees via the footer-documented flow.
+            let row = Hoverable::new(state, move |ms| {
+                let hovered = ms.is_hovered();
+                let bg = if hovered || is_sel {
+                    theme::hover_wash()
                 } else {
                     ColorU::new(0, 0, 0, 0)
                 };
-                let mut r = Flex::row()
+                let mut left = Flex::row()
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_child(
                         Container::new(
@@ -5322,17 +5339,69 @@ impl CraneShellView {
                         Text::new(label.clone(), ui_font, 12.5).with_color(color).finish(),
                     );
                 if !is_local {
-                    r = r.with_child(Self::spacer(8.0)).with_child(
-                        Text::new("remote".to_string(), ui_font, 10.0)
-                            .with_color(theme::text_muted())
-                            .finish(),
+                    // Small muted "remote" chip.
+                    left = left.with_child(Self::spacer(8.0)).with_child(
+                        Container::new(
+                            Text::new("remote".to_string(), ui_font, 10.0)
+                                .with_color(theme::text_muted())
+                                .finish(),
+                        )
+                        .with_background_color(theme::surface())
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
+                        .with_padding_left(6.0)
+                        .with_padding_right(6.0)
+                        .with_padding_top(1.0)
+                        .with_padding_bottom(1.0)
+                        .finish(),
                     );
                 }
-                Container::new(r.finish())
+                let mut inner = Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(Expanded::new(1.0, left.finish()).finish());
+                if hovered {
+                    let wt = wt_branch.clone();
+                    let reveal = EventHandler::new(
+                        Container::new(
+                            Flex::row()
+                                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                                .with_child(
+                                    Text::new(icons::PLUS.to_string(), icon_font, 11.0)
+                                        .with_color(theme::text_muted())
+                                        .finish(),
+                                )
+                                .with_child(Self::spacer(4.0))
+                                .with_child(
+                                    Text::new("worktree".to_string(), ui_font, 11.0)
+                                        .with_color(theme::text_muted())
+                                        .finish(),
+                                )
+                                .finish(),
+                        )
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                        .with_padding_left(6.0)
+                        .with_padding_right(6.0)
+                        .with_padding_top(3.0)
+                        .with_padding_bottom(3.0)
+                        .finish(),
+                    )
+                    .on_left_mouse_down(move |ctx, _app, _pos| {
+                        ctx.dispatch_typed_action(CraneShellAction::OpenNewWorkspace {
+                            pi,
+                            branch: Some(wt.clone()),
+                        });
+                        DispatchEventResult::StopPropagation
+                    })
+                    .with_always_handle()
+                    .finish();
+                    inner = inner.with_child(reveal).with_child(Self::spacer(4.0));
+                }
+                Container::new(inner.finish())
                     .with_background_color(bg)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
                     .with_padding_left(10.0)
-                    .with_padding_top(6.0)
-                    .with_padding_bottom(6.0)
+                    .with_padding_right(6.0)
+                    .with_padding_top(6.5)
+                    .with_padding_bottom(6.5)
                     .finish()
             })
             .with_cursor(Cursor::PointingHand)
@@ -5341,59 +5410,14 @@ impl CraneShellView {
                 ctx.dispatch_typed_action(CraneShellAction::CheckoutBranch(branch.clone()));
             })
             .finish();
-            // Right region: "+ worktree".
-            let wt_branch = b.clone();
-            let wt_state = self.hover_handle(&format!("sbw:{b}"));
-            let wt_btn = Hoverable::new(wt_state, move |ms| {
-                let bg = if ms.is_hovered() {
-                    theme::row_hover()
-                } else {
-                    ColorU::new(0, 0, 0, 0)
-                };
-                Container::new(
-                    Flex::row()
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(
-                            Text::new(icons::PLUS.to_string(), icon_font, 11.0)
-                                .with_color(theme::text_muted())
-                                .finish(),
-                        )
-                        .with_child(Self::spacer(3.0))
-                        .with_child(
-                            Text::new("worktree".to_string(), ui_font, 10.5)
-                                .with_color(theme::text_muted())
-                                .finish(),
-                        )
-                        .finish(),
-                )
-                .with_background_color(bg)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
-                .with_padding_left(6.0)
-                .with_padding_right(8.0)
-                .with_padding_top(4.0)
-                .with_padding_bottom(4.0)
-                .finish()
-            })
-            .with_cursor(Cursor::PointingHand)
-            .on_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(CraneShellAction::OpenNewWorkspace {
-                    pi,
-                    branch: Some(wt_branch.clone()),
-                });
-            })
-            .finish();
-            let row = Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(Expanded::new(1.0, name_region).finish())
-                .with_child(wt_btn)
-                .with_child(Self::spacer(6.0))
-                .finish();
             list = list.with_child(row);
+            row_count += 1;
         }
         // "Create new branch" row when the query names no existing branch.
         if !q.is_empty() && !exact {
             let new_name = st.query.trim().to_string();
             list = list.with_child(self.create_branch_row(new_name));
+            row_count += 1;
         }
         if filtered.is_empty() && q.is_empty() {
             list = list.with_child(
@@ -5405,20 +5429,29 @@ impl CraneShellView {
                 .with_uniform_padding(8.0)
                 .finish(),
             );
+            row_count += 1;
         }
-        let scrolled = ConstrainedBox::new(
-            ClippedScrollable::vertical(
-                self.switch_branch_scroll.clone(),
-                list.finish(),
-                ScrollbarWidth::Auto,
-                Fill::Solid(theme::border()),
-                Fill::Solid(theme::text_muted()),
-                Fill::None,
+        // Body height fits content: draw naturally up to ROW_CAP rows, then cap
+        // and scroll. The ClippedScrollable keeps a stable scroll handle.
+        let list = list.finish();
+        let content_h = row_count.max(1) as f32 * ROW_H;
+        let scrolled: Box<dyn Element> = if row_count > ROW_CAP {
+            ConstrainedBox::new(
+                ClippedScrollable::vertical(
+                    self.switch_branch_scroll.clone(),
+                    list,
+                    ScrollbarWidth::Auto,
+                    Fill::Solid(theme::border()),
+                    Fill::Solid(theme::text_muted()),
+                    Fill::None,
+                )
+                .finish(),
             )
-            .finish(),
-        )
-        .with_height(320.0)
-        .finish();
+            .with_height(ROW_CAP as f32 * ROW_H)
+            .finish()
+        } else {
+            ConstrainedBox::new(list).with_height(content_h).finish()
+        };
         let col = Flex::column()
             .with_child(self.modal_header("Switch Branch"))
             .with_child(Self::spacer(8.0))
@@ -5436,7 +5469,7 @@ impl CraneShellView {
                 Text::new(
                     "Enter checks out · + worktree creates a workspace · Esc closes".to_string(),
                     self.ui_font,
-                    10.5,
+                    10.0,
                 )
                 .with_color(theme::text_muted())
                 .finish(),
