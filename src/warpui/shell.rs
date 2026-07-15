@@ -282,6 +282,15 @@ pub struct CraneShellView {
     git_log_gen: u64,
     /// Debounce clock for ref-change auto-reloads.
     git_log_last_reload: std::time::Instant,
+    /// Debounce clock for background (non-active-repo) badge rescans —
+    /// see `drain_fs_events`'s non-active block.
+    bg_badge_last_scan: std::time::Instant,
+    /// Non-active repo roots touched since the last background badge scan but
+    /// not yet flushed because the debounce window hadn't elapsed. Carried
+    /// across ticks so a root touched right before the window closes isn't
+    /// dropped forever if no further edits land on it — the next tick (even
+    /// with zero new fs events) flushes it once the debounce clears.
+    pending_bg_roots: std::collections::HashSet<PathBuf>,
     /// Selected commit SHA (highlighted; drives the detail panel).
     git_log_selected: Option<String>,
     /// Fractional row scroll offset for the commit list (owned here so it
@@ -1462,6 +1471,8 @@ impl CraneShellView {
             git_log_loading: false,
             git_log_gen: 0,
             git_log_last_reload: std::time::Instant::now(),
+            bg_badge_last_scan: std::time::Instant::now(),
+            pending_bg_roots: std::collections::HashSet::new(),
             git_log_selected: None,
             git_log_scroll: Rc::new(Cell::new(0.0)),
             git_log_ref_filter: None,
@@ -6781,6 +6792,10 @@ impl CraneShellView {
         // ref/HEAD/packed-refs write from a commit / fetch / branch switch) —
         // that, and only that, needs the Git Log graph reloaded.
         let mut git_refs_touched = false;
+        // Every distinct non-active root touched this tick — folded into
+        // `pending_bg_roots` below so background repos' sidebar badges refresh
+        // live too (see the block after the active-repo one).
+        let mut bg_touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         while let Ok(ev) = self.fs_events.try_recv() {
             if let Some(ac) = active_canon.as_ref() {
                 if &ev.root == ac {
@@ -6793,8 +6808,10 @@ impl CraneShellView {
                     }) {
                         git_refs_touched = true;
                     }
+                    continue;
                 }
             }
+            bg_touched.insert(ev.root);
         }
         if active_touched {
             self.refresh_panel(ctx);
@@ -6822,6 +6839,40 @@ impl CraneShellView {
                 if !paths.is_empty() {
                     self.spawn_git_scan(ctx, "active-diff".to_string(), paths);
                 }
+            }
+        }
+        // Refresh sidebar badges for NON-active repos too — an agent or a git
+        // op in a background workspace should tick its +N/-M without a
+        // project switch. Roots touched this tick join any roots left over
+        // from a previous tick that missed the debounce window, so a root
+        // never gets stranded waiting for a fs event that may not come again.
+        self.pending_bg_roots.extend(bg_touched);
+        if !self.pending_bg_roots.is_empty()
+            && self.bg_badge_last_scan.elapsed() >= std::time::Duration::from_millis(500)
+        {
+            let bg_paths: Vec<PathBuf> = self
+                .pending_bg_roots
+                .iter()
+                .flat_map(|root| {
+                    self.projects
+                        .iter()
+                        .flat_map(|p| p.worktrees.iter())
+                        .filter(|w| {
+                            !w.path.is_empty()
+                                && std::fs::canonicalize(&w.path).ok().as_deref()
+                                    == Some(root.as_path())
+                        })
+                        .map(|w| PathBuf::from(&w.path))
+                })
+                .collect();
+            self.pending_bg_roots.clear();
+            self.bg_badge_last_scan = std::time::Instant::now();
+            // Own scope ("bg-diff") — a distinct generation counter from
+            // "active-diff" / "tree", so this can never cancel or starve the
+            // active-repo scan (each scope's generation only supersedes prior
+            // scans under that same scope; see `bump_scan_gen`).
+            if !bg_paths.is_empty() {
+                self.spawn_git_scan(ctx, "bg-diff".to_string(), bg_paths);
             }
         }
         // A ref/HEAD write in the active repo (commit / fetch / branch switch)
