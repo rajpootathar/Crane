@@ -23,3 +23,4 @@ Cargo.lock
 # Pdfium prebuilt binaries — fetched on demand by `make vendor-pdfium`
 # (see scripts/vendor-pdfium.sh). ~7 MB per arch, do not commit.
 /vendor/pdfium
+.superpowers/
