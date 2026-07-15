@@ -9128,8 +9128,13 @@ impl CraneShellView {
             })
             .finish();
 
-        let content = Flex::column()
-            .with_child(header)
+        // The File pane gets a second header row (the tab strip) between its
+        // chrome header and body; Flex shrinks the body to make room.
+        let mut col = Flex::column().with_child(header);
+        if self.files_pane == Some(id) {
+            col = col.with_child(self.file_tab_strip(app));
+        }
+        let content = col
             .with_child(Expanded::new(1.0, body).finish())
             .finish();
         let cell = self
@@ -9196,6 +9201,154 @@ impl CraneShellView {
         }
     }
 
+    /// The File pane's tab strip — second header row. Active tab: surface bg +
+    /// 2px accent underline. Inactive: flat, hover wash. Per-tab ✕ closes the tab.
+    fn file_tab_strip(&self, app: &AppContext) -> Box<dyn Element> {
+        let mut strip = Flex::row();
+        for (i, path) in self.file_pane_paths.iter().enumerate() {
+            let active = i == self.file_pane_active;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let dirty = self
+                .editor_views
+                .get(path)
+                .map(|h| h.as_ref(app).is_dirty(app))
+                .unwrap_or(false);
+            let state = self.hover_handle(&format!("ftab:{i}"));
+            let ui_font = self.ui_font;
+            let icon_font = self.icon_font;
+            let label_color = if active { theme::text() } else { theme::text_muted() };
+            let name_cl = name.clone();
+            let chip = Hoverable::new(state, move |ms| {
+                let bg = if active {
+                    theme::surface()
+                } else if ms.is_hovered() {
+                    theme::hover_wash()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                };
+                let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+                if dirty {
+                    row = row.with_child(
+                        Container::new(
+                            Text::new(icons::CIRCLE.to_string(), icon_font, 8.0)
+                                .with_color(theme::accent())
+                                .finish(),
+                        )
+                        .with_padding_right(5.0)
+                        .finish(),
+                    );
+                }
+                row = row.with_child(
+                    Text::new(name_cl.clone(), ui_font, 11.0)
+                        .with_color(label_color)
+                        .finish(),
+                );
+                // Underline: 2px accent for the active tab, transparent filler otherwise.
+                let underline = ConstrainedBox::new(
+                    Rect::new()
+                        .with_background_color(if active {
+                            theme::accent()
+                        } else {
+                            ColorU::new(0, 0, 0, 0)
+                        })
+                        .finish(),
+                )
+                .with_height(2.0)
+                .finish();
+                Container::new(
+                    Flex::column()
+                        .with_child(
+                            Expanded::new(
+                                1.0,
+                                Container::new(row.finish())
+                                    .with_padding_left(12.0)
+                                    .with_padding_right(4.0)
+                                    .with_padding_top(6.0)
+                                    .finish(),
+                            )
+                            .finish(),
+                        )
+                        .with_child(underline)
+                        .finish(),
+                )
+                .with_background_color(bg)
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::FileTabSelect(i));
+            })
+            .finish();
+            // Per-tab close — 16×16 hover box.
+            let xstate = self.hover_handle(&format!("ftabx:{i}"));
+            let icon_font2 = self.icon_font;
+            let close = Hoverable::new(xstate, move |ms| {
+                let (bg, fg) = if ms.is_hovered() {
+                    (theme::selection_wash(), theme::text_hover())
+                } else {
+                    (ColorU::new(0, 0, 0, 0), theme::text_muted())
+                };
+                ConstrainedBox::new(
+                    Container::new(
+                        Text::new(icons::X.to_string(), icon_font2, 10.0)
+                            .with_color(fg)
+                            .finish(),
+                    )
+                    .with_background_color(bg)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                    .with_padding_left(3.0)
+                    .with_padding_top(3.0)
+                    .finish(),
+                )
+                .with_width(16.0)
+                .with_height(16.0)
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(move |ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::FileTabClose(i));
+            })
+            .finish();
+            strip = strip.with_child(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(chip)
+                    .with_child(Container::new(close).with_padding_right(6.0).finish())
+                    .finish(),
+            );
+        }
+        ConstrainedBox::new(
+            Flex::column()
+                .with_child(
+                    Expanded::new(
+                        1.0,
+                        Stack::new()
+                            .with_child(
+                                Rect::new()
+                                    .with_background_color(theme::topbar_bg())
+                                    .finish(),
+                            )
+                            .with_child(strip.finish())
+                            .finish(),
+                    )
+                    .finish(),
+                )
+                .with_child(
+                    ConstrainedBox::new(
+                        Rect::new().with_background_color(theme::divider()).finish(),
+                    )
+                    .with_height(1.0)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_height(theme::TAB_H)
+        .finish()
+    }
+
     /// Pane header: title (click to focus) + expand-to-full + close.
     fn pane_header(&self, id: PaneId, app: &AppContext) -> Box<dyn Element> {
         let focused = self.focused == Some(id);
@@ -9206,83 +9359,28 @@ impl CraneShellView {
         let fg = if focused { theme::accent() } else { theme::text_muted() };
         let is_file_pane = self.files_pane == Some(id);
 
-        // For a File pane the header IS the file tab strip (shell-driven, so
-        // clicks route here). Other panes show a simple "Terminal" title.
-        let title: Box<dyn Element> = if is_file_pane {
-            let mut strip = Flex::row();
-            for (i, path) in self.file_pane_paths.iter().enumerate() {
-                let active = i == self.file_pane_active;
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                let tbg = if active { theme::surface() } else { theme::topbar_bg() };
-                let tfg = if active { theme::text() } else { theme::text_muted() };
-                // Unsaved indicator: a filled dot before the name when dirty.
-                let dirty = self
-                    .editor_views
-                    .get(path)
-                    .map(|h| h.as_ref(app).is_dirty(app))
-                    .unwrap_or(false);
-                let label = if dirty { format!("{name}  ") } else { name };
-                let mut chip_row = Flex::row();
-                if dirty {
-                    chip_row = chip_row.with_child(
-                        Container::new(self.icon(icons::CIRCLE, 8.0, theme::accent()))
-                            .with_padding_left(8.0)
-                            .with_padding_top(8.0)
-                            .finish(),
-                    );
-                }
-                let chip = EventHandler::new(
-                    Container::new(
-                        chip_row
-                            .with_child(
-                                Text::new(label, self.ui_font, 11.0).with_color(tfg).finish(),
-                            )
-                            .finish(),
-                    )
-                    .with_background_color(tbg)
-                    .with_padding_left(if dirty { 2.0 } else { 10.0 })
-                    .with_padding_right(4.0)
-                    .with_padding_top(4.0)
-                    .with_padding_bottom(4.0)
-                    .finish(),
-                )
-                .on_left_mouse_down(move |ctx, _app, _pos| {
-                    ctx.dispatch_typed_action(CraneShellAction::FileTabSelect(i));
-                    DispatchEventResult::StopPropagation
-                })
-                .finish();
-                let close = EventHandler::new(
-                    Container::new(self.icon(icons::X, 10.0, theme::text_muted()))
-                        .with_background_color(tbg)
-                        .with_padding_right(8.0)
-                        .with_padding_top(4.0)
-                        .with_padding_bottom(4.0)
-                        .finish(),
-                )
-                .on_left_mouse_down(move |ctx, _app, _pos| {
-                    ctx.dispatch_typed_action(CraneShellAction::FileTabClose(i));
-                    DispatchEventResult::StopPropagation
-                })
-                .finish();
-                strip = strip.with_child(Flex::row().with_child(chip).with_child(close).finish());
-            }
-            strip.finish()
-        } else {
+        // Row 1 is plain pane chrome (icon + title). The File pane's tab strip
+        // now renders as a SECOND row beneath this header (see `file_tab_strip`),
+        // so a File pane shows a static "Files" title here — pane close (the
+        // row-1 ✕) is thus separate from per-tab closes.
+        let title: Box<dyn Element> = {
             // Title + icon reflect the pane's content (Terminal is the default;
-            // Welcome / Markdown / Diff panes name themselves).
-            let (glyph, label): (&'static str, String) = match self.panes.get(&id) {
-                Some(PaneContent::Welcome(_)) => (icons::CUBE, "Welcome".to_string()),
-                Some(PaneContent::Markdown(h)) => {
-                    (icons::FILE_TEXT, h.as_ref(app).title().to_string())
+            // Welcome / Markdown / Diff panes name themselves; the File pane is
+            // always "Files").
+            let (glyph, label): (&'static str, String) = if is_file_pane {
+                (icons::FILE, "Files".to_string())
+            } else {
+                match self.panes.get(&id) {
+                    Some(PaneContent::Welcome(_)) => (icons::CUBE, "Welcome".to_string()),
+                    Some(PaneContent::Markdown(h)) => {
+                        (icons::FILE_TEXT, h.as_ref(app).title().to_string())
+                    }
+                    Some(PaneContent::Diff(h)) => {
+                        (icons::GIT_DIFF, format!("Diff: {}", h.as_ref(app).title()))
+                    }
+                    Some(PaneContent::Browser(h)) => (icons::GLOBE, h.as_ref(app).title()),
+                    _ => (icons::TERMINAL_WINDOW, "Terminal".to_string()),
                 }
-                Some(PaneContent::Diff(h)) => {
-                    (icons::GIT_DIFF, format!("Diff: {}", h.as_ref(app).title()))
-                }
-                Some(PaneContent::Browser(h)) => (icons::GLOBE, h.as_ref(app).title()),
-                _ => (icons::TERMINAL_WINDOW, "Terminal".to_string()),
             };
             EventHandler::new(
                 Container::new(
