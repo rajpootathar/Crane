@@ -92,7 +92,6 @@ pub fn menu_shadow() -> ColorU    { ColorU { r: 0, g: 0, b: 0, a: 128 } }
 
 // Panel dimensions — not colours, never change with themes.
 pub const TOPBAR_H: f32 = 36.0;
-pub const STATUS_H: f32 = 26.0;
 pub const HEADER_H: f32 = 24.0;
 pub const TAB_H: f32    = 26.0;
 pub const LEFT_W: f32   = 240.0;
