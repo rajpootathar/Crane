@@ -239,10 +239,22 @@ pub fn list_remote_branches(root: &Path) -> Vec<String> {
     if !out.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&out.stdout)
+    parse_remote_branch_lines(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `git branch -r --format=%(refname:short)` output into real
+/// remote-tracking branch names, dropping the remote's symbolic HEAD.
+///
+/// `%(refname:short)` collapses `refs/remotes/origin/HEAD` down to the bare
+/// remote name (`origin`) — with no `->` arrow — so the classic `-> ` filter
+/// misses it and a phantom "origin" leaks into the branch picker. A genuine
+/// remote branch always has a `<remote>/<branch>` shape, so requiring a `/`
+/// (and no `->`) discards the symbolic HEAD while keeping every real branch.
+fn parse_remote_branch_lines(stdout: &str) -> Vec<String> {
+    stdout
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.contains("->"))
+        .filter(|l| !l.is_empty() && !l.contains("->") && l.contains('/'))
         .map(str::to_string)
         .collect()
 }
@@ -1044,4 +1056,33 @@ pub fn spawn_git_commit(
         drop(guard);
         wake();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_remote_branches_drops_symbolic_head() {
+        // `%(refname:short)` renders `refs/remotes/origin/HEAD` as the bare
+        // remote name "origin" — the source of the phantom-branch bug.
+        let raw = "origin\norigin/main\norigin/feat/x\n";
+        assert_eq!(
+            parse_remote_branch_lines(raw),
+            vec!["origin/main".to_string(), "origin/feat/x".to_string()],
+        );
+    }
+
+    #[test]
+    fn parse_remote_branches_drops_arrow_form() {
+        // Older/`-a`-style output can still carry the arrow form.
+        let raw = "  origin/HEAD -> origin/main\n  origin/main\n";
+        assert_eq!(parse_remote_branch_lines(raw), vec!["origin/main".to_string()]);
+    }
+
+    #[test]
+    fn parse_remote_branches_empty_and_blank_lines() {
+        assert!(parse_remote_branch_lines("").is_empty());
+        assert!(parse_remote_branch_lines("\n  \n").is_empty());
+    }
 }
