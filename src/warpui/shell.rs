@@ -5452,7 +5452,6 @@ impl CraneShellView {
                         });
                         DispatchEventResult::StopPropagation
                     })
-                    .with_always_handle()
                     .finish();
                     inner = inner.with_child(reveal).with_child(Self::spacer(4.0));
                 }
@@ -5466,6 +5465,15 @@ impl CraneShellView {
                     .finish()
             })
             .with_cursor(Cursor::PointingHand)
+            // The checkout lives on the Hoverable's own mouse_down_handler,
+            // which fires UNCONDITIONALLY after the child chain unless defer is
+            // set (hoverable.rs dispatch_event honors a handled child only under
+            // defer_events_to_children). With defer: a click on the reveal makes
+            // the child chain return true (its EventHandler stops propagation)
+            // and checkout is skipped; a plain row click hits no child handler
+            // (EventHandler callbacks are bounds-gated), the chain returns
+            // false, and checkout still fires.
+            .with_defer_events_to_children()
             .on_mouse_down(move |ctx, _app, _pos| {
                 ctx.dispatch_typed_action(CraneShellAction::CloseModal);
                 ctx.dispatch_typed_action(CraneShellAction::CheckoutBranch(branch.clone()));
@@ -5492,27 +5500,24 @@ impl CraneShellView {
             );
             row_count += 1;
         }
-        // Body height fits content: draw naturally up to ROW_CAP rows, then cap
-        // and scroll. The ClippedScrollable keeps a stable scroll handle.
-        let list = list.finish();
-        let content_h = row_count.max(1) as f32 * ROW_H;
-        let scrolled: Box<dyn Element> = if row_count > ROW_CAP {
-            ConstrainedBox::new(
-                ClippedScrollable::vertical(
-                    self.switch_branch_scroll.clone(),
-                    list,
-                    ScrollbarWidth::Auto,
-                    Fill::Solid(theme::border()),
-                    Fill::Solid(theme::text_muted()),
-                    Fill::None,
-                )
-                .finish(),
+        // Body height fits content: min(content, cap) estimated from ROW_H.
+        // BOTH branches keep the ClippedScrollable wrapper (stable scroll
+        // handle) so if a painted row ever exceeds the ROW_H estimate the
+        // mismatch degrades to a scrollbar instead of overpainting the footer.
+        let body_h = (row_count.max(1).min(ROW_CAP) as f32) * ROW_H;
+        let scrolled: Box<dyn Element> = ConstrainedBox::new(
+            ClippedScrollable::vertical(
+                self.switch_branch_scroll.clone(),
+                list.finish(),
+                ScrollbarWidth::Auto,
+                Fill::Solid(theme::border()),
+                Fill::Solid(theme::text_muted()),
+                Fill::None,
             )
-            .with_height(ROW_CAP as f32 * ROW_H)
-            .finish()
-        } else {
-            ConstrainedBox::new(list).with_height(content_h).finish()
-        };
+            .finish(),
+        )
+        .with_height(body_h)
+        .finish();
         let col = Flex::column()
             .with_child(self.modal_header("Switch Branch"))
             .with_child(Self::spacer(8.0))
