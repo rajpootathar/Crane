@@ -7291,9 +7291,9 @@ impl CraneShellView {
                 // Hover-revealed trailing "+ new tab" on the row's right edge
                 // (old Crane's hover affordance) — the overlay only joins the
                 // stack while the pointer is over the row.
-                let state = self.hover_handle(&format!("wtplus:{pa:?}"));
-                let tip_key = format!("wtplus:{pa:?}");
-                let overlay = self.trailing_plus_overlay(row_h, pa, &tip_key, "New Tab");
+                let key = format!("wtplus:{pa:?}");
+                let state = self.hover_handle(&key);
+                let overlay = self.trailing_plus_overlay(row_h, pa, &key, "New Tab");
                 Box::new(Hoverable::new(state, move |ms| {
                     if ms.is_hovered() {
                         Stack::new().with_child(base).with_child(overlay).finish()
@@ -7773,9 +7773,9 @@ impl CraneShellView {
             } else {
                 (CraneShellAction::OpenNewWorkspace { pi, branch: None }, "New Workspace")
             };
-            let plus_state = self.hover_handle(&format!("pplus:{}", p.path));
-            let plus_tip_key = format!("pplus:{}", p.path);
-            let plus_overlay = self.trailing_plus_overlay(21.0, plus_action, &plus_tip_key, plus_tip);
+            let plus_key = format!("pplus:{}", p.path);
+            let plus_state = self.hover_handle(&plus_key);
+            let plus_overlay = self.trailing_plus_overlay(21.0, plus_action, &plus_key, plus_tip);
             let project_row = Box::new(Hoverable::new(plus_state, move |ms| {
                 if ms.is_hovered() {
                     Stack::new()
@@ -11546,9 +11546,15 @@ impl View for CraneShellView {
         }
         // Hover tooltip: above menus/toasts, below the blocking modal. Purely
         // decorative and click-through (see `tooltip_overlay`), so it never
-        // steals events from whatever's underneath.
+        // steals events from whatever's underneath. Paint-gated on the Left
+        // Panel being visible (every tooltip owner lives there) as a second
+        // line of defence behind the explicit `hover_tip = None` clears in the
+        // structural handlers (ToggleLeft / RemoveProject / RemoveGroup) —
+        // widen the gate if a tooltip owner ever lands outside the Left Panel.
         if let Some((text, x, y)) = &self.hover_tip {
-            root_stack = root_stack.with_child(self.tooltip_overlay(text, *x, *y));
+            if self.show_left {
+                root_stack = root_stack.with_child(self.tooltip_overlay(text, *x, *y));
+            }
         }
         // The blocking modal renders LAST — topmost, over every other overlay.
         if let Some(m) = &self.modal {
@@ -12993,6 +12999,12 @@ impl CraneShellView {
             CraneShellAction::ToggleLeft => {
                 if !self.any_text_input_focused(&*ctx) {
                     self.show_left = !self.show_left;
+                    // Defensive clear (same pattern as `context_menu` in the
+                    // structural handlers below): collapsing the panel unmounts
+                    // every tooltip-owning button in the same frame, so the
+                    // owning Hoverable never fires its hover-out and a shown
+                    // tooltip would otherwise stay painted at stale coordinates.
+                    self.hover_tip = None;
                 }
             }
             CraneShellAction::ToggleRight => {
@@ -13062,6 +13074,8 @@ impl CraneShellView {
             }
             CraneShellAction::RemoveGroup(group) => {
                 self.folder_menu = None;
+                // Member rows (and their tooltip-owning ＋s) unmount without a hover-out.
+                self.hover_tip = None;
                 self.remove_group(group, ctx);
             }
             CraneShellAction::SetTheme(name) => {
@@ -13154,6 +13168,8 @@ impl CraneShellView {
             }
             CraneShellAction::RemoveProject(i) => {
                 self.context_menu = None;
+                // Row (and its tooltip-owning ＋) unmounts without a hover-out.
+                self.hover_tip = None;
                 self.remove_project_at(*i, ctx);
             }
             CraneShellAction::ShowProjectMenu { project_idx, x, y } => {
