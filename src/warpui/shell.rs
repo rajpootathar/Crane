@@ -619,6 +619,10 @@ pub struct CraneShellView {
     /// 33ms browser reconcile tick (`browser_tick`). Near-idle when no Browser
     /// Pane exists — a single `matches!` scan of `self.panes` per tick.
     _browser_tick: warpui::r#async::SpawnedLocalStream,
+    /// 33ms animation tick — repaints while a toast or attention pulse is on
+    /// screen so the glow/dot breathe at full frame rate instead of the fast
+    /// tick's 4 FPS. No-op boolean check when idle.
+    _anim_tick: warpui::r#async::SpawnedLocalStream,
     /// Native WKWebView slots for Browser Panes, reconciled by `browser_tick`.
     browser_host: crate::warpui::browser::BrowserHost,
 }
@@ -1406,14 +1410,11 @@ impl CraneShellView {
                     let now = std::time::Instant::now();
                     this.toasts
                         .retain(|t| now.duration_since(t.at) < TOAST_TTL);
-                    // Keep repainting while any toast is visible (plus one final
-                    // tick when one expired) OR while any attention pulse is
-                    // still breathing — the latter animates + decays the
-                    // sidebar glow without input.
-                    if !this.toasts.is_empty()
-                        || this.toasts.len() != before
-                        || this.any_attention_active()
-                    {
+                    // One final notify when a toast just expired, so the
+                    // dismissal itself paints. Continuous animation (glow
+                    // breathing, toast still visible) is driven by the
+                    // dedicated 33ms `_anim_tick` below, not this 250ms tick.
+                    if this.toasts.len() != before {
                         vctx.notify();
                     }
                 });
@@ -1430,6 +1431,22 @@ impl CraneShellView {
             browser_ticker,
             |this: &mut Self, _instant, vctx| {
                 guarded_tick(this, vctx, "browser", |this, vctx| this.browser_tick(vctx));
+            },
+            |_this, _vctx| {},
+        );
+        // Animation tick — 33ms while a toast or attention pulse is on screen.
+        // The 250ms fast tick owns lifecycle (expiry, drain); this one only
+        // repaints so the glow/dot breathe at full rate instead of 4 FPS.
+        let anim_ticker =
+            warpui::r#async::Timer::interval(std::time::Duration::from_millis(33));
+        let anim_tick = ctx.spawn_stream_local(
+            anim_ticker,
+            |this: &mut Self, _instant, vctx| {
+                guarded_tick(this, vctx, "anim", |this, vctx| {
+                    if !this.toasts.is_empty() || this.any_attention_active() {
+                        vctx.notify();
+                    }
+                });
             },
             |_this, _vctx| {},
         );
@@ -1590,6 +1607,7 @@ impl CraneShellView {
             next_toast_id: 0,
             _fast_tick: fast_tick,
             _browser_tick: browser_tick,
+            _anim_tick: anim_tick,
             browser_host: crate::warpui::browser::BrowserHost::new(),
         };
         // Register every restored Project + Workspace root with the watcher so
