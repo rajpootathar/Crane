@@ -212,6 +212,21 @@ fn is_filtered(path: &Path) -> bool {
     {
         return true;
     }
+    // Linked-worktree private index churn. `git status` / `git diff` — which
+    // the shell's own badge scans run — refresh and rewrite
+    // `.git/worktrees/<name>/index`; letting those through feeds the scan's
+    // side-effects back in as new events (scan → index write → event → scan).
+    // Mirrors the `/.git/index.lock` drop above for the worktree-private dir.
+    // Plain top-level `/.git/index` stays UNfiltered (long-standing behavior;
+    // the shell classifies it as non-meta, so it can't loop the poller).
+    if let Some(idx) = s.find("/.git/worktrees/") {
+        let after = &s[idx + "/.git/worktrees/".len()..];
+        if let Some((_name, rel)) = after.split_once('/')
+            && (rel == "index" || rel == "index.lock")
+        {
+            return true;
+        }
+    }
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n,
         None => return false,
@@ -362,9 +377,20 @@ mod tests {
         assert!(is_filtered(Path::new("/repo/~$Document.docx")));
         assert!(is_filtered(Path::new("/repo/build.tmp")));
 
+        // Linked-worktree private index churn — written by `git status` /
+        // `git diff` themselves, so passing it through would loop the shell's
+        // badge scans (scan → index write → event → scan).
+        assert!(is_filtered(Path::new("/repo/.git/worktrees/wt/index")));
+        assert!(is_filtered(Path::new("/repo/.git/worktrees/wt/index.lock")));
+
         assert!(!is_filtered(Path::new("/repo/src/main.rs")));
         assert!(!is_filtered(Path::new("/repo/.git/HEAD")));
         assert!(!is_filtered(Path::new("/repo/.git/refs/heads/main")));
+        // Real ref writes in a linked worktree's private dir must survive.
+        assert!(!is_filtered(Path::new("/repo/.git/worktrees/wt/HEAD")));
+        assert!(!is_filtered(Path::new(
+            "/repo/.git/worktrees/wt/refs/bisect/bad"
+        )));
     }
 
     #[test]

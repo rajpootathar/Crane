@@ -282,6 +282,11 @@ pub struct CraneShellView {
     git_log_gen: u64,
     /// Debounce clock for ref-change auto-reloads.
     git_log_last_reload: std::time::Instant,
+    /// Last time a filesystem ref event triggered a synchronous
+    /// `poll_worktrees` from `drain_fs_events`. Rate-limits that path (>= 1s)
+    /// so an event storm can never saturate the UI thread with per-project
+    /// `git worktree list` shell-outs on the 250ms fast tick.
+    fs_ref_poll_last: std::time::Instant,
     /// Debounce clock for background (non-active-repo) badge rescans —
     /// see `drain_fs_events`'s non-active block.
     bg_badge_last_scan: std::time::Instant,
@@ -1491,6 +1496,7 @@ impl CraneShellView {
             git_log_loading: false,
             git_log_gen: 0,
             git_log_last_reload: std::time::Instant::now(),
+            fs_ref_poll_last: std::time::Instant::now(),
             bg_badge_last_scan: std::time::Instant::now(),
             pending_bg_roots: std::collections::HashSet::new(),
             git_log_selected: None,
@@ -6868,15 +6874,7 @@ impl CraneShellView {
         // linked worktree was committed to gets its +N/-M refreshed.
         let mut git_meta_roots: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
-        let is_git_meta = |paths: &[PathBuf]| {
-            paths.iter().any(|p| {
-                let s = p.to_string_lossy();
-                s.contains("/.git/refs/")
-                    || s.ends_with("/.git/HEAD")
-                    || s.ends_with("/.git/packed-refs")
-                    || s.contains("/.git/worktrees/")
-            })
-        };
+        let is_git_meta = |paths: &[PathBuf]| paths.iter().any(|p| git_meta_path(p));
         while let Ok(ev) = self.fs_events.try_recv() {
             if is_git_meta(&ev.paths) {
                 git_meta_roots.insert(ev.root.clone());
@@ -6978,7 +6976,15 @@ impl CraneShellView {
         // also moved a worktree's branch — refresh the sidebar branch labels on
         // the fast (~250ms) tick instead of waiting for the 1.5s worktree poll,
         // so a `git checkout` in the terminal shows up near-instantly.
-        if git_refs_touched {
+        // Rate-limited: `poll_worktrees` shells `git worktree list` per project
+        // SYNCHRONOUSLY on this (UI-thread) tick — unthrottled, an event storm
+        // would run it every 250ms and freeze the app (seen live with ~12
+        // projects). 1s keeps a checkout's label refresh feeling instant while
+        // capping the worst case at one poll per second.
+        if git_refs_touched
+            && self.fs_ref_poll_last.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            self.fs_ref_poll_last = std::time::Instant::now();
             self.poll_worktrees(ctx);
         }
         // Auto-reload the Git Log on a ref change while the dock is open,
@@ -14474,5 +14480,67 @@ impl CraneShellView {
         }
         // Mark the view dirty so warpui re-renders.
         ctx.notify();
+    }
+}
+
+/// True when `path` is a git-internal write that means "a ref moved" — a
+/// commit / checkout / fetch-with-ref-update — and therefore warrants a badge
+/// rescan + worktree poll. Deliberately NARROW: `git status` / `git diff`
+/// (exactly what our own badge scans run) refresh and rewrite
+/// `.git/worktrees/<name>/index`, so classifying every `/.git/worktrees/`
+/// write as a ref event feeds the scan's own index writes back into another
+/// scan — an infinite scan→event→scan loop that saturates the UI thread.
+/// Under `/.git/worktrees/<name>/` only HEAD, ORIG_HEAD, and `refs/…` count;
+/// `index`, `index.lock`, and `COMMIT_EDITMSG` never do. FETCH_HEAD is also
+/// deliberately excluded (both levels): a fetch that actually moves a ref
+/// writes under `refs/` anyway, and FETCH_HEAD alone changes no badge.
+fn git_meta_path(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy();
+    if s.contains("/.git/refs/")
+        || s.ends_with("/.git/HEAD")
+        || s.ends_with("/.git/packed-refs")
+        || s.ends_with("/.git/ORIG_HEAD")
+    {
+        return true;
+    }
+    // Linked-worktree private dir: `.git/worktrees/<name>/<rel>` — match on
+    // the <rel> tail only.
+    if let Some(idx) = s.find("/.git/worktrees/") {
+        let after = &s[idx + "/.git/worktrees/".len()..];
+        if let Some((_name, rel)) = after.split_once('/') {
+            return rel == "HEAD" || rel == "ORIG_HEAD" || rel.starts_with("refs/");
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod git_meta_tests {
+    use super::git_meta_path;
+    use std::path::Path;
+
+    #[test]
+    fn worktree_index_is_not_meta_but_head_and_refs_are() {
+        // Scan side-effects must NOT classify as ref writes (loop breaker).
+        assert!(!git_meta_path(Path::new("/r/.git/worktrees/x/index")));
+        assert!(!git_meta_path(Path::new("/r/.git/worktrees/x/index.lock")));
+        assert!(!git_meta_path(Path::new("/r/.git/worktrees/x/COMMIT_EDITMSG")));
+        assert!(!git_meta_path(Path::new("/r/.git/worktrees/x/FETCH_HEAD")));
+        assert!(!git_meta_path(Path::new("/r/.git/worktrees/x/logs/HEAD")));
+        assert!(!git_meta_path(Path::new("/r/.git/worktrees/x")));
+
+        // Real ref movement in a linked worktree DOES classify.
+        assert!(git_meta_path(Path::new("/r/.git/worktrees/x/HEAD")));
+        assert!(git_meta_path(Path::new("/r/.git/worktrees/x/ORIG_HEAD")));
+        assert!(git_meta_path(Path::new("/r/.git/worktrees/x/refs/bisect/bad")));
+
+        // Top level: refs / HEAD / packed-refs yes; index / FETCH_HEAD no.
+        assert!(git_meta_path(Path::new("/r/.git/refs/heads/main")));
+        assert!(git_meta_path(Path::new("/r/.git/HEAD")));
+        assert!(git_meta_path(Path::new("/r/.git/packed-refs")));
+        assert!(git_meta_path(Path::new("/r/.git/ORIG_HEAD")));
+        assert!(!git_meta_path(Path::new("/r/.git/index")));
+        assert!(!git_meta_path(Path::new("/r/.git/FETCH_HEAD")));
+        assert!(!git_meta_path(Path::new("/r/src/main.rs")));
     }
 }
