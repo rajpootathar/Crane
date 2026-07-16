@@ -12507,7 +12507,8 @@ impl View for CraneShellView {
             || self.new_pane_menu_open;
         // App-level keyboard shortcuts. The terminal pane propagates Cmd combos
         // up to here (its own on_keydown returns PropagateToParent for cmd).
-        EventHandler::new(root)
+        let scroll_wake = self.ui_wake.clone();
+        let shell = EventHandler::new(root)
             .on_left_mouse_down(move |ctx, _app, pos| {
                 let snapshot: Vec<(PaneId, RectF)> = focus_rects
                     .borrow()
@@ -12701,6 +12702,36 @@ impl View for CraneShellView {
                 // written verbatim to the PTY — deferred until warpui surfaces a
                 // composed-text event (only the single Keystroke.key is sent now).
                 ctx.dispatch_typed_action(CraneShellAction::SendKeys(ks.clone()));
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+
+        // Scroll repaint pump. Under Waterfall root dispatch (pinned in 7fdbe42
+        // to seal the modal → pane scroll leak) the topmost scrollable consumes
+        // the wheel and calls `ctx.notify()`. But a pure-notify event only
+        // *records* a window invalidation (`notify_view_observers`); nothing on
+        // that path calls `update_windows()`, which is what actually issues the
+        // OS `request_redraw`. Only action dispatch (via `flush_effects`) and
+        // the notify-timer path flush invalidations. Under the old release
+        // Broadcast root the wheel also reached the panes/terminal grid, whose
+        // handling dispatched an action and incidentally flushed — so scroll
+        // frames painted for free. Waterfall removed that side effect, so
+        // consumed scrolls (menus, popups, and lifted-finger momentum, which
+        // emit no accompanying mouse-move) stopped painting until the next
+        // incidental frame — reading as low-FPS/steppy scroll.
+        //
+        // Fix at the crane layer (vendor/warp is a pristine submodule): pulse
+        // the async repaint waker on every wheel. `ui_wake` feeds a stream whose
+        // handler runs inside the foreground executor's flush (the same path
+        // that already repaints on terminal PTY output), so it calls
+        // `update_windows()` and the scroll frame paints. `with_always_handle`
+        // makes this fire even when an inner scrollable already consumed the
+        // event; it wraps the whole shell (outermost element) so forcing the
+        // root-level scroll result to handled is inert.
+        EventHandler::new(shell)
+            .with_always_handle()
+            .on_scroll_wheel(move |_ctx, _app, _delta, _mods| {
+                scroll_wake();
                 DispatchEventResult::StopPropagation
             })
             .finish()
