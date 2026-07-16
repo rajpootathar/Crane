@@ -537,6 +537,112 @@ pub fn create_branch(repo: &Path, name: &str, checkout: bool) -> Result<(), Stri
     }
 }
 
+/// Recent distinct branches from the reflog checkout history — the branches
+/// the user most recently switched TO, newest first, current excluded and
+/// restricted to still-existing local branches (so detached-HEAD SHAs and
+/// deleted branches never leak in). Runs `git reflog --format=%gs` and parses
+/// `checkout: moving from X to Y` subject lines. Synchronous shell-out; call
+/// at popup-open time, never per frame.
+pub fn recent_branches(repo: &Path, limit: usize) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["reflog", "--format=%gs"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let current = current_branch(repo);
+    let locals: HashSet<String> = list_local_branches(repo).into_iter().collect();
+    parse_reflog_recents(&raw, &current)
+        .into_iter()
+        .filter(|b| locals.contains(b))
+        .take(limit)
+        .collect()
+}
+
+/// Pure parser for [`recent_branches`]. Extracts the `Y` target of every
+/// `checkout: moving from X to Y` reflog subject line, dedupes preserving
+/// first-seen (newest-first) order, and skips `current`. Does NOT truncate or
+/// validate against the branch list — the caller does both.
+fn parse_reflog_recents(raw: &str, current: &str) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let Some(rest) = line.trim().strip_prefix("checkout: moving from ") else {
+            continue;
+        };
+        let Some((_, to)) = rest.split_once(" to ") else {
+            continue;
+        };
+        let to = to.trim();
+        if to.is_empty() || to == current {
+            continue;
+        }
+        if seen.insert(to.to_string()) {
+            out.push(to.to_string());
+        }
+    }
+    out
+}
+
+/// Ahead/behind counts for every local branch vs its upstream, via a single
+/// `git for-each-ref refs/heads`. Returns `(branch, ahead, behind)`; a branch
+/// with no upstream (or level with it, or a gone upstream) reports `0, 0`.
+/// Synchronous shell-out; call at popup-open time, never per frame.
+pub fn branches_track(repo: &Path) -> Vec<(String, usize, usize)> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "for-each-ref",
+            "refs/heads",
+            "--format=%(refname:short)|%(upstream:track)",
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    raw.lines().filter_map(parse_track_line).collect()
+}
+
+/// Pure parser for one `for-each-ref` line `branch|[ahead N, behind M]`. The
+/// track field may be empty, `[ahead N]`, `[behind M]`, `[ahead N, behind M]`,
+/// or `[gone]`. Returns `(branch, ahead, behind)` with missing sides as 0;
+/// `None` for a blank line.
+fn parse_track_line(line: &str) -> Option<(String, usize, usize)> {
+    let (name, track) = line.trim_end().split_once('|')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), track_count(track, "ahead "), track_count(track, "behind ")))
+}
+
+/// Read the integer following `key` (e.g. `"ahead "`) inside a `[ahead N,
+/// behind M]` track field. 0 when the key is absent.
+fn track_count(track: &str, key: &str) -> usize {
+    let Some(pos) = track.find(key) else {
+        return 0;
+    };
+    track[pos + key.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}
+
 /// Working-tree changes in `root`, or empty on any error / non-repo.
 ///
 /// Runs `git status --porcelain -z --untracked-files=all`:
@@ -1084,5 +1190,42 @@ mod tests {
     fn parse_remote_branches_empty_and_blank_lines() {
         assert!(parse_remote_branch_lines("").is_empty());
         assert!(parse_remote_branch_lines("\n  \n").is_empty());
+    }
+
+    #[test]
+    fn parse_recent_reflog_dedupes_newest_first_and_skips_current() {
+        // `git reflog` emits newest first. Collect the checkout targets, dedupe
+        // preserving order, drop the current branch ("main").
+        let raw = "\
+checkout: moving from main to feature-a
+commit: work in progress
+checkout: moving from feature-a to main
+checkout: moving from main to feature-b
+checkout: moving from feature-b to feature-a
+checkout: moving from feature-a to main
+";
+        assert_eq!(
+            parse_reflog_recents(raw, "main"),
+            vec!["feature-a".to_string(), "feature-b".to_string()],
+        );
+    }
+
+    #[test]
+    fn parse_recent_reflog_ignores_non_checkout_and_blank() {
+        assert!(parse_reflog_recents("commit: x\nmerge y\n\n", "main").is_empty());
+        assert!(parse_reflog_recents("", "main").is_empty());
+    }
+
+    #[test]
+    fn parse_track_line_variants() {
+        assert_eq!(parse_track_line("main|"), Some(("main".to_string(), 0, 0)));
+        assert_eq!(parse_track_line("main|[ahead 2]"), Some(("main".to_string(), 2, 0)));
+        assert_eq!(parse_track_line("dev|[behind 3]"), Some(("dev".to_string(), 0, 3)));
+        assert_eq!(
+            parse_track_line("wip|[ahead 5, behind 1]"),
+            Some(("wip".to_string(), 5, 1)),
+        );
+        assert_eq!(parse_track_line("gone-br|[gone]"), Some(("gone-br".to_string(), 0, 0)));
+        assert_eq!(parse_track_line(""), None);
     }
 }
