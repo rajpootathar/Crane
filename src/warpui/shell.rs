@@ -843,6 +843,12 @@ pub struct NewWorkspaceState {
     /// Drives the create-vs-checkout decision: a typed name that matches an
     /// existing branch is checked out; anything else is created fresh.
     pub existing_branches: std::collections::HashSet<String>,
+    /// Remote-tracking branches keyed by short name (`feature` →
+    /// `origin/feature`), loaded once on open. A typed name that is remote-only
+    /// checks out via git's DWIM (`worktree add -- <path> <name>` creates a
+    /// local tracking branch) instead of `-b`, which would shadow the remote
+    /// with a fresh divergent local branch.
+    pub remote_branches: std::collections::HashMap<String, String>,
     /// Where the checkout lands (old `LocationMode` selector).
     pub mode: LocationMode,
     /// Parent folder for `LocationMode::Custom` (via Browse… or typed).
@@ -5857,14 +5863,16 @@ impl CraneShellView {
         })
         .finish();
 
-        // Live create-vs-checkout hint derived from branch existence (no toggle):
-        // a typed name matching an existing local branch is checked out; anything
-        // else is created fresh from the base branch.
+        // Live create-vs-checkout hint derived from branch existence (no toggle),
+        // mirroring `confirm_new_workspace`'s three-way derivation: local →
+        // checkout, remote-only → DWIM tracking checkout, neither → create.
         let trimmed = st.branch.trim();
         let hint_text: Option<String> = if trimmed.is_empty() {
             None
         } else if st.existing_branches.contains(trimmed) {
             Some("existing branch — will check out into the new workspace".to_string())
+        } else if let Some(remote) = st.remote_branches.get(trimmed) {
+            Some(format!("remote branch — will track {remote}"))
         } else if st.base_branch.is_empty() {
             Some("new branch — will be created from HEAD".to_string())
         } else {
@@ -6615,10 +6623,15 @@ impl CraneShellView {
         };
         let pi = st.project_idx;
         let branch = st.branch.trim().to_string();
-        // Create-vs-checkout is derived from branch existence (no toggle): a name
-        // that matches an existing local branch is checked out into the new
-        // worktree; anything else is created fresh with `worktree add -b`.
-        let create_branch = !st.existing_branches.contains(&branch);
+        // Create-vs-checkout is derived from branch existence (no toggle), same
+        // three-way split as the card's hint: a local branch is checked out; a
+        // remote-only name also goes through the non-`-b` arm, where git's DWIM
+        // (`worktree add -- <path> <name>`, bare short name) creates a local
+        // TRACKING branch from `<remote>/<name>` instead of `-b` shadowing the
+        // remote with a fresh divergent branch; only a name that exists nowhere
+        // is created fresh with `worktree add -b`.
+        let create_branch = !st.existing_branches.contains(&branch)
+            && !st.remote_branches.contains_key(&branch);
         if branch.is_empty() {
             if let Some(st) = self.new_workspace.as_mut() {
                 st.error = Some("Enter a branch name.".to_string());
@@ -14836,19 +14849,30 @@ impl CraneShellView {
             CraneShellAction::OpenNewWorkspace { pi, branch } => {
                 // Close any Switch-Branch modal first (it may have opened this).
                 self.switch_branch = None;
-                // Load the base branch (main repo HEAD) and the existing local
-                // branch set ONCE here — never per frame in the render path.
-                let (base_branch, existing_branches) = self
+                // Load the base branch (main repo HEAD), the local branch set,
+                // and the remote-tracking map ONCE here — never per frame in
+                // the render path. `list_remote_branches` is the popup's fixed
+                // lister (f611619): symbolic HEAD dropped, real branches only.
+                let (base_branch, existing_branches, remote_branches) = self
                     .projects
                     .get(*pi)
                     .map(|p| {
                         let root = std::path::Path::new(&p.path);
-                        (
-                            crate::warpui::git::current_branch(root),
+                        let locals: std::collections::HashSet<String> =
                             crate::warpui::git::list_local_branches(root)
                                 .into_iter()
-                                .collect::<std::collections::HashSet<String>>(),
-                        )
+                                .collect();
+                        // Short name → full remote-tracking name, first remote
+                        // wins on a clash (same dedup order as the popup).
+                        let mut remotes = std::collections::HashMap::new();
+                        for r in crate::warpui::git::list_remote_branches(root) {
+                            let short = r.splitn(2, '/').nth(1).unwrap_or(r.as_str());
+                            if short.is_empty() || short == "HEAD" {
+                                continue;
+                            }
+                            remotes.entry(short.to_string()).or_insert(r);
+                        }
+                        (crate::warpui::git::current_branch(root), locals, remotes)
                     })
                     .unwrap_or_default();
                 self.new_workspace = Some(NewWorkspaceState {
@@ -14859,6 +14883,7 @@ impl CraneShellView {
                     branch_locked: branch.is_some(),
                     base_branch,
                     existing_branches,
+                    remote_branches,
                     mode: LocationMode::Global,
                     custom_path: String::new(),
                     path_focused: false,
