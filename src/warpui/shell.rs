@@ -831,13 +831,18 @@ pub struct NewWorkspaceState {
     pub project_idx: usize,
     /// The branch name being typed / chosen.
     pub branch: String,
-    /// When true, create a brand-new branch (`worktree add -b`); else check out
-    /// an existing branch into the new worktree.
-    pub new_branch: bool,
     /// Opened from the branch picker with an EXISTING branch — the field is
-    /// read-only and the new-branch checkbox hides (a `worktree add -b
-    /// <existing>` would fail; old modal's `branch_locked`).
+    /// read-only (a `worktree add -b <existing>` would fail; old modal's
+    /// `branch_locked`).
     pub branch_locked: bool,
+    /// The base branch the new branch forks from — the main repo's current
+    /// branch (HEAD). Loaded once on open; shown in the context line and the
+    /// "will be created from <base>" hint. Empty for a detached HEAD / non-repo.
+    pub base_branch: String,
+    /// Local branch names in the project, loaded once on open (never per frame).
+    /// Drives the create-vs-checkout decision: a typed name that matches an
+    /// existing branch is checked out; anything else is created fresh.
+    pub existing_branches: std::collections::HashSet<String>,
     /// Where the checkout lands (old `LocationMode` selector).
     pub mode: LocationMode,
     /// Parent folder for `LocationMode::Custom` (via Browse… or typed).
@@ -5784,17 +5789,41 @@ impl CraneShellView {
         .finish()
     }
 
-    /// "New Workspace" card — create a git worktree for a branch. A branch field,
-    /// a "create new branch" toggle, the computed worktree path, and Create /
-    /// Cancel buttons. Port of old egui `src/modals/new_workspace.rs`.
+    /// "New Workspace" card — create a git worktree for a branch. A context line
+    /// (project · base branch), a branch field with live create-vs-checkout
+    /// detection, a segmented Location control, the computed worktree path, and
+    /// Create / Cancel buttons. Port of old egui `src/modals/new_workspace.rs`.
     fn new_workspace_card(&self) -> Box<dyn Element> {
         let Some(st) = self.new_workspace.as_ref() else {
             return self.modal_card(460.0, Flex::column().finish());
         };
         let project = self.projects.get(st.project_idx);
         let pname = project.map(|p| p.name.clone()).unwrap_or_default();
+        let ui_font = self.ui_font;
 
-        let branch_caret = if st.path_focused || st.branch_locked { "" } else { "|" };
+        // Context line: `[cube] <project>  from  [branch] <base>`. Phosphor glyphs
+        // (never Unicode) at 11px muted. The base is the main repo's current
+        // branch — what a new branch will fork from; omitted for a detached HEAD.
+        let mut context_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(self.icon(icons::CUBE, 11.0, theme::text_muted()))
+            .with_child(Self::spacer(5.0))
+            .with_child(Text::new(pname.clone(), ui_font, 11.0).with_color(theme::text()).finish());
+        if !st.base_branch.is_empty() {
+            context_row = context_row
+                .with_child(Self::spacer(8.0))
+                .with_child(Text::new("from".to_string(), ui_font, 11.0).with_color(theme::text_muted()).finish())
+                .with_child(Self::spacer(6.0))
+                .with_child(self.icon(icons::GIT_BRANCH, 11.0, theme::text_muted()))
+                .with_child(Self::spacer(4.0))
+                .with_child(Text::new(st.base_branch.clone(), ui_font, 11.0).with_color(theme::text_muted()).finish());
+        }
+        let context_line = context_row.finish();
+
+        // Branch field — ~28px, rounded-6, sidebar_bg fill, GIT_BRANCH glyph, a 1px
+        // border that lights to accent ONLY while the field owns typing.
+        let branch_focused = !st.path_focused && !st.branch_locked;
+        let branch_caret = if branch_focused { "|" } else { "" };
         let (btext, bcolor) = if st.branch.is_empty() {
             (format!("branch name…{branch_caret}"), theme::text_muted())
         } else {
@@ -5803,19 +5832,19 @@ impl CraneShellView {
         let branch_field = EventHandler::new(
             Container::new(
                 Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_child(self.icon(icons::GIT_BRANCH, 13.0, theme::text_muted()))
                     .with_child(Self::spacer(8.0))
-                    .with_child(Text::new(btext, self.ui_font, 13.0).with_color(bcolor).finish())
+                    .with_child(Text::new(btext, ui_font, 12.0).with_color(bcolor).finish())
                     .finish(),
             )
-            .with_background_color(theme::row_active())
-            .with_border(Border::all(1.0).with_border_color(
-                if st.path_focused || st.branch_locked {
-                    theme::border()
-                } else {
-                    theme::accent()
-                },
-            ))
+            .with_background_color(theme::sidebar_bg())
+            .with_border(Border::all(1.0).with_border_color(if branch_focused {
+                theme::accent()
+            } else {
+                theme::border()
+            }))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
             .with_padding_left(8.0)
             .with_padding_right(8.0)
             .with_padding_top(7.0)
@@ -5828,106 +5857,77 @@ impl CraneShellView {
         })
         .finish();
 
-        // "Create new branch" toggle row (a small checkbox box + label). Built
-        // from a bordered square (filled accent + CHECK when on) rather than a
-        // dedicated glyph so it never depends on an unbundled phosphor codepoint.
-        let checkbox = {
-            let inner: Box<dyn Element> = if st.new_branch {
-                self.icon(icons::CHECK, 11.0, ColorU::new(255, 255, 255, 255))
-            } else {
-                Rect::new().finish()
-            };
-            let bg = if st.new_branch {
-                theme::accent()
-            } else {
-                ColorU::new(0, 0, 0, 0)
-            };
-            ConstrainedBox::new(
-                Container::new(inner)
-                    .with_background_color(bg)
-                    .with_border(Border::all(1.0).with_border_color(theme::border()))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
-                    .finish(),
-            )
-            .with_width(16.0)
-            .with_height(16.0)
-            .finish()
+        // Live create-vs-checkout hint derived from branch existence (no toggle):
+        // a typed name matching an existing local branch is checked out; anything
+        // else is created fresh from the base branch.
+        let trimmed = st.branch.trim();
+        let hint_text: Option<String> = if trimmed.is_empty() {
+            None
+        } else if st.existing_branches.contains(trimmed) {
+            Some("existing branch — will check out into the new workspace".to_string())
+        } else if st.base_branch.is_empty() {
+            Some("new branch — will be created from HEAD".to_string())
+        } else {
+            Some(format!("new branch — will be created from {}", st.base_branch))
         };
-        let toggle = EventHandler::new(
-            Container::new(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(checkbox)
-                    .with_child(Self::spacer(8.0))
-                    .with_child(
-                        Text::new(
-                            "Create as a new branch".to_string(),
-                            self.ui_font,
-                            12.0,
+
+        // Location: one compact 24px segmented group — a single bordered container
+        // with 1px dividers between segments. Active = selection_wash + bright
+        // text; inactive = muted + hover wash.
+        let seg = |label: &'static str, mode: LocationMode| -> Box<dyn Element> {
+            let active = st.mode == mode;
+            let state = self.hover_handle(&format!("nwsseg:{label}"));
+            let font = ui_font;
+            Expanded::new(
+                1.0,
+                Hoverable::new(state, move |ms| {
+                    let bg = if active {
+                        theme::selection_wash()
+                    } else if ms.is_hovered() {
+                        theme::hover_wash()
+                    } else {
+                        ColorU::new(0, 0, 0, 0)
+                    };
+                    let fg = if active { theme::text() } else { theme::text_muted() };
+                    ConstrainedBox::new(
+                        Container::new(
+                            Align::new(
+                                Text::new(label.to_string(), font, 11.0).with_color(fg).finish(),
+                            )
+                            .finish(),
                         )
-                        .with_color(theme::text())
+                        .with_background_color(bg)
                         .finish(),
                     )
-                    .finish(),
-            )
-            .with_padding_top(4.0)
-            .with_padding_bottom(4.0)
-            .finish(),
-        )
-        .on_left_mouse_down(|ctx, _app, _pos| {
-            ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceToggleNewBranch);
-            DispatchEventResult::StopPropagation
-        })
-        .finish();
-
-        // Location mode selector (old modal's Global / Project-local / Custom).
-        let mode_pill = |label: &'static str, mode: LocationMode, hint: &'static str| -> Box<dyn Element> {
-            let active = st.mode == mode;
-            let _ = hint; // tooltips pending a warpui tooltip primitive
-            EventHandler::new(
-                Container::new(
-                    Text::new(label.to_string(), self.ui_font, 11.5)
-                        .with_color(if active { theme::text() } else { theme::text_muted() })
-                        .finish(),
-                )
-                .with_background_color(if active {
-                    theme::row_active()
-                } else {
-                    theme::surface()
+                    .with_height(24.0)
+                    .finish()
                 })
-                .with_border(Border::all(1.0).with_border_color(if active {
-                    theme::accent()
-                } else {
-                    theme::border()
-                }))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
-                .with_padding_left(10.0)
-                .with_padding_right(10.0)
-                .with_padding_top(3.0)
-                .with_padding_bottom(3.0)
+                .with_cursor(Cursor::PointingHand)
+                .on_mouse_down(move |ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceSetMode(mode));
+                })
                 .finish(),
             )
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceSetMode(mode));
-                DispatchEventResult::StopPropagation
-            })
             .finish()
         };
-        let location_row = Flex::row()
-            .with_child(mode_pill(
-                "Global",
-                LocationMode::Global,
-                "~/.crane-worktrees/<project>/<branch>",
-            ))
-            .with_child(Self::spacer(6.0))
-            .with_child(mode_pill(
-                "Project-local",
-                LocationMode::ProjectLocal,
-                "<project>/.crane-worktrees/<branch>",
-            ))
-            .with_child(Self::spacer(6.0))
-            .with_child(mode_pill("Custom", LocationMode::Custom, "Pick any folder"))
-            .finish();
+        let seg_divider = || {
+            ConstrainedBox::new(Rect::new().with_background_color(theme::border()).finish())
+                .with_width(1.0)
+                .with_height(24.0)
+                .finish()
+        };
+        let segmented = Container::new(
+            Flex::row()
+                .with_child(seg("Global", LocationMode::Global))
+                .with_child(seg_divider())
+                .with_child(seg("Project-local", LocationMode::ProjectLocal))
+                .with_child(seg_divider())
+                .with_child(seg("Custom", LocationMode::Custom))
+                .finish(),
+        )
+        .with_border(Border::all(1.0).with_border_color(theme::border()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
+        .finish();
 
         // Custom mode: editable parent-path field + Browse… (OS folder picker).
         let custom_row: Option<Box<dyn Element>> = (st.mode == LocationMode::Custom).then(|| {
@@ -5939,18 +5939,19 @@ impl CraneShellView {
             };
             let field = EventHandler::new(
                 Container::new(
-                    Text::new(ptext, self.ui_font, 12.0).with_color(pcolor).finish(),
+                    Text::new(ptext, ui_font, 12.0).with_color(pcolor).finish(),
                 )
-                .with_background_color(theme::row_active())
+                .with_background_color(theme::sidebar_bg())
                 .with_border(Border::all(1.0).with_border_color(if st.path_focused {
                     theme::accent()
                 } else {
                     theme::border()
                 }))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
                 .with_padding_left(8.0)
                 .with_padding_right(8.0)
-                .with_padding_top(5.0)
-                .with_padding_bottom(5.0)
+                .with_padding_top(6.0)
+                .with_padding_bottom(6.0)
                 .finish(),
             )
             .on_left_mouse_down(|ctx, _app, _pos| {
@@ -5960,17 +5961,17 @@ impl CraneShellView {
             .finish();
             let browse = EventHandler::new(
                 Container::new(
-                    Text::new("Browse…".to_string(), self.ui_font, 11.5)
+                    Text::new("Browse…".to_string(), ui_font, 11.0)
                         .with_color(theme::text())
                         .finish(),
                 )
                 .with_background_color(theme::surface())
                 .with_border(Border::all(1.0).with_border_color(theme::border()))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
                 .with_padding_left(10.0)
                 .with_padding_right(10.0)
-                .with_padding_top(4.0)
-                .with_padding_bottom(4.0)
+                .with_padding_top(5.0)
+                .with_padding_bottom(5.0)
                 .finish(),
             )
             .on_left_mouse_down(|ctx, _app, _pos| {
@@ -5979,6 +5980,7 @@ impl CraneShellView {
             })
             .finish();
             Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_child(Expanded::new(1.0, field).finish())
                 .with_child(Self::spacer(6.0))
                 .with_child(browse)
@@ -6000,69 +6002,106 @@ impl CraneShellView {
 
         let mut col = Flex::column()
             .with_child(self.modal_header("New Workspace"))
-            .with_child(Self::spacer(6.0))
-            .with_child(
-                Text::new(
-                    format!("Project: {pname}"),
-                    self.ui_font,
-                    11.5,
-                )
-                .with_color(theme::text_muted())
-                .finish(),
-            )
+            .with_child(Self::spacer(8.0))
+            .with_child(context_line)
             .with_child(Self::spacer(10.0))
-            .with_child(branch_field)
-            .with_child(Self::spacer(8.0));
-        if st.branch_locked {
-            // Existing branch from the picker: the checkbox hides — the only
-            // valid action is checking it out into a new worktree.
-            col = col.with_child(
-                Text::new(
-                    "Checking out existing branch into a new worktree".to_string(),
-                    self.ui_font,
-                    11.0,
-                )
-                .with_color(theme::text_muted())
-                .finish(),
+            .with_child(branch_field);
+        if let Some(h) = hint_text {
+            col = col.with_child(Self::spacer(6.0)).with_child(
+                Text::new(h, ui_font, 10.0).with_color(theme::text_muted()).finish(),
             );
-        } else {
-            col = col.with_child(toggle);
         }
         col = col
             .with_child(Self::spacer(10.0))
             .with_child(
-                Text::new("Location".to_string(), self.ui_font, 11.5)
-                    .with_color(theme::text())
+                Text::new("LOCATION".to_string(), ui_font, 10.0)
+                    .with_color(theme::text_muted())
                     .finish(),
             )
-            .with_child(Self::spacer(4.0))
-            .with_child(location_row);
+            .with_child(Self::spacer(5.0))
+            .with_child(segmented);
         if let Some(row) = custom_row {
             col = col.with_child(Self::spacer(6.0)).with_child(row);
         }
         col = col.with_child(Self::spacer(8.0)).with_child(
-            Text::new(path_text, self.ui_font, 10.5)
+            Text::new(path_text, ui_font, 10.0)
                 .with_color(theme::text_muted())
                 .finish(),
         );
         if let Some(err) = &st.error {
             col = col.with_child(Self::spacer(6.0)).with_child(
-                Text::new(err.clone(), self.ui_font, 11.0)
+                Text::new(err.clone(), ui_font, 11.0)
                     .with_color(theme::error())
                     .finish(),
             );
         }
+        // Cancel: a quiet text button (hover wash). Create: an accent-filled 26px
+        // rounded-6 button with white text (matching the app's accent-filled
+        // idiom, e.g. modal_button's Primary/Danger styles).
+        let cancel = {
+            let state = self.hover_handle("nwscancel");
+            let font = ui_font;
+            Hoverable::new(state, move |ms| {
+                let bg = if ms.is_hovered() {
+                    theme::hover_wash()
+                } else {
+                    ColorU::new(0, 0, 0, 0)
+                };
+                Container::new(
+                    Text::new("Cancel".to_string(), font, 12.0)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .with_background_color(bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
+                .with_padding_left(14.0)
+                .with_padding_right(14.0)
+                .with_padding_top(6.0)
+                .with_padding_bottom(6.0)
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(|ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::CloseModal);
+            })
+            .finish()
+        };
+        let create = {
+            let state = self.hover_handle("nwscreate");
+            let font = ui_font;
+            Hoverable::new(state, move |_ms| {
+                ConstrainedBox::new(
+                    Container::new(
+                        Align::new(
+                            Text::new("Create".to_string(), font, 12.0)
+                                .with_color(ColorU::new(255, 255, 255, 255))
+                                .finish(),
+                        )
+                        .finish(),
+                    )
+                    .with_background_color(theme::accent())
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
+                    .with_padding_left(18.0)
+                    .with_padding_right(18.0)
+                    .finish(),
+                )
+                .with_height(26.0)
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_mouse_down(|ctx, _app, _pos| {
+                ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceConfirm);
+            })
+            .finish()
+        };
         let buttons = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(Expanded::new(1.0, ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish()).finish())
-            .with_child(self.modal_button("Cancel", ModalBtn::Plain, CraneShellAction::CloseModal))
+            .with_child(cancel)
             .with_child(Self::spacer(8.0))
-            .with_child(self.modal_button(
-                "Create",
-                ModalBtn::Primary,
-                CraneShellAction::NewWorkspaceConfirm,
-            ))
+            .with_child(create)
             .finish();
-        col = col.with_child(Self::spacer(16.0)).with_child(buttons);
+        col = col.with_child(Self::spacer(14.0)).with_child(buttons);
         self.modal_card(460.0, col.finish())
     }
 
@@ -6576,7 +6615,10 @@ impl CraneShellView {
         };
         let pi = st.project_idx;
         let branch = st.branch.trim().to_string();
-        let create_branch = st.new_branch;
+        // Create-vs-checkout is derived from branch existence (no toggle): a name
+        // that matches an existing local branch is checked out into the new
+        // worktree; anything else is created fresh with `worktree add -b`.
+        let create_branch = !st.existing_branches.contains(&branch);
         if branch.is_empty() {
             if let Some(st) = self.new_workspace.as_mut() {
                 st.error = Some("Enter a branch name.".to_string());
@@ -13104,8 +13146,6 @@ pub enum CraneShellAction {
     OpenNewWorkspace { pi: usize, branch: Option<String> },
     /// A keystroke routed to the open New-Workspace branch field.
     NewWorkspaceKey(warpui::keymap::Keystroke),
-    /// Toggle the New-Workspace "create new branch" checkbox.
-    NewWorkspaceToggleNewBranch,
     /// Pick the New-Workspace location mode (Global / Project-local / Custom).
     NewWorkspaceSetMode(LocationMode),
     /// Move typing focus between the branch field and the custom-path field.
@@ -14796,14 +14836,29 @@ impl CraneShellView {
             CraneShellAction::OpenNewWorkspace { pi, branch } => {
                 // Close any Switch-Branch modal first (it may have opened this).
                 self.switch_branch = None;
-                let new_branch = branch.is_none();
+                // Load the base branch (main repo HEAD) and the existing local
+                // branch set ONCE here — never per frame in the render path.
+                let (base_branch, existing_branches) = self
+                    .projects
+                    .get(*pi)
+                    .map(|p| {
+                        let root = std::path::Path::new(&p.path);
+                        (
+                            crate::warpui::git::current_branch(root),
+                            crate::warpui::git::list_local_branches(root)
+                                .into_iter()
+                                .collect::<std::collections::HashSet<String>>(),
+                        )
+                    })
+                    .unwrap_or_default();
                 self.new_workspace = Some(NewWorkspaceState {
                     project_idx: *pi,
                     branch: branch.clone().unwrap_or_default(),
-                    new_branch,
                     // An existing branch from the picker locks the field —
                     // the only sensible action is checkout-into-new-worktree.
                     branch_locked: branch.is_some(),
+                    base_branch,
+                    existing_branches,
                     mode: LocationMode::Global,
                     custom_path: String::new(),
                     path_focused: false,
@@ -14843,11 +14898,6 @@ impl CraneShellView {
                     }
                     vctx.notify();
                 });
-            }
-            CraneShellAction::NewWorkspaceToggleNewBranch => {
-                if let Some(st) = self.new_workspace.as_mut() {
-                    st.new_branch = !st.new_branch;
-                }
             }
             CraneShellAction::NewWorkspaceConfirm => {
                 self.confirm_new_workspace(ctx);
