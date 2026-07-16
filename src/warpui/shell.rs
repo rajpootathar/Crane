@@ -9611,28 +9611,43 @@ impl CraneShellView {
         self.menu_popover(items, x, y)
     }
 
+    /// Cached `git diff --numstat` totals for the active workspace, resolved
+    /// by the `selected` (project, worktree, tab) index. This is the single
+    /// source of truth shared with the breadcrumb capsule and left-panel
+    /// badges; it is deliberately NOT keyed off `active_cwd`, which can point
+    /// at a different worktree than `selected` (e.g. after a session restore).
+    fn selected_diff_stat(
+        projects: &[crate::warpui::projects::ProjectNode],
+        selected: (usize, usize, usize),
+    ) -> (u32, u32) {
+        let (pi, wi, _) = selected;
+        projects
+            .get(pi)
+            .and_then(|p| p.worktrees.get(wi))
+            .map(|w| w.diff_stat)
+            .unwrap_or((0, 0))
+    }
+
     /// Dirty diff-stat chip: a rounded `surface()` pill with `+{added}`
     /// (success) / `-{deleted}` (error). Data is the active workspace's
     /// cached `git diff --numstat` totals — the SAME source the Left Panel
-    /// branch badge uses. Shown only when the tree is dirty AND numstat
-    /// reports line changes (untracked-only dirt has no counts; the
-    /// breadcrumb dot already signals it). Clicking the chip opens Switch
-    /// Branch, same as the capsule. Lives in the top bar, immediately after
-    /// the breadcrumb capsule (moved out of the status bar).
+    /// branch badge uses. Shown only when numstat reports line changes.
+    /// Clicking the chip opens Switch Branch, same as the capsule. Lives in
+    /// the top bar, immediately after the breadcrumb capsule (moved out of
+    /// the status bar).
+    ///
+    /// The active workspace is resolved by the `self.selected` index — the
+    /// SAME single source of truth the breadcrumb capsule (branch) and the
+    /// left-panel badges use. The old path resolution (string-match
+    /// `active_cwd` against `w.path`) diverged from `selected` after a
+    /// session restore: `active_cwd` defaults to `projects[0].worktrees[0]`
+    /// while `selected` restores to the actual active tab, so on any repo
+    /// other than the first the chip read the WRONG worktree's `diff_stat`
+    /// (zero for a clean default project) and hid itself even though the
+    /// capsule + badges rendered the real, dirty workspace correctly.
     fn diff_chip(&self) -> Option<Box<dyn Element>> {
-        let (added, deleted) = self
-            .active_cwd
-            .as_ref()
-            .map(|cwd| cwd.to_string_lossy().to_string())
-            .and_then(|s| {
-                self.projects
-                    .iter()
-                    .flat_map(|p| p.worktrees.iter())
-                    .find(|w| w.path == s)
-                    .map(|w| w.diff_stat)
-            })
-            .unwrap_or((0, 0));
-        if self.changes.is_empty() || (added == 0 && deleted == 0) {
+        let (added, deleted) = Self::selected_diff_stat(&self.projects, self.selected);
+        if added == 0 && deleted == 0 {
             return None;
         }
         let ui_font = self.ui_font;
@@ -14725,5 +14740,65 @@ mod title_debounce_tests {
         let t3 = t0 + Duration::from_secs(5);
         assert_eq!(map.entry(42).or_default().observe("claude · 3k", t3, WINDOW), "claude · 3k");
         assert_eq!(map.entry(7).or_default().observe("cargo build", t3, WINDOW), "cargo build");
+    }
+}
+
+#[cfg(test)]
+mod diff_chip_tests {
+    use super::CraneShellView;
+    use crate::warpui::projects::{ProjectNode, WorktreeNode};
+
+    fn wt(name: &str, path: &str, diff_stat: (u32, u32)) -> WorktreeNode {
+        WorktreeNode {
+            name: name.to_string(),
+            path: path.to_string(),
+            tabs: Vec::new(),
+            diff_stat,
+            dirty: diff_stat != (0, 0),
+        }
+    }
+
+    fn proj(name: &str, path: &str, worktrees: Vec<WorktreeNode>) -> ProjectNode {
+        ProjectNode {
+            name: name.to_string(),
+            path: path.to_string(),
+            worktrees,
+            tint: None,
+            is_loose: false,
+            group_path: None,
+        }
+    }
+
+    /// The chip resolves the active workspace's numstat by the `selected`
+    /// index, NOT by matching `active_cwd` against `w.path`. This regression
+    /// pins the session-restore case: `selected` points at a dirty worktree in
+    /// a project OTHER than the first, while `active_cwd` would default to
+    /// `projects[0].worktrees[0]` (clean). The old path-string resolution read
+    /// the clean first worktree → (0, 0) → chip hidden; index resolution reads
+    /// the real selected worktree.
+    #[test]
+    fn selected_diff_stat_follows_selection_not_first_worktree() {
+        let projects = vec![
+            proj("first", "/a", vec![wt("main", "/a", (0, 0))]),
+            proj("second", "/b", vec![wt("main", "/b", (296, 272))]),
+        ];
+
+        // Selection on the dirty second project → its real numstat.
+        assert_eq!(
+            CraneShellView::selected_diff_stat(&projects, (1, 0, 7)),
+            (296, 272)
+        );
+
+        // Selection on the clean first project → zero (chip hidden).
+        assert_eq!(
+            CraneShellView::selected_diff_stat(&projects, (0, 0, 3)),
+            (0, 0)
+        );
+
+        // Out-of-range selection degrades to zero, never panics.
+        assert_eq!(
+            CraneShellView::selected_diff_stat(&projects, (9, 9, 9)),
+            (0, 0)
+        );
     }
 }
