@@ -8516,13 +8516,21 @@ impl CraneShellView {
                 _ => RowTier::Plain,
             };
             let tint = self.project_color_for(pi);
-            // Label follows the tier; a `Selected` row also brightens its icon,
-            // while `Ancestor`/`Plain` rows keep any explicit project tint on the
-            // icon (the coloured CUBE stays recognisable in the chain).
+            // USER-set tint colours the label too (tree-wide rule shared with
+            // group headers and tab rows: tinted → icon + text; the `Selected`
+            // row still brightens to text_hover so "you are here" stays
+            // legible). Untinted rows keep the tier colours. Note the icon
+            // ALSO tints for untinted projects (accent fallback) — the label
+            // deliberately does not, or every project name would be accent.
+            let user_tint = self
+                .projects
+                .get(pi)
+                .and_then(|p| p.tint)
+                .map(|[r, g, b]| ColorU::new(r, g, b, 255));
             let pcol = match p_tier {
                 RowTier::Selected => theme::text_hover(),
-                RowTier::Ancestor => theme::text(),
-                RowTier::Plain => theme::text_muted(),
+                RowTier::Ancestor => user_tint.unwrap_or_else(theme::text),
+                RowTier::Plain => user_tint.unwrap_or_else(theme::text_muted),
             };
             let picon = if p_tier == RowTier::Selected {
                 theme::text_hover()
@@ -8679,14 +8687,16 @@ impl CraneShellView {
                 } else {
                     RowTier::Plain
                 };
-                // Tint priority: explicit per-worktree tint keeps colouring the
-                // icon in the `Ancestor`/`Plain` tiers; the `Selected` row brightens
-                // both icon and label to `text_hover`.
+                // Tint rule (tree-wide, same as project rows / group headers /
+                // tab rows): a user-set tint colours icon AND label in the
+                // `Ancestor`/`Plain` tiers; the `Selected` row brightens both
+                // to `text_hover`.
                 let wt_tint = self.worktree_tints.get(&w.path).copied();
+                let wt_tint_col = wt_tint.map(|[r, g, b]| ColorU::new(r, g, b, 255));
                 let wcol = match w_tier {
                     RowTier::Selected => theme::text_hover(),
-                    RowTier::Ancestor => theme::text(),
-                    RowTier::Plain => theme::text_muted(),
+                    RowTier::Ancestor => wt_tint_col.unwrap_or_else(theme::text),
+                    RowTier::Plain => wt_tint_col.unwrap_or_else(theme::text_muted),
                 };
                 let wicon = if w_tier == RowTier::Selected {
                     theme::text_hover()
