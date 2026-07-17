@@ -143,7 +143,7 @@ enum RowTier {
 struct PendingNewEntry {
     parent: PathBuf,
     is_folder: bool,
-    name: String,
+    name: crate::warpui::line_edit::LineEdit,
     error: Option<String>,
 }
 
@@ -362,7 +362,7 @@ pub struct CraneShellView {
     /// `None` = `--all` (the full graph).
     git_log_ref_filter: Option<String>,
     /// Case-insensitive text filter over subject / hash / author; "" = off.
-    git_log_filter: String,
+    git_log_filter: crate::warpui::line_edit::LineEdit,
     /// True while the git-log filter field owns typing (`SendKeys` routes here).
     git_log_filter_active: bool,
     /// Filtered-frame cache keyed by (needle, generation) — `filtered_frame`
@@ -373,7 +373,7 @@ pub struct CraneShellView {
     /// Open commit context menu: (sha, window x, window y).
     git_log_menu: Option<(String, f32, f32)>,
     /// Inline "create branch from commit" prompt: (sha, name buffer).
-    git_log_branch_prompt: Option<(String, String)>,
+    git_log_branch_prompt: Option<(String, crate::warpui::line_edit::LineEdit)>,
     /// True while `git fetch --all --prune --tags` runs off-thread.
     git_log_fetching: bool,
     /// Last release re-check (in-session updates are re-polled every 6h).
@@ -440,7 +440,7 @@ pub struct CraneShellView {
     git_log_detail_file: usize,
     /// Commit message buffer + whether the commit box has keyboard focus
     /// (keys route to it instead of the terminal).
-    commit_msg: String,
+    commit_msg: crate::warpui::line_edit::LineEdit,
     commit_focused: bool,
     /// Draggable left-panel boundary (fraction of the window width).
     left_ratio: Rc<Cell<f32>>,
@@ -773,7 +773,7 @@ pub struct FifMatch {
 /// same keystroke path as the commit box (`edit_find_in_files`); each edit
 /// re-runs a synchronous recursive substring search over the active project.
 pub struct FindInFilesState {
-    pub query: String,
+    pub query: crate::warpui::line_edit::LineEdit,
     pub results: Vec<FifMatch>,
     /// True when the result set was capped at `FIF_MAX_RESULTS`.
     pub truncated: bool,
@@ -794,7 +794,7 @@ pub struct TabSwitcherState {
 /// names) into the rendered list. Picking a branch checks it out in the active
 /// workspace; each row also offers "+ worktree" (open New Workspace pre-filled).
 pub struct SwitchBranchState {
-    pub query: String,
+    pub query: crate::warpui::line_edit::LineEdit,
     /// The active project index (for "+ worktree" / new-branch worktree flows).
     pub project_idx: usize,
     /// Every candidate branch name (locals first, then deduped remote shorts).
@@ -810,7 +810,7 @@ pub struct SwitchBranchState {
     pub track: std::collections::HashMap<String, (usize, usize)>,
     /// When `Some`, the footer "＋ New Branch…" row is an active text input
     /// holding the typed name; `None` = the footer shows its resting row.
-    pub new_branch_input: Option<String>,
+    pub new_branch_input: Option<crate::warpui::line_edit::LineEdit>,
     /// Highlighted row (Enter checks it out).
     pub selected: usize,
     /// True while the off-thread `git branch` / `git branch -r` listing is in
@@ -830,7 +830,7 @@ pub struct NewWorkspaceState {
     /// The project the worktree is created under.
     pub project_idx: usize,
     /// The branch name being typed / chosen.
-    pub branch: String,
+    pub branch: crate::warpui::line_edit::LineEdit,
     /// Opened from the branch picker with an EXISTING branch — the field is
     /// read-only (a `worktree add -b <existing>` would fail; old modal's
     /// `branch_locked`).
@@ -852,7 +852,7 @@ pub struct NewWorkspaceState {
     /// Where the checkout lands (old `LocationMode` selector).
     pub mode: LocationMode,
     /// Parent folder for `LocationMode::Custom` (via Browse… or typed).
-    pub custom_path: String,
+    pub custom_path: crate::warpui::line_edit::LineEdit,
     /// True while the custom-path field owns typing (else the branch field).
     pub path_focused: bool,
     /// Error surfaced under the field on a failed `git worktree add`.
@@ -882,7 +882,7 @@ const FIF_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// `Some`, exactly like the commit box captures keys via `commit_focused`.
 pub struct RenameState {
     pub target: RenameTarget,
-    pub buffer: String,
+    pub buffer: crate::warpui::line_edit::LineEdit,
 }
 
 /// What the active inline rename targets.
@@ -1618,7 +1618,7 @@ impl CraneShellView {
             // `new`) — never shelled out synchronously here, so startup paints
             // without waiting on `git`.
             branch: String::new(),
-            commit_msg: String::new(),
+            commit_msg: crate::warpui::line_edit::LineEdit::default(),
             commit_focused: false,
             show_git_log: false,
             git_log_ratio: Rc::new(Cell::new(0.7)),
@@ -1634,7 +1634,7 @@ impl CraneShellView {
             git_log_selected: None,
             git_log_scroll: Rc::new(Cell::new(0.0)),
             git_log_ref_filter: None,
-            git_log_filter: String::new(),
+            git_log_filter: crate::warpui::line_edit::LineEdit::default(),
             git_log_filter_active: false,
             git_log_filtered: std::cell::RefCell::new(None),
             git_log_menu: None,
@@ -5223,17 +5223,24 @@ impl CraneShellView {
         let Some(st) = self.find_in_files.as_ref() else {
             return self.modal_card(640.0, Flex::column().finish());
         };
-        // Query field — mirrors the commit box's editable-looking Text field.
-        let (qtext, qcolor) = if st.query.is_empty() {
-            ("Search files in the active project…".to_string(), theme::text_muted())
-        } else {
-            (format!("{}|", st.query), theme::text())
-        };
+        // Query field — a real LineEdit (caret, selection, click-to-place).
+        let query_input = crate::warpui::line_edit::LineEditField::new(
+            &st.query,
+            true,
+            self.ui_font,
+            13.0,
+        )
+        .with_placeholder("Search files in the active project…")
+        .on_click_index(|ctx, idx| {
+            ctx.dispatch_typed_action(CraneShellAction::FindInFilesCaret(idx));
+        })
+        .finish();
         let query_field = Container::new(
             Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_child(self.icon(icons::MAGNIFYING_GLASS, 13.0, theme::text_muted()))
                 .with_child(Self::spacer(8.0))
-                .with_child(Text::new(qtext, self.ui_font, 13.0).with_color(qcolor).finish())
+                .with_child(Expanded::new(1.0, query_input).finish())
                 .finish(),
         )
         .with_background_color(theme::row_active())
@@ -5245,7 +5252,7 @@ impl CraneShellView {
         .finish();
 
         // Status line: match count / cap notice / empty-query hint.
-        let status = if st.query.trim().is_empty() {
+        let status = if st.query.text().trim().is_empty() {
             "Type to search across the active project".to_string()
         } else if st.results.is_empty() {
             "No matches".to_string()
@@ -5451,7 +5458,7 @@ impl CraneShellView {
                 y,
             )));
         };
-        let q = st.query.trim().to_lowercase();
+        let q = st.query.text().trim().to_lowercase();
         let filtering = !q.is_empty();
         let filtered: Vec<String> = st
             .all
@@ -5463,18 +5470,24 @@ impl CraneShellView {
         let pi = st.project_idx;
 
         // ── Search field (28px, rounded 6, sidebar_bg, magnifier) ──
-        let (qtext, qcolor) = if st.query.is_empty() {
-            ("Search branches…".to_string(), theme::text_muted())
-        } else {
-            (format!("{}|", st.query), theme::text())
-        };
+        let query_input = crate::warpui::line_edit::LineEditField::new(
+            &st.query,
+            true,
+            self.ui_font,
+            12.5,
+        )
+        .with_placeholder("Search branches…")
+        .on_click_index(|ctx, idx| {
+            ctx.dispatch_typed_action(CraneShellAction::SwitchBranchCaret(idx));
+        })
+        .finish();
         let query_field = ConstrainedBox::new(
             Container::new(
                 Flex::row()
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_child(self.icon(icons::MAGNIFYING_GLASS, 12.0, theme::text_muted()))
                     .with_child(Self::spacer(8.0))
-                    .with_child(Text::new(qtext, self.ui_font, 12.5).with_color(qcolor).finish())
+                    .with_child(Expanded::new(1.0, query_input).finish())
                     .finish(),
             )
             .with_background_color(theme::sidebar_bg())
@@ -5544,7 +5557,7 @@ impl CraneShellView {
         }
         // "Create new branch '<query>'" row when the query names no branch.
         if filtering && !exact {
-            list = list.with_child(self.create_branch_row(st.query.trim().to_string()));
+            list = list.with_child(self.create_branch_row(st.query.text().trim().to_string()));
             row_count += 1;
         }
         if row_count == 0 {
@@ -5587,7 +5600,7 @@ impl CraneShellView {
         .with_padding_top(4.0)
         .with_padding_bottom(4.0)
         .finish();
-        let footer = self.switch_branch_footer(st.new_branch_input.as_deref());
+        let footer = self.switch_branch_footer(st.new_branch_input.as_ref());
 
         let col = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
@@ -5781,29 +5794,25 @@ impl CraneShellView {
     /// `SwitchBranchStartNewBranch`). In input mode: a bordered accent field
     /// (Enter runs `git checkout -b <name>`; Esc cancels) mirroring the git-log
     /// branch prompt.
-    fn switch_branch_footer(&self, input: Option<&str>) -> Box<dyn Element> {
+    fn switch_branch_footer(
+        &self,
+        input: Option<&crate::warpui::line_edit::LineEdit>,
+    ) -> Box<dyn Element> {
         let ui_font = self.ui_font;
         let icon_font = self.icon_font;
         if let Some(buf) = input {
-            let (btext, bcolor) = if buf.is_empty() {
-                ("new branch name…".to_string(), theme::text_muted())
-            } else {
-                (buf.to_string(), theme::text())
-            };
+            let name_input = crate::warpui::line_edit::LineEditField::new(buf, true, ui_font, 12.0)
+                .with_placeholder("new branch name…")
+                .on_click_index(|ctx, idx| {
+                    ctx.dispatch_typed_action(CraneShellAction::SwitchBranchNewCaret(idx));
+                })
+                .finish();
             return Container::new(
                 Flex::row()
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_child(self.icon(icons::GIT_BRANCH, 12.0, theme::accent()))
                     .with_child(Self::spacer(8.0))
-                    .with_child(Text::new(btext, ui_font, 12.0).with_color(bcolor).finish())
-                    .with_child(
-                        ConstrainedBox::new(
-                            Rect::new().with_background_color(theme::accent()).finish(),
-                        )
-                        .with_width(2.0)
-                        .with_height(13.0)
-                        .finish(),
-                    )
+                    .with_child(Expanded::new(1.0, name_input).finish())
                     .finish(),
             )
             .with_background_color(theme::sidebar_bg())
@@ -5933,19 +5942,28 @@ impl CraneShellView {
         // Branch field — ~28px, rounded-6, sidebar_bg fill, GIT_BRANCH glyph, a 1px
         // border that lights to accent ONLY while the field owns typing.
         let branch_focused = !st.path_focused && !st.branch_locked;
-        let branch_caret = if branch_focused { "|" } else { "" };
-        let (btext, bcolor) = if st.branch.is_empty() {
-            (format!("branch name…{branch_caret}"), theme::text_muted())
-        } else {
-            (format!("{}{branch_caret}", st.branch), theme::text())
-        };
+        let branch_input = crate::warpui::line_edit::LineEditField::new(
+            &st.branch,
+            branch_focused,
+            ui_font,
+            12.0,
+        )
+        .with_color(if st.branch_locked { theme::text_muted() } else { theme::text() })
+        .with_placeholder("branch name…")
+        .on_click_index(|ctx, idx| {
+            ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceCaret {
+                path_field: false,
+                index: idx,
+            });
+        })
+        .finish();
         let branch_field = EventHandler::new(
             Container::new(
                 Flex::row()
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_child(self.icon(icons::GIT_BRANCH, 13.0, theme::text_muted()))
                     .with_child(Self::spacer(8.0))
-                    .with_child(Text::new(btext, ui_font, 12.0).with_color(bcolor).finish())
+                    .with_child(Expanded::new(1.0, branch_input).finish())
                     .finish(),
             )
             .with_background_color(theme::sidebar_bg())
@@ -5970,7 +5988,7 @@ impl CraneShellView {
         // Live create-vs-checkout hint derived from branch existence (no toggle),
         // mirroring `confirm_new_workspace`'s three-way derivation: local →
         // checkout, remote-only → DWIM tracking checkout, neither → create.
-        let trimmed = st.branch.trim();
+        let trimmed = st.branch.text().trim();
         let hint_text: Option<String> = if trimmed.is_empty() {
             None
         } else if st.existing_branches.contains(trimmed) {
@@ -6043,16 +6061,22 @@ impl CraneShellView {
 
         // Custom mode: editable parent-path field + Browse… (OS folder picker).
         let custom_row: Option<Box<dyn Element>> = (st.mode == LocationMode::Custom).then(|| {
-            let caret = if st.path_focused { "|" } else { "" };
-            let (ptext, pcolor) = if st.custom_path.is_empty() {
-                (format!("/path/to/parent{caret}"), theme::text_muted())
-            } else {
-                (format!("{}{caret}", st.custom_path), theme::text())
-            };
+            let path_input = crate::warpui::line_edit::LineEditField::new(
+                &st.custom_path,
+                st.path_focused,
+                ui_font,
+                12.0,
+            )
+            .with_placeholder("/path/to/parent")
+            .on_click_index(|ctx, idx| {
+                ctx.dispatch_typed_action(CraneShellAction::NewWorkspaceCaret {
+                    path_field: true,
+                    index: idx,
+                });
+            })
+            .finish();
             let field = EventHandler::new(
-                Container::new(
-                    Text::new(ptext, ui_font, 12.0).with_color(pcolor).finish(),
-                )
+                Container::new(path_input)
                 .with_background_color(theme::sidebar_bg())
                 .with_border(Border::all(1.0).with_border_color(if st.path_focused {
                     theme::accent()
@@ -6101,11 +6125,11 @@ impl CraneShellView {
 
         // Live target preview: mode-resolved parent + the (flattened) branch.
         let ppath = project.map(|p| p.path.clone()).unwrap_or_default();
-        let parent = Self::resolved_worktree_parent(st.mode, &st.custom_path, &ppath, &pname);
-        let shown_branch = if st.branch.is_empty() {
+        let parent = Self::resolved_worktree_parent(st.mode, st.custom_path.text(), &ppath, &pname);
+        let shown_branch = if st.branch.text().is_empty() {
             "<branch>".to_string()
         } else {
-            st.branch.replace('/', "-")
+            st.branch.text().replace('/', "-")
         };
         let path_text = format!(
             "→ {}/{shown_branch}",
@@ -6250,7 +6274,7 @@ impl CraneShellView {
         st.results.clear();
         st.truncated = false;
         st.selected = 0;
-        let needle = st.query.trim().to_lowercase();
+        let needle = st.query.text().trim().to_lowercase();
         if needle.is_empty() {
             return;
         }
@@ -6337,19 +6361,14 @@ impl CraneShellView {
                     self.open_fif_match(path, line, ctx);
                 }
             }
-            "backspace" => {
-                if let Some(st) = self.find_in_files.as_mut() {
-                    st.query.pop();
+            _ => {
+                let Some(st) = self.find_in_files.as_mut() else {
+                    return;
+                };
+                if Self::line_edit_key(&mut st.query, ks, ctx) == Some(true) {
+                    self.run_find_in_files();
                 }
-                self.run_find_in_files();
             }
-            k if k.chars().count() == 1 && !ks.cmd && !ks.ctrl => {
-                if let Some(st) = self.find_in_files.as_mut() {
-                    st.query.push_str(k);
-                }
-                self.run_find_in_files();
-            }
-            _ => {}
         }
     }
 
@@ -6501,7 +6520,7 @@ impl CraneShellView {
         let pi = self.active_tab.map(|(p, _, _)| p).unwrap_or(0);
         let generation = self.bump_scan_gen("switchbranch");
         self.switch_branch = Some(SwitchBranchState {
-            query: String::new(),
+            query: crate::warpui::line_edit::LineEdit::default(),
             project_idx: pi,
             all: Vec::new(),
             locals: HashSet::new(),
@@ -6554,8 +6573,8 @@ impl CraneShellView {
                     let name = self
                         .switch_branch
                         .as_ref()
-                        .and_then(|st| st.new_branch_input.clone())
-                        .map(|n| n.trim().to_string())
+                        .and_then(|st| st.new_branch_input.as_ref())
+                        .map(|n| n.text().trim().to_string())
                         .unwrap_or_default();
                     // CreateBranchCheckout's handler runs `git checkout -b`,
                     // refreshes the panel, and clears `switch_branch` itself.
@@ -6567,17 +6586,13 @@ impl CraneShellView {
                         self.handle_action(&CraneShellAction::CreateBranchCheckout(name), ctx);
                     }
                 }
-                "backspace" => {
-                    if let Some(Some(buf)) = self.switch_branch.as_mut().map(|st| st.new_branch_input.as_mut()) {
-                        buf.pop();
+                _ => {
+                    if let Some(Some(buf)) =
+                        self.switch_branch.as_mut().map(|st| st.new_branch_input.as_mut())
+                    {
+                        Self::line_edit_key(buf, ks, ctx);
                     }
                 }
-                k if k.chars().count() == 1 && !ks.cmd && !ks.ctrl => {
-                    if let Some(Some(buf)) = self.switch_branch.as_mut().map(|st| st.new_branch_input.as_mut()) {
-                        buf.push_str(k);
-                    }
-                }
-                _ => {}
             }
             return;
         }
@@ -6590,7 +6605,7 @@ impl CraneShellView {
         // resolve Enter's target.
         let filtered: Vec<String> = match self.switch_branch.as_ref() {
             Some(st) => {
-                let q = st.query.trim().to_lowercase();
+                let q = st.query.text().trim().to_lowercase();
                 st.all
                     .iter()
                     .filter(|b| q.is_empty() || b.to_lowercase().contains(&q))
@@ -6623,7 +6638,7 @@ impl CraneShellView {
                 let (query, sel) = self
                     .switch_branch
                     .as_ref()
-                    .map(|st| (st.query.trim().to_string(), st.selected))
+                    .map(|st| (st.query.text().trim().to_string(), st.selected))
                     .unwrap_or_default();
                 if let Some(branch) = filtered.get(sel).cloned() {
                     // Close the popup first — CheckoutBranch itself doesn't
@@ -6637,56 +6652,72 @@ impl CraneShellView {
                     self.handle_action(&a, ctx);
                 }
             }
-            "backspace" => {
+            _ => {
                 if let Some(st) = self.switch_branch.as_mut() {
-                    st.query.pop();
-                    st.selected = 0;
+                    if Self::line_edit_key(&mut st.query, ks, ctx) == Some(true) {
+                        st.selected = 0;
+                    }
                 }
             }
-            k if k.chars().count() == 1 && !ks.cmd && !ks.ctrl => {
-                if let Some(st) = self.switch_branch.as_mut() {
-                    st.query.push_str(k);
-                    st.selected = 0;
-                }
-            }
-            _ => {}
         }
     }
 
     /// Route a keystroke into the New-Workspace branch field. Enter confirms;
     /// typing edits the branch name.
+    /// Route a keystroke into a [`line_edit::LineEdit`] and service its
+    /// clipboard intents (Cmd+C/X write, Cmd+V reads + inserts). Returns
+    /// `Some(text_changed)` when the field consumed the key, `None` when the
+    /// key isn't an editing key (enter / escape / up / down …) — the caller
+    /// keeps its own semantics for those.
+    fn line_edit_key(
+        le: &mut crate::warpui::line_edit::LineEdit,
+        ks: &warpui::keymap::Keystroke,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<bool> {
+        use crate::warpui::line_edit::Outcome;
+        match le.handle_key(ks) {
+            Outcome::Changed => Some(true),
+            Outcome::CaretMoved => Some(false),
+            Outcome::Copy(s) => {
+                ctx.clipboard()
+                    .write(warpui::clipboard::ClipboardContent::plain_text(s));
+                Some(false)
+            }
+            Outcome::Cut(s) => {
+                ctx.clipboard()
+                    .write(warpui::clipboard::ClipboardContent::plain_text(s));
+                Some(true)
+            }
+            Outcome::Paste => {
+                let text = ctx.clipboard().read().plain_text;
+                if text.is_empty() {
+                    Some(false)
+                } else {
+                    le.insert_str(&text);
+                    Some(true)
+                }
+            }
+            Outcome::Ignored => None,
+        }
+    }
+
     fn edit_new_workspace(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
-        match ks.key.as_str() {
-            "enter" | "return" | "numpadenter" => {
-                self.confirm_new_workspace(ctx);
-            }
-            "backspace" => {
-                if let Some(st) = self.new_workspace.as_mut() {
-                    if st.path_focused {
-                        st.custom_path.pop();
-                    } else if !st.branch_locked {
-                        st.branch.pop();
-                    }
-                    st.error = None;
-                }
-            }
-            "space" if self.new_workspace.as_ref().is_some_and(|st| st.path_focused) => {
-                if let Some(st) = self.new_workspace.as_mut() {
-                    st.custom_path.push(' ');
-                    st.error = None;
-                }
-            }
-            k if k.chars().count() == 1 && !ks.cmd && !ks.ctrl => {
-                if let Some(st) = self.new_workspace.as_mut() {
-                    if st.path_focused {
-                        st.custom_path.push_str(k);
-                    } else if !st.branch_locked {
-                        st.branch.push_str(k);
-                    }
-                    st.error = None;
-                }
-            }
-            _ => {}
+        if matches!(ks.key.as_str(), "enter" | "return" | "numpadenter") {
+            self.confirm_new_workspace(ctx);
+            return;
+        }
+        let Some(st) = self.new_workspace.as_mut() else {
+            return;
+        };
+        let le = if st.path_focused {
+            &mut st.custom_path
+        } else if !st.branch_locked {
+            &mut st.branch
+        } else {
+            return;
+        };
+        if Self::line_edit_key(le, ks, ctx) == Some(true) {
+            st.error = None;
         }
     }
 
@@ -6726,7 +6757,7 @@ impl CraneShellView {
             return;
         };
         let pi = st.project_idx;
-        let branch = st.branch.trim().to_string();
+        let branch = st.branch.text().trim().to_string();
         // Create-vs-checkout is derived from branch existence (no toggle), same
         // three-way split as the card's hint: a local branch is checked out; a
         // remote-only name also goes through the non-`-b` arm, where git's DWIM
@@ -6743,7 +6774,7 @@ impl CraneShellView {
             return;
         }
         let mode = st.mode;
-        let custom_path = st.custom_path.clone();
+        let custom_path = st.custom_path.text().to_string();
         let Some(project) = self.projects.get(pi) else {
             return;
         };
@@ -7907,7 +7938,7 @@ impl CraneShellView {
         diff_stat: (u32, u32),
         dirty: bool,
         indent: f32,
-        rename_buf: Option<String>,
+        rename_buf: Option<crate::warpui::line_edit::LineEdit>,
         action: CraneShellAction,
         plus_action: Option<CraneShellAction>,
     ) -> Box<dyn Element> {
@@ -7941,9 +7972,16 @@ impl CraneShellView {
                     // commit box's text rendering.
                     if let Some(buf) = &rename_buf {
                         Container::new(
-                            Text::new(format!("{buf}|"), self.ui_font, size)
-                                .with_color(theme::text())
-                                .finish(),
+                            crate::warpui::line_edit::LineEditField::new(
+                                buf,
+                                true,
+                                self.ui_font,
+                                size,
+                            )
+                            .on_click_index(|ctx, idx| {
+                                ctx.dispatch_typed_action(CraneShellAction::RenameCaret(idx));
+                            })
+                            .finish(),
                         )
                         .with_background_color(theme::row_active())
                         .with_padding_left(4.0)
@@ -8181,7 +8219,7 @@ impl CraneShellView {
         icon_color: ColorU,
         name: &str,
         indent: f32,
-        rename_buf: Option<String>,
+        rename_buf: Option<crate::warpui::line_edit::LineEdit>,
         select_action: CraneShellAction,
         close_action: CraneShellAction,
     ) -> Box<dyn Element> {
@@ -8195,8 +8233,10 @@ impl CraneShellView {
         // becomes an editable field (buffer + caret) on a highlighted bg.
         let label_text: Box<dyn Element> = if let Some(buf) = &rename_buf {
             Container::new(
-                Text::new(format!("{buf}|"), self.ui_font, size)
-                    .with_color(theme::text())
+                crate::warpui::line_edit::LineEditField::new(buf, true, self.ui_font, size)
+                    .on_click_index(|ctx, idx| {
+                        ctx.dispatch_typed_action(CraneShellAction::RenameCaret(idx));
+                    })
                     .finish(),
             )
             .with_background_color(theme::row_active())
@@ -9619,22 +9659,24 @@ impl CraneShellView {
     /// "Commit to <branch> (<N staged>)". Commit / op errors show below.
     fn commit_box(&self) -> Box<dyn Element> {
         let staged = self.changes.iter().filter(|c| c.staged).count();
-        let has_message = !self.commit_msg.trim().is_empty();
+        let has_message = !self.commit_msg.text().trim().is_empty();
         let op = self.active_op_status();
         let any_running = op.is_running();
         let can_commit = staged > 0 && has_message && !any_running;
 
-        let (text, color) = if self.commit_msg.is_empty() {
-            (
-                if staged > 0 { "Commit message".to_string() } else { "Stage files to commit".to_string() },
-                theme::text_muted(),
-            )
-        } else {
-            let caret = if self.commit_focused { "|" } else { "" };
-            (format!("{}{}", self.commit_msg, caret), theme::text())
-        };
+        let msg_input = crate::warpui::line_edit::LineEditField::new(
+            &self.commit_msg,
+            self.commit_focused,
+            self.ui_font,
+            12.0,
+        )
+        .with_placeholder(if staged > 0 { "Commit message" } else { "Stage files to commit" })
+        .on_click_index(|ctx, idx| {
+            ctx.dispatch_typed_action(CraneShellAction::CommitMsgCaret(idx));
+        })
+        .finish();
         let field = EventHandler::new(
-            Container::new(Text::new(text, self.ui_font, 12.0).with_color(color).finish())
+            Container::new(msg_input)
                 .with_background_color(if self.commit_focused {
                     theme::row_active()
                 } else {
@@ -9725,12 +9767,13 @@ impl CraneShellView {
     fn pending_entry_row(&self, p: &PendingNewEntry) -> Box<dyn Element> {
         let glyph = if p.is_folder { icons::FOLDER } else { icons::FILE };
         let hint = if p.is_folder { "folder-name" } else { "filename.ext" };
-        let shown = if p.name.is_empty() {
-            hint.to_string()
-        } else {
-            format!("{}|", p.name)
-        };
-        let text_color = if p.name.is_empty() { theme::text_muted() } else { theme::text() };
+        let name_input =
+            crate::warpui::line_edit::LineEditField::new(&p.name, true, self.ui_font, 12.0)
+                .with_placeholder(hint)
+                .on_click_index(|ctx, idx| {
+                    ctx.dispatch_typed_action(CraneShellAction::PendingEntryCaret(idx));
+                })
+                .finish();
         let row = Flex::row()
             .with_child(
                 Container::new(self.icon(glyph, 12.0, theme::text_muted()))
@@ -9740,11 +9783,7 @@ impl CraneShellView {
                     .finish(),
             )
             .with_child(
-                Container::new(
-                    Text::new(shown, self.ui_font, 12.0).with_color(text_color).finish(),
-                )
-                .with_padding_top(3.0)
-                .finish(),
+                Container::new(name_input).with_padding_top(3.0).finish(),
             )
             .finish();
         let mut col = Flex::column().with_child(
@@ -11102,25 +11141,19 @@ impl CraneShellView {
     /// field model as the find bar. Arrow keys step the selection even while
     /// the field is focused (old log.rs let you filter-then-arrow).
     fn edit_git_log_filter(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
-        if ks.cmd || ks.ctrl {
-            return;
-        }
         match ks.key.as_str() {
-            "up" | "down" => {
+            "up" | "down" if !ks.cmd && !ks.ctrl && !ks.alt => {
                 let a = CraneShellAction::GitLogStepSelection(ks.key == "down");
                 self.handle_action(&a, ctx);
             }
-            "enter" => self.git_log_filter_active = false,
+            "enter" if !ks.cmd && !ks.ctrl => self.git_log_filter_active = false,
             "escape" => {
-                self.git_log_filter.clear();
+                self.git_log_filter.set_text("");
                 self.git_log_filter_active = false;
             }
-            "backspace" => {
-                self.git_log_filter.pop();
+            _ => {
+                Self::line_edit_key(&mut self.git_log_filter, ks, ctx);
             }
-            "space" => self.git_log_filter.push(' '),
-            k if k.chars().count() == 1 => self.git_log_filter.push_str(k),
-            _ => {}
         }
     }
 
@@ -11139,7 +11172,7 @@ impl CraneShellView {
         };
         match ks.key.as_str() {
             "enter" => {
-                let name = buf.trim().to_string();
+                let name = buf.text().trim().to_string();
                 let sha = sha.clone();
                 self.git_log_branch_prompt = None;
                 self.git_log_menu = None;
@@ -11163,11 +11196,9 @@ impl CraneShellView {
                 self.git_log_branch_prompt = None;
                 self.git_log_menu = None;
             }
-            "backspace" => {
-                buf.pop();
+            _ => {
+                Self::line_edit_key(buf, ks, ctx);
             }
-            k if k.chars().count() == 1 => buf.push_str(k),
-            _ => {}
         }
     }
 
@@ -11177,7 +11208,7 @@ impl CraneShellView {
     /// lane relayout over up to 10k commits must not run per paint).
     fn git_log_shown_frame(&self) -> Option<Rc<crate::warpui::git_log::GraphFrame>> {
         let frame = self.git_log_frame.clone()?;
-        let needle = self.git_log_filter.trim().to_string();
+        let needle = self.git_log_filter.text().trim().to_string();
         if needle.is_empty() {
             return Some(frame);
         }
@@ -11399,32 +11430,19 @@ impl CraneShellView {
                 .with_padding_top(4.0)
                 .finish(),
         );
-        let shown = if self.git_log_filter.is_empty() && !self.git_log_filter_active {
-            "Filter commits (subject / hash / author)".to_string()
-        } else {
-            self.git_log_filter.clone()
-        };
-        let mut field = Flex::row().with_child(
-            Text::new(shown, self.ui_font, 11.0)
-                .with_color(
-                    if self.git_log_filter.is_empty() && !self.git_log_filter_active {
-                        theme::text_muted()
-                    } else {
-                        theme::text()
-                    },
-                )
-                .finish(),
-        );
-        if self.git_log_filter_active {
-            field = field.with_child(
-                ConstrainedBox::new(Rect::new().with_background_color(theme::accent()).finish())
-                    .with_width(2.0)
-                    .with_height(12.0)
-                    .finish(),
-            );
-        }
+        let filter_input = crate::warpui::line_edit::LineEditField::new(
+            &self.git_log_filter,
+            self.git_log_filter_active,
+            self.ui_font,
+            11.0,
+        )
+        .with_placeholder("Filter commits (subject / hash / author)")
+        .on_click_index(|ctx, idx| {
+            ctx.dispatch_typed_action(CraneShellAction::GitLogFilterCaret(idx));
+        })
+        .finish();
         let field = EventHandler::new(
-            Container::new(field.finish())
+            Container::new(filter_input)
                 .with_background_color(theme::bg())
                 .with_border(Border::all(1.0).with_border_color(
                     if self.git_log_filter_active {
@@ -11659,8 +11677,19 @@ impl CraneShellView {
 
     /// The inline "create branch from commit" prompt, anchored like a menu.
     /// Enter creates the branch (`git branch <name> <sha>`), Escape cancels.
-    fn git_log_branch_prompt_overlay(&self, sha: &str, buf: &str) -> Box<dyn Element> {
+    fn git_log_branch_prompt_overlay(
+        &self,
+        sha: &str,
+        buf: &crate::warpui::line_edit::LineEdit,
+    ) -> Box<dyn Element> {
         let short: String = sha.chars().take(7).collect();
+        let name_input =
+            crate::warpui::line_edit::LineEditField::new(buf, true, self.ui_font, 12.0)
+                .with_placeholder("branch name…")
+                .on_click_index(|ctx, idx| {
+                    ctx.dispatch_typed_action(CraneShellAction::GitLogBranchPromptCaret(idx));
+                })
+                .finish();
         let col = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(
@@ -11673,23 +11702,7 @@ impl CraneShellView {
                 .finish(),
             )
             .with_child(
-                Container::new(
-                    Flex::row()
-                        .with_child(
-                            Text::new(buf.to_string(), self.ui_font, 12.0)
-                                .with_color(theme::text())
-                                .finish(),
-                        )
-                        .with_child(
-                            ConstrainedBox::new(
-                                Rect::new().with_background_color(theme::accent()).finish(),
-                            )
-                            .with_width(2.0)
-                            .with_height(13.0)
-                            .finish(),
-                        )
-                        .finish(),
-                )
+                Container::new(name_input)
                 .with_background_color(theme::bg())
                 .with_border(Border::all(1.0).with_border_color(theme::accent()))
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
@@ -11989,7 +12002,11 @@ impl CraneShellView {
 
     /// The live rename buffer for worktree (pi, wi), or None when that row is
     /// not the active rename target.
-    fn worktree_rename_buf(&self, pi: usize, wi: usize) -> Option<String> {
+    fn worktree_rename_buf(
+        &self,
+        pi: usize,
+        wi: usize,
+    ) -> Option<crate::warpui::line_edit::LineEdit> {
         self.renaming.as_ref().and_then(|r| match &r.target {
             RenameTarget::Worktree { pi: rp, wi: rw } if *rp == pi && *rw == wi => {
                 Some(r.buffer.clone())
@@ -12000,7 +12017,10 @@ impl CraneShellView {
 
     /// The live rename buffer for tab `key`, or None when that row is not the
     /// active rename target.
-    fn tab_rename_buf(&self, key: (usize, usize, usize)) -> Option<String> {
+    fn tab_rename_buf(
+        &self,
+        key: (usize, usize, usize),
+    ) -> Option<crate::warpui::line_edit::LineEdit> {
         self.renaming.as_ref().and_then(|r| match &r.target {
             RenameTarget::Tab { key: k } if *k == key => Some(r.buffer.clone()),
             _ => None,
@@ -12008,23 +12028,17 @@ impl CraneShellView {
     }
 
     /// Apply a keystroke to the active inline rename buffer. Enter commits,
-    /// Escape cancels, Backspace deletes, printable chars append — mirrors
-    /// `edit_commit` / `edit_new_entry`.
-    fn edit_rename(&mut self, ks: &warpui::keymap::Keystroke) {
+    /// Escape cancels, everything else routes through the LineEdit (caret,
+    /// selection, clipboard) — mirrors `edit_commit` / `edit_new_entry`.
+    fn edit_rename(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
         match ks.key.as_str() {
             "enter" | "return" | "numpadenter" => self.commit_rename(),
             "escape" => self.renaming = None,
-            "backspace" => {
+            _ => {
                 if let Some(r) = self.renaming.as_mut() {
-                    r.buffer.pop();
+                    Self::line_edit_key(&mut r.buffer, ks, ctx);
                 }
             }
-            k if k.chars().count() == 1 => {
-                if let Some(r) = self.renaming.as_mut() {
-                    r.buffer.push_str(k);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -12033,7 +12047,7 @@ impl CraneShellView {
     /// cancel. Persistence happens via the global save at the end of the action.
     fn commit_rename(&mut self) {
         let Some(r) = self.renaming.take() else { return };
-        let name = r.buffer.trim().to_string();
+        let name = r.buffer.text().trim().to_string();
         if name.is_empty() {
             return;
         }
@@ -12057,21 +12071,19 @@ impl CraneShellView {
     }
 
     /// Edit the commit message buffer from a keystroke (commit box focused).
-    fn edit_commit(&mut self, ks: &warpui::keymap::Keystroke) {
+    fn edit_commit(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
         match ks.key.as_str() {
             "enter" | "return" | "numpadenter" => self.commit_now(),
-            "backspace" => {
-                self.commit_msg.pop();
+            _ => {
+                Self::line_edit_key(&mut self.commit_msg, ks, ctx);
             }
-            k if k.chars().count() == 1 => self.commit_msg.push_str(k),
-            _ => {}
         }
     }
 
     /// Commit staged changes with the current message on a background thread
     /// (so the op pill animates like Push/Pull), then clear the message.
     fn commit_now(&mut self) {
-        let msg = self.commit_msg.trim().to_string();
+        let msg = self.commit_msg.text().trim().to_string();
         let staged = self.changes.iter().filter(|c| c.staged).count();
         if msg.is_empty() || staged == 0 {
             return;
@@ -12084,7 +12096,7 @@ impl CraneShellView {
             let status = self.git_op.clone();
             let wake = self.git_wake.clone();
             crate::warpui::git::spawn_git_commit(root, msg, status, move || wake());
-            self.commit_msg.clear();
+            self.commit_msg.set_text("");
             self.commit_focused = false;
         }
     }
@@ -12104,17 +12116,11 @@ impl CraneShellView {
         match ks.key.as_str() {
             "enter" | "return" | "numpadenter" => self.commit_pending_entry(ctx),
             "escape" => self.pending_new_entry = None,
-            "backspace" => {
+            _ => {
                 if let Some(p) = self.pending_new_entry.as_mut() {
-                    p.name.pop();
+                    Self::line_edit_key(&mut p.name, ks, ctx);
                 }
             }
-            k if k.chars().count() == 1 => {
-                if let Some(p) = self.pending_new_entry.as_mut() {
-                    p.name.push_str(k);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -12123,7 +12129,7 @@ impl CraneShellView {
     /// `try_commit_pending`).
     fn commit_pending_entry(&mut self, ctx: &mut ViewContext<Self>) {
         let Some(p) = self.pending_new_entry.as_ref() else { return };
-        let name = p.name.trim().to_string();
+        let name = p.name.text().trim().to_string();
         if name.is_empty() {
             self.pending_new_entry = None;
             return;
@@ -12756,10 +12762,17 @@ impl View for CraneShellView {
                     return DispatchEventResult::StopPropagation;
                 }
                 // The Switch Branch popup (a non-modal overlay) captures typing /
-                // nav / Escape the same way the old modal did. Cmd chords still
-                // fall through to the global shortcuts below; only plain keys are
-                // routed into the popup (and consumed).
-                if switch_branch_open && !ks.cmd && !ks.ctrl && !ks.alt {
+                // nav / Escape the same way the old modal did. Editing chords the
+                // LineEdit understands (Cmd+A/C/V/X, Cmd/Alt+arrows, Alt+Backspace)
+                // route in too; every other Cmd chord still falls through to the
+                // global shortcuts below.
+                let edit_chord = (ks.cmd
+                    && matches!(
+                        ks.key.as_str(),
+                        "a" | "c" | "v" | "x" | "left" | "right" | "backspace"
+                    ))
+                    || (ks.alt && !ks.cmd);
+                if switch_branch_open && ((!ks.cmd && !ks.ctrl && !ks.alt) || edit_chord) {
                     ctx.dispatch_typed_action(CraneShellAction::SwitchBranchKey(ks.clone()));
                     return DispatchEventResult::StopPropagation;
                 }
@@ -13274,6 +13287,25 @@ pub enum CraneShellAction {
     OpenNewWorkspace { pi: usize, branch: Option<String> },
     /// A keystroke routed to the open New-Workspace branch field.
     NewWorkspaceKey(warpui::keymap::Keystroke),
+    /// Click-to-place-caret in a New Workspace field (`path_field` selects
+    /// the custom-path vs branch field; `index` is a byte offset).
+    NewWorkspaceCaret { path_field: bool, index: usize },
+    /// Click-to-place-caret in the Find-in-Files query (byte offset).
+    FindInFilesCaret(usize),
+    /// Click-to-place-caret in the Switch Branch query (byte offset).
+    SwitchBranchCaret(usize),
+    /// Click-to-place-caret in the Switch Branch new-branch input (byte offset).
+    SwitchBranchNewCaret(usize),
+    /// Click-to-place-caret in the git-log filter field (byte offset).
+    GitLogFilterCaret(usize),
+    /// Click-to-place-caret in the git-log new-branch prompt (byte offset).
+    GitLogBranchPromptCaret(usize),
+    /// Click-to-place-caret in the active inline-rename field (byte offset).
+    RenameCaret(usize),
+    /// Click-to-place-caret in the commit message box (byte offset).
+    CommitMsgCaret(usize),
+    /// Click-to-place-caret in the pending new-file/folder name (byte offset).
+    PendingEntryCaret(usize),
     /// Pick the New-Workspace location mode (Global / Project-local / Custom).
     NewWorkspaceSetMode(LocationMode),
     /// Move typing focus between the branch field and the custom-path field.
@@ -13419,7 +13451,7 @@ impl CraneShellView {
             }
             CraneShellAction::SendKeys(ks) => {
                 if self.renaming.is_some() {
-                    self.edit_rename(ks);
+                    self.edit_rename(ks, ctx);
                 } else if self.pending_new_entry.is_some() {
                     self.edit_new_entry(ks, ctx);
                 } else if self.git_log_branch_prompt.is_some() {
@@ -13427,7 +13459,7 @@ impl CraneShellView {
                 } else if self.git_log_filter_active {
                     self.edit_git_log_filter(ks, ctx);
                 } else if self.commit_focused {
-                    self.edit_commit(ks);
+                    self.edit_commit(ks, ctx);
                 } else if let Some(id) = self.active_input_pane() {
                     if let Some(h) = self.terminal_at(id) {
                         h.update(ctx, |view, _| view.write_keystroke(ks));
@@ -13823,7 +13855,7 @@ impl CraneShellView {
                 self.pending_new_entry = Some(PendingNewEntry {
                     parent: parent.clone(),
                     is_folder: *is_folder,
-                    name: String::new(),
+                    name: crate::warpui::line_edit::LineEdit::default(),
                     error: None,
                 });
                 self.refresh_panel(ctx);
@@ -13965,7 +13997,8 @@ impl CraneShellView {
                 // Keep git_log_menu's (x, y) — the prompt overlay anchors
                 // there; the menu itself stops rendering while the prompt is
                 // open (render gates on branch_prompt.is_none()).
-                self.git_log_branch_prompt = Some((sha.clone(), String::new()));
+                self.git_log_branch_prompt =
+                    Some((sha.clone(), crate::warpui::line_edit::LineEdit::default()));
             }
             CraneShellAction::GitLogSetRefFilter(r) => {
                 // Clicking the already-active ref clears the scope (toggle).
@@ -14411,7 +14444,7 @@ impl CraneShellView {
                         .unwrap_or_else(|| w.name.clone());
                     self.renaming = Some(RenameState {
                         target: RenameTarget::Worktree { pi: *pi, wi: *wi },
-                        buffer: cur,
+                        buffer: crate::warpui::line_edit::LineEdit::new(cur),
                     });
                 }
             }
@@ -14425,7 +14458,7 @@ impl CraneShellView {
                     .unwrap_or_default();
                 self.renaming = Some(RenameState {
                     target: RenameTarget::Tab { key: *key },
-                    buffer: cur,
+                    buffer: crate::warpui::line_edit::LineEdit::new(cur),
                 });
             }
             CraneShellAction::RemoveWorktree { pi, wi } => {
@@ -14762,7 +14795,7 @@ impl CraneShellView {
             }
             CraneShellAction::OpenFindInFiles => {
                 self.find_in_files = Some(FindInFilesState {
-                    query: String::new(),
+                    query: crate::warpui::line_edit::LineEdit::default(),
                     results: Vec::new(),
                     truncated: false,
                     selected: 0,
@@ -14941,7 +14974,7 @@ impl CraneShellView {
             }
             CraneShellAction::SwitchBranchStartNewBranch => {
                 if let Some(st) = self.switch_branch.as_mut() {
-                    st.new_branch_input = Some(String::new());
+                    st.new_branch_input = Some(crate::warpui::line_edit::LineEdit::default());
                 }
             }
             CraneShellAction::CreateBranchCheckout(name) => {
@@ -14992,7 +15025,9 @@ impl CraneShellView {
                     .unwrap_or_default();
                 self.new_workspace = Some(NewWorkspaceState {
                     project_idx: *pi,
-                    branch: branch.clone().unwrap_or_default(),
+                    branch: crate::warpui::line_edit::LineEdit::new(
+                        branch.clone().unwrap_or_default(),
+                    ),
                     // An existing branch from the picker locks the field —
                     // the only sensible action is checkout-into-new-worktree.
                     branch_locked: branch.is_some(),
@@ -15000,7 +15035,7 @@ impl CraneShellView {
                     existing_branches,
                     remote_branches,
                     mode: LocationMode::Global,
-                    custom_path: String::new(),
+                    custom_path: crate::warpui::line_edit::LineEdit::default(),
                     path_focused: false,
                     error: None,
                 });
@@ -15008,6 +15043,55 @@ impl CraneShellView {
             }
             CraneShellAction::NewWorkspaceKey(ks) => {
                 self.edit_new_workspace(ks, ctx);
+            }
+            CraneShellAction::NewWorkspaceCaret { path_field, index } => {
+                if let Some(st) = self.new_workspace.as_mut() {
+                    if *path_field {
+                        st.custom_path.set_caret(*index);
+                        st.path_focused = true;
+                    } else if !st.branch_locked {
+                        st.branch.set_caret(*index);
+                        st.path_focused = false;
+                    }
+                }
+            }
+            CraneShellAction::FindInFilesCaret(index) => {
+                if let Some(st) = self.find_in_files.as_mut() {
+                    st.query.set_caret(*index);
+                }
+            }
+            CraneShellAction::SwitchBranchCaret(index) => {
+                if let Some(st) = self.switch_branch.as_mut() {
+                    st.query.set_caret(*index);
+                }
+            }
+            CraneShellAction::SwitchBranchNewCaret(index) => {
+                if let Some(le) = self.switch_branch.as_mut().and_then(|st| st.new_branch_input.as_mut()) {
+                    le.set_caret(*index);
+                }
+            }
+            CraneShellAction::GitLogFilterCaret(index) => {
+                self.git_log_filter.set_caret(*index);
+                self.git_log_filter_active = true;
+            }
+            CraneShellAction::GitLogBranchPromptCaret(index) => {
+                if let Some((_, le)) = self.git_log_branch_prompt.as_mut() {
+                    le.set_caret(*index);
+                }
+            }
+            CraneShellAction::RenameCaret(index) => {
+                if let Some(r) = self.renaming.as_mut() {
+                    r.buffer.set_caret(*index);
+                }
+            }
+            CraneShellAction::CommitMsgCaret(index) => {
+                self.commit_msg.set_caret(*index);
+                self.commit_focused = true;
+            }
+            CraneShellAction::PendingEntryCaret(index) => {
+                if let Some(p) = self.pending_new_entry.as_mut() {
+                    p.name.set_caret(*index);
+                }
             }
             CraneShellAction::NewWorkspaceSetMode(mode) => {
                 if let Some(st) = self.new_workspace.as_mut() {
@@ -15024,7 +15108,7 @@ impl CraneShellView {
                 let start = self
                     .new_workspace
                     .as_ref()
-                    .map(|st| st.custom_path.clone())
+                    .map(|st| st.custom_path.text().to_string())
                     .filter(|p| !p.is_empty())
                     .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
                 let fut = rfd::AsyncFileDialog::new()
@@ -15033,7 +15117,8 @@ impl CraneShellView {
                     .pick_folder();
                 ctx.spawn(fut, |this, res: Option<rfd::FileHandle>, vctx| {
                     if let (Some(handle), Some(st)) = (res, this.new_workspace.as_mut()) {
-                        st.custom_path = handle.path().to_string_lossy().to_string();
+                        st.custom_path
+                            .set_text(handle.path().to_string_lossy().to_string());
                         st.mode = LocationMode::Custom;
                     }
                     vctx.notify();

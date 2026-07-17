@@ -385,9 +385,9 @@ enum FindMode {
 struct FindState {
     mode: FindMode,
     /// The search query (Find/Replace) or the line-number text (Goto).
-    query: String,
+    query: crate::warpui::line_edit::LineEdit,
     /// The replacement text (Replace mode).
-    replace: String,
+    replace: crate::warpui::line_edit::LineEdit,
     /// Which field captures typed characters: `true` = query, `false` = replace.
     find_field_active: bool,
     /// Match ranges as 0-based char offsets into the buffer text `(start, end)`,
@@ -401,8 +401,8 @@ impl FindState {
     fn new(mode: FindMode) -> Self {
         Self {
             mode,
-            query: String::new(),
-            replace: String::new(),
+            query: crate::warpui::line_edit::LineEdit::default(),
+            replace: crate::warpui::line_edit::LineEdit::default(),
             find_field_active: true,
             matches: Vec::new(),
             current: None,
@@ -631,8 +631,27 @@ impl WarpEditorView {
         let m = self.model.clone();
         m.update(ctx, |m: &mut CodeModel, mctx| m.select_all(mctx));
     }
-    /// Insert clipboard text at the cursor (Cmd+V).
-    pub fn paste(&self, text: &str, ctx: &mut ViewContext<Self>) {
+    /// Insert clipboard text at the cursor (Cmd+V). With the find bar open,
+    /// the paste belongs to the active find-bar field, not the buffer.
+    pub fn paste(&mut self, text: &str, ctx: &mut ViewContext<Self>) {
+        if let Some(f) = self.find.as_mut() {
+            let goto = f.mode == FindMode::Goto;
+            let clean: String = if goto {
+                text.chars().filter(|c| c.is_ascii_digit()).collect()
+            } else {
+                text.to_string()
+            };
+            if !clean.is_empty() {
+                let le = if goto || f.find_field_active { &mut f.query } else { &mut f.replace };
+                le.insert_str(&clean);
+                let recompute = !goto && f.find_field_active;
+                if recompute {
+                    self.recompute_matches(ctx);
+                }
+            }
+            ctx.notify();
+            return;
+        }
         let text = text.to_string();
         let m = self.model.clone();
         m.update(ctx, |m: &mut CodeModel, mctx| m.user_insert(&text, mctx));
@@ -1537,7 +1556,7 @@ impl WarpEditorView {
             state.query = q;
         } else if let Some(sel) = self.selected_text(ctx) {
             if !sel.is_empty() && !sel.contains('\n') {
-                state.query = sel;
+                state.query = crate::warpui::line_edit::LineEdit::new(sel);
             }
         }
         self.find = Some(state);
@@ -1623,7 +1642,7 @@ impl WarpEditorView {
     /// Goto mode.
     fn recompute_matches(&mut self, ctx: &mut ViewContext<Self>) {
         let (mode, query) = match self.find.as_ref() {
-            Some(f) => (f.mode, f.query.clone()),
+            Some(f) => (f.mode, f.query.text().to_string()),
             None => return,
         };
         if mode == FindMode::Goto {
@@ -1808,7 +1827,7 @@ impl WarpEditorView {
     /// Jump the caret to the line typed into the Goto bar, then close it.
     fn do_goto_line(&mut self, ctx: &mut ViewContext<Self>) {
         let n: usize = match self.find.as_ref() {
-            Some(f) => f.query.trim().parse::<usize>().unwrap_or(1).max(1),
+            Some(f) => f.query.text().trim().parse::<usize>().unwrap_or(1).max(1),
             None => return,
         };
         let text = self.buffer_text(ctx);
@@ -1828,7 +1847,7 @@ impl WarpEditorView {
     fn replace_current(&mut self, ctx: &mut ViewContext<Self>) {
         let (range, replacement) = match self.find.as_ref() {
             Some(f) if f.mode == FindMode::Replace => match f.current {
-                Some(c) if c < f.matches.len() => (f.matches[c], f.replace.clone()),
+                Some(c) if c < f.matches.len() => (f.matches[c], f.replace.text().to_string()),
                 _ => return,
             },
             _ => return,
@@ -1854,7 +1873,7 @@ impl WarpEditorView {
     fn replace_all(&mut self, ctx: &mut ViewContext<Self>) {
         let (mut matches, replacement) = match self.find.as_ref() {
             Some(f) if f.mode == FindMode::Replace && !f.matches.is_empty() => {
-                (f.matches.clone(), f.replace.clone())
+                (f.matches.clone(), f.replace.text().to_string())
             }
             _ => return,
         };
@@ -1876,46 +1895,53 @@ impl WarpEditorView {
         ctx.notify();
     }
 
-    /// Route a typed string into the active find-bar field.
-    fn find_type(&mut self, s: &str, ctx: &mut ViewContext<Self>) {
-        let mut recompute = false;
-        if let Some(f) = self.find.as_mut() {
-            match f.mode {
-                FindMode::Goto => {
-                    for ch in s.chars() {
-                        if ch.is_ascii_digit() {
-                            f.query.push(ch);
-                        }
-                    }
-                }
-                _ => {
-                    if f.find_field_active {
-                        f.query.push_str(s);
-                        recompute = true;
-                    } else {
-                        f.replace.push_str(s);
-                    }
+    /// Route an editing keystroke into the active find-bar field's LineEdit
+    /// (caret, selection, word-nav, clipboard). Goto mode only accepts digits.
+    fn find_edit_key(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
+        use crate::warpui::line_edit::Outcome;
+        let Some(f) = self.find.as_mut() else { return };
+        let goto = f.mode == FindMode::Goto;
+        // Goto: reject non-digit printable chars up front (LineEdit would
+        // insert them).
+        if goto
+            && ks.key.chars().count() == 1
+            && !ks.cmd
+            && !ks.ctrl
+            && !ks.key.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return;
+        }
+        let le = if goto || f.find_field_active { &mut f.query } else { &mut f.replace };
+        let changed = match le.handle_key(ks) {
+            Outcome::Changed => true,
+            Outcome::CaretMoved => false,
+            Outcome::Copy(s) => {
+                ctx.clipboard()
+                    .write(warpui::clipboard::ClipboardContent::plain_text(s));
+                false
+            }
+            Outcome::Cut(s) => {
+                ctx.clipboard()
+                    .write(warpui::clipboard::ClipboardContent::plain_text(s));
+                true
+            }
+            Outcome::Paste => {
+                let text = ctx.clipboard().read().plain_text;
+                let text: String = if goto {
+                    text.chars().filter(|c| c.is_ascii_digit()).collect()
+                } else {
+                    text
+                };
+                if text.is_empty() {
+                    false
+                } else {
+                    le.insert_str(&text);
+                    true
                 }
             }
-        }
-        if recompute {
-            self.recompute_matches(ctx);
-        }
-        ctx.notify();
-    }
-
-    /// Delete the last char of the active find-bar field.
-    fn find_backspace(&mut self, ctx: &mut ViewContext<Self>) {
-        let mut recompute = false;
-        if let Some(f) = self.find.as_mut() {
-            let goto = f.mode == FindMode::Goto;
-            if goto || f.find_field_active {
-                f.query.pop();
-                recompute = !goto;
-            } else {
-                f.replace.pop();
-            }
-        }
+            Outcome::Ignored => false,
+        };
+        let recompute = changed && !goto && f.find_field_active;
         if recompute {
             self.recompute_matches(ctx);
         }
@@ -2263,6 +2289,17 @@ impl WarpEditorView {
         // if it never routes these here, the public `open_find` / `open_replace`
         // / `open_goto_line` methods are the hookup — a 1-line shell keybinding.)
         if ks.cmd || ks.ctrl {
+            // With the find bar open, editing chords (Cmd+A/C/V/X, Cmd+arrows,
+            // Cmd+Backspace, Ctrl+A/E) belong to the active find field.
+            if self.find.is_some()
+                && matches!(
+                    ks.key.as_str(),
+                    "a" | "c" | "v" | "x" | "e" | "left" | "right" | "backspace"
+                )
+            {
+                self.find_edit_key(ks, ctx);
+                return;
+            }
             match ks.key.as_str() {
                 "f" => self.open_find(ctx),
                 "h" => self.open_replace(ctx),
@@ -2283,8 +2320,6 @@ impl WarpEditorView {
                         _ => self.find_step(!ks.shift, ctx),
                     }
                 }
-                "backspace" | "delete" => self.find_backspace(ctx),
-                "space" => self.find_type(" ", ctx),
                 // Tab toggles between the find and replace fields (Replace mode).
                 "tab" => {
                     if let Some(f) = self.find.as_mut() {
@@ -2294,8 +2329,7 @@ impl WarpEditorView {
                     }
                     ctx.notify();
                 }
-                k if k.chars().count() == 1 => self.find_type(k, ctx),
-                _ => {}
+                _ => self.find_edit_key(ks, ctx),
             }
             return;
         }
@@ -2476,8 +2510,8 @@ impl View for WarpEditorView {
             };
             FindBarElement::new(
                 find.bar_mode(),
-                find.query.clone(),
-                find.replace.clone(),
+                &find.query,
+                &find.replace,
                 find.matches.len(),
                 find.current,
                 find.find_field_active,

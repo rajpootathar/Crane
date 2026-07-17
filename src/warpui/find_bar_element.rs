@@ -53,6 +53,13 @@ pub struct FindBarElement {
     pub mode: BarMode,
     pub find_query: String,
     pub replace_query: String,
+    /// Caret byte offset + selection range of the find field (from its
+    /// LineEdit); drawn only while that field is active.
+    pub find_caret: usize,
+    pub find_selection: Option<(usize, usize)>,
+    /// Caret byte offset + selection range of the replace field.
+    pub replace_caret: usize,
+    pub replace_selection: Option<(usize, usize)>,
     pub match_count: usize,
     pub current_match: Option<usize>,  // 0-based
     pub find_field_active: bool,       // false = replace field active
@@ -79,8 +86,8 @@ impl FindBarElement {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mode: BarMode,
-        find_query: String,
-        replace_query: String,
+        find_query: &crate::warpui::line_edit::LineEdit,
+        replace_query: &crate::warpui::line_edit::LineEdit,
         match_count: usize,
         current_match: Option<usize>,
         find_field_active: bool,
@@ -95,8 +102,12 @@ impl FindBarElement {
     ) -> Self {
         Self {
             mode,
-            find_query,
-            replace_query,
+            find_query: find_query.text().to_string(),
+            find_caret: find_query.caret(),
+            find_selection: find_query.selection(),
+            replace_query: replace_query.text().to_string(),
+            replace_caret: replace_query.caret(),
+            replace_selection: replace_query.selection(),
             match_count,
             current_match,
             find_field_active,
@@ -170,6 +181,41 @@ impl FindBarElement {
                     .unwrap_or(size * 0.6)
             })
             .sum()
+    }
+
+    /// Draw a field's selection wash + caret bar over/next to its text.
+    /// `text_x` is where the text starts; `caret`/`selection` are byte offsets
+    /// into `text` (from the field's LineEdit).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_field_caret(
+        ctx: &mut PaintContext,
+        fc: &warpui::fonts::Cache,
+        font_id: warpui::fonts::FontId,
+        text: &str,
+        text_x: f32,
+        field_rect: RectF,
+        caret: usize,
+        selection: Option<(usize, usize)>,
+    ) {
+        let w_to = |b: usize| Self::text_width(fc, font_id, &text[..b.min(text.len())], FONT_SZ);
+        if let Some((s, e)) = selection {
+            let (sx, ex) = (text_x + w_to(s), text_x + w_to(e));
+            if ex > sx {
+                ctx.scene
+                    .draw_rect_without_hit_recording(RectF::new(
+                        vec2f(sx, field_rect.origin().y()),
+                        vec2f(ex - sx, field_rect.size().y()),
+                    ))
+                    .with_background(Fill::Solid(theme::selection_wash()));
+            }
+        }
+        let cx = text_x + w_to(caret);
+        ctx.scene
+            .draw_rect_without_hit_recording(RectF::new(
+                vec2f(cx, field_rect.origin().y() + 2.0),
+                vec2f(1.5, field_rect.size().y() - 4.0),
+            ))
+            .with_background(Fill::Solid(theme::accent()));
     }
 
     /// Draw a small button (icon or label) with a hover-style background; register region.
@@ -281,6 +327,11 @@ impl Element for FindBarElement {
                 let show = if self.find_query.is_empty() { "1" } else { &self.find_query };
                 let q_color = if self.find_query.is_empty() { fg_muted } else { fg_text };
                 Self::draw_str(ctx, fc, mono_id, show, x + 4.0, oy + baseline, FONT_SZ, q_color);
+                Self::draw_field_caret(
+                    ctx, fc, mono_id,
+                    &self.find_query, x + 4.0, field_rect,
+                    self.find_caret, self.find_selection,
+                );
                 self.regions.push((Hit::FindField, field_rect));
                 x += field_w + PAD;
 
@@ -329,6 +380,13 @@ impl Element for FindBarElement {
                 let q_color = if self.find_query.is_empty() { fg_muted } else { fg_text };
                 let q_show = if self.find_query.is_empty() { "find…" } else { &self.find_query };
                 Self::draw_str(ctx, fc, mono_id, q_show, x + 4.0, oy + baseline, FONT_SZ, q_color);
+                if find_active {
+                    Self::draw_field_caret(
+                        ctx, fc, mono_id,
+                        &self.find_query, x + 4.0, find_rect,
+                        self.find_caret, self.find_selection,
+                    );
+                }
                 self.regions.push((Hit::FindField, find_rect));
                 x += field_w + PAD;
 
@@ -382,6 +440,13 @@ impl Element for FindBarElement {
                     let rq_color = if self.replace_query.is_empty() { fg_muted } else { fg_text };
                     let rq_show = if self.replace_query.is_empty() { "replace…" } else { &self.replace_query };
                     Self::draw_str(ctx, fc, mono_id, rq_show, rx + 4.0, oy2 + baseline, FONT_SZ, rq_color);
+                    if !self.find_field_active {
+                        Self::draw_field_caret(
+                            ctx, fc, mono_id,
+                            &self.replace_query, rx + 4.0, rep_rect,
+                            self.replace_caret, self.replace_selection,
+                        );
+                    }
                     self.regions.push((Hit::ReplaceField, rep_rect));
                     rx += field_w + PAD;
 

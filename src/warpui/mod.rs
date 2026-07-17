@@ -34,6 +34,7 @@ pub mod scrollbar_element;
 pub mod icons;
 pub mod input;
 pub mod layout;
+pub mod line_edit;
 pub mod persist;
 pub mod platform_menu;
 pub mod projects;
