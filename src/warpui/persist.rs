@@ -116,16 +116,35 @@ pub struct WarpuiState {
     pub show_right: bool,
     #[serde(default)]
     pub files_tab: bool,
-    /// Active tab as (project_idx, worktree_idx, tab_id).
+    /// Active tab as (project_idx, worktree_idx, tab_id). LEGACY — indices
+    /// shift when projects/worktrees are added, removed or reordered between
+    /// runs. Kept written + read as a fallback; `active_tab_path` wins.
     #[serde(default)]
     pub active_tab: Option<(usize, usize, usize)>,
     #[serde(default)]
     pub expanded_projects: Vec<usize>,
     #[serde(default)]
     pub expanded_worktrees: Vec<(usize, usize)>,
-    /// Per (project_idx, worktree_idx): the tabs in that worktree.
+    /// Per (project_idx, worktree_idx): the tabs in that worktree. LEGACY —
+    /// see `worktree_tabs_by_path`, which restore prefers.
     #[serde(default)]
     pub worktree_tabs: Vec<((usize, usize), Vec<STab>)>,
+    /// Per worktree checkout PATH: the tabs in that worktree. Paths are stable
+    /// across reloads (indices shift), so tab lists + terminal histories land
+    /// back in the RIGHT worktree even after projects are added/removed/reordered.
+    #[serde(default)]
+    pub worktree_tabs_by_path: Vec<(String, Vec<STab>)>,
+    /// Active tab as (worktree checkout path, tab_id) — the stable-key twin of
+    /// `active_tab`.
+    #[serde(default)]
+    pub active_tab_path: Option<(String, usize)>,
+    /// Expanded sidebar projects keyed by project path (stable-key twin of
+    /// `expanded_projects`).
+    #[serde(default)]
+    pub expanded_project_paths: Vec<String>,
+    /// Expanded sidebar worktrees keyed by worktree checkout path.
+    #[serde(default)]
+    pub expanded_worktree_paths: Vec<String>,
     #[serde(default)]
     pub next_tab_id: usize,
     #[serde(default)]
@@ -268,28 +287,41 @@ pub fn save(state: &WarpuiState) {
     let Ok(bytes) = serde_json::to_vec_pretty(state) else {
         return;
     };
-    write_bytes_async(path, bytes);
+    std::thread::spawn(move || write_bytes(&path, &bytes));
 }
 
-/// Off-thread crash-safe write of already-serialized bytes. Owns its inputs so
-/// the closure is `'static` for the spawned thread.
-fn write_bytes_async(path: std::path::PathBuf, bytes: Vec<u8>) {
-    std::thread::spawn(move || {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+/// Synchronous variant of `save` for the app-terminate path: the process may
+/// exit before a spawned writer thread finishes, so the final save (which
+/// carries the freshest terminal snapshots) must complete on the calling
+/// thread before termination is approved.
+pub fn save_sync(state: &WarpuiState) {
+    let Some(path) = state_file() else { return };
+    let Ok(bytes) = serde_json::to_vec_pretty(state) else {
+        return;
+    };
+    write_bytes(&path, &bytes);
+}
+
+/// Crash-safe write of already-serialized bytes (tmp → rename). The tmp name
+/// is unique per write so a concurrent async save and the terminate-path sync
+/// save can never interleave into the same tmp file.
+fn write_bytes(path: &std::path::Path, bytes: &[u8]) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp{n}"));
+    if std::fs::write(&tmp, bytes).is_ok() {
+        // Best-effort backup of the current good state before we replace it,
+        // so a crash between here and the rename still leaves a recoverable
+        // copy.
+        if path.exists() {
+            let bak = path.with_extension("json.bak");
+            let _ = std::fs::copy(path, &bak);
         }
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            // Best-effort backup of the current good state before we replace it,
-            // so a crash between here and the rename still leaves a recoverable
-            // copy.
-            if path.exists() {
-                let bak = path.with_extension("json.bak");
-                let _ = std::fs::copy(&path, &bak);
-            }
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    });
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 /// Helper to rebuild HashMap fields from the flat Vecs.
@@ -304,4 +336,56 @@ pub fn expanded_sets(
         state.expanded_projects.iter().copied().collect(),
         state.expanded_worktrees.iter().copied().collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The path-keyed session fields must survive a serialize → deserialize
+    /// round trip (they carry tab lists + the active tab across restarts).
+    #[test]
+    fn path_keyed_fields_round_trip() {
+        let mut st = WarpuiState::default();
+        st.worktree_tabs_by_path = vec![(
+            "/tmp/wt".into(),
+            vec![STab {
+                id: 3,
+                name: "build".into(),
+                layout: SNode::Leaf(7),
+                focus: Some(7),
+                renamed: true,
+            }],
+        )];
+        st.active_tab_path = Some(("/tmp/wt".into(), 3));
+        st.expanded_project_paths = vec!["/tmp/proj".into()];
+        st.expanded_worktree_paths = vec!["/tmp/wt".into()];
+        let bytes = serde_json::to_vec(&st).unwrap();
+        let back: WarpuiState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.worktree_tabs_by_path.len(), 1);
+        assert_eq!(back.worktree_tabs_by_path[0].0, "/tmp/wt");
+        assert_eq!(back.worktree_tabs_by_path[0].1[0].id, 3);
+        assert_eq!(back.worktree_tabs_by_path[0].1[0].focus, Some(7));
+        assert_eq!(back.active_tab_path, Some(("/tmp/wt".into(), 3)));
+        assert_eq!(back.expanded_project_paths, vec!["/tmp/proj".to_string()]);
+        assert_eq!(back.expanded_worktree_paths, vec!["/tmp/wt".to_string()]);
+    }
+
+    /// A state file written BEFORE the path-keyed fields existed must still
+    /// parse, with the new fields defaulting to empty (restore then falls back
+    /// to the legacy index-keyed fields).
+    #[test]
+    fn legacy_state_file_still_parses() {
+        let legacy = r#"{
+            "show_left": true,
+            "active_tab": [1, 0, 4],
+            "worktree_tabs": [[[1, 0], [{"id": 4, "name": "t", "layout": {"Leaf": 9}}]]]
+        }"#;
+        let st: WarpuiState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(st.active_tab, Some((1, 0, 4)));
+        assert_eq!(st.worktree_tabs.len(), 1);
+        assert!(st.worktree_tabs_by_path.is_empty());
+        assert!(st.active_tab_path.is_none());
+        assert!(st.expanded_project_paths.is_empty());
+    }
 }

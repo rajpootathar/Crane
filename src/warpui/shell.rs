@@ -1243,8 +1243,40 @@ impl CraneShellView {
             show_left = st.show_left;
             show_right = st.show_right;
             files_tab = st.files_tab;
-            expanded_projects = st.expanded_projects.iter().copied().collect();
-            expanded_worktrees = st.expanded_worktrees.iter().copied().collect();
+            // Path → (project_idx, worktree_idx) resolver for the stable-key
+            // state fields. Worktree checkout paths are unique and survive
+            // project add/remove/reorder; the saved indices don't.
+            let wt_index: HashMap<&str, (usize, usize)> = projects
+                .iter()
+                .enumerate()
+                .flat_map(|(pi, p)| {
+                    p.worktrees
+                        .iter()
+                        .enumerate()
+                        .map(move |(wi, w)| (w.path.as_str(), (pi, wi)))
+                })
+                .collect();
+            let proj_index: HashMap<&str, usize> = projects
+                .iter()
+                .enumerate()
+                .map(|(pi, p)| (p.path.as_str(), pi))
+                .collect();
+            expanded_projects = if !st.expanded_project_paths.is_empty() {
+                st.expanded_project_paths
+                    .iter()
+                    .filter_map(|p| proj_index.get(p.as_str()).copied())
+                    .collect()
+            } else {
+                st.expanded_projects.iter().copied().collect()
+            };
+            expanded_worktrees = if !st.expanded_worktree_paths.is_empty() {
+                st.expanded_worktree_paths
+                    .iter()
+                    .filter_map(|p| wt_index.get(p.as_str()).copied())
+                    .collect()
+            } else {
+                st.expanded_worktrees.iter().copied().collect()
+            };
             next_tab_id = st.next_tab_id;
             next_pane_id = st.next_pane_id;
             let saved_files_pane = st.files_pane;
@@ -1252,7 +1284,21 @@ impl CraneShellView {
             saved_active = st.file_pane_active;
             restored_term_cache = st.terminals.iter().cloned().collect();
             restored_browsers = st.browsers.iter().cloned().collect();
-            for ((pi, wi), stabs) in &st.worktree_tabs {
+            // Tab lists: prefer the path-keyed field (stable across project
+            // reordering); fall back to the legacy index-keyed one for state
+            // files written before `worktree_tabs_by_path` existed.
+            let effective_tabs: Vec<((usize, usize), Vec<crate::warpui::persist::STab>)> =
+                if !st.worktree_tabs_by_path.is_empty() {
+                    st.worktree_tabs_by_path
+                        .iter()
+                        .filter_map(|(path, tabs)| {
+                            wt_index.get(path.as_str()).map(|k| (*k, tabs.clone()))
+                        })
+                        .collect()
+                } else {
+                    st.worktree_tabs.clone()
+                };
+            for ((pi, wi), stabs) in &effective_tabs {
                 let Some(wpath) = projects
                     .get(*pi)
                     .and_then(|p| p.worktrees.get(*wi))
@@ -1348,15 +1394,23 @@ impl CraneShellView {
                     worktree_tabs.insert((*pi, *wi), metas);
                 }
             }
-            // Restore the active tab if its layout survived.
-            if let Some(at) = st.active_tab {
+            // Restore the active tab if its layout survived. The path-keyed
+            // field wins (stable across project reordering); legacy indices
+            // are the fallback for older state files.
+            let saved_active_tab = st
+                .active_tab_path
+                .as_ref()
+                .and_then(|(path, tid)| {
+                    wt_index.get(path.as_str()).map(|(pi, wi)| (*pi, *wi, *tid))
+                })
+                .or(st.active_tab);
+            if let Some(at) = saved_active_tab {
                 if layouts.contains_key(&at) {
                     active_tab = Some(at);
                     selected = at;
                     // Prefer the saved per-tab focus (if it's still a live leaf),
                     // otherwise fall back to the layout's first leaf.
-                    let saved_focus = st
-                        .worktree_tabs
+                    let saved_focus = effective_tabs
                         .iter()
                         .find(|((pi, wi), _)| *pi == at.0 && *wi == at.1)
                         .and_then(|(_, stabs)| stabs.iter().find(|s| s.id == at.2))
@@ -1717,6 +1771,7 @@ impl CraneShellView {
     /// terminate returns `true` immediately.
     pub fn approve_terminate(&mut self, vctx: &mut ViewContext<Self>) -> bool {
         if self.confirmed_quit {
+            self.save_state_now(&*vctx);
             return true;
         }
         if self.count_running_terminals(vctx) > 0 {
@@ -1724,6 +1779,9 @@ impl CraneShellView {
             vctx.notify();
             false
         } else {
+            // Final save BEFORE the process dies: fresh terminal snapshots,
+            // synchronous write (a spawned writer thread would be killed).
+            self.save_state_now(&*vctx);
             true
         }
     }
@@ -1805,12 +1863,27 @@ impl CraneShellView {
     }
 
     /// Snapshot the persistable UI state and write it to ~/.crane/warpui-state.json.
-    /// `refresh_terminals` re-snapshots terminal scrollback first (skip on keystrokes).
     fn save_state(&self, app: &AppContext) {
-        use crate::warpui::persist::{save, SNode, STab, WarpuiState};
         // Always attempt a terminal refresh; it self-debounces (400ms) so this
         // is cheap even when called on every keystroke.
         self.refresh_term_cache(app);
+        crate::warpui::persist::save(&self.build_state(app));
+    }
+
+    /// Terminate-path save: force a FRESH terminal snapshot (bypass the 400ms
+    /// debounce) and write SYNCHRONOUSLY. The async `save` spawns a writer
+    /// thread the process would kill mid-write on quit, and the debounce would
+    /// otherwise drop the last seconds of terminal output — the exact tail the
+    /// user watched before quitting.
+    fn save_state_now(&self, app: &AppContext) {
+        self.last_term_snapshot.set(None);
+        self.refresh_term_cache(app);
+        crate::warpui::persist::save_sync(&self.build_state(app));
+    }
+
+    /// Build the persistable UI state snapshot from the live shell.
+    fn build_state(&self, app: &AppContext) -> crate::warpui::persist::WarpuiState {
+        use crate::warpui::persist::{SNode, STab, WarpuiState};
         let terminals: Vec<(PaneId, crate::warpui::persist::STerminal)> = self
             .term_cache
             .borrow()
@@ -1828,7 +1901,7 @@ impl CraneShellView {
                 _ => None,
             })
             .collect();
-        let worktree_tabs = self
+        let worktree_tabs: Vec<((usize, usize), Vec<STab>)> = self
             .worktree_tabs
             .iter()
             .map(|(k, tabs)| {
@@ -1863,7 +1936,34 @@ impl CraneShellView {
             .and_then(|id| app.window_bounds(&id))
             .map(|r| (r.size().x(), r.size().y()))
             .unwrap_or((0.0, 0.0));
-        save(&WarpuiState {
+        // Stable-key twins of the index-keyed fields: worktree/project PATHS
+        // survive projects being added, removed or reordered between runs;
+        // indices don't. Restore prefers these; the index fields remain as a
+        // legacy fallback (and keep older builds readable).
+        let wt_path = |pi: usize, wi: usize| -> Option<String> {
+            self.projects
+                .get(pi)
+                .and_then(|p| p.worktrees.get(wi))
+                .map(|w| w.path.clone())
+        };
+        let worktree_tabs_by_path: Vec<(String, Vec<STab>)> = worktree_tabs
+            .iter()
+            .filter_map(|((pi, wi), tabs)| wt_path(*pi, *wi).map(|p| (p, tabs.clone())))
+            .collect();
+        let active_tab_path = self
+            .active_tab
+            .and_then(|(pi, wi, tid)| wt_path(pi, wi).map(|p| (p, tid)));
+        let expanded_project_paths: Vec<String> = self
+            .expanded_projects
+            .iter()
+            .filter_map(|pi| self.projects.get(*pi).map(|p| p.path.clone()))
+            .collect();
+        let expanded_worktree_paths: Vec<String> = self
+            .expanded_worktrees
+            .iter()
+            .filter_map(|(pi, wi)| wt_path(*pi, *wi))
+            .collect();
+        WarpuiState {
             show_left: self.show_left,
             show_right: self.show_right,
             files_tab: self.files_tab,
@@ -1872,6 +1972,10 @@ impl CraneShellView {
             browsers,
             expanded_worktrees: self.expanded_worktrees.iter().copied().collect(),
             worktree_tabs,
+            worktree_tabs_by_path,
+            active_tab_path,
+            expanded_project_paths,
+            expanded_worktree_paths,
             next_tab_id: self.next_tab_id,
             next_pane_id: self.next_pane_id,
             files_pane: self.files_pane,
@@ -1924,7 +2028,7 @@ impl CraneShellView {
                     (v.clone(), s)
                 })
                 .collect(),
-        });
+        }
     }
 
     /// Resolve the tint color for the project at `idx`: uses the user-chosen tint
