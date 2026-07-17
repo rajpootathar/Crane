@@ -8896,7 +8896,14 @@ impl CraneShellView {
             .with_height(2.0)
             .finish();
             Container::new(
+                // Stretch: the enclosing Flex::row measures this chip with an
+                // UNBOUNDED width (Flutter algorithm), and a bare Rect sizes to
+                // constraint.max — infinite. Stretch triggers Flex's second
+                // layout pass, which re-lays the underline at the widest finite
+                // sibling (the label row), instead of tripping the paint-time
+                // infinite-rect debug assert.
                 Flex::column()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                     .with_child(
                         Expanded::new(
                             1.0,
@@ -10443,7 +10450,11 @@ impl CraneShellView {
                 .finish();
                 EventHandler::new(
                     Container::new(
+                        // Stretch: same infinite-width guard as `tab_label` —
+                        // the strip's Flex::row measures chips unbounded and a
+                        // bare Rect sizes to constraint.max.
                         Flex::column()
+                            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                             .with_child(
                                 Expanded::new(
                                     1.0,
