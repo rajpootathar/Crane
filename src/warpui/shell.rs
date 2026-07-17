@@ -543,6 +543,9 @@ pub struct CraneShellView {
     /// Scroll state for the Right Panel change/file list (so the commit box
     /// stays reachable when there are many rows). Persists across re-renders.
     right_scroll: ClippedScrollStateHandle,
+    /// Scroll state for the Left Panel project tree (keeps the Add Project
+    /// footer sticky while the tree scrolls).
+    left_scroll: ClippedScrollStateHandle,
     /// Scroll state for the branch-picker overlay list.
     branch_scroll: ClippedScrollStateHandle,
     /// Active worktree/branch row context menu (pi, wi, x, y), or None.
@@ -1706,6 +1709,7 @@ impl CraneShellView {
             branch_picker: None,
             branch_list: Vec::new(),
             right_scroll: ClippedScrollStateHandle::new(),
+            left_scroll: ClippedScrollStateHandle::new(),
             branch_scroll: ClippedScrollStateHandle::new(),
             worktree_menu: None,
             tab_menu: None,
@@ -8908,10 +8912,15 @@ impl CraneShellView {
             .with_child(add_body)
             .finish();
 
-        // Header, then the project list (fills), then the quiet Add Project footer.
+        // Header, then the project list (fills + scrolls), then the quiet Add
+        // Project footer — pinned OUTSIDE the scroll region so it stays sticky
+        // no matter how long the tree grows.
         let outer = Flex::column()
             .with_child(header_row)
-            .with_child(Expanded::new(1.0, col.finish()).finish())
+            .with_child(
+                Expanded::new(1.0, Self::vscroll(self.left_scroll.clone(), col.finish()))
+                    .finish(),
+            )
             .with_child(add_footer)
             .finish();
         // No fixed width — the enclosing SplitBox sizes it (draggable).
@@ -9256,8 +9265,15 @@ impl CraneShellView {
     /// region carries stable scroll state so the list scrolls and pinned chrome
     /// (the commit box) stays reachable.
     fn scroll_list(&self, content: Box<dyn Element>) -> Box<dyn Element> {
+        Self::vscroll(self.right_scroll.clone(), content)
+    }
+
+    /// Vertical scroll container with the shared theme styling (auto-width
+    /// thumb, no track). Each caller supplies its OWN stable state handle —
+    /// same rule as `scroll_list`.
+    fn vscroll(state: ClippedScrollStateHandle, content: Box<dyn Element>) -> Box<dyn Element> {
         ClippedScrollable::vertical(
-            self.right_scroll.clone(),
+            state,
             content,
             ScrollbarWidth::Auto,
             Fill::Solid(theme::border()),
