@@ -16713,7 +16713,10 @@ mod restore_wiring_integration_tests {
                     // hand A's pane B's identity (and B's File Tab strip).
                     let (fp_a, paths_a_raw, _) = v.files_pane_state_for_test(ws_a);
                     let fp_a = fp_a.expect("Workspace A must own a Files Pane");
-                    assert_eq!(!paths_a_raw.is_empty(), true);
+                    assert!(
+                        !paths_a_raw.is_empty(),
+                        "Workspace A's File Tab list must not be empty after opening a file in it"
+                    );
                     assert_eq!(
                         v.pane_ws_for_test(fp_a),
                         (Some(ws_a), true),
@@ -17171,6 +17174,75 @@ mod restore_wiring_integration_tests {
                         [doc_b2.clone()],
                         "Workspace B's File Tab must follow Project B to its new index"
                     );
+                });
+            });
+        });
+    }
+
+    /// `ws_key_for_path_for_test` intentionally hardcodes worktree index 0
+    /// (it resolves a Project by its own root path, and every OTHER
+    /// scenario in this module gives each Project exactly one Workspace) —
+    /// so the `wi` half of every `(project_idx, worktree_idx)` key used
+    /// above is never exercised as anything but 0. This test gives one
+    /// Project a SECOND Workspace directly (no real git worktree needed —
+    /// `ProjectNode` / `WorktreeNode` are plain data, and the Files-Pane
+    /// maps only care about the `(pi, wi)` key, not how the Workspace was
+    /// discovered) and confirms the maps keep `wi = 0` and `wi = 1` apart.
+    #[test]
+    fn files_pane_state_distinguishes_worktrees_within_one_project() {
+        use crate::warpui::projects::WorktreeNode;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let path = proj.path().to_string_lossy().into_owned();
+
+        let mut st = WarpuiState::default();
+        st.added_projects = vec![AddedProject { name: "proj".to_string(), path: path.clone() }];
+
+        let path2 = path.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    let ws0 = v
+                        .ws_key_for_path_for_test(&path2)
+                        .expect("project must resolve to a Workspace");
+                    assert_eq!(ws0.1, 0, "the Project's own checkout is worktree 0");
+
+                    // Synthesize a second Workspace for the SAME Project.
+                    v.projects[ws0.0].worktrees.push(WorktreeNode {
+                        name: "second".to_string(),
+                        path: format!("{path2}-second"),
+                        tabs: Vec::new(),
+                        diff_stat: (0, 0),
+                        dirty: false,
+                    });
+                    let ws1 = (ws0.0, 1);
+
+                    // Bookkeeping-level only (no live Tab/Layout/pane needed
+                    // to exercise the key granularity): seed distinct
+                    // File-Tab state directly under wi=0 and wi=1.
+                    let doc0 = std::path::PathBuf::from(format!("{path2}/wi0.md"));
+                    let doc1 = std::path::PathBuf::from(format!("{path2}/wi1.md"));
+                    v.file_pane_paths.insert(ws0, vec![doc0.clone()]);
+                    v.file_pane_active.insert(ws0, 0);
+                    v.files_pane.insert(ws0, 100);
+                    v.file_pane_paths.insert(ws1, vec![doc1.clone()]);
+                    v.file_pane_active.insert(ws1, 0);
+                    v.files_pane.insert(ws1, 101);
+
+                    let (fp0, paths0, _) = v.files_pane_state_for_test(ws0);
+                    let (fp1, paths1, _) = v.files_pane_state_for_test(ws1);
+                    assert_eq!(paths0, [doc0], "wi=0 keeps its own File Tab list");
+                    assert_eq!(paths1, [doc1], "wi=1 keeps a SEPARATE File Tab list");
+                    assert_ne!(fp0, fp1, "wi=0 and wi=1 get distinct Files Pane ids");
                 });
             });
         });
