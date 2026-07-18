@@ -460,6 +460,27 @@ warpui handles `Tag::Item` but never `Tag::List`; old Crane handled both (`views
 > preserving the guard that is already there. Read the current code before editing, and
 > do not remove the equivalent guard on the `BlockQuote` arm.
 
+#### Additional required fix: container-start prose loss
+
+Task 1's review found the same content-loss class one level over, unfixed.
+`Event::Start(Tag::Item)` and `Event::Start(Tag::BlockQuote)` both call `runs.clear()`
+unconditionally. When an outer blockquote has leading prose and then contains a nested
+list, starting the inner `Item` wipes the blockquote's pending prose:
+
+```
+> Quote intro.
+>
+> - Item text
+```
+
+"Quote intro." is silently lost. Apply the **same stash/restore pattern Task 1 used for
+tables** — read how `pending_container_runs` is stashed at `Start(Tag::Table)` and
+drained at `End(TagEnd::Table)` in the current code, and mirror it for the nested
+container case. Do not invent a second mechanism.
+
+Add a regression test asserting the blockquote-intro case above retains "Quote intro.",
+and confirm it fails before your change.
+
 - [ ] **Step 1: Write the failing test**
 
 Add to `mod tests`:
