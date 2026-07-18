@@ -16989,4 +16989,170 @@ mod restore_wiring_integration_tests {
             });
         });
     }
+
+    /// Reordering two root-level Projects must rekey `files_pane` /
+    /// `file_pane_paths` / `file_pane_active` by PATH, exactly like it
+    /// already rekeys `layouts` / `worktree_tabs`. The Files-Pane block in
+    /// `rekey_after_reorder` is what keeps that true — deleting it still
+    /// left 136/136 green with no other test noticing, because nothing
+    /// exercised a reorder against a Workspace that had a Files Pane open.
+    ///
+    /// Drives the EXACT sequence `apply_tree_drop` runs for a sidebar
+    /// Project drag (`order_snapshot` -> `move_block` -> `consolidate_groups`
+    /// -> `rekey_after_reorder`) rather than re-simulating drag geometry —
+    /// same rekey shape, without needing to fabricate drop-zone rects.
+    #[test]
+    fn reordering_projects_rekeys_files_pane_by_path_not_index() {
+        use crate::warpui::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj_a = tempfile::tempdir().expect("project a tempdir");
+        let proj_b = tempfile::tempdir().expect("project b tempdir");
+        let path_a = proj_a.path().to_string_lossy().into_owned();
+        let path_b = proj_b.path().to_string_lossy().into_owned();
+
+        let seed_a = proj_a.path().join("seed-a.md");
+        let seed_b = proj_b.path().join("seed-b.md");
+        let doc_a = proj_a.path().join("only-in-a.md");
+        let doc_b = proj_b.path().join("only-in-b.md");
+        for p in [&seed_a, &seed_b, &doc_a, &doc_b] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID_A: PaneId = 50;
+        const PID_B: PaneId = 51;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 52;
+        st.added_projects = vec![
+            AddedProject { name: "proj-a".to_string(), path: path_a.clone() },
+            AddedProject { name: "proj-b".to_string(), path: path_b.clone() },
+        ];
+        st.worktree_tabs_by_path = vec![
+            (
+                path_a.clone(),
+                vec![STab {
+                    id: 0,
+                    name: "A".to_string(),
+                    layout: SNode::Leaf(PID_A),
+                    focus: Some(PID_A),
+                    renamed: false,
+                }],
+            ),
+            (
+                path_b.clone(),
+                vec![STab {
+                    id: 1,
+                    name: "B".to_string(),
+                    layout: SNode::Leaf(PID_B),
+                    focus: Some(PID_B),
+                    renamed: false,
+                }],
+            ),
+        ];
+        st.active_tab_path = Some((path_a.clone(), 0));
+        st.markdowns = vec![
+            (PID_A, SMarkdown { path: seed_a, editing: false }),
+            (PID_B, SMarkdown { path: seed_b, editing: false }),
+        ];
+
+        let (path_a2, path_b2) = (path_a.clone(), path_b.clone());
+        let (doc_a2, doc_b2) = (doc_a.clone(), doc_b.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws_a = v
+                        .ws_key_for_path_for_test(&path_a2)
+                        .expect("project A must resolve to a Workspace");
+                    let ws_b = v
+                        .ws_key_for_path_for_test(&path_b2)
+                        .expect("project B must resolve to a Workspace");
+                    assert_eq!(ws_a, (0, 0), "project A is added first");
+                    assert_eq!(ws_b, (1, 0), "project B is added second");
+
+                    // Open a File Tab in each Workspace so each has a
+                    // `files_pane` / `file_pane_paths` entry to rekey.
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (0, 0, 0),
+                            path: std::path::PathBuf::from(&path_a2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(doc_a2.clone(), vctx);
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (1, 0, 1),
+                            path: std::path::PathBuf::from(&path_b2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(doc_b2.clone(), vctx);
+
+                    let (fp_a_before, _, _) = v.files_pane_state_for_test(ws_a);
+                    let fp_a_before = fp_a_before.expect("Workspace A must own a Files Pane");
+                    let (fp_b_before, _, _) = v.files_pane_state_for_test(ws_b);
+                    let fp_b_before = fp_b_before.expect("Workspace B must own a Files Pane");
+
+                    // Reorder: swap the two root-level Projects — the exact
+                    // `move_block` + `consolidate_groups` +
+                    // `rekey_after_reorder` sequence `apply_tree_drop` runs
+                    // for a sidebar Project drag (neither Project has a
+                    // `group_path`, so each is its own one-element block;
+                    // moving block 0 past block 1 swaps them).
+                    let snapshot = v.order_snapshot();
+                    v.move_block(0, 2);
+                    v.consolidate_groups();
+                    v.rekey_after_reorder(&snapshot);
+
+                    // Project A is now at index 1, Project B at index 0.
+                    let ws_a2 = v
+                        .ws_key_for_path_for_test(&path_a2)
+                        .expect("project A must still resolve after reorder");
+                    let ws_b2 = v
+                        .ws_key_for_path_for_test(&path_b2)
+                        .expect("project B must still resolve after reorder");
+                    assert_eq!(ws_a2, (1, 0), "project A moved to the second slot");
+                    assert_eq!(ws_b2, (0, 0), "project B moved to the first slot");
+
+                    // The File Tabs must have followed each Project's PATH
+                    // to its NEW slot — not stayed pinned to the stale index
+                    // (which, post-swap, now belongs to the OTHER Project).
+                    let (fp_a_after, paths_a_after, _) = v.files_pane_state_for_test(ws_a2);
+                    assert_eq!(
+                        fp_a_after,
+                        Some(fp_a_before),
+                        "Workspace A's Files Pane id must follow it to the new slot"
+                    );
+                    assert_eq!(
+                        paths_a_after,
+                        [doc_a2.clone()],
+                        "Workspace A's File Tab must follow Project A to its new index, \
+                         not get left keyed under the stale (0, 0) — which now belongs \
+                         to Project B"
+                    );
+
+                    let (fp_b_after, paths_b_after, _) = v.files_pane_state_for_test(ws_b2);
+                    assert_eq!(
+                        fp_b_after,
+                        Some(fp_b_before),
+                        "Workspace B's Files Pane id must follow it to the new slot"
+                    );
+                    assert_eq!(
+                        paths_b_after,
+                        [doc_b2.clone()],
+                        "Workspace B's File Tab must follow Project B to its new index"
+                    );
+                });
+            });
+        });
+    }
 }
