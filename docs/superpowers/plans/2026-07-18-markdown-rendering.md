@@ -452,6 +452,14 @@ warpui handles `Tag::Item` but never `Tag::List`; old Crane handled both (`views
 - Consumes: `Block`, `Run` from Task 1.
 - Produces: `Block::Bullet { runs: Vec<Run>, depth: usize, ordinal: Option<usize> }` — replaces the current tuple variant `Block::Bullet(Vec<Run>)`.
 
+> **Note — the empty-block guard already exists.** Task 1's review found that a list
+> item or blockquote containing only a table emitted an empty block, and the fix added
+> an `if !runs.iter().all(|r| r.text.trim().is_empty())` guard to both the
+> `End(TagEnd::Item)` and `End(TagEnd::BlockQuote)` arms. You are **not** adding that
+> guard fresh — you are rewriting the `Item` arm to carry `depth` and `ordinal` while
+> preserving the guard that is already there. Read the current code before editing, and
+> do not remove the equivalent guard on the `BlockQuote` arm.
+
 - [ ] **Step 1: Write the failing test**
 
 Add to `mod tests`:
