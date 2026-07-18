@@ -2,8 +2,10 @@
 //! document. The warpui port of old Crane's `views/markdown_view.rs`: parse with
 //! `pulldown_cmark` once at construction into an owned block model, then rebuild
 //! warpui elements from that model each frame (elements are transient; the model
-//! persists). Read-only in v1 — links/images render as plain text, matching the
-//! old egui behavior.
+//! persists). Read-only in v1. Links render through `FormattedTextElement`'s
+//! native hyperlink support (destination URL carried on `Run::link`); inline
+//! images still render as plain text — deferred, pending the `Image` element
+//! introduced by the image-viewer plan.
 
 use std::path::PathBuf;
 
@@ -613,22 +615,26 @@ impl WarpMarkdownView {
     }
 
     /// One inline block. Fast path: a single soft-wrapping `Text` when the block
-    /// is uniform prose (no inline code, no emphasis) — the common case, and the
-    /// cheapest path. Mixed blocks (inline code, bold, or italic present) build a
-    /// `FormattedTextElement`, warp's multi-style body-text element, which wraps
-    /// by default — replacing the old `Flex::row` fallback, which could not wrap
-    /// by construction. Inline code renders as a colored chip via
-    /// `with_inline_code_properties`; bold and italic runs currently render as
-    /// plain prose (undifferentiated from Normal — see `Emph`'s doc comment).
+    /// is uniform prose (no inline code, emphasis, or link) — the common case,
+    /// and the cheapest path. Mixed blocks build a `FormattedTextElement`,
+    /// warp's multi-style body-text element, which wraps by default —
+    /// replacing the old `Flex::row` fallback, which could not wrap by
+    /// construction. Inline code renders as a colored chip via
+    /// `with_inline_code_properties`; bold, italic, strikethrough and links
+    /// each render as their own distinct fragment style (see `fragments()`).
     fn inline_element(&self, runs: &[Run], base_color: ColorU) -> Box<dyn Element> {
         if runs.is_empty() {
             return Text::new(String::new(), self.prose, BASE)
                 .with_color(base_color)
                 .finish();
         }
+        // A run can carry `link: Some(_)` while `emph` is still `Normal` (a
+        // plain, unemphasized link) — the plain-`Text` fast path below has no
+        // way to render hyperlink styling, so a linked run always forces the
+        // `FormattedTextElement` path even when no `Emph` variant does.
         let mixed = runs
             .iter()
-            .any(|r| !matches!(r.emph, Emph::Normal));
+            .any(|r| !matches!(r.emph, Emph::Normal) || r.link.is_some());
         if !mixed {
             let text: String = runs.iter().map(|r| r.text.as_str()).collect();
             return Text::new(text, self.prose, BASE)
@@ -654,17 +660,32 @@ impl WarpMarkdownView {
         .finish()
     }
 
-    /// Convert the owned `Run` model into FormattedTextFragments. Bold and
-    /// Italic both map to a plain-text fragment — neither is visually
-    /// distinguished from Normal prose yet. Only `Emph::Code` gets a distinct
-    /// fragment kind (`inline_code`, styled via `with_inline_code_properties`
-    /// in `inline_element`). Per-fragment bold/italic is deferred (see
-    /// `Emph`'s doc comment above).
+    /// Convert the owned `Run` model into `FormattedTextFragment`s, one
+    /// distinct fragment kind per `Emph` variant (`FormattedTextFragment`
+    /// ships a purpose-built constructor for each — see
+    /// `vendor/warp/crates/markdown_parser/src/lib.rs`, `plain_text`/`bold`/
+    /// `italic`/`hyperlink`/`inline_code`/`strikethrough`). A run's `link`
+    /// wins over its `emph`: hyperlink fragments are colored by
+    /// `hyperlink_font_color` and click-handled by the element itself, so a
+    /// linked run always renders as a hyperlink regardless of any emphasis
+    /// also active on it.
+    ///
+    /// Model limitation, out of scope here: `Emph` is a flat enum, so
+    /// `***bold italic***` collapses to whichever of Bold/Italic wins in
+    /// `emph_now` and can never reach `FormattedTextFragment::bold_italic`.
     fn fragments(&self, runs: &[Run]) -> Vec<FormattedTextFragment> {
         runs.iter()
-            .map(|r| match r.emph {
-                Emph::Code => FormattedTextFragment::inline_code(r.text.clone()),
-                _ => FormattedTextFragment::plain_text(r.text.clone()),
+            .map(|r| {
+                if let Some(url) = &r.link {
+                    return FormattedTextFragment::hyperlink(r.text.clone(), url.clone());
+                }
+                match r.emph {
+                    Emph::Code => FormattedTextFragment::inline_code(r.text.clone()),
+                    Emph::Bold => FormattedTextFragment::bold(r.text.clone()),
+                    Emph::Italic => FormattedTextFragment::italic(r.text.clone()),
+                    Emph::Strike => FormattedTextFragment::strikethrough(r.text.clone()),
+                    Emph::Normal => FormattedTextFragment::plain_text(r.text.clone()),
+                }
             })
             .collect()
     }
