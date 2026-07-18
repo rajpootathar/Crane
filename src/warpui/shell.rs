@@ -1028,6 +1028,128 @@ fn edge_dir_before(edge: DockEdge) -> Option<(Dir, bool)> {
     }
 }
 
+// ── Restore-time pane classification ────────────────────────────────────
+//
+// Pulled out of `CraneShellView::new`'s restore loop as plain functions over
+// the saved-state shape (no `ViewContext`, no file IO, no view construction)
+// so the branch selection that used to live inline in an `if`/`else if`
+// ladder is unit-testable on its own — see `restore_pane_kind_tests` below.
+// Mirrors `needs_formatted_text` in `markdown_view.rs`: extracted for
+// testability, not because it needs `&self`.
+
+/// Whether `path` is a markdown file by extension — the same check
+/// `open_file` uses to route a `.md` / `.markdown` file to the read-only
+/// Markdown pane instead of the Editor. Restore has no live `PaneContent` to
+/// inspect for a background File Tab (see `markdown_path_set` below), so
+/// this extension check is its only signal; kept as one function so the two
+/// call sites can never drift apart.
+fn is_markdown_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+        .unwrap_or(false)
+}
+
+/// Every path that must restore into a Markdown pane rather than an Editor.
+/// Union of:
+///  - `markdown_paths` — the paths recorded by a LIVE Markdown pane at save
+///    time (`WarpuiState::markdowns`, keyed by pane id). `build_state` only
+///    records a pane's ACTIVE content, so a markdown file sitting in a
+///    background File Tab of the shared Files pane has NO entry here.
+///  - every markdown-extension path in the Files pane's own saved tab list
+///    (`saved_paths`, i.e. `WarpuiState::file_pane_paths`) — extension is
+///    the only signal available for those background tabs.
+/// An empty path (a stale/corrupt `SMarkdown` default) is dropped, mirroring
+/// the terminal restore arm's `st.cwd` guard.
+///
+/// Building this set ONCE, and having every restored pane's content decision
+/// consult it (see `restored_pane_kind`) instead of each arm deciding
+/// independently, is what keeps a path from ending up wanting BOTH an
+/// Editor view and a Markdown view after restore.
+fn markdown_path_set<'a>(
+    markdown_paths: impl IntoIterator<Item = &'a PathBuf>,
+    saved_paths: &[PathBuf],
+) -> HashSet<PathBuf> {
+    let mut set: HashSet<PathBuf> = markdown_paths
+        .into_iter()
+        .filter(|p| !p.as_os_str().is_empty())
+        .cloned()
+        .collect();
+    set.extend(saved_paths.iter().filter(|p| is_markdown_path(p.as_path())).cloned());
+    set
+}
+
+/// The Files-pane saved paths that must get an EDITOR handle at restore —
+/// every `saved_paths` entry except the ones in `md_paths` (those get a
+/// Markdown handle instead, built from `md_paths` directly). Its own
+/// function — not inlined at each call site — so there is exactly one place
+/// that decides the Editor/Markdown partition of `saved_paths` and exactly
+/// one place a future change could break it back apart.
+fn editor_paths_for_restore<'a>(
+    saved_paths: &'a [PathBuf],
+    md_paths: &HashSet<PathBuf>,
+) -> Vec<&'a PathBuf> {
+    saved_paths.iter().filter(|p| !md_paths.contains(*p)).collect()
+}
+
+/// Outcome of `restored_pane_kind`. `Markdown.is_files_pane` tells the
+/// caller whether this pid is ALSO the saved Files pane, so it knows to
+/// additionally populate the restored files-pane bookkeeping
+/// (`files_pane` / `file_pane_paths` / `file_pane_active`) that a standalone
+/// Markdown pane otherwise wouldn't need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoredPaneKind {
+    Markdown { path: PathBuf, is_files_pane: bool },
+    Editor { path: PathBuf },
+    Browser,
+    Terminal,
+    FreshTerminal,
+}
+
+/// The pane content a saved leaf `pid` should restore as, decided entirely
+/// from the plain saved-state shape. Mirrors `WarpuiState`'s
+/// `files_pane` / `file_pane_paths` / `markdowns` / `browsers` / `terminals`
+/// shape exactly.
+///
+/// Pins the regression this function exists to fix (see
+/// `a_saved_markdown_pane_that_is_also_the_files_pane_restores_as_markdown`
+/// below): a saved Markdown pane that is ALSO the saved Files pane
+/// (`saved_files_pane == Some(pid)`, `saved_paths` non-empty) used to decide
+/// `Editor` because that check ran unconditionally ahead of the Markdown
+/// one. Deciding Editor-vs-Markdown from `md_paths` (which already folds in
+/// every live Markdown pane's path) fixes that — and because every caller of
+/// this function, for every pid, consults the SAME `md_paths` set, it also
+/// guarantees a path never simultaneously wants an Editor view from one pane
+/// and a Markdown view from another.
+fn restored_pane_kind(
+    pid: PaneId,
+    saved_files_pane: Option<PaneId>,
+    saved_paths: &[PathBuf],
+    saved_active: usize,
+    md_paths: &HashSet<PathBuf>,
+    markdown_path: Option<&PathBuf>,
+    is_browser: bool,
+    is_terminal: bool,
+) -> RestoredPaneKind {
+    if Some(pid) == saved_files_pane && !saved_paths.is_empty() {
+        let active = saved_active.min(saved_paths.len() - 1);
+        let path = saved_paths[active].clone();
+        if md_paths.contains(&path) {
+            RestoredPaneKind::Markdown { path, is_files_pane: true }
+        } else {
+            RestoredPaneKind::Editor { path }
+        }
+    } else if is_browser {
+        RestoredPaneKind::Browser
+    } else if let Some(path) = markdown_path.filter(|p| !p.as_os_str().is_empty()) {
+        RestoredPaneKind::Markdown { path: path.clone(), is_files_pane: false }
+    } else if is_terminal {
+        RestoredPaneKind::Terminal
+    } else {
+        RestoredPaneKind::FreshTerminal
+    }
+}
+
 impl CraneShellView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
         let ui_font = warpui::fonts::Cache::handle(ctx)
@@ -15457,5 +15579,155 @@ mod diff_chip_tests {
             CraneShellView::selected_diff_stat(&projects, (9, 9, 9)),
             (0, 0)
         );
+    }
+}
+
+#[cfg(test)]
+mod restore_pane_kind_tests {
+    use super::{
+        editor_paths_for_restore, is_markdown_path, markdown_path_set, restored_pane_kind,
+        PaneId, RestoredPaneKind,
+    };
+    use std::path::{Path, PathBuf};
+
+    /// REQUIRED regression test: the real saved shape `open_file` actually
+    /// writes for a markdown file opened as the very first Files-pane tab —
+    /// `files_pane = Some(P)`, `file_pane_paths = [doc.md]`,
+    /// `markdowns = [(P, doc.md)]` (see `open_file` :10820-10855 and
+    /// `build_state` :1925-1940 / :2019-2020). Before the fix this decided
+    /// `Editor` because the saved-Files-pane check ran unconditionally ahead
+    /// of the Markdown one, so a `.md` file restored showing raw source in a
+    /// `WarpEditorView` instead of the rendered `WarpMarkdownView`.
+    #[test]
+    fn a_saved_markdown_pane_that_is_also_the_files_pane_restores_as_markdown() {
+        let doc = PathBuf::from("/tmp/doc.md");
+        let p: PaneId = 7;
+        let saved_paths = vec![doc.clone()];
+        let md_paths = markdown_path_set([&doc], &saved_paths);
+
+        let kind =
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, Some(&doc), false, false);
+
+        assert_eq!(
+            kind,
+            RestoredPaneKind::Markdown { path: doc, is_files_pane: true },
+            "a markdown file saved as the Files pane's tab must restore as Markdown, not Editor"
+        );
+    }
+
+    /// A markdown file that is NOT the shared Files pane — a standalone
+    /// Markdown pane elsewhere — still restores as Markdown via its own
+    /// per-pid `markdowns` record.
+    #[test]
+    fn a_standalone_markdown_pane_restores_as_markdown() {
+        let doc = PathBuf::from("/tmp/notes.md");
+        let saved_paths: Vec<PathBuf> = Vec::new();
+        let md_paths = markdown_path_set([&doc], &saved_paths);
+
+        let kind =
+            restored_pane_kind(3, None, &saved_paths, 0, &md_paths, Some(&doc), false, false);
+
+        assert_eq!(kind, RestoredPaneKind::Markdown { path: doc, is_files_pane: false });
+    }
+
+    /// A saved Files pane whose active tab is a NON-markdown file still
+    /// restores as Editor — the fix must not turn every Files-pane restore
+    /// into Markdown.
+    #[test]
+    fn a_files_pane_on_a_code_file_still_restores_as_editor() {
+        let code = PathBuf::from("/tmp/main.rs");
+        let p: PaneId = 9;
+        let saved_paths = vec![code.clone()];
+        let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
+
+        let kind =
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, None, false, false);
+
+        assert_eq!(kind, RestoredPaneKind::Editor { path: code });
+    }
+
+    /// Minor fix: a `SMarkdown` with an empty (default) path — a
+    /// stale/corrupt entry — must fall through instead of restoring a
+    /// Markdown pane that can't read anything (a read-error block), mirroring
+    /// the terminal restore arm's `st.cwd` guard.
+    #[test]
+    fn an_empty_saved_markdown_path_falls_through_instead_of_rendering() {
+        let empty = PathBuf::new();
+        let saved_paths: Vec<PathBuf> = Vec::new();
+        let md_paths = markdown_path_set([&empty], &saved_paths);
+        assert!(md_paths.is_empty(), "an empty path must never enter the markdown set");
+
+        // No files-pane match, no browser, empty markdown path → falls
+        // through to the terminal-cache arm (here: true → Terminal).
+        let kind =
+            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, Some(&empty), false, true);
+        assert_eq!(kind, RestoredPaneKind::Terminal);
+
+        // And with no terminal cache entry either, all the way to fresh.
+        let kind =
+            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, Some(&empty), false, false);
+        assert_eq!(kind, RestoredPaneKind::FreshTerminal);
+    }
+
+    /// The "worse reachable variant": `doc.md` opened in Tab A (its own
+    /// standalone Markdown pane, P1) is ALSO sitting as a background File Tab
+    /// in the shared Files pane (P2, whose active tab is a different file).
+    /// Both panes reference the same path — the decision for each must agree
+    /// it is Markdown; the path can never resolve to Editor for one pane and
+    /// Markdown for the other, which is how it used to end up in BOTH
+    /// `editor_views` and `markdown_views` at once.
+    #[test]
+    fn a_path_shared_by_two_saved_panes_never_disagrees_on_markdown_vs_editor() {
+        let doc = PathBuf::from("/tmp/doc.md");
+        let other = PathBuf::from("/tmp/other.rs");
+        let p1: PaneId = 1;
+        let p2: PaneId = 2;
+        let saved_paths = vec![doc.clone(), other.clone()];
+        let md_paths = markdown_path_set([&doc], &saved_paths);
+
+        // P1: standalone Markdown pane recorded in `markdowns`.
+        let k1 =
+            restored_pane_kind(p1, Some(p2), &saved_paths, 1, &md_paths, Some(&doc), false, false);
+        assert_eq!(k1, RestoredPaneKind::Markdown { path: doc.clone(), is_files_pane: false });
+
+        // P2: the shared Files pane, active tab = other.rs (index 1).
+        let k2 = restored_pane_kind(p2, Some(p2), &saved_paths, 1, &md_paths, None, false, false);
+        assert_eq!(k2, RestoredPaneKind::Editor { path: other });
+
+        // `doc.md` sits in P2's own saved_paths too (a background tab there)
+        // but must never independently resolve to Editor because of that.
+        assert!(md_paths.contains(&doc));
+    }
+
+    /// Direct pin for "a path cannot occupy both view maps after restore":
+    /// `editor_paths_for_restore` (which drives the pre-pass that populates
+    /// `editor_views`) must never include a path that `markdown_path_set`
+    /// (which drives `markdown_views`) also claims.
+    #[test]
+    fn a_path_never_ends_up_in_both_the_editor_and_markdown_view_maps() {
+        let doc = PathBuf::from("/tmp/doc.md");
+        let other = PathBuf::from("/tmp/other.rs");
+        let saved_paths = vec![doc.clone(), other.clone()];
+        // doc.md is recorded as a live Markdown pane's path (e.g. pane P1)
+        // even though it ALSO sits in the shared Files pane's saved tab list.
+        let md_paths = markdown_path_set([&doc], &saved_paths);
+        let editor_paths = editor_paths_for_restore(&saved_paths, &md_paths);
+
+        assert!(
+            !editor_paths.contains(&&doc),
+            "doc.md is a markdown path — it must not also get an editor handle"
+        );
+        assert!(editor_paths.contains(&&other));
+        for p in &editor_paths {
+            assert!(!md_paths.contains(*p), "{p:?} claimed by both the editor and markdown sets");
+        }
+    }
+
+    #[test]
+    fn is_markdown_path_matches_md_and_markdown_case_insensitively() {
+        assert!(is_markdown_path(Path::new("/a/b/DOC.MD")));
+        assert!(is_markdown_path(Path::new("/a/b/readme.markdown")));
+        assert!(!is_markdown_path(Path::new("/a/b/main.rs")));
+        assert!(!is_markdown_path(Path::new("/a/b/no_extension")));
     }
 }
