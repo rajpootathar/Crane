@@ -16,7 +16,7 @@ use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use warpui::color::ColorU;
 use warpui::elements::{
-    ConstrainedBox, Container, DispatchEventResult, Element, EventHandler, Expanded, Flex,
+    Border, ConstrainedBox, Container, DispatchEventResult, Element, EventHandler, Expanded, Flex,
     FormattedTextElement, ParentElement, Rect, Stack, Text,
 };
 use warpui::fonts::FamilyId;
@@ -837,16 +837,41 @@ impl WarpMarkdownView {
     }
 
     fn quote_element(&self, runs: &[Run]) -> Box<dyn Element> {
-        // Left accent bar drawn as a full-height Rect underneath the indented
-        // text (a Rect fills its Stack's height while constrained to 3px width).
-        let bar = ConstrainedBox::new(Rect::new().with_background_color(theme::accent()).finish())
-            .with_width(3.0)
-            .finish();
+        // Left accent bar drawn as the body Container's LEFT BORDER — NOT as a
+        // `Rect` inside a `Stack`, which is what this used to be and which
+        // crashed the app on any document containing a blockquote:
+        //
+        //   * `Rect::layout` returns `constraint.max` verbatim
+        //     (vendor/warp/crates/warpui_core/src/elements/gui/rect.rs:110), so
+        //     an unconstrained axis makes the Rect INFINITE on that axis.
+        //   * `Stack::layout` hands each child its own incoming constraint
+        //     unchanged and takes the max of the results
+        //     (…/elements/gui/stack/mod.rs:184-196), so it neither bounds the
+        //     Rect nor filters an infinite result back out.
+        //   * Every Markdown block is a NON-flexible child of `render`'s
+        //     `Flex::column`, and a column gives such children an UNBOUNDED max
+        //     height by design (`SizeConstraint::child_constraint_along_axis`,
+        //     …/presenter.rs:771-783 — the Flutter flex algorithm).
+        //
+        // So the bar was laid out at height ∞. `Container::layout` returns
+        // `child_size + padding/border/margin` without clamping to its own
+        // constraint (…/elements/gui/container.rs:269-279), so ∞ propagated
+        // straight up through every ancestor Container to the pane wrapper,
+        // which then painted an infinitely tall rect and tripped
+        // `Scene::validate_rect` (…/scene.rs:567) — a debug_assert that aborts
+        // the process.
+        //
+        // A border has no such failure mode: it is painted on the Container's
+        // OWN rect, whose height is the (finite) text height plus padding, so
+        // it hugs the quote exactly like the old bar did while being
+        // structurally incapable of going infinite. `with_padding_left(9.0)`
+        // plus the 3px border keeps the text at the same 12px inset as before
+        // (`Container::paint` offsets the child past the border, container.rs:309-314).
         let body = Container::new(self.inline_element(runs, theme::text_muted()))
-            .with_padding_left(12.0)
+            .with_padding_left(9.0)
+            .with_border(Border::left(3.0).with_border_color(theme::accent()))
             .finish();
-        let stack = Stack::new().with_child(bar).with_child(body).finish();
-        self.pad_block(stack, 4.0)
+        self.pad_block(body, 4.0)
     }
 
     fn code_element(&self, lines: &[String]) -> Box<dyn Element> {
@@ -1627,5 +1652,90 @@ mod tests {
         assert!(!is_allowed_hyperlink_scheme("some-app://do-something"));
         assert!(!is_allowed_hyperlink_scheme("not a url at all"));
         assert!(!is_allowed_hyperlink_scheme(""));
+    }
+
+    // ── Layout regression tests ──────────────────────────────────────────────
+    //
+    // These build a REAL scene headlessly (warpui's test platform: stub window
+    // manager + stub font DB), which runs the full layout + paint pass over the
+    // rendered element tree. `Scene::validate_rect`
+    // (vendor/warp/crates/warpui_core/src/scene.rs:550-574) debug-asserts that
+    // no painted rect has a non-finite origin or size, so any element that
+    // resolves to an infinite width/height aborts the test the same way it
+    // aborted the app. Nothing else in the suite exercises layout at all.
+    fn build_markdown_scene(src: &'static str) {
+        use std::collections::HashSet;
+
+        use warpui::geometry::vector::vec2f;
+        use warpui::platform::WindowStyle;
+        use warpui::{App, Presenter, WindowInvalidation};
+
+        App::test((), |mut app| async move {
+            let app = &mut app;
+            let (window_id, _view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                WarpMarkdownView::from_source(ctx, "test.md".to_string(), src.to_string())
+            });
+            let mut presenter = Presenter::new(window_id);
+            let mut updated = HashSet::new();
+            updated.insert(app.root_view_id(window_id).unwrap());
+            let invalidation = WindowInvalidation { updated, ..Default::default() };
+            app.update(move |ctx| {
+                presenter.invalidate(invalidation, ctx);
+                // A concrete, finite window — the pane a Markdown view lives in
+                // is always finitely sized; the infinities are produced INSIDE
+                // the view, by children laid out under the unbounded main-axis
+                // constraint that `Flex::column` hands every non-flexible child.
+                let _ = presenter.build_scene(vec2f(900.0, 600.0), 1.0, None, ctx);
+            });
+        });
+    }
+
+    #[test]
+    fn a_table_lays_out_finitely() {
+        // The crash repro: a table-heavy document. Table cells sit in a
+        // `Flex::row` nested in a `Flex::column`, and a column hands its
+        // non-flexible children an unbounded max height
+        // (`SizeConstraint::child_constraint_along_axis`,
+        // presenter.rs:771-783). Anything in that subtree that sizes itself
+        // to `constraint.max` — a bare `Rect` most of all (rect.rs:110) —
+        // becomes infinitely tall and poisons every ancestor's height.
+        build_markdown_scene(
+            "| Service | User | Notes |\n\
+             |---|---|---|\n\
+             | one | a@example.com | first |\n\
+             | two | b@example.com | second |\n\
+             | three | c@example.com | third |\n",
+        );
+    }
+
+    #[test]
+    fn a_blockquote_lays_out_finitely() {
+        // `quote_element`'s accent bar is a `Rect` in a `Stack`, and a `Stack`
+        // passes its own constraint straight through to every child
+        // (stack/mod.rs:184-196). Under the column's unbounded height that
+        // Rect resolved to an infinitely tall bar.
+        build_markdown_scene("> a quoted line\n>\n> and another\n");
+    }
+
+    #[test]
+    fn a_bullet_list_lays_out_finitely() {
+        // `bullet_element`'s dot marker is also a Rect; its ConstrainedBox
+        // pins both axes, but the row around it must stay finite too.
+        build_markdown_scene("- one\n- two\n  - nested\n1. first\n2. second\n");
+    }
+
+    #[test]
+    fn a_mixed_document_lays_out_finitely() {
+        // Everything at once, in the shape of the file that crashed: headings,
+        // prose, a rule, a fenced code block, a table and a blockquote.
+        build_markdown_scene(
+            "# Logins\n\n\
+             Some prose with `code`, **bold** and a [link](https://example.com).\n\n\
+             ---\n\n\
+             ```sh\necho hi\n```\n\n\
+             | Env | URL |\n|---|---|\n| dev | https://dev.example.com |\n\n\
+             > remember to rotate these\n\n\
+             - a bullet\n",
+        );
     }
 }
