@@ -47,6 +47,9 @@ struct Run {
     emph: Emph,
 }
 
+/// One table cell's inline content.
+type Cell = Vec<Run>;
+
 /// A block-level element in the rendered document.
 enum Block {
     Heading { level: u8, text: String },
@@ -54,6 +57,7 @@ enum Block {
     Bullet(Vec<Run>),
     Quote(Vec<Run>),
     Code(Vec<String>),
+    Table { headers: Vec<Cell>, rows: Vec<Vec<Cell>> },
     Rule,
 }
 
@@ -86,6 +90,10 @@ fn parse(src: &str) -> Vec<Block> {
     let mut in_code = false;
     let mut in_bullet = false;
     let mut in_quote = false;
+    let mut table_headers: Vec<Cell> = Vec::new();
+    let mut table_rows: Vec<Vec<Cell>> = Vec::new();
+    let mut table_row: Vec<Cell> = Vec::new();
+    let mut in_table_head = false;
 
     let emph_now = |bold: bool, italic: bool| {
         if bold {
@@ -186,6 +194,50 @@ fn parse(src: &str) -> Vec<Block> {
                 }
             }
             Event::Rule => blocks.push(Block::Rule),
+            Event::Start(Tag::Table(_)) => {
+                table_headers.clear();
+                table_rows.clear();
+                table_row.clear();
+                runs.clear();
+            }
+            Event::Start(Tag::TableHead) => {
+                in_table_head = true;
+                table_row.clear();
+            }
+            Event::End(TagEnd::TableHead) => {
+                table_headers = std::mem::take(&mut table_row);
+                in_table_head = false;
+            }
+            Event::Start(Tag::TableRow) => {
+                table_row.clear();
+            }
+            Event::End(TagEnd::TableRow) => {
+                if !in_table_head {
+                    table_rows.push(std::mem::take(&mut table_row));
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                runs.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                table_row.push(std::mem::take(&mut runs));
+            }
+            Event::End(TagEnd::Table) => {
+                blocks.push(Block::Table {
+                    headers: std::mem::take(&mut table_headers),
+                    rows: std::mem::take(&mut table_rows),
+                });
+                table_row.clear();
+                runs.clear();
+            }
+            // A paragraph START must reset the inline accumulator. Without this, any
+            // unflushed runs (from an unhandled construct) silently merge into this
+            // paragraph — the root cause of the table content-loss bug.
+            Event::Start(Tag::Paragraph) => {
+                if !in_bullet && !in_quote {
+                    runs.clear();
+                }
+            }
             _ => {}
         }
     }
@@ -272,6 +324,7 @@ impl WarpMarkdownView {
             Block::Bullet(runs) => self.bullet_element(runs),
             Block::Quote(runs) => self.quote_element(runs),
             Block::Code(lines) => self.code_element(lines),
+            Block::Table { headers, rows } => self.table_element(headers, rows),
             Block::Rule => self.rule_element(),
         }
     }
@@ -413,6 +466,63 @@ impl WarpMarkdownView {
         self.pad_block(panel, 4.0)
     }
 
+    /// A table as a column of rows, each row a Flex::row of equal-weight cells.
+    /// Header cells are brightened; a hairline separates each row.
+    fn table_element(&self, headers: &[Cell], rows: &[Vec<Cell>]) -> Box<dyn Element> {
+        let mut col = Flex::column();
+
+        if !headers.is_empty() {
+            let mut head = Flex::row();
+            for cell in headers {
+                head = head.with_child(
+                    Expanded::new(
+                        1.0,
+                        Container::new(self.inline_element(cell, theme::text_header()))
+                            .with_uniform_padding(6.0)
+                            .finish(),
+                    )
+                    .finish(),
+                );
+            }
+            col = col.with_child(head.finish());
+            col = col.with_child(
+                ConstrainedBox::new(
+                    Rect::new().with_background_color(theme::border()).finish(),
+                )
+                .with_height(1.0)
+                .finish(),
+            );
+        }
+
+        for row in rows {
+            let mut r = Flex::row();
+            for cell in row {
+                r = r.with_child(
+                    Expanded::new(
+                        1.0,
+                        Container::new(self.inline_element(cell, theme::text()))
+                            .with_uniform_padding(6.0)
+                            .finish(),
+                    )
+                    .finish(),
+                );
+            }
+            col = col.with_child(r.finish());
+            col = col.with_child(
+                ConstrainedBox::new(
+                    Rect::new().with_background_color(theme::border()).finish(),
+                )
+                .with_height(1.0)
+                .finish(),
+            );
+        }
+
+        let panel = Container::new(col.finish())
+            .with_background_color(theme::surface())
+            .finish();
+        self.pad_block(panel, 4.0)
+    }
+
     fn rule_element(&self) -> Box<dyn Element> {
         let line = ConstrainedBox::new(Rect::new().with_background_color(theme::border()).finish())
             .with_height(1.0)
@@ -501,5 +611,56 @@ impl View for WarpMarkdownView {
             .with_child(Expanded::new(1.0, scroll_body).finish())
             .finish();
         self.panel(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn para_texts(blocks: &[Block]) -> Vec<String> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Para(runs) => {
+                    Some(runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn table_cell_text_does_not_leak_into_following_paragraph() {
+        let src = "| A | B |\n|---|---|\n| 1 | 2 |\n\nAfter the table.\n";
+        let blocks = parse(src);
+
+        let tables = blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Table { .. }))
+            .count();
+        assert_eq!(tables, 1, "a table must produce exactly one Block::Table");
+
+        assert_eq!(
+            para_texts(&blocks),
+            vec!["After the table."],
+            "table cell text must not leak into the following paragraph"
+        );
+    }
+
+    #[test]
+    fn table_headers_and_rows_are_captured() {
+        let src = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let blocks = parse(src);
+        let table = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Table { headers, rows } => Some((headers, rows)),
+                _ => None,
+            })
+            .expect("Block::Table present");
+        assert_eq!(table.0.len(), 2, "two header cells");
+        assert_eq!(table.1.len(), 1, "one body row");
+        assert_eq!(table.1[0].len(), 2, "two cells in the body row");
     }
 }
