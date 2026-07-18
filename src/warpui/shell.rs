@@ -1430,6 +1430,47 @@ impl CraneShellView {
                 } else {
                     st.worktree_tabs.clone()
                 };
+            // Pre-pass: classify every path this restore can reference
+            // (Markdown vs Editor, see `markdown_path_set`) and build its
+            // view handle exactly ONCE, before the per-tab leaf loop below
+            // assigns pane content. Building each path's handle once here —
+            // instead of once per saved pane that happens to reference it —
+            // is what keeps a path from ending up wanting BOTH a
+            // `markdown_views` and an `editor_views` handle, and keeps every
+            // pane sharing a path pointed at the SAME live view instance
+            // (matching how `open_file` shares handles across panes at
+            // runtime). See `restored_pane_kind` for the per-pane decision.
+            let md_paths = markdown_path_set(
+                restored_markdowns.values().map(|sm| &sm.path),
+                &saved_paths,
+            );
+            for p in &md_paths {
+                let pc = p.clone();
+                let h = ctx.add_typed_action_view(move |ctx| {
+                    crate::warpui::markdown_view::WarpMarkdownView::new(ctx, pc)
+                });
+                restored_markdown_views.insert(p.clone(), h);
+            }
+            if !saved_paths.is_empty() {
+                let mono = warpui::fonts::Cache::handle(ctx)
+                    .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
+                for p in editor_paths_for_restore(&saved_paths, &md_paths) {
+                    let content = std::fs::read_to_string(p).unwrap_or_default();
+                    let pc = p.clone();
+                    let goto = Self::lsp_goto_cb(p.clone());
+                    let h = ctx.add_typed_action_view(move |ctx| {
+                        crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, pc)
+                            .with_goto(goto)
+                    });
+                    h.update(ctx, |v, vctx| {
+                        if init_word_wrap {
+                            v.set_word_wrap(true, vctx);
+                        }
+                        v.set_trim_on_save(init_trim);
+                    });
+                    restored_editor_views.insert(p.clone(), h);
+                }
+            }
             for ((pi, wi), stabs) in &effective_tabs {
                 let Some(wpath) = projects
                     .get(*pi)
@@ -1444,83 +1485,104 @@ impl CraneShellView {
                     stab.layout.leaves(&mut leaves);
                     for pid in leaves {
                         // The File pane leaf is rebuilt as a File pane (with its
-                        // tabs); everything else is a terminal.
-                        if Some(pid) == saved_files_pane && !saved_paths.is_empty() {
-                            // Rebuild the file pane with Warp's REAL editor. Build a
-                            // live editor for EVERY saved path (kept in editor_views)
-                            // so all tabs restore and switch; show the active one.
-                            let mono = warpui::fonts::Cache::handle(ctx).update(
-                                ctx,
-                                |cache, _| crate::warpui::bundled_fonts::mono(cache),
-                            );
-                            for p in &saved_paths {
-                                let content = std::fs::read_to_string(p).unwrap_or_default();
-                                let pc = p.clone();
-                                let goto = Self::lsp_goto_cb(p.clone());
-                                let h = ctx.add_typed_action_view(move |ctx| {
-                                    crate::warpui::editor_view::WarpEditorView::new(
-                                        ctx, content, mono, pc,
-                                    )
-                                    .with_goto(goto)
-                                });
-                                h.update(ctx, |v, vctx| {
-                                    if init_word_wrap {
-                                        v.set_word_wrap(true, vctx);
-                                    }
-                                    v.set_trim_on_save(init_trim);
-                                });
-                                restored_editor_views.insert(p.clone(), h);
+                        // tabs); a Markdown / Browser pane is rebuilt on its saved
+                        // file / tabs; everything else is a terminal. The actual
+                        // Editor-vs-Markdown-vs-Browser-vs-Terminal decision lives
+                        // in `restored_pane_kind` (pure, unit-tested) so it can't
+                        // silently drift from the pre-pass above that built the
+                        // handles this match reuses.
+                        let markdown_path = restored_markdowns.get(&pid).map(|sm| &sm.path);
+                        let is_browser = restored_browsers.contains_key(&pid);
+                        let is_terminal = restored_term_cache.contains_key(&pid);
+                        match restored_pane_kind(
+                            pid,
+                            saved_files_pane,
+                            &saved_paths,
+                            saved_active,
+                            &md_paths,
+                            markdown_path,
+                            is_browser,
+                            is_terminal,
+                        ) {
+                            RestoredPaneKind::Markdown { path, is_files_pane } => {
+                                let h = restored_markdown_views.get(&path).cloned().expect(
+                                    "the pre-pass above built a markdown handle for every \
+                                     path in md_paths, which restored_pane_kind only returns \
+                                     Markdown for",
+                                );
+                                panes.insert(pid, PaneContent::Markdown(h));
+                                // This pid is ALSO the saved Files pane (its active
+                                // File Tab happens to be markdown) — populate the
+                                // same bookkeeping the Editor arm below does, so the
+                                // Files pane's tab bar restores instead of coming
+                                // back empty (`files_pane == None`).
+                                if is_files_pane {
+                                    restored_files_pane = Some(pid);
+                                    restored_file_paths = saved_paths.clone();
+                                    restored_active =
+                                        saved_active.min(saved_paths.len().saturating_sub(1));
+                                }
                             }
-                            let active = saved_active.min(saved_paths.len() - 1);
-                            let active_h = restored_editor_views[&saved_paths[active]].clone();
-                            panes.insert(pid, PaneContent::Editor(active_h));
-                            restored_files_pane = Some(pid);
-                            restored_file_paths = saved_paths.clone();
-                            restored_active = active;
-                        } else if let Some(sb) = restored_browsers.get(&pid) {
-                            // Rebuild a Browser pane with its saved tabs; the
-                            // webviews materialise (and start loading) on the
-                            // first browser tick after the pane paints.
-                            let tabs = sb.tabs.clone();
-                            let active = sb.active;
-                            let h = ctx.add_typed_action_view(move |_ctx| {
-                                crate::warpui::browser_view::WarpBrowserView::new(
-                                    pid, ui_font, icon_font, tabs, active,
-                                )
-                            });
-                            panes.insert(pid, PaneContent::Browser(h));
-                        } else if let Some(sm) = restored_markdowns.get(&pid) {
-                            // Rebuild the Markdown pane on its saved file.
-                            // Without this the pane fell through to a fresh
-                            // terminal and the document was lost.
-                            let p = sm.path.clone();
-                            let h = ctx.add_typed_action_view(move |ctx| {
-                                crate::warpui::markdown_view::WarpMarkdownView::new(ctx, p)
-                            });
-                            restored_markdown_views.insert(sm.path.clone(), h.clone());
-                            panes.insert(pid, PaneContent::Markdown(h));
-                        } else if let Some(st) = restored_term_cache.get(&pid) {
-                            // Restore the terminal in its saved cwd and replay its
-                            // ANSI scrollback so it looks as it did last session.
-                            let cwd = if st.cwd.as_os_str().is_empty() {
-                                wpath.clone()
-                            } else {
-                                st.cwd.clone()
-                            };
-                            let history = st.history.clone();
-                            let h = ctx.add_view(move |ctx| {
-                                crate::warpui::view::TerminalView::new_restore(ctx, cwd, history)
-                            });
-                            panes.insert(pid, PaneContent::Terminal(h));
-                        } else {
-                            panes.insert(
-                                pid,
-                                PaneContent::Terminal(Self::spawn_terminal(
-                                    ctx,
-                                    wpath.clone(),
-                                    ui_wake.clone(),
-                                )),
-                            );
+                            RestoredPaneKind::Editor { path } => {
+                                let h = restored_editor_views.get(&path).cloned().expect(
+                                    "the pre-pass above built an editor handle for every \
+                                     saved path not in md_paths, which restored_pane_kind \
+                                     only returns Editor for",
+                                );
+                                panes.insert(pid, PaneContent::Editor(h));
+                                restored_files_pane = Some(pid);
+                                restored_file_paths = saved_paths.clone();
+                                restored_active =
+                                    saved_active.min(saved_paths.len().saturating_sub(1));
+                            }
+                            RestoredPaneKind::Browser => {
+                                // Rebuild a Browser pane with its saved tabs; the
+                                // webviews materialise (and start loading) on the
+                                // first browser tick after the pane paints.
+                                let sb = restored_browsers
+                                    .get(&pid)
+                                    .expect("restored_pane_kind returned Browser")
+                                    .clone();
+                                let tabs = sb.tabs;
+                                let active = sb.active;
+                                let h = ctx.add_typed_action_view(move |_ctx| {
+                                    crate::warpui::browser_view::WarpBrowserView::new(
+                                        pid, ui_font, icon_font, tabs, active,
+                                    )
+                                });
+                                panes.insert(pid, PaneContent::Browser(h));
+                            }
+                            RestoredPaneKind::Terminal => {
+                                // Restore the terminal in its saved cwd and replay
+                                // its ANSI scrollback so it looks as it did last
+                                // session.
+                                let st = restored_term_cache
+                                    .get(&pid)
+                                    .expect("restored_pane_kind returned Terminal")
+                                    .clone();
+                                let cwd = if st.cwd.as_os_str().is_empty() {
+                                    wpath.clone()
+                                } else {
+                                    st.cwd.clone()
+                                };
+                                let history = st.history;
+                                let h = ctx.add_view(move |ctx| {
+                                    crate::warpui::view::TerminalView::new_restore(
+                                        ctx, cwd, history,
+                                    )
+                                });
+                                panes.insert(pid, PaneContent::Terminal(h));
+                            }
+                            RestoredPaneKind::FreshTerminal => {
+                                panes.insert(
+                                    pid,
+                                    PaneContent::Terminal(Self::spawn_terminal(
+                                        ctx,
+                                        wpath.clone(),
+                                        ui_wake.clone(),
+                                    )),
+                                );
+                            }
                         }
                         drag_states.insert(pid, DraggableState::default());
                     }
@@ -10947,11 +11009,7 @@ impl CraneShellView {
         }
         // Markdown files render read-only in a Markdown pane instead of the
         // editor (peer of the editor path below, same placement / reuse logic).
-        let is_md = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
-            .unwrap_or(false);
+        let is_md = is_markdown_path(&path);
         if is_md {
             let handle = if let Some(h) = self.markdown_views.get(&path) {
                 h.clone()
