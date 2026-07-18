@@ -1073,20 +1073,17 @@ mod tests {
         // suppresses those) — this guards against *content loss*: the outer
         // item's own prose ("top one") must survive being flushed early, at
         // the moment its nested list's first item opens and starts reusing
-        // `runs`.
+        // `runs`. Asserting the actual text (not just non-emptiness) is the
+        // point: a variant that replaced "top one" with something else must
+        // fail this test.
         let src = "- top one\n  - nested\n- top two\n";
         let blocks = parse(src);
-        let bullets: Vec<&Block> = blocks
-            .iter()
-            .filter(|b| matches!(b, Block::Bullet { .. }))
-            .collect();
-        assert_eq!(bullets.len(), 3, "exactly three bullets, no phantom empty one");
-        for b in &bullets {
-            if let Block::Bullet { runs, .. } = b {
-                let text: String = runs.iter().map(|r| r.text.as_str()).collect();
-                assert!(!text.trim().is_empty(), "no bullet may be empty");
-            }
-        }
+        assert_eq!(
+            bullet_texts(&blocks),
+            vec!["top one", "nested", "top two"],
+            "the outer item's prose must survive intact as \"top one\", not merely \
+             survive non-empty"
+        );
     }
 
     #[test]
