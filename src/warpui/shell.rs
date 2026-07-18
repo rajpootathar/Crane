@@ -1222,6 +1222,12 @@ impl CraneShellView {
             HashMap::new();
         let mut restored_browsers: HashMap<PaneId, crate::warpui::persist::SBrowser> =
             HashMap::new();
+        let mut restored_markdowns: HashMap<PaneId, crate::warpui::persist::SMarkdown> =
+            HashMap::new();
+        let mut restored_markdown_views: HashMap<
+            PathBuf,
+            ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>,
+        > = HashMap::new();
         let mut saved_active: usize = 0;
 
         // Ensure built-in theme TOML files are written to ~/.crane/themes/ on
@@ -1287,6 +1293,7 @@ impl CraneShellView {
             saved_active = st.file_pane_active;
             restored_term_cache = st.terminals.iter().cloned().collect();
             restored_browsers = st.browsers.iter().cloned().collect();
+            restored_markdowns = st.markdowns.iter().cloned().collect();
             // Tab lists: prefer the path-keyed field (stable across project
             // reordering); fall back to the legacy index-keyed one for state
             // files written before `worktree_tabs_by_path` existed.
@@ -1360,6 +1367,16 @@ impl CraneShellView {
                                 )
                             });
                             panes.insert(pid, PaneContent::Browser(h));
+                        } else if let Some(sm) = restored_markdowns.get(&pid) {
+                            // Rebuild the Markdown pane on its saved file.
+                            // Without this the pane fell through to a fresh
+                            // terminal and the document was lost.
+                            let p = sm.path.clone();
+                            let h = ctx.add_typed_action_view(move |ctx| {
+                                crate::warpui::markdown_view::WarpMarkdownView::new(ctx, p)
+                            });
+                            restored_markdown_views.insert(sm.path.clone(), h.clone());
+                            panes.insert(pid, PaneContent::Markdown(h));
                         } else if let Some(st) = restored_term_cache.get(&pid) {
                             // Restore the terminal in its saved cwd and replay its
                             // ANSI scrollback so it looks as it did last session.
@@ -1605,7 +1622,7 @@ impl CraneShellView {
             file_pane_paths: restored_file_paths,
             file_pane_active: restored_active,
             editor_views: restored_editor_views,
-            markdown_views: HashMap::new(),
+            markdown_views: restored_markdown_views,
             term_cache: RefCell::new(restored_term_cache),
             last_term_snapshot: std::cell::Cell::new(None),
             term_cleared: RefCell::new(HashSet::new()),

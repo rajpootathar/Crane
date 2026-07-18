@@ -1748,4 +1748,104 @@ mod tests {
              - a bullet\n",
         );
     }
+
+    // ── Restore-path coverage ─────────────────────────────────────────────────
+    //
+    // The session-restore code in `shell.rs` rebuilds a Markdown pane via
+    // `WarpMarkdownView::new(ctx, path)` — the SAME constructor a fresh "open
+    // file" click uses, never `from_source`. Before this task that arm did not
+    // exist at all: a saved Markdown pane fell through to a fresh terminal.
+    // These tests exercise `new` (not `from_source`) directly, the way restore
+    // does, to catch a regression in either the path plumbing or the layout
+    // pass on a file-backed view specifically.
+    #[test]
+    fn new_from_a_real_path_records_that_path_for_persistence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "# hello\n").expect("write temp md file");
+
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let file_for_view = file.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                WarpMarkdownView::new(ctx, file_for_view.clone())
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    assert_eq!(
+                        v.path(),
+                        Some(file_for_view.as_path()),
+                        "a view built via `new` (the restore constructor) must report its \
+                         source path, or the pane can never be found again by \
+                         `build_state`'s save-side lookup"
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn a_view_restored_via_new_lays_out_finitely() {
+        // Proves the exact call the restore arm makes — WarpMarkdownView::new
+        // on a real file — runs the full layout + paint pass without tripping
+        // `Scene::validate_rect`, the same crash class the `_lays_out_finitely`
+        // tests above guard for `from_source`.
+        use std::collections::HashSet;
+
+        use warpui::geometry::vector::vec2f;
+        use warpui::platform::WindowStyle;
+        use warpui::{App, Presenter, WindowInvalidation};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("restored.md");
+        std::fs::write(
+            &file,
+            "# Restored\n\nSome prose with `code` and a [link](https://example.com).\n\n\
+             | A | B |\n|---|---|\n| 1 | 2 |\n\n> a quote\n\n- a bullet\n",
+        )
+        .expect("write temp md file");
+
+        App::test((), |mut app| async move {
+            let app = &mut app;
+            let (window_id, _view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                WarpMarkdownView::new(ctx, file)
+            });
+            let mut presenter = Presenter::new(window_id);
+            let mut updated = HashSet::new();
+            updated.insert(app.root_view_id(window_id).unwrap());
+            let invalidation = WindowInvalidation { updated, ..Default::default() };
+            app.update(move |ctx| {
+                presenter.invalidate(invalidation, ctx);
+                let _ = presenter.build_scene(vec2f(900.0, 600.0), 1.0, None, ctx);
+            });
+        });
+    }
+
+    #[test]
+    fn from_source_has_no_path() {
+        // The other half of the path/None split this task introduces:
+        // in-memory documents cannot be persisted, so `path()` must be None
+        // for them, not an empty PathBuf standing in for "unset".
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        App::test((), |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                WarpMarkdownView::from_source(ctx, "in-memory.md".to_string(), "# hi\n".to_string())
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    assert_eq!(
+                        v.path(),
+                        None,
+                        "an in-memory document built via from_source must report no path"
+                    );
+                });
+            });
+        });
+    }
 }
