@@ -31,9 +31,15 @@ const RENDER_BLOCKS: usize = 400;
 
 // ── Owned block model (parsed once, rendered each frame) ─────────────────────
 
-/// Inline emphasis for one text run. Bold is simulated with a brighter color —
-/// the shipped proportional font has no bold face (same rationale as old egui's
-/// markdown view). Italic is honored via the font `Style`.
+/// Inline emphasis for one text run. Bold and Italic are currently rendered
+/// identically to Normal prose — `fragments()` maps both to a plain-text
+/// fragment, so no visual distinction exists yet between the three. This is a
+/// deliberate, accepted scope cut (not a regression to fix here): per-fragment
+/// weight/style is deferred to a later task via `FormattedTextFragment`'s
+/// `with_weight` support. The shipped proportional font has no bold face
+/// regardless, so any future bold treatment must still avoid a bold font face
+/// (same rationale as old egui's markdown view) and use a color/style cue
+/// instead.
 #[derive(Clone, Copy, PartialEq)]
 enum Emph {
     Normal,
@@ -383,10 +389,12 @@ impl WarpMarkdownView {
 
     /// One inline block. Fast path: a single soft-wrapping `Text` when the block
     /// is uniform prose (no inline code, no emphasis) — the common case, and the
-    /// cheapest path. Mixed blocks (inline code, bold, or italic) build a
+    /// cheapest path. Mixed blocks (inline code, bold, or italic present) build a
     /// `FormattedTextElement`, warp's multi-style body-text element, which wraps
-    /// by default and renders inline code as a chip natively — replacing the old
-    /// `Flex::row` fallback, which could not wrap by construction.
+    /// by default — replacing the old `Flex::row` fallback, which could not wrap
+    /// by construction. Inline code renders as a colored chip via
+    /// `with_inline_code_properties`; bold and italic runs currently render as
+    /// plain prose (undifferentiated from Normal — see `Emph`'s doc comment).
     fn inline_element(&self, runs: &[Run], base_color: ColorU) -> Box<dyn Element> {
         if runs.is_empty() {
             return Text::new(String::new(), self.prose, BASE)
@@ -416,13 +424,17 @@ impl WarpMarkdownView {
             base_color,
             Default::default(),
         )
+        .with_inline_code_properties(Some(theme::warning()), Some(theme::surface()))
         .with_line_height_ratio(LINE_H)
         .finish()
     }
 
-    /// Convert the owned `Run` model into FormattedTextFragments. Bold is
-    /// brightened via a separate color rather than a bold face — the bundled
-    /// proportional font has no bold face (see `Emph`'s doc comment above).
+    /// Convert the owned `Run` model into FormattedTextFragments. Bold and
+    /// Italic both map to a plain-text fragment — neither is visually
+    /// distinguished from Normal prose yet. Only `Emph::Code` gets a distinct
+    /// fragment kind (`inline_code`, styled via `with_inline_code_properties`
+    /// in `inline_element`). Per-fragment bold/italic is deferred (see
+    /// `Emph`'s doc comment above).
     fn fragments(&self, runs: &[Run]) -> Vec<FormattedTextFragment> {
         runs.iter()
             .map(|r| match r.emph {
