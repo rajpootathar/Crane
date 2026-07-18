@@ -3,9 +3,11 @@
 //! `pulldown_cmark` once at construction into an owned block model, then rebuild
 //! warpui elements from that model each frame (elements are transient; the model
 //! persists). Read-only in v1. Links render through `FormattedTextElement`'s
-//! native hyperlink support (destination URL carried on `Run::link`); inline
-//! images still render as plain text — deferred, pending the `Image` element
-//! introduced by the image-viewer plan.
+//! hyperlink fragment support (destination URL carried on `Run::link`) with
+//! click handling wired up explicitly via `register_default_click_handlers`
+//! in `inline_element` — that registration is required, not automatic, see
+//! that method's doc comment; inline images still render as plain text —
+//! deferred, pending the `Image` element introduced by the image-viewer plan.
 
 use std::path::PathBuf;
 
@@ -513,6 +515,35 @@ fn parse(src: &str) -> Vec<Block> {
     blocks
 }
 
+/// Whether a run of inline content needs the `FormattedTextElement` path
+/// (multi-style, wraps by default) rather than the plain-`Text` fast path.
+/// A free function, not a method, so it can be unit-tested directly without
+/// standing up a `WarpMarkdownView` or a font instance — see the tests
+/// module. True when any run carries emphasis other than `Emph::Normal`, or
+/// carries a link: a run can have `link: Some(_)` while `emph` is still
+/// `Normal` (a plain, unemphasized link), and the fast `Text` path has no way
+/// to render hyperlink styling, so a linked run always forces the
+/// `FormattedTextElement` path even when no `Emph` variant does.
+fn needs_formatted_text(runs: &[Run]) -> bool {
+    runs.iter()
+        .any(|r| !matches!(r.emph, Emph::Normal) || r.link.is_some())
+}
+
+/// Scheme allowlist for hyperlink clicks opened via the OS `open`/`xdg-open`
+/// command. Markdown files come from untrusted repositories, and `open` will
+/// launch arbitrary URL schemes — `file://` to reveal local paths, or a
+/// custom app scheme to trigger unwanted local behavior — not just web
+/// URLs. Only `http`, `https` and `mailto` are considered safe enough to
+/// hand to the OS opener; anything else (including no scheme at all) is
+/// silently ignored. Checked via a case-insensitive prefix match — no URL
+/// parsing crate is pulled in for this.
+fn is_allowed_hyperlink_scheme(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+}
+
 // ── View ─────────────────────────────────────────────────────────────────────
 
 pub struct WarpMarkdownView {
@@ -616,26 +647,24 @@ impl WarpMarkdownView {
 
     /// One inline block. Fast path: a single soft-wrapping `Text` when the block
     /// is uniform prose (no inline code, emphasis, or link) — the common case,
-    /// and the cheapest path. Mixed blocks build a `FormattedTextElement`,
-    /// warp's multi-style body-text element, which wraps by default —
-    /// replacing the old `Flex::row` fallback, which could not wrap by
-    /// construction. Inline code renders as a colored chip via
+    /// and the cheapest path (see `needs_formatted_text`). Mixed blocks build a
+    /// `FormattedTextElement`, warp's multi-style body-text element, which
+    /// wraps by default — replacing the old `Flex::row` fallback, which could
+    /// not wrap by construction. Inline code renders as a colored chip via
     /// `with_inline_code_properties`; bold, italic, strikethrough and links
     /// each render as their own distinct fragment style (see `fragments()`).
+    /// `register_default_click_handlers` wires up hyperlink clicks: without
+    /// it, `FormattedTextElement` never populates its mouse-handler table, so
+    /// a hyperlink fragment renders with no click styling and does nothing on
+    /// click (see `is_allowed_hyperlink_scheme` for why the click handler
+    /// filters the URL before handing it to the OS opener).
     fn inline_element(&self, runs: &[Run], base_color: ColorU) -> Box<dyn Element> {
         if runs.is_empty() {
             return Text::new(String::new(), self.prose, BASE)
                 .with_color(base_color)
                 .finish();
         }
-        // A run can carry `link: Some(_)` while `emph` is still `Normal` (a
-        // plain, unemphasized link) — the plain-`Text` fast path below has no
-        // way to render hyperlink styling, so a linked run always forces the
-        // `FormattedTextElement` path even when no `Emph` variant does.
-        let mixed = runs
-            .iter()
-            .any(|r| !matches!(r.emph, Emph::Normal) || r.link.is_some());
-        if !mixed {
+        if !needs_formatted_text(runs) {
             let text: String = runs.iter().map(|r| r.text.as_str()).collect();
             return Text::new(text, self.prose, BASE)
                 .with_color(base_color)
@@ -657,6 +686,19 @@ impl WarpMarkdownView {
         )
         .with_inline_code_properties(Some(theme::warning()), Some(theme::surface()))
         .with_line_height_ratio(LINE_H)
+        .register_default_click_handlers(|url, _ctx, _app| {
+            let url = url.url;
+            // Markdown is untrusted input (repos the user opens) — only ever
+            // hand the OS opener a scheme we know is inert to click on. See
+            // `is_allowed_hyperlink_scheme` for the rationale.
+            if !is_allowed_hyperlink_scheme(&url) {
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+            #[cfg(target_os = "linux")]
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        })
         .finish()
     }
 
@@ -666,13 +708,20 @@ impl WarpMarkdownView {
     /// `vendor/warp/crates/markdown_parser/src/lib.rs`, `plain_text`/`bold`/
     /// `italic`/`hyperlink`/`inline_code`/`strikethrough`). A run's `link`
     /// wins over its `emph`: hyperlink fragments are colored by
-    /// `hyperlink_font_color` and click-handled by the element itself, so a
-    /// linked run always renders as a hyperlink regardless of any emphasis
-    /// also active on it.
+    /// `hyperlink_font_color`, and are only made clickable at all by
+    /// `inline_element`'s explicit `.register_default_click_handlers(...)`
+    /// call — `FormattedTextElement` does not wire up hyperlink click
+    /// handling (or the `hyperlink_font_color` highlight) on its own, so a
+    /// linked run always renders as a hyperlink fragment regardless of any
+    /// emphasis also active on it, but is inert without that registration.
     ///
     /// Model limitation, out of scope here: `Emph` is a flat enum, so
     /// `***bold italic***` collapses to whichever of Bold/Italic wins in
     /// `emph_now` and can never reach `FormattedTextFragment::bold_italic`.
+    /// The same flattening means `~~**both**~~` collapses to a single
+    /// `Emph::Strike` run — strike wins `emph_now`'s precedence chain over
+    /// bold/italic — so bold-and-struck text renders as struck-only, never
+    /// `FormattedTextFragment::bold`+strikethrough combined.
     fn fragments(&self, runs: &[Run]) -> Vec<FormattedTextFragment> {
         runs.iter()
             .map(|r| {
@@ -1376,5 +1425,77 @@ mod tests {
             vec!["q1", "q2"],
             "both the blockquote and its nested blockquote must render as Block::Quote"
         );
+    }
+
+    // ── needs_formatted_text (Finding 2: the rendering-layer decision that
+    // no prior test exercised — reverting `|| r.link.is_some()` at this
+    // check would previously have failed nothing) ──────────────────────────
+
+    #[test]
+    fn all_plain_runs_do_not_need_formatted_text() {
+        // The fast path must be preserved for the common case: uniform
+        // prose, no code/emphasis/link on any run.
+        let runs = vec![
+            Run { text: "plain ".to_string(), emph: Emph::Normal, link: None },
+            Run { text: "prose".to_string(), emph: Emph::Normal, link: None },
+        ];
+        assert!(
+            !needs_formatted_text(&runs),
+            "all-Normal, link-free runs must take the plain-Text fast path"
+        );
+    }
+
+    #[test]
+    fn a_run_with_inline_code_needs_formatted_text() {
+        let runs = vec![
+            Run { text: "run ".to_string(), emph: Emph::Normal, link: None },
+            Run { text: "code".to_string(), emph: Emph::Code, link: None },
+        ];
+        assert!(
+            needs_formatted_text(&runs),
+            "an Emph::Code run must force the FormattedTextElement path"
+        );
+    }
+
+    #[test]
+    fn a_plain_unemphasized_link_needs_formatted_text() {
+        // The regression this task exists to guard: a run can be Emph::Normal
+        // and still carry a link. The plain-Text fast path has no way to
+        // render hyperlink styling or clicks, so this case alone must force
+        // FormattedTextElement even though no `Emph` variant is non-Normal.
+        let runs = vec![Run {
+            text: "click me".to_string(),
+            emph: Emph::Normal,
+            link: Some("https://example.com".to_string()),
+        }];
+        assert!(
+            needs_formatted_text(&runs),
+            "a Normal-emph run carrying a link must still force FormattedTextElement, \
+             or hyperlink styling/clicks silently disappear"
+        );
+    }
+
+    // ── is_allowed_hyperlink_scheme (Finding 1: the security allowlist that
+    // gates which URLs are handed to the OS `open`/`xdg-open` command) ──────
+
+    #[test]
+    fn http_https_and_mailto_schemes_are_allowed() {
+        assert!(is_allowed_hyperlink_scheme("http://example.com"));
+        assert!(is_allowed_hyperlink_scheme("https://example.com/guide"));
+        assert!(is_allowed_hyperlink_scheme("mailto:someone@example.com"));
+        // Case-insensitive prefix match, per the brief.
+        assert!(is_allowed_hyperlink_scheme("HTTPS://Example.Com"));
+    }
+
+    #[test]
+    fn other_schemes_are_rejected() {
+        // A malicious README could point a link at a local-file or
+        // custom-app scheme to trigger unwanted local behavior via `open`.
+        assert!(!is_allowed_hyperlink_scheme("file:///etc/passwd"));
+        assert!(!is_allowed_hyperlink_scheme("javascript:alert(1)"));
+        assert!(!is_allowed_hyperlink_scheme("ftp://example.com/file"));
+        assert!(!is_allowed_hyperlink_scheme("some-app://do-something"));
+        assert!(!is_allowed_hyperlink_scheme("not a url at all"));
+        assert!(!is_allowed_hyperlink_scheme(""));
     }
 }
