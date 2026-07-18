@@ -1106,6 +1106,18 @@ enum RestoredPaneKind {
     FreshTerminal,
 }
 
+/// The Files pane's active-tab index, clamped against how many saved paths
+/// actually survived. One spelling shared by `restored_pane_kind` (to pick
+/// which saved path decides Editor vs Markdown) and `files_pane_bookkeeping`
+/// (to pick the restored `file_pane_active`) — these used to be two
+/// independently-written clamps (`len() - 1` vs `len().saturating_sub(1)`)
+/// that happened to agree only because both call sites are unreachable with
+/// an empty `saved_paths`. `saturating_sub` makes that safe even if a future
+/// caller lifts that guard.
+fn clamped_active_index(saved_active: usize, saved_paths_len: usize) -> usize {
+    saved_active.min(saved_paths_len.saturating_sub(1))
+}
+
 /// The pane content a saved leaf `pid` should restore as, decided entirely
 /// from the plain saved-state shape. Mirrors `WarpuiState`'s
 /// `files_pane` / `file_pane_paths` / `markdowns` / `browsers` / `terminals`
@@ -1132,7 +1144,7 @@ fn restored_pane_kind(
     is_terminal: bool,
 ) -> RestoredPaneKind {
     if Some(pid) == saved_files_pane && !saved_paths.is_empty() {
-        let active = saved_active.min(saved_paths.len() - 1);
+        let active = clamped_active_index(saved_active, saved_paths.len());
         let path = saved_paths[active].clone();
         if md_paths.contains(&path) {
             RestoredPaneKind::Markdown { path, is_files_pane: true }
@@ -1148,6 +1160,46 @@ fn restored_pane_kind(
     } else {
         RestoredPaneKind::FreshTerminal
     }
+}
+
+/// Files-pane bookkeeping for a restored leaf: the pane id that becomes the
+/// Files Pane, its tab list, and the clamped active index. `Some` for an
+/// Editor leaf and for a Markdown leaf that is also the saved Files pane
+/// (`RestoredPaneKind::Markdown { is_files_pane: true, .. }`); `None` for a
+/// standalone Markdown leaf, a Browser leaf, a Terminal leaf, or a
+/// FreshTerminal leaf — none of those are the shared Files pane.
+///
+/// This is the half of the fix for "files_pane came back None, so the next
+/// open split a duplicate pane" that actually performs the assignment
+/// (`restored_pane_kind` only decides Editor-vs-Markdown; it never touches
+/// `files_pane` / `file_pane_paths` / `file_pane_active`). Pulling it into
+/// its own function — called exactly once per leaf, from the single site in
+/// `new` that also drives the match on `RestoredPaneKind` — means there is
+/// one place that can assign the bookkeeping, not one per match arm that
+/// could independently forget to.
+///
+/// The active-index clamp is shared with `restored_pane_kind` via
+/// `clamped_active_index` — this used to be recomputed here with a second,
+/// different spelling (`len() - 1`, which the file-pane arms happened never
+/// to hit with an empty `saved_paths`, unlike this function in principle).
+fn files_pane_bookkeeping(
+    kind: &RestoredPaneKind,
+    pid: PaneId,
+    saved_paths: &[PathBuf],
+    saved_active: usize,
+) -> Option<(PaneId, Vec<PathBuf>, usize)> {
+    let is_files_pane = match kind {
+        RestoredPaneKind::Markdown { is_files_pane, .. } => *is_files_pane,
+        RestoredPaneKind::Editor { .. } => true,
+        RestoredPaneKind::Browser | RestoredPaneKind::Terminal | RestoredPaneKind::FreshTerminal => {
+            false
+        }
+    };
+    if !is_files_pane {
+        return None;
+    }
+    let active = clamped_active_index(saved_active, saved_paths.len());
+    Some((pid, saved_paths.to_vec(), active))
 }
 
 impl CraneShellView {
@@ -1430,6 +1482,38 @@ impl CraneShellView {
                 } else {
                     st.worktree_tabs.clone()
                 };
+            // Reachability pre-pass: a saved leaf only actually restores if
+            // the tab that owns it survives — same guard the leaf-restore
+            // loop below uses (`projects.get(pi).worktrees.get(wi)` still
+            // resolves; a removed project/worktree makes that tab's whole
+            // `continue` fire and none of its leaves are ever visited).
+            // Without this, a saved Files pane whose owning tab no longer
+            // resolves would still pay N `read_to_string` calls + N
+            // `WarpEditorView`/`WarpMarkdownView` constructions below for
+            // tabs nothing will ever display or retain.
+            let mut reachable_pids: HashSet<PaneId> = HashSet::new();
+            for ((pi, wi), stabs) in &effective_tabs {
+                if projects.get(*pi).and_then(|p| p.worktrees.get(*wi)).is_none() {
+                    continue;
+                }
+                for stab in stabs {
+                    let mut leaves = Vec::new();
+                    stab.layout.leaves(&mut leaves);
+                    reachable_pids.extend(leaves);
+                }
+            }
+            // The Files pane's saved tab list only matters if the leaf that
+            // was the Files pane will itself restore; otherwise treat it as
+            // empty for the purposes of the handle-building pre-pass below
+            // (the per-leaf loop never reaches an unreachable pid either, so
+            // this can't desync from `restored_pane_kind`'s own decisions).
+            let empty_saved_paths: Vec<PathBuf> = Vec::new();
+            let effective_saved_paths: &[PathBuf] =
+                if saved_files_pane.is_some_and(|p| reachable_pids.contains(&p)) {
+                    &saved_paths
+                } else {
+                    &empty_saved_paths
+                };
             // Pre-pass: classify every path this restore can reference
             // (Markdown vs Editor, see `markdown_path_set`) and build its
             // view handle exactly ONCE, before the per-tab leaf loop below
@@ -1441,8 +1525,11 @@ impl CraneShellView {
             // (matching how `open_file` shares handles across panes at
             // runtime). See `restored_pane_kind` for the per-pane decision.
             let md_paths = markdown_path_set(
-                restored_markdowns.values().map(|sm| &sm.path),
-                &saved_paths,
+                restored_markdowns
+                    .iter()
+                    .filter(|(pid, _)| reachable_pids.contains(pid))
+                    .map(|(_, sm)| &sm.path),
+                effective_saved_paths,
             );
             for p in &md_paths {
                 let pc = p.clone();
@@ -1451,10 +1538,10 @@ impl CraneShellView {
                 });
                 restored_markdown_views.insert(p.clone(), h);
             }
-            if !saved_paths.is_empty() {
+            if !effective_saved_paths.is_empty() {
                 let mono = warpui::fonts::Cache::handle(ctx)
                     .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
-                for p in editor_paths_for_restore(&saved_paths, &md_paths) {
+                for p in editor_paths_for_restore(effective_saved_paths, &md_paths) {
                     let content = std::fs::read_to_string(p).unwrap_or_default();
                     let pc = p.clone();
                     let goto = Self::lsp_goto_cb(p.clone());
@@ -1494,7 +1581,7 @@ impl CraneShellView {
                         let markdown_path = restored_markdowns.get(&pid).map(|sm| &sm.path);
                         let is_browser = restored_browsers.contains_key(&pid);
                         let is_terminal = restored_term_cache.contains_key(&pid);
-                        match restored_pane_kind(
+                        let kind = restored_pane_kind(
                             pid,
                             saved_files_pane,
                             &saved_paths,
@@ -1503,46 +1590,66 @@ impl CraneShellView {
                             markdown_path,
                             is_browser,
                             is_terminal,
-                        ) {
-                            RestoredPaneKind::Markdown { path, is_files_pane } => {
-                                let h = restored_markdown_views.get(&path).cloned().expect(
-                                    "the pre-pass above built a markdown handle for every \
-                                     path in md_paths, which restored_pane_kind only returns \
-                                     Markdown for",
-                                );
+                        );
+                        match &kind {
+                            RestoredPaneKind::Markdown { path, .. } => {
+                                // The pre-pass above is expected to have built a
+                                // markdown handle for every path `restored_pane_kind`
+                                // can return `Markdown` for. A corrupt or
+                                // future-drifted `warpui-state.json` could still
+                                // break that lockstep — degrade to a fresh terminal
+                                // for this one leaf instead of panicking on user
+                                // data, matching the `FreshTerminal` arm below.
+                                let Some(h) = restored_markdown_views.get(path).cloned() else {
+                                    panes.insert(
+                                        pid,
+                                        PaneContent::Terminal(Self::spawn_terminal(
+                                            ctx,
+                                            wpath.clone(),
+                                            ui_wake.clone(),
+                                        )),
+                                    );
+                                    drag_states.insert(pid, DraggableState::default());
+                                    continue;
+                                };
                                 panes.insert(pid, PaneContent::Markdown(h));
-                                // This pid is ALSO the saved Files pane (its active
-                                // File Tab happens to be markdown) — populate the
-                                // same bookkeeping the Editor arm below does, so the
-                                // Files pane's tab bar restores instead of coming
-                                // back empty (`files_pane == None`).
-                                if is_files_pane {
-                                    restored_files_pane = Some(pid);
-                                    restored_file_paths = saved_paths.clone();
-                                    restored_active =
-                                        saved_active.min(saved_paths.len().saturating_sub(1));
-                                }
                             }
                             RestoredPaneKind::Editor { path } => {
-                                let h = restored_editor_views.get(&path).cloned().expect(
-                                    "the pre-pass above built an editor handle for every \
-                                     saved path not in md_paths, which restored_pane_kind \
-                                     only returns Editor for",
-                                );
+                                // Same lockstep assumption as the Markdown arm
+                                // above, for the editor pre-pass / `editor_views`.
+                                let Some(h) = restored_editor_views.get(path).cloned() else {
+                                    panes.insert(
+                                        pid,
+                                        PaneContent::Terminal(Self::spawn_terminal(
+                                            ctx,
+                                            wpath.clone(),
+                                            ui_wake.clone(),
+                                        )),
+                                    );
+                                    drag_states.insert(pid, DraggableState::default());
+                                    continue;
+                                };
                                 panes.insert(pid, PaneContent::Editor(h));
-                                restored_files_pane = Some(pid);
-                                restored_file_paths = saved_paths.clone();
-                                restored_active =
-                                    saved_active.min(saved_paths.len().saturating_sub(1));
                             }
                             RestoredPaneKind::Browser => {
                                 // Rebuild a Browser pane with its saved tabs; the
                                 // webviews materialise (and start loading) on the
-                                // first browser tick after the pane paints.
-                                let sb = restored_browsers
-                                    .get(&pid)
-                                    .expect("restored_pane_kind returned Browser")
-                                    .clone();
+                                // first browser tick after the pane paints. Same
+                                // lockstep assumption as above: `restored_pane_kind`
+                                // only returns `Browser` when `restored_browsers`
+                                // has an entry for this pid.
+                                let Some(sb) = restored_browsers.get(&pid).cloned() else {
+                                    panes.insert(
+                                        pid,
+                                        PaneContent::Terminal(Self::spawn_terminal(
+                                            ctx,
+                                            wpath.clone(),
+                                            ui_wake.clone(),
+                                        )),
+                                    );
+                                    drag_states.insert(pid, DraggableState::default());
+                                    continue;
+                                };
                                 let tabs = sb.tabs;
                                 let active = sb.active;
                                 let h = ctx.add_typed_action_view(move |_ctx| {
@@ -1555,11 +1662,19 @@ impl CraneShellView {
                             RestoredPaneKind::Terminal => {
                                 // Restore the terminal in its saved cwd and replay
                                 // its ANSI scrollback so it looks as it did last
-                                // session.
-                                let st = restored_term_cache
-                                    .get(&pid)
-                                    .expect("restored_pane_kind returned Terminal")
-                                    .clone();
+                                // session. Same lockstep assumption as above.
+                                let Some(st) = restored_term_cache.get(&pid).cloned() else {
+                                    panes.insert(
+                                        pid,
+                                        PaneContent::Terminal(Self::spawn_terminal(
+                                            ctx,
+                                            wpath.clone(),
+                                            ui_wake.clone(),
+                                        )),
+                                    );
+                                    drag_states.insert(pid, DraggableState::default());
+                                    continue;
+                                };
                                 let cwd = if st.cwd.as_os_str().is_empty() {
                                     wpath.clone()
                                 } else {
@@ -1583,6 +1698,20 @@ impl CraneShellView {
                                     )),
                                 );
                             }
+                        }
+                        // Single call site for every leaf, regardless of which arm
+                        // above ran: `files_pane_bookkeeping` (pure, unit-tested)
+                        // decides from `kind` alone whether this pid is the
+                        // restored Files pane. Folding this out of the match arms
+                        // means no arm can independently forget to populate
+                        // `files_pane` / `file_pane_paths` / `file_pane_active` —
+                        // the bug this whole restructure exists to fix.
+                        if let Some((fp, paths, active)) =
+                            files_pane_bookkeeping(&kind, pid, &saved_paths, saved_active)
+                        {
+                            restored_files_pane = Some(fp);
+                            restored_file_paths = paths;
+                            restored_active = active;
                         }
                         drag_states.insert(pid, DraggableState::default());
                     }
