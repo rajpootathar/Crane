@@ -13074,14 +13074,22 @@ impl CraneShellView {
         self.drag_states.remove(&focused);
         self.pane_rects.borrow_mut().remove(&focused);
         // Closing the File Edit pane via Cmd+W / its × button (as opposed to
-        // the last-File-Tab-closed path, which already resets this) left
-        // `files_pane` pointing at a removed pane id. `open_file` self-heals
-        // that on the next open, but other readers (`is_file_pane`, the tab
-        // strip's close-shortcut gate) compare against it directly — reset it
-        // here so it never dangles.
+        // the last-File-Tab-closed path, which already resets all three maps)
+        // must do the same: leaving `file_pane_paths` / `file_pane_active`
+        // behind while only forgetting `files_pane` orphans that Workspace's
+        // tab list forever — nothing else ever clears it, so every
+        // `editor_views` entry it names is pinned permanently (a leak).
+        // It also resurrects those stale tabs: `open_file`'s
+        // `files_pane.contains_key(&ws)` reset branch only fires when
+        // `files_pane` is STILL populated, so with only `files_pane` cleared
+        // here, that branch is skipped and the next file opened in this
+        // Workspace gets appended onto the orphaned old list instead of
+        // starting fresh — closing the Files Pane and reopening any file
+        // brought the old tabs back. `clear_ws_files` drops all three maps
+        // together, so neither hazard exists.
         if let Some(ws) = ws {
             if self.files_pane.get(&ws) == Some(&focused) {
-                self.files_pane.remove(&ws);
+                self.clear_ws_files(ws);
             }
         }
         // The sibling that just reclaimed the closed pane's space must reflow
@@ -16878,6 +16886,104 @@ mod restore_wiring_integration_tests {
                     assert!(
                         !v.markdown_views.contains_key(&shared_doc2),
                         "markdown_views must not hold a cached buffer for a deleted path"
+                    );
+                });
+            });
+        });
+    }
+
+    /// `close_focused`'s pre-fix cleanup only forgot `files_pane`, leaving
+    /// `file_pane_paths` / `file_pane_active` for that Workspace populated.
+    /// With File Tab state scoped per Workspace via a `HashMap` (rather than
+    /// one flat field), that orphaned entry is never revisited by anything
+    /// else — a permanent leak, since it pins whatever paths it still lists
+    /// — and it also resurrects itself: `open_file`'s "start a fresh tab
+    /// list" reset branch only fires when `files_pane` is STILL populated,
+    /// so with only `files_pane` cleared, the next file opened in this
+    /// Workspace gets appended onto the stale list instead of starting
+    /// clean.
+    #[test]
+    fn closing_the_files_pane_releases_its_workspace_tab_list() {
+        use crate::warpui::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let path = proj.path().to_string_lossy().into_owned();
+
+        let seed = proj.path().join("seed.md");
+        let doc1 = proj.path().join("first.md");
+        let doc2 = proj.path().join("second.md");
+        for p in [&seed, &doc1, &doc2] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID_SEED: PaneId = 40;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 41;
+        st.added_projects = vec![AddedProject { name: "proj".to_string(), path: path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID_SEED),
+                focus: Some(PID_SEED),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((path.clone(), 0));
+        st.markdowns = vec![(PID_SEED, SMarkdown { path: seed, editing: false })];
+
+        let path2 = path.clone();
+        let (doc1_2, doc2_2) = (doc1.clone(), doc2.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws = v
+                        .ws_key_for_path_for_test(&path2)
+                        .expect("project must resolve to a Workspace");
+
+                    v.open_file(doc1_2.clone(), vctx);
+                    let (fp, paths, _) = v.files_pane_state_for_test(ws);
+                    assert_eq!(paths, [doc1_2.clone()], "opening the first file creates its tab");
+                    assert!(fp.is_some(), "opening a file creates the Files Pane");
+
+                    // Cmd+W over the (focused) Files Pane, exactly one open
+                    // tab — routes straight to `close_focused` (CloseFocused
+                    // only detours through FileTabClose when the Files Pane
+                    // has MORE than one tab).
+                    v.handle_action_impl(&CraneShellAction::CloseFocused, vctx);
+
+                    let (fp_after, paths_after, active_after) = v.files_pane_state_for_test(ws);
+                    assert!(
+                        fp_after.is_none(),
+                        "files_pane must be forgotten once its only File Tab closes"
+                    );
+                    assert!(
+                        paths_after.is_empty(),
+                        "file_pane_paths must be released too, not just files_pane — an \
+                         orphaned entry here is a permanent editor_views leak"
+                    );
+                    assert_eq!(active_after, 0, "file_pane_active resets with the rest");
+
+                    // Reopening ANY file afterward must start a clean tab
+                    // list — not resurrect the tab that was just closed.
+                    v.open_file(doc2_2.clone(), vctx);
+                    let (_, paths_reopened, _) = v.files_pane_state_for_test(ws);
+                    assert_eq!(
+                        paths_reopened,
+                        [doc2_2.clone()],
+                        "reopening a file after the Files Pane was closed must show ONLY \
+                         the newly opened file, not resurrect the previously closed tab"
                     );
                 });
             });
