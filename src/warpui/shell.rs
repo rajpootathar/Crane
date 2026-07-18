@@ -11249,11 +11249,20 @@ impl CraneShellView {
     /// Any site asking "is this pane the Files Pane?" must resolve against the
     /// pane's own Workspace via this lookup, never against `ws_key()`.
     fn ws_of_pane(&self, id: PaneId) -> Option<(usize, usize)> {
-        self.layouts.iter().find_map(|((pi, wi, _), node)| {
-            let mut leaves = Vec::new();
-            node.leaves(&mut leaves);
-            leaves.contains(&id).then_some((*pi, *wi))
-        })
+        self.layouts
+            .iter()
+            .find_map(|((pi, wi, _), node)| node.contains_leaf(id).then_some((*pi, *wi)))
+    }
+
+    /// The full `(project_idx, worktree_idx, tab_id)` Tab key that owns pane
+    /// `id` — the tid-preserving counterpart of `ws_of_pane`. Needed when a
+    /// pane must be spliced out of its OWN Tab's Layout tree rather than
+    /// `self.active_tab`'s, e.g. tearing down a Files Pane leaf that belongs
+    /// to a Workspace/Tab that isn't the one currently on screen.
+    fn tab_of_pane(&self, id: PaneId) -> Option<(usize, usize, usize)> {
+        self.layouts
+            .iter()
+            .find_map(|(key, node)| node.contains_leaf(id).then_some(*key))
     }
 
     /// True when `id` is the Files Pane of the Workspace that owns it. The
@@ -11280,6 +11289,115 @@ impl CraneShellView {
         self.files_pane.remove(&key);
         self.file_pane_paths.remove(&key);
         self.file_pane_active.remove(&key);
+    }
+
+    /// Remove leaf `pane` from `tab`'s Layout tree and drop its per-pane
+    /// bookkeeping (`panes` / `drag_states` / `pane_rects`). Only touches
+    /// `self.active_tab` / `self.focused` when `tab` is the Tab currently
+    /// active — closing a leaf that belongs to a Workspace/Tab that ISN'T
+    /// on screen right now (e.g. a background Workspace's Files Pane, swept
+    /// during a file delete) must never disturb what IS on screen.
+    fn remove_pane_leaf(
+        &mut self,
+        tab: (usize, usize, usize),
+        pane: PaneId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let is_active = self.active_tab == Some(tab);
+        if let Some(node) = self.layouts.remove(&tab) {
+            match node.close_leaf(pane) {
+                Some(remaining) => {
+                    if is_active {
+                        self.focused = Some(remaining.first_leaf());
+                    }
+                    self.layouts.insert(tab, remaining);
+                }
+                None => {
+                    self.title_debounce.borrow_mut().remove(&tab.2);
+                    if is_active {
+                        self.active_tab = None;
+                        self.focused = None;
+                    }
+                }
+            }
+        }
+        self.panes.remove(&pane);
+        self.drag_states.remove(&pane);
+        self.pane_rects.borrow_mut().remove(&pane);
+        ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
+    }
+
+    /// Close File Tab `idx` in Workspace `ws`, WITHOUT assuming `ws` is the
+    /// currently selected/active one — safe to call on a background
+    /// Workspace. Mirrors `FileTabCloseConfirmed`'s bookkeeping (active-index
+    /// fixup, tearing the pane down when the last tab goes) but never reads
+    /// `self.ws_key()` and never touches `editor_views` / `markdown_views` —
+    /// the caller (`purge_path_everywhere`) owns that decision, because the
+    /// two callers disagree on it: an interactive close only drops the
+    /// cached buffer once no OTHER Workspace still has the path open, while a
+    /// delete must drop it unconditionally.
+    fn close_file_tab_in_ws(&mut self, ws: (usize, usize), idx: usize, ctx: &mut ViewContext<Self>) {
+        let Some(fp) = self.files_pane.get(&ws).copied() else {
+            return;
+        };
+        if idx >= self.ws_file_paths(ws).len() {
+            return;
+        }
+        self.file_pane_paths.entry(ws).or_default().remove(idx);
+        if self.ws_file_paths(ws).is_empty() {
+            // Last tab in this Workspace — tear the Files Pane leaf down.
+            // `fp`'s owning Tab need not be `self.active_tab`: `ws` may be a
+            // Workspace that isn't currently on screen.
+            self.clear_ws_files(ws);
+            if let Some(tab) = self.tab_of_pane(fp) {
+                self.remove_pane_leaf(tab, fp, ctx);
+            }
+        } else {
+            let len = self.ws_file_paths(ws).len();
+            let active = self.ws_file_active(ws);
+            let active = if active >= len {
+                len - 1
+            } else if active > idx {
+                active - 1
+            } else {
+                active
+            };
+            self.file_pane_active.insert(ws, active);
+            let path = self.ws_file_paths(ws)[active].clone();
+            if let Some(pc) = self.file_tab_pane(&path) {
+                self.panes.insert(fp, pc);
+            }
+        }
+    }
+
+    /// Close every Workspace's File Tab for `path` (an exact match, or —
+    /// for a deleted directory — any path nested under it) and drop the
+    /// cached buffer unconditionally once the sweep is done.
+    ///
+    /// The interactive close path (`FileTabCloseConfirmed`) only drops
+    /// `editor_views` / `markdown_views` once NO Workspace still lists the
+    /// path as open — a refcount that lets tab-reuse share one buffer
+    /// across Workspaces. Deletion is a stronger, user-stated intent than
+    /// that refcount: the file is gone from disk, so no Workspace may go on
+    /// holding a buffer that could re-write it on its own Cmd+S, even one
+    /// that isn't the currently selected Workspace.
+    fn purge_path_everywhere(&mut self, path: &PathBuf, ctx: &mut ViewContext<Self>) {
+        let affected_ws: Vec<(usize, usize)> = self
+            .file_pane_paths
+            .iter()
+            .filter(|(_, paths)| paths.iter().any(|p| p.starts_with(path)))
+            .map(|(k, _)| *k)
+            .collect();
+        for ws in affected_ws {
+            while let Some(idx) = self.ws_file_paths(ws).iter().position(|p| p.starts_with(path)) {
+                self.close_file_tab_in_ws(ws, idx, ctx);
+            }
+        }
+        // Belt-and-suspenders: the sweep above should already have dropped
+        // every reference, but a trashed path must never leave a cached
+        // buffer alive regardless.
+        self.editor_views.retain(|p, _| !p.starts_with(path));
+        self.markdown_views.retain(|p, _| !p.starts_with(path));
     }
 
     /// Insert `content` beside the focused pane (even split). Returns the id.
@@ -14498,18 +14616,14 @@ impl CraneShellView {
                             self.selected_file = None;
                         }
                         // Close any File Tab holding the deleted file (or a file
-                        // under a deleted directory) — a surviving dirty buffer
-                        // could otherwise re-write the trashed path on Cmd+S.
-                        // FileTabCloseConfirmed handles active-index fixup and
-                        // tears the pane down when the last tab goes.
-                        while let Some(idx) = self
-                            .ws_file_paths(self.ws_key())
-                            .iter()
-                            .position(|p| p.starts_with(&path))
-                        {
-                            let a = CraneShellAction::FileTabCloseConfirmed(idx);
-                            self.handle_action(&a, ctx);
-                        }
+                        // under a deleted directory) in EVERY Workspace — not
+                        // just the active one. A surviving dirty buffer in a
+                        // Workspace that isn't currently selected could
+                        // otherwise re-write the trashed path on ITS OWN
+                        // Cmd+S; the deletion is the user's stated intent and
+                        // must win over the "still open elsewhere" refcount
+                        // that keeps `editor_views` alive for tab reuse.
+                        self.purge_path_everywhere(&path, ctx);
                     }
                     self.refresh_panel(ctx);
                 }
@@ -16605,6 +16719,166 @@ mod restore_wiring_integration_tests {
                         "Workspace A keeps its own File Tab after B opened one"
                     );
                     assert_eq!(active_a, 0, "A's active File Tab indexes into A's own list");
+                });
+            });
+        });
+    }
+
+    /// The delete-resurrection hazard: the same file open as a File Tab in
+    /// TWO Workspaces, deleted from one of them. Before the fix, deleting
+    /// only swept `ws_file_paths(self.ws_key())` — the CURRENTLY SELECTED
+    /// Workspace's own tab list — so the other Workspace's tab, and the
+    /// `editor_views` cache entry it keeps alive via the "still open
+    /// elsewhere" refcount, both survived. Reopening that tab later shows a
+    /// normal-looking editor over a trashed file, and Cmd+S writes it back
+    /// to disk. The fix (`purge_path_everywhere`) sweeps every Workspace's
+    /// tab list unconditionally, because deletion is a stronger intent than
+    /// the refcount that exists only to let unrelated Workspaces share one
+    /// cached buffer.
+    #[test]
+    fn deleting_a_file_closes_its_tab_in_every_workspace() {
+        use crate::warpui::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj_a = tempfile::tempdir().expect("project a tempdir");
+        let proj_b = tempfile::tempdir().expect("project b tempdir");
+        let path_a = proj_a.path().to_string_lossy().into_owned();
+        let path_b = proj_b.path().to_string_lossy().into_owned();
+
+        let seed_a = proj_a.path().join("seed-a.md");
+        let seed_b = proj_b.path().join("seed-b.md");
+        // The SAME logical document, opened as a File Tab in both Projects —
+        // mirrors a monorepo-style shared file, or simply the same absolute
+        // path bind-mounted / symlinked into both checkouts. What matters
+        // for this test is only that both Workspaces' `file_pane_paths`
+        // list the identical `PathBuf`.
+        let shared_doc = proj_a.path().join("shared.md");
+        for p in [&seed_a, &seed_b, &shared_doc] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID_A: PaneId = 30;
+        const PID_B: PaneId = 31;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 32;
+        st.added_projects = vec![
+            AddedProject { name: "proj-a".to_string(), path: path_a.clone() },
+            AddedProject { name: "proj-b".to_string(), path: path_b.clone() },
+        ];
+        st.worktree_tabs_by_path = vec![
+            (
+                path_a.clone(),
+                vec![STab {
+                    id: 0,
+                    name: "A".to_string(),
+                    layout: SNode::Leaf(PID_A),
+                    focus: Some(PID_A),
+                    renamed: false,
+                }],
+            ),
+            (
+                path_b.clone(),
+                vec![STab {
+                    id: 1,
+                    name: "B".to_string(),
+                    layout: SNode::Leaf(PID_B),
+                    focus: Some(PID_B),
+                    renamed: false,
+                }],
+            ),
+        ];
+        st.active_tab_path = Some((path_a.clone(), 0));
+        st.markdowns = vec![
+            (PID_A, SMarkdown { path: seed_a, editing: false }),
+            (PID_B, SMarkdown { path: seed_b, editing: false }),
+        ];
+
+        let (path_a2, path_b2) = (path_a.clone(), path_b.clone());
+        let shared_doc2 = shared_doc.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws_a = v
+                        .ws_key_for_path_for_test(&path_a2)
+                        .expect("project A must resolve to a Workspace");
+                    let ws_b = v
+                        .ws_key_for_path_for_test(&path_b2)
+                        .expect("project B must resolve to a Workspace");
+                    assert_ne!(ws_a, ws_b);
+
+                    // Open the SAME path as a File Tab in both Workspaces.
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws_a.0, ws_a.1, 0),
+                            path: std::path::PathBuf::from(&path_a2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(shared_doc2.clone(), vctx);
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws_b.0, ws_b.1, 1),
+                            path: std::path::PathBuf::from(&path_b2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(shared_doc2.clone(), vctx);
+
+                    // Sanity: both Workspaces show it open, and the shared
+                    // path is cached exactly once in `editor_views` (or
+                    // `markdown_views`, since this is a `.md` doc).
+                    let (fp_a, paths_a, _) = v.files_pane_state_for_test(ws_a);
+                    assert!(fp_a.is_some(), "Workspace A must own a Files Pane");
+                    assert_eq!(paths_a, [shared_doc2.clone()]);
+                    let (fp_b, paths_b, _) = v.files_pane_state_for_test(ws_b);
+                    assert!(fp_b.is_some(), "Workspace B must own a Files Pane");
+                    assert_eq!(paths_b, [shared_doc2.clone()]);
+
+                    // Delete it while Workspace B is the SELECTED one — the
+                    // hazard the finding describes deletes from whichever
+                    // Workspace is active; B was the last one selected above.
+                    v.handle_action_impl(
+                        &CraneShellAction::RequestDelete(shared_doc2.clone()),
+                        vctx,
+                    );
+                    v.handle_action_impl(&CraneShellAction::ConfirmDelete, vctx);
+
+                    // Gone from BOTH Workspaces' tab lists...
+                    let (fp_a_after, paths_a_after, _) = v.files_pane_state_for_test(ws_a);
+                    assert!(
+                        paths_a_after.is_empty(),
+                        "Workspace A's File Tab for the deleted path must be closed too, \
+                         even though A isn't the Workspace the delete was issued from"
+                    );
+                    assert!(
+                        fp_a_after.is_none(),
+                        "Workspace A's Files Pane must be torn down once its only tab closes"
+                    );
+                    let (fp_b_after, paths_b_after, _) = v.files_pane_state_for_test(ws_b);
+                    assert!(paths_b_after.is_empty(), "Workspace B's File Tab must be closed");
+                    assert!(fp_b_after.is_none(), "Workspace B's Files Pane must be torn down");
+
+                    // ...AND the cached buffer must not survive either — this
+                    // is the part that actually prevents Cmd+S from
+                    // resurrecting the trashed file: no `editor_views` /
+                    // `markdown_views` entry may still point at this path.
+                    assert!(
+                        !v.editor_views.contains_key(&shared_doc2),
+                        "editor_views must not hold a cached buffer for a deleted path"
+                    );
+                    assert!(
+                        !v.markdown_views.contains_key(&shared_doc2),
+                        "markdown_views must not hold a cached buffer for a deleted path"
+                    );
                 });
             });
         });
