@@ -36,6 +36,74 @@
 
 ---
 
+### Task 0: Make restore integration-testable (do this FIRST)
+
+The whole restore path is currently unreachable from tests. A reviewer proved it: commenting out the files-pane bookkeeping call inside `CraneShellView::new` leaves the full suite green. Every restore fix so far is pinned only at the pure-helper level, with the wiring verified by reading. Task 1 rewrites ~78 sites in that same constructor — it must not land on unverifiable ground.
+
+The harness already exists. `markdown_view.rs`'s layout tests use `App::test(…)` → `app.add_window(WindowStyle::NotStealFocus, |ctx| …)` to obtain a real `ViewContext` and run a full layout+paint pass. `mod.rs:164` shows production hands `CraneShellView::new` to `add_window` the same way. The only blocker is that `new` reads global state internally.
+
+**Files:**
+- Modify: `src/warpui/shell.rs` (`new` at `:1206`, which calls `persist::load()` at `:1224`)
+- Test: `src/warpui/shell.rs` test module
+
+- [ ] **Step 1: Add the seam**
+
+```rust
+/// Build the shell from an explicit persisted state. Split out of `new` so
+/// restore can be exercised from tests without touching `~/.crane`.
+pub fn new_with_state(ctx: &mut ViewContext<Self>, saved_state: Option<WarpuiState>) -> Self
+
+pub fn new(ctx: &mut ViewContext<Self>) -> Self {
+    Self::new_with_state(ctx, crate::warpui::persist::load())
+}
+```
+
+Move the body to `new_with_state` and replace the internal `persist::load()` call with the parameter. No behavior change — `new` must remain byte-equivalent in effect.
+
+- [ ] **Step 2: Write the integration test that was previously impossible**
+
+Model it on `markdown_view.rs`'s `App::test` tests. Construct a `WarpuiState` matching the real saved shape and assert on the resulting `panes` map:
+
+```rust
+#[test]
+fn a_saved_markdown_files_pane_restores_as_markdown_end_to_end() {
+    // The shape the app actually writes when you open a .md file: the pane is
+    // BOTH the files pane and a markdown pane.
+    let mut st = WarpuiState::default();
+    // … set files_pane, file_pane_paths, markdowns to the same pid/path …
+
+    App::test((), move |mut app| async move {
+        let (_wid, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+            CraneShellView::new_with_state(ctx, Some(st))
+        });
+        // assert the restored pane for that pid is PaneContent::Markdown
+    });
+}
+```
+
+Determine the exact assertion surface by reading how the markdown layout tests reach into the view. If `panes` is private, add a `#[cfg(test)]` accessor rather than loosening real visibility.
+
+- [ ] **Step 3: Prove it catches what unit tests could not**
+
+Comment out the `files_pane_bookkeeping` call site in `new_with_state` and confirm **this test goes RED**. That exact deletion currently leaves 134/134 green — that is the gap this task closes. Report the result.
+
+- [ ] **Step 4: Run the suite and commit**
+
+Run: `make test` — all 134 plus yours.
+
+```bash
+git add src/warpui/shell.rs
+git commit -m "test(warpui): make session restore reachable from tests
+
+The restore path ran only inside CraneShellView::new, which loads global
+state internally, so nothing could exercise it — deleting the files-pane
+bookkeeping left the whole suite green. Splitting out new_with_state lets
+a test drive restore from an explicit state through the same App::test
+harness the layout tests already use."
+```
+
+---
+
 ### Task 1: Scope the runtime state per Workspace
 
 **Files:**
