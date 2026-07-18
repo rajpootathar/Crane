@@ -101,6 +101,17 @@ pub struct SBrowser {
     pub active: usize,
 }
 
+/// Persisted Markdown Pane: the file it renders and whether it was left in
+/// edit mode. Restored as a Markdown (or Editor) pane rather than a terminal.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SMarkdown {
+    #[serde(default)]
+    pub path: PathBuf,
+    /// True = the pane was showing the editor, false = the rendered preview.
+    #[serde(default)]
+    pub editing: bool,
+}
+
 /// A project added via the warpui "Add Project" flow (not sourced from session.json).
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct AddedProject {
@@ -165,6 +176,10 @@ pub struct WarpuiState {
     /// restore loop rebuilds a Browser (not a terminal) at that leaf.
     #[serde(default)]
     pub browsers: Vec<(PaneId, SBrowser)>,
+    /// Per Markdown pane: the file + mode, keyed by pane id, so the restore
+    /// loop rebuilds a Markdown pane (not a terminal) at that leaf.
+    #[serde(default)]
+    pub markdowns: Vec<(PaneId, SMarkdown)>,
     /// Projects the user added via "Add Project" (not from session.json).
     #[serde(default)]
     pub added_projects: Vec<AddedProject>,
@@ -387,5 +402,29 @@ mod tests {
         assert!(st.worktree_tabs_by_path.is_empty());
         assert!(st.active_tab_path.is_none());
         assert!(st.expanded_project_paths.is_empty());
+    }
+
+    /// A Markdown pane's saved file + mode must survive a serialize →
+    /// deserialize round trip, keyed by pane id, the same as `browsers`.
+    #[test]
+    fn markdown_panes_survive_a_state_round_trip() {
+        let mut st = WarpuiState::default();
+        st.markdowns = vec![(
+            7,
+            SMarkdown { path: std::path::PathBuf::from("/tmp/doc.md"), editing: false },
+        )];
+        let json = serde_json::to_string(&st).expect("serialize");
+        let back: WarpuiState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.markdowns.len(), 1, "markdown panes must survive a round trip");
+        assert_eq!(back.markdowns[0].1.path, std::path::PathBuf::from("/tmp/doc.md"));
+    }
+
+    /// Backward compatibility: an existing ~/.crane/warpui-state.json predates
+    /// this field and must still deserialize rather than wiping the session.
+    #[test]
+    fn state_without_markdowns_still_loads() {
+        let legacy = r#"{}"#;
+        let st: WarpuiState = serde_json::from_str(legacy).expect("legacy state must load");
+        assert!(st.markdowns.is_empty());
     }
 }

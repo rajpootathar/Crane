@@ -1905,6 +1905,22 @@ impl CraneShellView {
                 _ => None,
             })
             .collect();
+        let markdowns: Vec<(PaneId, crate::warpui::persist::SMarkdown)> = self
+            .panes
+            .iter()
+            .filter_map(|(id, pc)| match pc {
+                PaneContent::Markdown(h) => h.as_ref(app).path().map(|p| {
+                    (
+                        *id,
+                        crate::warpui::persist::SMarkdown {
+                            path: p.to_path_buf(),
+                            editing: false,
+                        },
+                    )
+                }),
+                _ => None,
+            })
+            .collect();
         let worktree_tabs: Vec<((usize, usize), Vec<STab>)> = self
             .worktree_tabs
             .iter()
@@ -1974,6 +1990,7 @@ impl CraneShellView {
             active_tab: self.active_tab,
             expanded_projects: self.expanded_projects.iter().copied().collect(),
             browsers,
+            markdowns,
             expanded_worktrees: self.expanded_worktrees.iter().copied().collect(),
             worktree_tabs,
             worktree_tabs_by_path,

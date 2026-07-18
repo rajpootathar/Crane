@@ -606,6 +606,9 @@ pub struct WarpMarkdownView {
     blocks: Vec<Block>,
     /// First visible block index (manual scroll window, like `FileView`).
     scroll: usize,
+    /// Source file, when this view was opened from one. `None` for
+    /// `from_source` (in-memory) documents, which cannot be persisted.
+    path: Option<PathBuf>,
 }
 
 impl WarpMarkdownView {
@@ -630,6 +633,7 @@ impl WarpMarkdownView {
             title,
             blocks,
             scroll: 0,
+            path: Some(path),
         }
     }
 
@@ -644,11 +648,17 @@ impl WarpMarkdownView {
             title,
             blocks: parse(&text),
             scroll: 0,
+            path: None,
         }
     }
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Source file this view renders, if any. `None` for in-memory documents.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
     }
 
     /// Load the proportional UI font (headings/prose) + the mono font (code).
