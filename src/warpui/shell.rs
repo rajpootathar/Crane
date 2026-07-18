@@ -15772,8 +15772,8 @@ mod diff_chip_tests {
 #[cfg(test)]
 mod restore_pane_kind_tests {
     use super::{
-        editor_paths_for_restore, is_markdown_path, markdown_path_set, restored_pane_kind,
-        PaneId, RestoredPaneKind,
+        editor_paths_for_restore, files_pane_bookkeeping, is_markdown_path, markdown_path_set,
+        restored_pane_kind, PaneId, RestoredPaneKind,
     };
     use std::path::{Path, PathBuf};
 
@@ -15857,33 +15857,50 @@ mod restore_pane_kind_tests {
     }
 
     /// The "worse reachable variant": `doc.md` opened in Tab A (its own
-    /// standalone Markdown pane, P1) is ALSO sitting as a background File Tab
-    /// in the shared Files pane (P2, whose active tab is a different file).
-    /// Both panes reference the same path — the decision for each must agree
-    /// it is Markdown; the path can never resolve to Editor for one pane and
+    /// standalone Markdown pane, P1) is ALSO the shared Files pane's (P2)
+    /// CURRENT ACTIVE tab — not merely a background tab in its list. Both
+    /// panes reference the same path — the decision for each must agree it
+    /// is Markdown; the path can never resolve to Editor for one pane and
     /// Markdown for the other, which is how it used to end up in BOTH
     /// `editor_views` and `markdown_views` at once.
+    ///
+    /// This construction is deliberate: an earlier version of this test put
+    /// `doc.md` in P2's saved tab list at a NON-active index, with P2's
+    /// active tab pointing at a different (non-markdown) file. That passed
+    /// against the pre-fix ladder too — the pre-fix bug lived entirely in
+    /// the `Some(pid) == saved_files_pane` branch, which never consulted
+    /// `md_paths` and always returned `Editor` for the Files pane's ACTIVE
+    /// path; a non-markdown active path was correctly `Editor` either way,
+    /// so the old test's only path-vs-ladder-order assertion never
+    /// exercised the buggy branch. Making `doc.md` the Files pane's actual
+    /// active tab forces P2 through that exact branch: pre-fix it returns
+    /// `Editor { doc }` (disagreeing with P1's `Markdown`); post-fix it
+    /// consults `md_paths` and agrees.
     #[test]
     fn a_path_shared_by_two_saved_panes_never_disagrees_on_markdown_vs_editor() {
         let doc = PathBuf::from("/tmp/doc.md");
         let other = PathBuf::from("/tmp/other.rs");
         let p1: PaneId = 1;
         let p2: PaneId = 2;
-        let saved_paths = vec![doc.clone(), other.clone()];
+        // doc.md is the Files pane's (p2) ACTIVE saved tab — index 1 of 2.
+        let saved_paths = vec![other, doc.clone()];
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
-        // P1: standalone Markdown pane recorded in `markdowns`.
+        // P1: standalone Markdown pane recorded in `markdowns`, referencing
+        // the very same doc.md. Unaffected by the files-pane branch since
+        // p1 != p2 == saved_files_pane.
         let k1 =
             restored_pane_kind(p1, Some(p2), &saved_paths, 1, &md_paths, Some(&doc), false, false);
         assert_eq!(k1, RestoredPaneKind::Markdown { path: doc.clone(), is_files_pane: false });
 
-        // P2: the shared Files pane, active tab = other.rs (index 1).
+        // P2: the shared Files pane, active tab (index 1) = doc.md itself.
         let k2 = restored_pane_kind(p2, Some(p2), &saved_paths, 1, &md_paths, None, false, false);
-        assert_eq!(k2, RestoredPaneKind::Editor { path: other });
-
-        // `doc.md` sits in P2's own saved_paths too (a background tab there)
-        // but must never independently resolve to Editor because of that.
-        assert!(md_paths.contains(&doc));
+        assert_eq!(
+            k2,
+            RestoredPaneKind::Markdown { path: doc, is_files_pane: true },
+            "the Files pane's own active tab is doc.md — it must agree with P1 and resolve to \
+             Markdown, not Editor"
+        );
     }
 
     /// Direct pin for "a path cannot occupy both view maps after restore":
@@ -15916,5 +15933,87 @@ mod restore_pane_kind_tests {
         assert!(is_markdown_path(Path::new("/a/b/readme.markdown")));
         assert!(!is_markdown_path(Path::new("/a/b/main.rs")));
         assert!(!is_markdown_path(Path::new("/a/b/no_extension")));
+    }
+
+    /// (a) A Markdown leaf that IS the saved Files pane must yield `Some`
+    /// with this leaf's own pid and the full saved tab list — this is the
+    /// exact case the duplicate-pane bug lived in: `files_pane` coming back
+    /// `None` for a restored Markdown-that-is-also-the-Files-pane leaf, so
+    /// the next `open_file` split a duplicate Files pane instead of reusing
+    /// this one.
+    #[test]
+    fn markdown_leaf_that_is_the_files_pane_yields_bookkeeping() {
+        let doc = PathBuf::from("/tmp/doc.md");
+        let pid: PaneId = 7;
+        let saved_paths = vec![doc.clone()];
+        let kind = RestoredPaneKind::Markdown { path: doc, is_files_pane: true };
+
+        let result = files_pane_bookkeeping(&kind, pid, &saved_paths, 0);
+
+        assert_eq!(result, Some((pid, saved_paths, 0)));
+    }
+
+    /// (b) A Markdown leaf that is NOT the saved Files pane (a standalone
+    /// Markdown pane elsewhere) must yield `None` — it must not steal the
+    /// Files-pane bookkeeping away from whichever leaf actually owns it.
+    #[test]
+    fn markdown_leaf_that_is_not_the_files_pane_yields_none() {
+        let doc = PathBuf::from("/tmp/notes.md");
+        let pid: PaneId = 3;
+        let saved_paths: Vec<PathBuf> = Vec::new();
+        let kind = RestoredPaneKind::Markdown { path: doc, is_files_pane: false };
+
+        assert_eq!(files_pane_bookkeeping(&kind, pid, &saved_paths, 0), None);
+    }
+
+    /// (c) An Editor leaf — the ordinary (non-markdown) Files-pane restore —
+    /// must also yield `Some`. `restored_pane_kind` only ever returns
+    /// `Editor` when this pid IS the saved Files pane, so this arm must
+    /// unconditionally populate the bookkeeping too.
+    #[test]
+    fn editor_leaf_yields_bookkeeping() {
+        let code = PathBuf::from("/tmp/main.rs");
+        let pid: PaneId = 9;
+        let saved_paths = vec![code.clone()];
+        let kind = RestoredPaneKind::Editor { path: code };
+
+        let result = files_pane_bookkeeping(&kind, pid, &saved_paths, 0);
+
+        assert_eq!(result, Some((pid, saved_paths, 0)));
+    }
+
+    /// (d) `saved_active` past the end of `saved_paths` (a stale index left
+    /// over from a state file written before a tab was closed) must clamp
+    /// to the last valid index, never panic and never silently wrap.
+    #[test]
+    fn out_of_range_saved_active_clamps_to_the_last_saved_path() {
+        let a = PathBuf::from("/tmp/a.rs");
+        let b = PathBuf::from("/tmp/b.rs");
+        let pid: PaneId = 4;
+        let saved_paths = vec![a, b];
+        let kind = RestoredPaneKind::Editor { path: saved_paths[1].clone() };
+
+        // saved_active (5) is well past saved_paths.len() (2).
+        let result = files_pane_bookkeeping(&kind, pid, &saved_paths, 5);
+
+        assert_eq!(
+            result,
+            Some((pid, saved_paths.clone(), saved_paths.len() - 1)),
+            "an out-of-range saved_active must clamp to the last surviving path"
+        );
+    }
+
+    /// Rounding out the match: a Browser, Terminal, or FreshTerminal leaf is
+    /// never the Files pane — all three must yield `None`.
+    #[test]
+    fn browser_terminal_and_fresh_terminal_leaves_never_get_bookkeeping() {
+        let saved_paths = vec![PathBuf::from("/tmp/a.rs")];
+        let pid: PaneId = 1;
+        assert_eq!(files_pane_bookkeeping(&RestoredPaneKind::Browser, pid, &saved_paths, 0), None);
+        assert_eq!(files_pane_bookkeeping(&RestoredPaneKind::Terminal, pid, &saved_paths, 0), None);
+        assert_eq!(
+            files_pane_bookkeeping(&RestoredPaneKind::FreshTerminal, pid, &saved_paths, 0),
+            None
+        );
     }
 }
