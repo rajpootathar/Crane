@@ -94,6 +94,14 @@ fn parse(src: &str) -> Vec<Block> {
     let mut table_rows: Vec<Vec<Cell>> = Vec::new();
     let mut table_row: Vec<Cell> = Vec::new();
     let mut in_table_head = false;
+    // Holds prose accumulated for an enclosing bullet/quote while a nested
+    // table is being parsed. `runs` itself cannot hold it across the table:
+    // `Start(Tag::TableCell)` unconditionally clears `runs` for each cell, so
+    // merely skipping the clear at table start is not enough — the first
+    // cell would still wipe it out. Stashed here at `Start(Tag::Table)` and
+    // restored into `runs` at `End(TagEnd::Table)`, once cell processing is
+    // done.
+    let mut pending_container_runs: Vec<Run> = Vec::new();
 
     let emph_now = |bold: bool, italic: bool| {
         if bold {
@@ -145,7 +153,13 @@ fn parse(src: &str) -> Vec<Block> {
                 runs.clear();
             }
             Event::End(TagEnd::Item) => {
-                blocks.push(Block::Bullet(std::mem::take(&mut runs)));
+                // A nested table's own End(TagEnd::Table) clears `runs`, so a
+                // list item whose only content was a table must not push an
+                // empty Block::Bullet here.
+                let runs = std::mem::take(&mut runs);
+                if !runs.iter().all(|r| r.text.trim().is_empty()) {
+                    blocks.push(Block::Bullet(runs));
+                }
                 in_bullet = false;
             }
             Event::Start(Tag::BlockQuote(_)) => {
@@ -153,7 +167,13 @@ fn parse(src: &str) -> Vec<Block> {
                 runs.clear();
             }
             Event::End(TagEnd::BlockQuote) => {
-                blocks.push(Block::Quote(std::mem::take(&mut runs)));
+                // Same guard as Item above: a nested table's End(TagEnd::Table)
+                // clears `runs`, so a blockquote whose only content was a
+                // table must not push an empty Block::Quote here.
+                let runs = std::mem::take(&mut runs);
+                if !runs.iter().all(|r| r.text.trim().is_empty()) {
+                    blocks.push(Block::Quote(runs));
+                }
                 in_quote = false;
             }
             Event::End(TagEnd::Paragraph) => {
@@ -198,7 +218,16 @@ fn parse(src: &str) -> Vec<Block> {
                 table_headers.clear();
                 table_rows.clear();
                 table_row.clear();
-                runs.clear();
+                // `runs` may still hold prose pending for an enclosing bullet
+                // or quote (which only flush at their own end tag). Stash it
+                // instead of clearing it outright — cell processing below
+                // needs `runs` to start empty, but the pending prose must
+                // survive to be restored once the table is done.
+                if in_bullet || in_quote {
+                    pending_container_runs = std::mem::take(&mut runs);
+                } else {
+                    runs.clear();
+                }
             }
             Event::Start(Tag::TableHead) => {
                 in_table_head = true;
@@ -228,7 +257,12 @@ fn parse(src: &str) -> Vec<Block> {
                     rows: std::mem::take(&mut table_rows),
                 });
                 table_row.clear();
-                runs.clear();
+                // Restore whatever prose was stashed at table start (empty if
+                // none was pending — equivalent to the old unconditional
+                // clear for a top-level table). `runs` is already empty here
+                // (the last cell's End(TagEnd::TableCell) took it), so this
+                // never drops in-progress cell content.
+                runs = std::mem::take(&mut pending_container_runs);
             }
             // A paragraph START must reset the inline accumulator. Without this, any
             // unflushed runs (from an unhandled construct) silently merge into this
@@ -662,5 +696,107 @@ mod tests {
         assert_eq!(table.0.len(), 2, "two header cells");
         assert_eq!(table.1.len(), 1, "one body row");
         assert_eq!(table.1[0].len(), 2, "two cells in the body row");
+    }
+
+    fn quote_texts(blocks: &[Block]) -> Vec<String> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Quote(runs) => {
+                    Some(runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn bullet_texts(blocks: &[Block]) -> Vec<String> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Bullet(runs) => {
+                    Some(runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn table_inside_blockquote_preceded_by_prose_retains_prose() {
+        // Finding 1, quote case: an unguarded runs.clear() on Tag::Table start
+        // must not clobber prose still pending for the enclosing blockquote.
+        let src = "> Intro text.\n>\n> | A | B |\n> |---|---|\n> | 1 | 2 |\n";
+        let blocks = parse(src);
+
+        let tables = blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Table { .. }))
+            .count();
+        assert_eq!(tables, 1, "a table must produce exactly one Block::Table");
+
+        assert_eq!(
+            quote_texts(&blocks),
+            vec!["Intro text."],
+            "prose preceding a nested table must survive in the enclosing Block::Quote"
+        );
+    }
+
+    #[test]
+    fn table_inside_bullet_preceded_by_prose_retains_prose() {
+        // Finding 1, bullet case: same defect for a table nested in a list item.
+        let src = "- Intro text.\n\n  | A | B |\n  |---|---|\n  | 1 | 2 |\n";
+        let blocks = parse(src);
+
+        let tables = blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Table { .. }))
+            .count();
+        assert_eq!(tables, 1, "a table must produce exactly one Block::Table");
+
+        assert_eq!(
+            bullet_texts(&blocks),
+            vec!["Intro text."],
+            "prose preceding a nested table must survive in the enclosing Block::Bullet"
+        );
+    }
+
+    #[test]
+    fn bullet_containing_only_a_table_produces_no_empty_bullet_block() {
+        // Finding 2, bullet case: End(TagEnd::Table) clears `runs`, so the
+        // subsequent End(TagEnd::Item) must not unconditionally push an empty
+        // Block::Bullet.
+        let src = "- | A | B |\n  |---|---|\n  | 1 | 2 |\n";
+        let blocks = parse(src);
+
+        let tables = blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Table { .. }))
+            .count();
+        assert_eq!(tables, 1, "a table must produce exactly one Block::Table");
+
+        assert!(
+            bullet_texts(&blocks).is_empty(),
+            "a list item containing only a table must not produce an empty Block::Bullet"
+        );
+    }
+
+    #[test]
+    fn blockquote_containing_only_a_table_produces_no_empty_quote_block() {
+        // Finding 2, quote case: same defect for a table that is the sole
+        // content of a blockquote.
+        let src = "> | A | B |\n> |---|---|\n> | 1 | 2 |\n";
+        let blocks = parse(src);
+
+        let tables = blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Table { .. }))
+            .count();
+        assert_eq!(tables, 1, "a table must produce exactly one Block::Table");
+
+        assert!(
+            quote_texts(&blocks).is_empty(),
+            "a blockquote containing only a table must not produce an empty Block::Quote"
+        );
     }
 }
