@@ -823,41 +823,57 @@ Expected: PASS, all tests in the module.
 Extend the `fragments` helper from Task 2. A run carrying `link` becomes a native
 hyperlink fragment — do **not** build a bespoke clickable label:
 
+`FormattedTextFragment` ships purpose-built constructors for every style we need — verified
+in `vendor/warp/crates/markdown_parser/src/lib.rs`. Use these directly; do **not** hand-roll
+`with_weight` / `CustomWeight`:
+
+| Constructor | Line |
+|---|---|
+| `FormattedTextFragment::plain_text(text)` | `:555` |
+| `FormattedTextFragment::bold(text)` | `:577` |
+| `FormattedTextFragment::italic(text)` | `:587` |
+| `FormattedTextFragment::bold_italic(text)` | `:597` |
+| `FormattedTextFragment::hyperlink(tag, url)` | `:608` |
+| `FormattedTextFragment::inline_code(text)` | `:629` |
+| `FormattedTextFragment::strikethrough(text)` | `:639` |
+
+Strikethrough is a genuine fragment style (`styles.strikethrough`), honored by warp's
+renderer at `:477` — it does **not** need to be faked by dimming the color.
+
 ```rust
 fn fragments(&self, runs: &[Run]) -> Vec<FormattedTextFragment> {
     runs.iter()
         .map(|r| {
+            // A link wins over emphasis: hyperlink fragments are colored by
+            // hyperlink_font_color and click-handled by the element itself.
             if let Some(url) = &r.link {
-                // Native hyperlink: colored by hyperlink_font_color and
-                // click-handled by the element itself.
                 return FormattedTextFragment::hyperlink(r.text.clone(), url.clone());
             }
             match r.emph {
                 Emph::Code => FormattedTextFragment::inline_code(r.text.clone()),
-                Emph::Bold => {
-                    let mut f = FormattedTextFragment::plain_text(r.text.clone());
-                    f.with_weight(Some(CustomWeight::Bold));
-                    f
-                }
-                // Strikethrough has no dedicated fragment style; dim it so
-                // struck text is visually de-emphasized against live prose.
-                Emph::Strike | Emph::Italic | Emph::Normal => {
-                    FormattedTextFragment::plain_text(r.text.clone())
-                }
+                Emph::Bold => FormattedTextFragment::bold(r.text.clone()),
+                Emph::Italic => FormattedTextFragment::italic(r.text.clone()),
+                Emph::Strike => FormattedTextFragment::strikethrough(r.text.clone()),
+                Emph::Normal => FormattedTextFragment::plain_text(r.text.clone()),
             }
         })
         .collect()
 }
 ```
 
-`with_weight` takes `Option<CustomWeight>` and returns `&Self` (it mutates in place,
-`markdown_parser/src/lib.rs:572`) — bind the fragment to a local `mut` first as shown
-rather than chaining. Confirm the `CustomWeight` variant name before use:
+This also retires the temporary bold/italic regression that Task 2 introduced, and removes
+the stale doc comments describing it.
 
-Run: `grep -nE 'enum CustomWeight' -A 8 vendor/warp/crates/markdown_parser/src/lib.rs`
+**Open question the implementer must answer, not assume.** The `Emph` doc comment claims the
+bundled proportional font has no bold face, which is why the pre-warpui code brightened the
+color instead. warp's renderer selects a font variant for bold/italic at `:483-491`. Determine
+whether `FormattedTextFragment::bold` actually renders differently with Crane's bundled font,
+or silently falls back to regular. If it falls back, say so in the report and propose the
+remedy (brighten as before, or load a bold face) rather than shipping bold that looks identical
+to normal.
 
-If `CustomWeight` has no `Bold` variant, fall back to `plain_text` for `Emph::Bold` and
-note it in the task report — do not invent a variant.
+**Model limitation, out of scope:** `Emph` is a flat enum, so `***bold italic***` collapses to
+one or the other and cannot reach `bold_italic`. Pre-existing; note it, do not fix it here.
 
 - [ ] **Step 7: Verify in the running app and commit**
 
