@@ -1204,6 +1204,20 @@ fn files_pane_bookkeeping(
 
 impl CraneShellView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
+        Self::new_with_state(ctx, crate::warpui::persist::load())
+    }
+
+    /// Build the shell from an explicit persisted state. `new` above reads
+    /// the real on-disk state via `persist::load()` and delegates here; this
+    /// function is the ENTIRE body `new` used to own, unchanged in effect.
+    /// Splitting it out means session restore can be driven from a test
+    /// through an explicit `WarpuiState` — via the same `App::test` /
+    /// `add_window` harness `markdown_view.rs`'s layout tests use — without
+    /// ever touching the real `~/.crane`.
+    pub fn new_with_state(
+        ctx: &mut ViewContext<Self>,
+        saved_state: Option<crate::warpui::persist::WarpuiState>,
+    ) -> Self {
         let ui_font = warpui::fonts::Cache::handle(ctx)
             .update(ctx, |cache, _| crate::warpui::bundled_fonts::ui(cache));
         let icon_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
@@ -1219,9 +1233,9 @@ impl CraneShellView {
         // Bundled JetBrains Mono (graceful Menlo fallback inside).
         let mono_font = warpui::fonts::Cache::handle(ctx)
             .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
-        // Load warpui persisted state early so we can apply the project overlay
-        // (added/removed/tints) when building the initial project list.
-        let saved_state = crate::warpui::persist::load();
+        // Project overlay (added/removed/tints) applied when building the
+        // initial project list, sourced from the `saved_state` parameter above
+        // (production hands in `persist::load()`'s result via `new`).
         let init_added: Vec<crate::warpui::persist::AddedProject> = saved_state
             .as_ref()
             .map(|s| s.added_projects.clone())
@@ -2094,6 +2108,31 @@ impl CraneShellView {
         let scan_paths = crate::warpui::projects::scan_paths(&view.projects);
         view.spawn_git_scan(ctx, "tree".to_string(), scan_paths);
         view
+    }
+
+    /// Test-only peek at what a restored leaf became: `Some("Markdown")` /
+    /// `Some("Editor")` / etc., or `None` if `pid` has no pane at all. A
+    /// `#[cfg(test)]` accessor rather than loosening `panes`'s real (private)
+    /// visibility — see `a_saved_markdown_files_pane_restores_as_markdown_end_to_end`.
+    #[cfg(test)]
+    pub(crate) fn pane_kind_for_test(&self, pid: PaneId) -> Option<&'static str> {
+        self.panes.get(&pid).map(|p| match p {
+            PaneContent::Terminal(_) => "Terminal",
+            PaneContent::File(_) => "File",
+            PaneContent::Editor(_) => "Editor",
+            PaneContent::Welcome(_) => "Welcome",
+            PaneContent::Markdown(_) => "Markdown",
+            PaneContent::Diff(_) => "Diff",
+            PaneContent::Browser(_) => "Browser",
+        })
+    }
+
+    /// Test-only peek at the restored Files-pane bookkeeping (`files_pane` /
+    /// `file_pane_paths` / `file_pane_active`) — the exact fields
+    /// `files_pane_bookkeeping`'s call site in `new_with_state` populates.
+    #[cfg(test)]
+    pub(crate) fn files_pane_state_for_test(&self) -> (Option<PaneId>, &[PathBuf], usize) {
+        (self.files_pane, &self.file_pane_paths, self.file_pane_active)
     }
 
     /// Quit guard for the OS terminate / close-window hooks (wired in
@@ -16015,5 +16054,144 @@ mod restore_pane_kind_tests {
             files_pane_bookkeeping(&RestoredPaneKind::FreshTerminal, pid, &saved_paths, 0),
             None
         );
+    }
+}
+
+// ── Restore wiring, end to end ───────────────────────────────────────────────
+//
+// Every test above pins `restored_pane_kind` / `files_pane_bookkeeping` in
+// isolation — pure functions, called directly with hand-built arguments. None
+// of them touch the ONE place that actually wires those functions' outputs
+// into a running shell: the restore loop inside `CraneShellView::new`, which
+// used to be reachable only by launching the real app (it called
+// `persist::load()` — real `~/.crane` state — internally). A reviewer proved
+// the consequence directly: commenting out the `files_pane_bookkeeping(...)`
+// call site in that loop left the entire 134-test suite green, because
+// nothing exercised the wiring at all.
+//
+// `new_with_state` (this file, above `new`) is the seam: `new` now just
+// delegates to it with `persist::load()`'s result, and a test can hand it an
+// explicit `WarpuiState` instead. This module is the first thing to actually
+// call it, using the same `App::test` → `add_window` harness
+// `markdown_view.rs`'s layout tests already use to get a real `ViewContext`.
+#[cfg(test)]
+mod restore_wiring_integration_tests {
+    use super::{CraneShellView, PaneId};
+    use crate::warpui::persist::{AddedProject, SMarkdown, SNode, STab, WarpuiState};
+
+    /// Overrides `HOME` for the scope of one test. `new_with_state` still
+    /// reaches several HOME-derived paths that have nothing to do with the
+    /// `saved_state` parameter itself — `projects::load_projects_shallow`
+    /// reads `~/.crane/session.json` to discover session-opened folders, and
+    /// `theme::ensure_builtin_tomls_on_disk` writes missing builtin theme
+    /// files under `~/.crane/themes/` — so without this override, constructing
+    /// a `CraneShellView` in a test would read (and write) the user's real,
+    /// live `~/.crane`. Pointing `HOME` at a throwaway temp dir makes every one
+    /// of those paths resolve harmlessly under it instead. Restores the
+    /// previous value on drop — including on an assertion panic, since unwind
+    /// still runs destructors — so a failing assertion here can never leave
+    /// `HOME` wrong for a test that runs afterward in the same process.
+    struct HomeOverride(Option<std::ffi::OsString>);
+
+    impl HomeOverride {
+        fn scoped(dir: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            // SAFETY: test-only; the previous value is restored in `Drop`
+            // below before this scope's caller can observe it.
+            unsafe { std::env::set_var("HOME", dir) };
+            HomeOverride(previous)
+        }
+    }
+
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            // SAFETY: same test-only justification as `scoped` above.
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    /// The exact shape the app writes when a `.md` file is open as the Files
+    /// pane's tab (`open_file` + `build_state`): one pane id is BOTH the saved
+    /// `files_pane` (with its path as `file_pane_paths[0]`) AND has a
+    /// `markdowns` entry for that same path. Feeds it straight through
+    /// `CraneShellView::new_with_state` — the real restore path, not a
+    /// hand-simulated stand-in — and asserts:
+    ///
+    /// 1. the restored pane at that pid is `PaneContent::Markdown`, not
+    ///    `Editor` (the bug `restored_pane_kind` was written to fix, now
+    ///    pinned through the actual wiring instead of only at the pure-helper
+    ///    level); and
+    /// 2. `files_pane` / `file_pane_paths` / `file_pane_active` landed on that
+    ///    same pane — the part `files_pane_bookkeeping`'s call site owns and
+    ///    that deleting it silently drops (see the RED/green check this test
+    ///    was built to satisfy, in the task-0 report).
+    #[test]
+    fn a_saved_markdown_files_pane_restores_as_markdown_end_to_end() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        // A real (but non-git) folder standing in for the Project this pane's
+        // Tab belongs to — `load_projects_shallow` needs `(pi, wi)` to resolve
+        // to a real worktree path for the saved leaf to be reachable at all.
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let project_path = project_dir.path().to_string_lossy().into_owned();
+        let doc = project_dir.path().join("notes.md");
+        std::fs::write(&doc, "# hello\n").expect("write temp md file");
+
+        const PID: PaneId = 42;
+
+        let mut st = WarpuiState::default();
+        st.added_projects =
+            vec![AddedProject { name: "proj".to_string(), path: project_path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            project_path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID),
+                focus: Some(PID),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((project_path, 0));
+        st.files_pane = Some(PID);
+        st.file_pane_paths = vec![doc.clone()];
+        st.file_pane_active = 0;
+        st.markdowns = vec![(PID, SMarkdown { path: doc, editing: false })];
+
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    assert_eq!(
+                        v.pane_kind_for_test(PID),
+                        Some("Markdown"),
+                        "a pane that is both the saved Files pane and has a `markdowns` entry \
+                         must restore as PaneContent::Markdown, not Editor"
+                    );
+                    let (files_pane, file_pane_paths, file_pane_active) =
+                        v.files_pane_state_for_test();
+                    assert_eq!(
+                        files_pane,
+                        Some(PID),
+                        "files_pane_bookkeeping's call site in new_with_state must still assign \
+                         `files_pane` for a Markdown leaf that is also the saved Files pane"
+                    );
+                    assert_eq!(file_pane_paths.len(), 1, "file_pane_paths must carry the saved tab");
+                    assert_eq!(file_pane_active, 0);
+                });
+            });
+        });
     }
 }
