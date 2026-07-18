@@ -278,16 +278,25 @@ pub struct CraneShellView {
     focused: Option<PaneId>,
     /// When set, only this pane renders (expand-to-full / maximize).
     maximized: Option<PaneId>,
-    /// The dedicated File pane (files open as TABS inside it), if open.
-    files_pane: Option<PaneId>,
-    /// Open file paths in the File pane (shell-side mirror, drives the header
-    /// tab strip + persistence).
-    file_pane_paths: Vec<PathBuf>,
-    /// Active file tab index in the File pane.
-    file_pane_active: usize,
+    /// The dedicated File pane (files open as TABS inside it), PER WORKSPACE.
+    /// Keyed `(project_idx, worktree_idx)`, matching `worktree_tabs`. This was
+    /// a single `Option<PaneId>` until it turned out one Project's Files Pane
+    /// was being reused for every other Project's files.
+    files_pane: HashMap<(usize, usize), PaneId>,
+    /// Open file paths in each Workspace's File pane (shell-side mirror, drives
+    /// the header tab strip + persistence). Per Workspace for the same reason
+    /// as `files_pane`: File Tabs opened in one Project must never appear in
+    /// another's Files Pane.
+    file_pane_paths: HashMap<(usize, usize), Vec<PathBuf>>,
+    /// Active file tab index within that Workspace's own `file_pane_paths`.
+    file_pane_active: HashMap<(usize, usize), usize>,
     /// Live warp editor per open file path — kept alive across tab switches so
     /// each tab preserves its own cursor / scroll / unsaved edits. The Editor
-    /// pane shows the one for `file_pane_paths[file_pane_active]`.
+    /// pane shows the one for the active File Tab of its Workspace.
+    ///
+    /// Deliberately NOT per Workspace: this is a handle CACHE keyed by path, and
+    /// two Workspaces that open the same file should share one live buffer.
+    /// Only File Tab *visibility* is Workspace-scoped.
     editor_views: HashMap<PathBuf, ViewHandle<crate::warpui::editor_view::WarpEditorView>>,
     /// Live markdown views per open `.md` path — kept alive across tab switches
     /// so each rendered doc preserves its own scroll offset (peer of
@@ -1399,9 +1408,15 @@ impl CraneShellView {
         let mut files_tab = false;
         let mut expanded_projects: HashSet<usize> = HashSet::from([0]);
         let mut expanded_worktrees: HashSet<(usize, usize)> = HashSet::from([(0, 0)]);
-        let mut restored_files_pane: Option<PaneId> = None;
-        let mut restored_file_paths: Vec<PathBuf> = Vec::new();
-        let mut restored_active: usize = 0;
+        // Per-Workspace Files-Pane bookkeeping, keyed like `worktree_tabs`. The
+        // persisted state is still FLAT (one `files_pane` / `file_pane_paths` /
+        // `file_pane_active`), so at most one Workspace — the one owning the
+        // saved pane id — gets an entry here. Path-keyed persistence that can
+        // restore several Workspaces' File Tabs is a separate change; this one
+        // is runtime state only.
+        let mut restored_files_pane: HashMap<(usize, usize), PaneId> = HashMap::new();
+        let mut restored_file_paths: HashMap<(usize, usize), Vec<PathBuf>> = HashMap::new();
+        let mut restored_active: HashMap<(usize, usize), usize> = HashMap::new();
         let mut restored_editor_views: HashMap<
             PathBuf,
             ViewHandle<crate::warpui::editor_view::WarpEditorView>,
@@ -1720,12 +1735,15 @@ impl CraneShellView {
                         // means no arm can independently forget to populate
                         // `files_pane` / `file_pane_paths` / `file_pane_active` —
                         // the bug this whole restructure exists to fix.
+                        // Filed under the Workspace that owns this leaf's Tab
+                        // (`(*pi, *wi)`) rather than globally — that is exactly
+                        // the scoping this pass exists to establish.
                         if let Some((fp, paths, active)) =
                             files_pane_bookkeeping(&kind, pid, &saved_paths, saved_active)
                         {
-                            restored_files_pane = Some(fp);
-                            restored_file_paths = paths;
-                            restored_active = active;
+                            restored_files_pane.insert((*pi, *wi), fp);
+                            restored_file_paths.insert((*pi, *wi), paths);
+                            restored_active.insert((*pi, *wi), active);
                         }
                         drag_states.insert(pid, DraggableState::default());
                     }
@@ -2131,8 +2149,27 @@ impl CraneShellView {
     /// `file_pane_paths` / `file_pane_active`) — the exact fields
     /// `files_pane_bookkeeping`'s call site in `new_with_state` populates.
     #[cfg(test)]
-    pub(crate) fn files_pane_state_for_test(&self) -> (Option<PaneId>, &[PathBuf], usize) {
-        (self.files_pane, &self.file_pane_paths, self.file_pane_active)
+    pub(crate) fn files_pane_state_for_test(
+        &self,
+        key: (usize, usize),
+    ) -> (Option<PaneId>, &[PathBuf], usize) {
+        (
+            self.files_pane.get(&key).copied(),
+            self.ws_file_paths(key),
+            self.ws_file_active(key),
+        )
+    }
+
+    /// Test-only `(project_idx, worktree_idx)` for a Project's root path — lets
+    /// a test address a Workspace without hard-coding the order
+    /// `load_projects_shallow` happens to return Projects in.
+    #[cfg(test)]
+    pub(crate) fn ws_key_for_path_for_test(&self, path: &str) -> Option<(usize, usize)> {
+        self.projects
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.path == path)
+            .map(|(pi, _)| (pi, 0))
     }
 
     /// Quit guard for the OS terminate / close-window hooks (wired in
@@ -2368,9 +2405,13 @@ impl CraneShellView {
             expanded_worktree_paths,
             next_tab_id: self.next_tab_id,
             next_pane_id: self.next_pane_id,
-            files_pane: self.files_pane,
-            file_pane_paths: self.file_pane_paths.clone(),
-            file_pane_active: self.file_pane_active,
+            // The persisted schema is still flat (one Files Pane for the whole
+            // session), so save the Workspace currently on screen. Persisting
+            // every Workspace's File Tabs needs a path-keyed schema + migration
+            // and is handled separately; this pass is runtime state only.
+            files_pane: self.files_pane.get(&self.ws_key()).copied(),
+            file_pane_paths: self.ws_file_paths(self.ws_key()).to_vec(),
+            file_pane_active: self.ws_file_active(self.ws_key()),
             terminals,
             window_w,
             window_h,
@@ -2803,6 +2844,26 @@ impl CraneShellView {
                 self.worktree_tabs.insert((np, nw), tabs);
             }
         }
+        // The Files-Pane maps share `worktree_tabs`'s key, so they rekey with it
+        // — otherwise a reorder would strand every File Tab under a stale index.
+        let old_fp = std::mem::take(&mut self.files_pane);
+        for ((pi, wi), fp) in old_fp {
+            if let Some(nk) = remap(pi, wi) {
+                self.files_pane.insert(nk, fp);
+            }
+        }
+        let old_fpp = std::mem::take(&mut self.file_pane_paths);
+        for ((pi, wi), paths) in old_fpp {
+            if let Some(nk) = remap(pi, wi) {
+                self.file_pane_paths.insert(nk, paths);
+            }
+        }
+        let old_fpa = std::mem::take(&mut self.file_pane_active);
+        for ((pi, wi), active) in old_fpa {
+            if let Some(nk) = remap(pi, wi) {
+                self.file_pane_active.insert(nk, active);
+            }
+        }
         if let Some((pi, wi, tid)) = self.active_tab {
             if let Some((np, nw)) = remap(pi, wi) {
                 self.active_tab = Some((np, nw, tid));
@@ -3038,9 +3099,14 @@ impl CraneShellView {
                 });
                 // A moved open file keeps its editor tab pointing at the old
                 // path — retarget the File Tab list entry so re-clicks work.
-                for p in self.file_pane_paths.iter_mut() {
-                    if *p == src {
-                        *p = target.clone();
+                // EVERY Workspace's list, not just the current one — the same
+                // file can be open as a File Tab in more than one Workspace,
+                // and each stale entry would break re-clicks there too.
+                for paths in self.file_pane_paths.values_mut() {
+                    for p in paths.iter_mut() {
+                        if *p == src {
+                            *p = target.clone();
+                        }
                     }
                 }
                 if self.selected_file.as_deref() == Some(src.as_path()) {
@@ -3123,9 +3189,12 @@ impl CraneShellView {
                 if let Err(e) = std::fs::rename(&to, &from) {
                     self.commit_error = Some(format!("Undo move: {e}"));
                 } else {
-                    for p in self.file_pane_paths.iter_mut() {
-                        if *p == to {
-                            *p = from.clone();
+                    // Every Workspace's list — mirror of the Move path above.
+                    for paths in self.file_pane_paths.values_mut() {
+                        for p in paths.iter_mut() {
+                            if *p == to {
+                                *p = from.clone();
+                            }
                         }
                     }
                     if self.selected_file.as_deref() == Some(to.as_path()) {
@@ -3326,6 +3395,27 @@ impl CraneShellView {
                         self.worktree_tabs.insert((np, wi), tabs);
                     }
                 }
+                // 3b) Rekey the Files-Pane maps alongside it (same key). Entries
+                // for the removed Project are dropped, not shifted onto whoever
+                // now occupies its index.
+                let old_fp = std::mem::take(&mut self.files_pane);
+                for ((pi, wi), fp) in old_fp {
+                    if let Some(np) = remap(pi) {
+                        self.files_pane.insert((np, wi), fp);
+                    }
+                }
+                let old_fpp = std::mem::take(&mut self.file_pane_paths);
+                for ((pi, wi), paths) in old_fpp {
+                    if let Some(np) = remap(pi) {
+                        self.file_pane_paths.insert((np, wi), paths);
+                    }
+                }
+                let old_fpa = std::mem::take(&mut self.file_pane_active);
+                for ((pi, wi), active) in old_fpa {
+                    if let Some(np) = remap(pi) {
+                        self.file_pane_active.insert((np, wi), active);
+                    }
+                }
                 // 4) Rekey expand state.
                 self.expanded_projects =
                     self.expanded_projects.iter().filter_map(|pi| remap(*pi)).collect();
@@ -3343,12 +3433,16 @@ impl CraneShellView {
                     None => (0, 0, usize::MAX),
                 };
                 // 6) Clear any focused/files pane whose backing pane was town down.
-                if let Some(fp) = self.files_pane {
-                    if !self.panes.contains_key(&fp) {
-                        self.files_pane = None;
-                        self.file_pane_paths.clear();
-                        self.file_pane_active = 0;
-                    }
+                // Per Workspace: a Files Pane torn down with its Project must
+                // not take another surviving Workspace's File Tabs with it.
+                let dead_ws: Vec<(usize, usize)> = self
+                    .files_pane
+                    .iter()
+                    .filter(|(_, fp)| !self.panes.contains_key(fp))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in dead_ws {
+                    self.clear_ws_files(k);
                 }
                 if let Some(f) = self.focused {
                     if !self.panes.contains_key(&f) {
@@ -4549,7 +4643,7 @@ impl CraneShellView {
     /// edits. Cancel keeps the tab; Close discards the edits.
     fn confirm_close_file_tab_card(&self, index: usize) -> Box<dyn Element> {
         let name = self
-            .file_pane_paths
+            .ws_file_paths(self.ws_key())
             .get(index)
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
@@ -10727,8 +10821,11 @@ impl CraneShellView {
         // The File pane gets a second header row (the tab strip) between its
         // chrome header and body; Flex shrinks the body to make room.
         let mut col = Flex::column().with_child(header);
-        if self.files_pane == Some(id) {
-            col = col.with_child(self.file_tab_strip(app));
+        // Resolve against the Workspace that owns THIS pane, not the selected
+        // one — a background Tab's pane can render while another Workspace is
+        // on screen, and it must show its own Workspace's File Tabs.
+        if let Some(ws) = self.ws_of_pane(id).filter(|_| self.is_files_pane(id)) {
+            col = col.with_child(self.file_tab_strip(ws, app));
         }
         let content = col
             .with_child(Expanded::new(1.0, body).finish())
@@ -10799,10 +10896,14 @@ impl CraneShellView {
 
     /// The File pane's tab strip — second header row. Active tab: surface bg +
     /// 2px accent underline. Inactive: flat, hover wash. Per-tab ✕ closes the tab.
-    fn file_tab_strip(&self, app: &AppContext) -> Box<dyn Element> {
+    /// `ws` is the Workspace that owns the pane this strip belongs to — passed
+    /// in by `render_pane` rather than read off `ws_key()`, so a Files Pane in a
+    /// background Tab still lists its own Workspace's File Tabs.
+    fn file_tab_strip(&self, ws: (usize, usize), app: &AppContext) -> Box<dyn Element> {
         let mut strip = Flex::row();
-        for (i, path) in self.file_pane_paths.iter().enumerate() {
-            let active = i == self.file_pane_active;
+        let ws_active = self.ws_file_active(ws);
+        for (i, path) in self.ws_file_paths(ws).iter().enumerate() {
+            let active = i == ws_active;
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -10939,8 +11040,8 @@ impl CraneShellView {
         // pane — since this strip only exists alongside the File pane. Markdown
         // tabs have no editor_views entry, so the readout simply hides for them.
         if let Some((ln, col, sel)) = self
-            .file_pane_paths
-            .get(self.file_pane_active)
+            .ws_file_paths(ws)
+            .get(ws_active)
             .and_then(|p| self.editor_views.get(p))
             .map(|h| {
                 h.read(app, |v, a| {
@@ -11010,7 +11111,8 @@ impl CraneShellView {
         // marks the active tab in the left panel — so the focused pane and its tab
         // read as one selection.
         let fg = if focused { theme::accent() } else { theme::text_muted() };
-        let is_file_pane = self.files_pane == Some(id);
+        // Same Workspace-of-this-pane resolution as `render_pane`'s tab strip.
+        let is_file_pane = self.is_files_pane(id);
 
         // Row 1 is plain pane chrome (icon + title). The File pane's tab strip
         // now renders as a SECOND row beneath this header (see `file_tab_strip`),
@@ -11111,6 +11213,67 @@ impl CraneShellView {
         id
     }
 
+    // ── Workspace scoping for the Files Pane ─────────────────────────────────
+
+    /// The Workspace whose pane tree is on screen — `(project_idx,
+    /// worktree_idx)`, the same key `worktree_tabs` uses. The Tab index is
+    /// deliberately NOT part of it: File Tabs belong to the Workspace, not to
+    /// one Tab, so splitting a new Tab keeps the same Files Pane list.
+    ///
+    /// Derived from `active_tab` rather than `selected` because `split_with_at`
+    /// (which creates the Files Pane) splits inside `active_tab`'s layout. The
+    /// two agree in the common case, but clicking a Workspace row in the Left
+    /// Panel moves `selected` without moving `active_tab`; keying off
+    /// `selected` there would file the pane under a Workspace whose layout does
+    /// not contain it, and every `pane -> Workspace` lookup below would then
+    /// disagree with it. `selected` is the fallback for the no-active-Tab case.
+    fn ws_key(&self) -> (usize, usize) {
+        self.active_tab
+            .map(|(pi, wi, _)| (pi, wi))
+            .unwrap_or((self.selected.0, self.selected.1))
+    }
+
+    /// The Workspace that OWNS pane `id` — found by locating the layout whose
+    /// leaves contain it.
+    ///
+    /// `self.panes` deliberately keeps panes from every Tab alive, so a pane can
+    /// be rendered or reasoned about while a *different* Workspace is selected.
+    /// Any site asking "is this pane the Files Pane?" must resolve against the
+    /// pane's own Workspace via this lookup, never against `ws_key()`.
+    fn ws_of_pane(&self, id: PaneId) -> Option<(usize, usize)> {
+        self.layouts.iter().find_map(|((pi, wi, _), node)| {
+            let mut leaves = Vec::new();
+            node.leaves(&mut leaves);
+            leaves.contains(&id).then_some((*pi, *wi))
+        })
+    }
+
+    /// True when `id` is the Files Pane of the Workspace that owns it. The
+    /// Workspace-correct replacement for the old `self.files_pane == Some(id)`.
+    fn is_files_pane(&self, id: PaneId) -> bool {
+        self.ws_of_pane(id)
+            .and_then(|k| self.files_pane.get(&k))
+            .copied()
+            == Some(id)
+    }
+
+    /// The open File Tab paths of Workspace `key` (empty when it has none).
+    fn ws_file_paths(&self, key: (usize, usize)) -> &[PathBuf] {
+        self.file_pane_paths.get(&key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The active File Tab index within Workspace `key`'s own tab list.
+    fn ws_file_active(&self, key: (usize, usize)) -> usize {
+        self.file_pane_active.get(&key).copied().unwrap_or(0)
+    }
+
+    /// Forget every Files-Pane record for Workspace `key` (all three maps).
+    fn clear_ws_files(&mut self, key: (usize, usize)) {
+        self.files_pane.remove(&key);
+        self.file_pane_paths.remove(&key);
+        self.file_pane_active.remove(&key);
+    }
+
     /// Insert `content` beside the focused pane (even split). Returns the id.
     fn split_with(&mut self, content: PaneContent) -> Option<PaneId> {
         self.split_with_at(content, false, 0.5)
@@ -11147,7 +11310,7 @@ impl CraneShellView {
     /// into a pane that never renders, so the file pane "won't open". Returns
     /// None in those cases so the caller splits a fresh pane instead.
     fn reusable_files_pane(&self) -> Option<PaneId> {
-        let fp = self.files_pane?;
+        let fp = *self.files_pane.get(&self.ws_key())?;
         let is_doc = matches!(
             self.panes.get(&fp),
             Some(PaneContent::Editor(_))
@@ -11168,13 +11331,18 @@ impl CraneShellView {
 
     /// first time; thereafter adds/switches a tab inside it (old Crane FilesPane).
     fn open_file(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        // Every File Tab mutation below lands in THIS Workspace's list only —
+        // opening a file in one Project must never touch another's tab strip.
+        let ws = self.ws_key();
         // Track the tab order + active index.
-        if let Some(i) = self.file_pane_paths.iter().position(|p| p == &path) {
-            self.file_pane_active = i;
+        let paths = self.file_pane_paths.entry(ws).or_default();
+        let active = if let Some(i) = paths.iter().position(|p| p == &path) {
+            i
         } else {
-            self.file_pane_paths.push(path.clone());
-            self.file_pane_active = self.file_pane_paths.len() - 1;
-        }
+            paths.push(path.clone());
+            paths.len() - 1
+        };
+        self.file_pane_active.insert(ws, active);
         // Markdown files render read-only in a Markdown pane instead of the
         // editor (peer of the editor path below, same placement / reuse logic).
         let is_md = is_markdown_path(&path);
@@ -11197,8 +11365,10 @@ impl CraneShellView {
                 self.focused = Some(fp);
                 return;
             }
-            self.files_pane = None; // stale (closed or on another tab)
-            self.files_pane = self.split_with_at(PaneContent::Markdown(handle), false, 0.35);
+            self.files_pane.remove(&ws); // stale (closed or on another tab)
+            if let Some(fp) = self.split_with_at(PaneContent::Markdown(handle), false, 0.35) {
+                self.files_pane.insert(ws, fp);
+            }
             ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
             return;
         }
@@ -11215,10 +11385,11 @@ impl CraneShellView {
             let content = match std::fs::read(&path).map(String::from_utf8) {
                 Ok(Ok(s)) => s,
                 _ => {
-                    self.file_pane_paths.retain(|p| p != &path);
-                    if self.file_pane_active >= self.file_pane_paths.len() {
-                        self.file_pane_active =
-                            self.file_pane_paths.len().saturating_sub(1);
+                    let paths = self.file_pane_paths.entry(ws).or_default();
+                    paths.retain(|p| p != &path);
+                    let last = paths.len().saturating_sub(1);
+                    if self.ws_file_active(ws) >= self.ws_file_paths(ws).len() {
+                        self.file_pane_active.insert(ws, last);
                     }
                     let name = path
                         .file_name()
@@ -11282,15 +11453,17 @@ impl CraneShellView {
             self.focused = Some(fp);
             return;
         }
-        if self.files_pane.is_some() {
-            self.files_pane = None; // stale (closed or on another tab)
-            self.file_pane_paths = vec![path.clone()];
-            self.file_pane_active = 0;
+        if self.files_pane.contains_key(&ws) {
+            self.files_pane.remove(&ws); // stale (closed or on another tab)
+            self.file_pane_paths.insert(ws, vec![path.clone()]);
+            self.file_pane_active.insert(ws, 0);
         }
         // First open: File pane goes on the RIGHT and takes ~65% width (the
         // existing pane keeps 35% as the first child). Full height by default;
         // the user can drag the splitter to resize. Backed by Warp's REAL editor.
-        self.files_pane = self.split_with_at(PaneContent::Editor(handle), false, 0.35);
+        if let Some(fp) = self.split_with_at(PaneContent::Editor(handle), false, 0.35) {
+            self.files_pane.insert(ws, fp);
+        }
         ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
     }
 
@@ -11355,7 +11528,8 @@ impl CraneShellView {
     /// The path of the editor currently shown in the File pane (the active file
     /// tab), if that tab is a real editor (not a Markdown preview).
     fn active_editor_path(&self) -> Option<PathBuf> {
-        let path = self.file_pane_paths.get(self.file_pane_active)?.clone();
+        let ws = self.ws_key();
+        let path = self.ws_file_paths(ws).get(self.ws_file_active(ws))?.clone();
         self.editor_views.contains_key(&path).then_some(path)
     }
 
@@ -12748,6 +12922,9 @@ impl CraneShellView {
         let (Some(tab), Some(focused)) = (self.active_tab, self.focused) else {
             return;
         };
+        // Resolve the pane's Workspace BEFORE the layout edit below removes it
+        // from the tree — `ws_of_pane` would find nothing afterwards.
+        let ws = self.ws_of_pane(focused);
         if let Some(node) = self.layouts.remove(&tab) {
             match node.close_leaf(focused) {
                 Some(remaining) => {
@@ -12776,8 +12953,10 @@ impl CraneShellView {
         // that on the next open, but other readers (`is_file_pane`, the tab
         // strip's close-shortcut gate) compare against it directly — reset it
         // here so it never dangles.
-        if self.files_pane == Some(focused) {
-            self.files_pane = None;
+        if let Some(ws) = ws {
+            if self.files_pane.get(&ws) == Some(&focused) {
+                self.files_pane.remove(&ws);
+            }
         }
         // The sibling that just reclaimed the closed pane's space must reflow
         // now (SIGWINCH the terminal) rather than on the next stray event.
@@ -13804,11 +13983,18 @@ impl CraneShellView {
                 // Files pane with >1 open file tabs: close only the ACTIVE file
                 // tab (route to FileTabClose), which tears the pane down only when
                 // the last tab closes. Otherwise close the whole pane.
-                let close_file_tab = self.files_pane.is_some()
-                    && self.focused == self.files_pane
-                    && self.file_pane_paths.len() > 1;
+                // Resolve against the focused pane's OWN Workspace, so Cmd+W
+                // never consults another Workspace's File Tab list.
+                let focused_ws = self.focused.and_then(|id| self.ws_of_pane(id));
+                let close_file_tab = matches!(
+                    (self.focused, focused_ws),
+                    (Some(f), Some(ws))
+                        if self.files_pane.get(&ws) == Some(&f)
+                            && self.ws_file_paths(ws).len() > 1
+                );
                 if close_file_tab {
-                    let a = CraneShellAction::FileTabClose(self.file_pane_active);
+                    let ws = focused_ws.expect("close_file_tab implies a resolved Workspace");
+                    let a = CraneShellAction::FileTabClose(self.ws_file_active(ws));
                     self.handle_action(&a, ctx);
                 } else {
                     // Guard: if the focused pane is a terminal running a foreground
@@ -13991,10 +14177,11 @@ impl CraneShellView {
                 }
             }
             CraneShellAction::FileTabSelect(i) => {
-                if let Some(fp) = self.files_pane {
+                let ws = self.ws_key();
+                if let Some(fp) = self.files_pane.get(&ws).copied() {
                     self.focused = Some(fp);
-                    if let Some(path) = self.file_pane_paths.get(*i).cloned() {
-                        self.file_pane_active = *i;
+                    if let Some(path) = self.ws_file_paths(ws).get(*i).cloned() {
+                        self.file_pane_active.insert(ws, *i);
                         // Swap the document pane to show this file (Markdown or Editor).
                         if let Some(pc) = self.file_tab_pane(&path) {
                             self.panes.insert(fp, pc);
@@ -14007,7 +14194,7 @@ impl CraneShellView {
                 // edits confirms first (the top-level Tab confirm doesn't cover
                 // this per-file path). Clean buffers close immediately.
                 let dirty = self
-                    .file_pane_paths
+                    .ws_file_paths(self.ws_key())
                     .get(*i)
                     .and_then(|p| self.editor_views.get(p))
                     .map(|h| h.as_ref(&*ctx).is_dirty(&*ctx))
@@ -14021,24 +14208,41 @@ impl CraneShellView {
             }
             CraneShellAction::FileTabCloseConfirmed(i) => {
                 self.modal = None;
-                if let Some(fp) = self.files_pane {
-                    if *i < self.file_pane_paths.len() {
-                        let removed = self.file_pane_paths.remove(*i);
-                        self.editor_views.remove(&removed);
-                        self.markdown_views.remove(&removed);
-                        if self.file_pane_paths.is_empty() {
+                let ws = self.ws_key();
+                if let Some(fp) = self.files_pane.get(&ws).copied() {
+                    if *i < self.ws_file_paths(ws).len() {
+                        let removed =
+                            self.file_pane_paths.entry(ws).or_default().remove(*i);
+                        // `editor_views` / `markdown_views` are GLOBAL caches
+                        // shared by every Workspace, so only drop the live
+                        // buffer once no other Workspace still has this path
+                        // open as a File Tab — otherwise closing a tab here
+                        // would discard another Project's unsaved edits.
+                        let still_open = self
+                            .file_pane_paths
+                            .values()
+                            .any(|paths| paths.contains(&removed));
+                        if !still_open {
+                            self.editor_views.remove(&removed);
+                            self.markdown_views.remove(&removed);
+                        }
+                        if self.ws_file_paths(ws).is_empty() {
                             // Last tab closed — close the whole editor pane.
-                            self.files_pane = None;
-                            self.file_pane_active = 0;
+                            self.clear_ws_files(ws);
                             self.focused = Some(fp);
                             self.close_focused(ctx);
                         } else {
-                            if self.file_pane_active >= self.file_pane_paths.len() {
-                                self.file_pane_active = self.file_pane_paths.len() - 1;
-                            } else if self.file_pane_active > *i {
-                                self.file_pane_active -= 1;
-                            }
-                            let path = self.file_pane_paths[self.file_pane_active].clone();
+                            let len = self.ws_file_paths(ws).len();
+                            let active = self.ws_file_active(ws);
+                            let active = if active >= len {
+                                len - 1
+                            } else if active > *i {
+                                active - 1
+                            } else {
+                                active
+                            };
+                            self.file_pane_active.insert(ws, active);
+                            let path = self.ws_file_paths(ws)[active].clone();
                             if let Some(pc) = self.file_tab_pane(&path) {
                                 self.panes.insert(fp, pc);
                             }
@@ -14291,7 +14495,7 @@ impl CraneShellView {
                         // FileTabCloseConfirmed handles active-index fixup and
                         // tears the pane down when the last tab goes.
                         while let Some(idx) = self
-                            .file_pane_paths
+                            .ws_file_paths(self.ws_key())
                             .iter()
                             .position(|p| p.starts_with(&path))
                         {
@@ -15004,6 +15208,43 @@ impl CraneShellView {
                         self.worktree_tabs.insert((p, w), tabs);
                     }
                 }
+                // 3b) Rekey the Files-Pane maps alongside it (same key).
+                let old_fp = std::mem::take(&mut self.files_pane);
+                for ((p, w), fp) in old_fp {
+                    match (p == pi).then(|| remap_w(w)) {
+                        Some(Some(nw)) => {
+                            self.files_pane.insert((p, nw), fp);
+                        }
+                        Some(None) => {}
+                        None => {
+                            self.files_pane.insert((p, w), fp);
+                        }
+                    }
+                }
+                let old_fpp = std::mem::take(&mut self.file_pane_paths);
+                for ((p, w), paths) in old_fpp {
+                    match (p == pi).then(|| remap_w(w)) {
+                        Some(Some(nw)) => {
+                            self.file_pane_paths.insert((p, nw), paths);
+                        }
+                        Some(None) => {}
+                        None => {
+                            self.file_pane_paths.insert((p, w), paths);
+                        }
+                    }
+                }
+                let old_fpa = std::mem::take(&mut self.file_pane_active);
+                for ((p, w), active) in old_fpa {
+                    match (p == pi).then(|| remap_w(w)) {
+                        Some(Some(nw)) => {
+                            self.file_pane_active.insert((p, nw), active);
+                        }
+                        Some(None) => {}
+                        None => {
+                            self.file_pane_active.insert((p, w), active);
+                        }
+                    }
+                }
                 // 4) Rekey expand state.
                 self.expanded_worktrees = self
                     .expanded_worktrees
@@ -15034,12 +15275,15 @@ impl CraneShellView {
                     (sp, sw, st)
                 };
                 // 6) Clear focused / files pane whose backing pane was torn down.
-                if let Some(fp) = self.files_pane {
-                    if !self.panes.contains_key(&fp) {
-                        self.files_pane = None;
-                        self.file_pane_paths.clear();
-                        self.file_pane_active = 0;
-                    }
+                // Per Workspace — see the same block in RemoveProject.
+                let dead_ws: Vec<(usize, usize)> = self
+                    .files_pane
+                    .iter()
+                    .filter(|(_, fp)| !self.panes.contains_key(fp))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in dead_ws {
+                    self.clear_ws_files(k);
                 }
                 if let Some(f) = self.focused {
                     if !self.panes.contains_key(&f) {
@@ -16181,7 +16425,7 @@ mod restore_wiring_integration_tests {
                          must restore as PaneContent::Markdown, not Editor"
                     );
                     let (files_pane, file_pane_paths, file_pane_active) =
-                        v.files_pane_state_for_test();
+                        v.files_pane_state_for_test((0, 0));
                     assert_eq!(
                         files_pane,
                         Some(PID),
@@ -16190,6 +16434,143 @@ mod restore_wiring_integration_tests {
                     );
                     assert_eq!(file_pane_paths.len(), 1, "file_pane_paths must carry the saved tab");
                     assert_eq!(file_pane_active, 0);
+                });
+            });
+        });
+    }
+
+    /// The user-reported bug, end to end: "I opened a new project and then
+    /// opened a md file in it — somehow its file editor opened other projects'
+    /// open files too."
+    ///
+    /// Two Projects, each with one Workspace and one Tab. A file is opened in
+    /// Workspace A, then the shell switches to Workspace B and opens a
+    /// different file there. Each Workspace must see exactly its own File Tab.
+    /// While `file_pane_paths` was one flat `Vec`, Workspace B's Files Pane
+    /// listed BOTH files — Workspace A's tab leaked across the Project
+    /// boundary.
+    ///
+    /// Both restored leaves are Markdown panes on purpose: a bare leaf would
+    /// restore as a fresh Terminal and spawn a real PTY inside the test
+    /// process. `files_pane` is left unset in the saved state so restore does
+    /// no Files-pane bookkeeping of its own — every File Tab in this test is
+    /// created by the live `open_file` path, which is what the bug reports.
+    #[test]
+    fn file_tabs_do_not_leak_between_workspaces() {
+        use crate::warpui::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj_a = tempfile::tempdir().expect("project a tempdir");
+        let proj_b = tempfile::tempdir().expect("project b tempdir");
+        let path_a = proj_a.path().to_string_lossy().into_owned();
+        let path_b = proj_b.path().to_string_lossy().into_owned();
+        // The doc each Tab's restored Markdown leaf renders...
+        let seed_a = proj_a.path().join("seed-a.md");
+        let seed_b = proj_b.path().join("seed-b.md");
+        // ...and the doc the test opens as a File Tab in that Workspace.
+        let doc_a = proj_a.path().join("only-in-a.md");
+        let doc_b = proj_b.path().join("only-in-b.md");
+        for p in [&seed_a, &seed_b, &doc_a, &doc_b] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID_A: PaneId = 10;
+        const PID_B: PaneId = 11;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 12;
+        st.added_projects = vec![
+            AddedProject { name: "proj-a".to_string(), path: path_a.clone() },
+            AddedProject { name: "proj-b".to_string(), path: path_b.clone() },
+        ];
+        st.worktree_tabs_by_path = vec![
+            (
+                path_a.clone(),
+                vec![STab {
+                    id: 0,
+                    name: "A".to_string(),
+                    layout: SNode::Leaf(PID_A),
+                    focus: Some(PID_A),
+                    renamed: false,
+                }],
+            ),
+            (
+                path_b.clone(),
+                vec![STab {
+                    id: 1,
+                    name: "B".to_string(),
+                    layout: SNode::Leaf(PID_B),
+                    focus: Some(PID_B),
+                    renamed: false,
+                }],
+            ),
+        ];
+        st.active_tab_path = Some((path_a.clone(), 0));
+        st.markdowns = vec![
+            (PID_A, SMarkdown { path: seed_a, editing: false }),
+            (PID_B, SMarkdown { path: seed_b, editing: false }),
+        ];
+
+        let (path_a2, path_b2) = (path_a.clone(), path_b.clone());
+        let (doc_a2, doc_b2) = (doc_a.clone(), doc_b.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    // Resolve each Project's Workspace key by PATH — the order
+                    // `load_projects_shallow` returns them in is not this
+                    // test's business.
+                    let ws_a = v
+                        .ws_key_for_path_for_test(&path_a2)
+                        .expect("project A must resolve to a Workspace");
+                    let ws_b = v
+                        .ws_key_for_path_for_test(&path_b2)
+                        .expect("project B must resolve to a Workspace");
+                    assert_ne!(ws_a, ws_b, "the two Projects must be distinct Workspaces");
+
+                    // Workspace A: select its Tab, then open a file in it.
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws_a.0, ws_a.1, 0),
+                            path: std::path::PathBuf::from(&path_a2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(doc_a2.clone(), vctx);
+
+                    // Workspace B: select its Tab, then open a DIFFERENT file.
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws_b.0, ws_b.1, 1),
+                            path: std::path::PathBuf::from(&path_b2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(doc_b2.clone(), vctx);
+
+                    let (_, paths_b, active_b) = v.files_pane_state_for_test(ws_b);
+                    assert_eq!(
+                        paths_b,
+                        [doc_b2.clone()],
+                        "Workspace B's Files Pane must list ONLY the file opened in B — \
+                         Workspace A's File Tab must not leak across the Project boundary"
+                    );
+                    assert_eq!(active_b, 0, "B's active File Tab indexes into B's own list");
+
+                    let (_, paths_a, active_a) = v.files_pane_state_for_test(ws_a);
+                    assert_eq!(
+                        paths_a,
+                        [doc_a2.clone()],
+                        "Workspace A keeps its own File Tab after B opened one"
+                    );
+                    assert_eq!(active_a, 0, "A's active File Tab indexes into A's own list");
                 });
             });
         });
