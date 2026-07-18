@@ -79,13 +79,40 @@ fn heading_u8(level: HeadingLevel) -> u8 {
     }
 }
 
+/// Which kind of enclosing container a run of pending prose belongs to.
+/// Pushed onto `container_stack` at `Start(Tag::Item)` / `Start(Tag::BlockQuote)`,
+/// popped at the matching `End` tag. Replaces two independent `in_bullet` /
+/// `in_quote` booleans, which could not express "a blockquote nested inside
+/// an already-open list item": `in_bullet` never got cleared when the
+/// blockquote opened, so blockquote prose nested in a list item was
+/// mistyped as `Block::Bullet` (and, in an ordered list, stole an ordinal it
+/// had no business consuming). The stack always names the *innermost*
+/// currently open container, which is exactly what a nested container's
+/// `Start` event needs in order to flush the right thing.
+///
+/// `Bullet`'s `depth`/`ordinal` are computed once, at the item's own
+/// `Start(Tag::Item)`, and carried on the stack entry rather than
+/// recomputed later: `flush_open_container` may need to push this item's
+/// content *before* its own `End(TagEnd::Item)` fires (when a nested
+/// Item/BlockQuote is about to reuse `runs`), and the ordinal counter must
+/// advance exactly once per item no matter which of those two sites ends up
+/// doing the pushing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ContainerKind {
+    Bullet {
+        depth: usize,
+        ordinal: Option<usize>,
+    },
+    Quote,
+}
+
 /// Take whatever prose is pending in `runs` and push it as a block belonging
-/// to the *currently open* enclosing bullet/quote (picked via `in_bullet`/
-/// `in_quote`). Called at `Start(Tag::Item)` / `Start(Tag::BlockQuote)` when
-/// the new item/quote is itself nested inside an already-open bullet or
-/// quote: unconditionally clearing `runs` for the nested container would
-/// wipe out the *outer* container's own pending text — the container-start
-/// prose loss bug, one level over from the table-in-container case that
+/// to the innermost currently open container (the top of `container_stack`).
+/// Called at `Start(Tag::Item)` / `Start(Tag::BlockQuote)` when the new
+/// item/quote is itself nested inside an already-open bullet or quote:
+/// unconditionally clearing `runs` for the nested container would wipe out
+/// the *outer* container's own pending text — the container-start prose loss
+/// bug, one level over from the table-in-container case that
 /// `pending_container_runs` fixes.
 ///
 /// This deliberately does not reuse the stash-then-restore-into-`runs` shape
@@ -96,35 +123,39 @@ fn heading_u8(level: HeadingLevel) -> u8 {
 /// so deferring the outer's flush that way would land its block after the
 /// inner one in `blocks`, out of reading order. Flushing immediately, right
 /// here, keeps blocks in document order.
-///
-/// `list_stack` must already have any list level pushed by the nested
-/// construct's own preceding `Start(Tag::List)` sliced off by the caller —
-/// depth/ordinal must be computed for the *outer* list, not the one about to
-/// open.
 fn flush_open_container(
     blocks: &mut Vec<Block>,
     runs: &mut Vec<Run>,
-    in_bullet: bool,
-    in_quote: bool,
-    list_stack: &mut [Option<u64>],
+    container_stack: &[ContainerKind],
 ) {
     let taken = std::mem::take(runs);
     if taken.iter().all(|r| r.text.trim().is_empty()) {
         return;
     }
-    if in_bullet {
-        let depth = list_stack.len().saturating_sub(1);
-        let ordinal = match list_stack.last_mut() {
-            Some(Some(n)) => {
-                let cur = *n as usize;
-                *n += 1;
-                Some(cur)
-            }
-            _ => None,
-        };
-        blocks.push(Block::Bullet { runs: taken, depth, ordinal });
-    } else if in_quote {
-        blocks.push(Block::Quote(taken));
+    debug_assert!(
+        !container_stack.is_empty(),
+        "flush_open_container has non-empty pending prose but no open container to flush into"
+    );
+    match container_stack.last() {
+        Some(ContainerKind::Bullet { depth, ordinal }) => {
+            blocks.push(Block::Bullet {
+                runs: taken,
+                depth: *depth,
+                ordinal: *ordinal,
+            });
+        }
+        Some(ContainerKind::Quote) => {
+            blocks.push(Block::Quote(taken));
+        }
+        None => {
+            // Unreachable through the current call sites (each only calls
+            // this once `container_stack` is confirmed non-empty) — the
+            // debug_assert above already catches the mistake in debug/test
+            // builds. Fall back to a plain paragraph in release rather than
+            // silently dropping content, in case a future call site forgets
+            // the guard.
+            blocks.push(Block::Para(taken));
+        }
     }
 }
 
@@ -144,12 +175,14 @@ fn parse(src: &str) -> Vec<Block> {
     let mut italic = false;
     let mut heading: Option<u8> = None;
     let mut in_code = false;
-    let mut in_bullet = false;
-    let mut in_quote = false;
+    // Innermost-first stack of open bullet/blockquote containers. See
+    // `ContainerKind`'s doc comment for why this replaced two independent
+    // `in_bullet` / `in_quote` booleans.
+    let mut container_stack: Vec<ContainerKind> = Vec::new();
     // One entry per open list. `Some(n)` = ordered list, next number is `n`;
     // `None` = unordered. Pushed at `Start(Tag::List)`, popped at
-    // `End(TagEnd::List)`; `len() - 1` at an `Item`'s own end is that item's
-    // nesting depth.
+    // `End(TagEnd::List)`; `len() - 1` at an `Item`'s own start is that
+    // item's nesting depth.
     let mut list_stack: Vec<Option<u64>> = Vec::new();
     let mut table_headers: Vec<Cell> = Vec::new();
     let mut table_rows: Vec<Vec<Cell>> = Vec::new();
@@ -216,74 +249,84 @@ fn parse(src: &str) -> Vec<Block> {
                 list_stack.pop();
             }
             Event::Start(Tag::Item) => {
-                if in_bullet {
-                    // A new list level was already pushed by the
-                    // `Start(Tag::List)` that always immediately precedes an
-                    // `Item`; the *outer* item's own depth is one level
-                    // shallower than that, hence the slice.
-                    let outer_len = list_stack.len().saturating_sub(1);
-                    flush_open_container(
-                        &mut blocks,
-                        &mut runs,
-                        true,
-                        false,
-                        &mut list_stack[..outer_len],
-                    );
-                } else if in_quote {
-                    flush_open_container(&mut blocks, &mut runs, false, true, &mut []);
-                } else {
+                if container_stack.is_empty() {
                     runs.clear();
+                } else {
+                    flush_open_container(&mut blocks, &mut runs, &container_stack);
                 }
-                in_bullet = true;
+                // The ordinal counter advances on every item, unconditionally
+                // — an item whose only content is (say) a table or a
+                // blockquote still legitimately occupies its slot in the
+                // list: its own block renders, only the bullet marker/text
+                // is suppressed by the empty-block guard in
+                // `End(TagEnd::Item)` below. A guarded increment would
+                // silently skip a number and mis-number every later sibling.
+                // Reserved here, at Start, rather than at End, because
+                // `flush_open_container` above may already push this item's
+                // `Block::Bullet` before its own End tag fires (when a
+                // nested Item/BlockQuote reuses `runs`) — computing
+                // depth/ordinal once and carrying them on the stack entry
+                // guarantees exactly one increment per item no matter which
+                // site ends up doing the flushing.
+                let depth = list_stack.len().saturating_sub(1);
+                let ordinal = match list_stack.last_mut() {
+                    Some(Some(n)) => {
+                        let cur = *n as usize;
+                        *n += 1;
+                        Some(cur)
+                    }
+                    _ => None,
+                };
+                container_stack.push(ContainerKind::Bullet { depth, ordinal });
             }
             Event::End(TagEnd::Item) => {
-                let depth = list_stack.len().saturating_sub(1);
+                let popped = container_stack.pop();
+                debug_assert!(
+                    matches!(popped, Some(ContainerKind::Bullet { .. })),
+                    "End(TagEnd::Item) without a matching Bullet on the container stack"
+                );
                 // A nested table's own End(TagEnd::Table) clears `runs`, so a
                 // list item whose only content was a table must not push an
-                // empty Block::Bullet here. The ordinal counter is advanced
-                // only inside this guard (not unconditionally) so an empty
-                // item never consumes a number that a later sibling should
-                // get.
-                let runs = std::mem::take(&mut runs);
-                if !runs.iter().all(|r| r.text.trim().is_empty()) {
-                    let ordinal = match list_stack.last_mut() {
-                        Some(Some(n)) => {
-                            let cur = *n as usize;
-                            *n += 1;
-                            Some(cur)
-                        }
-                        _ => None,
-                    };
-                    blocks.push(Block::Bullet { runs, depth, ordinal });
+                // empty Block::Bullet here.
+                if let Some(ContainerKind::Bullet { depth, ordinal }) = popped {
+                    let runs = std::mem::take(&mut runs);
+                    if !runs.iter().all(|r| r.text.trim().is_empty()) {
+                        blocks.push(Block::Bullet {
+                            runs,
+                            depth,
+                            ordinal,
+                        });
+                    }
                 }
-                in_bullet = false;
             }
             Event::Start(Tag::BlockQuote(_)) => {
-                // Unlike `Start(Tag::Item)`, BlockQuote never pushes to
-                // `list_stack`, so no depth adjustment is needed here.
-                if in_bullet {
-                    flush_open_container(&mut blocks, &mut runs, true, false, &mut list_stack);
-                } else if in_quote {
-                    flush_open_container(&mut blocks, &mut runs, false, true, &mut []);
-                } else {
+                if container_stack.is_empty() {
                     runs.clear();
+                } else {
+                    flush_open_container(&mut blocks, &mut runs, &container_stack);
                 }
-                in_quote = true;
+                container_stack.push(ContainerKind::Quote);
             }
             Event::End(TagEnd::BlockQuote) => {
+                let popped = container_stack.pop();
+                debug_assert!(
+                    matches!(popped, Some(ContainerKind::Quote)),
+                    "End(TagEnd::BlockQuote) without a matching Quote on the container stack"
+                );
                 // Same guard as Item above: a nested table's End(TagEnd::Table)
                 // clears `runs`, so a blockquote whose only content was a
                 // table must not push an empty Block::Quote here.
-                let runs = std::mem::take(&mut runs);
-                if !runs.iter().all(|r| r.text.trim().is_empty()) {
-                    blocks.push(Block::Quote(runs));
+                if matches!(popped, Some(ContainerKind::Quote)) {
+                    let runs = std::mem::take(&mut runs);
+                    if !runs.iter().all(|r| r.text.trim().is_empty()) {
+                        blocks.push(Block::Quote(runs));
+                    }
                 }
-                in_quote = false;
             }
             Event::End(TagEnd::Paragraph) => {
                 // Bullets/quotes flush at their own end tag (a paragraph may nest
                 // inside them); a bare paragraph flushes here.
-                if !in_bullet && !in_quote {
+                if container_stack.is_empty() {
                     blocks.push(Block::Para(std::mem::take(&mut runs)));
                 }
             }
@@ -327,7 +370,7 @@ fn parse(src: &str) -> Vec<Block> {
                 // instead of clearing it outright — cell processing below
                 // needs `runs` to start empty, but the pending prose must
                 // survive to be restored once the table is done.
-                if in_bullet || in_quote {
+                if !container_stack.is_empty() {
                     pending_container_runs = std::mem::take(&mut runs);
                 } else {
                     runs.clear();
@@ -372,7 +415,7 @@ fn parse(src: &str) -> Vec<Block> {
             // unflushed runs (from an unhandled construct) silently merge into this
             // paragraph — the root cause of the table content-loss bug.
             Event::Start(Tag::Paragraph) => {
-                if !in_bullet && !in_quote {
+                if container_stack.is_empty() {
                     runs.clear();
                 }
             }
@@ -541,13 +584,31 @@ impl WarpMarkdownView {
             .collect()
     }
 
-    /// `depth` (0 = top-level) widens the marker column so nested items
-    /// indent under their parent. `ordinal` renders a "N." marker for
-    /// ordered-list items; `None` (unordered) keeps the drawn dot marker
-    /// (NOT a Unicode "•" glyph — the bundled fonts don't cover it and it
-    /// would render as tofu), nudged down to sit on the text baseline.
-    fn bullet_element(&self, runs: &[Run], depth: usize, ordinal: Option<usize>) -> Box<dyn Element> {
-        let indent = 22.0 + (depth as f32 * 18.0);
+    /// `depth` (0 = top-level) indents the whole row under its parent —
+    /// applied as left padding on a wrapper `Container`, not folded into the
+    /// marker column's width (see `MARKER_MIN_WIDTH` below for why).
+    /// `ordinal` renders a "N." marker for ordered-list items; `None`
+    /// (unordered) keeps the drawn dot marker (NOT a Unicode "•" glyph — the
+    /// bundled fonts don't cover it and it would render as tofu), nudged
+    /// down to sit on the text baseline.
+    fn bullet_element(
+        &self,
+        runs: &[Run],
+        depth: usize,
+        ordinal: Option<usize>,
+    ) -> Box<dyn Element> {
+        // A floor, not a ceiling, on the marker column's width.
+        // `ConstrainedBox::with_width` (the previous approach) clamps *both*
+        // min and max, forcing the column — and the marker `Text` inside it,
+        // which uses `soft_wrap(false)` — to exactly that many pixels no
+        // matter how wide its content is. At depth 0 that left roughly 8px
+        // for the marker after its own padding, clipping any ordinal wider
+        // than a single digit ("10.", "99."). `with_min_width` only ever
+        // grows the column to fit wider content, so a single-digit ordinal
+        // or the bullet dot still aligns into a consistent column while a
+        // multi-digit ordinal simply widens the column instead of being cut
+        // off.
+        const MARKER_MIN_WIDTH: f32 = 22.0;
 
         let marker: Box<dyn Element> = match ordinal {
             Some(n) => Container::new(
@@ -574,10 +635,22 @@ impl WarpMarkdownView {
         };
 
         let row = Flex::row()
-            .with_child(ConstrainedBox::new(marker).with_width(indent).finish())
+            .with_child(
+                ConstrainedBox::new(marker)
+                    .with_min_width(MARKER_MIN_WIDTH)
+                    .finish(),
+            )
             .with_child(Expanded::new(1.0, self.inline_element(runs, theme::text())).finish())
             .finish();
-        self.pad_block(row, 2.0)
+
+        // Nesting depth becomes left padding on the row, decoupled from the
+        // marker column's own sizing — a wide ordinal at depth 2 can no
+        // longer be squeezed by a width that was only ever computed for
+        // depth 0.
+        let indented = Container::new(row)
+            .with_padding_left(depth as f32 * 18.0)
+            .finish();
+        self.pad_block(indented, 2.0)
     }
 
     fn quote_element(&self, runs: &[Run]) -> Box<dyn Element> {
@@ -935,7 +1008,12 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_nested_list_emits_no_phantom_bullet() {
+    fn closing_a_nested_list_preserves_the_outer_items_prose() {
+        // Not a phantom-bullet check (an earlier empty-block guard already
+        // suppresses those) — this guards against *content loss*: the outer
+        // item's own prose ("top one") must survive being flushed early, at
+        // the moment its nested list's first item opens and starts reusing
+        // `runs`.
         let src = "- top one\n  - nested\n- top two\n";
         let blocks = parse(src);
         let bullets: Vec<&Block> = blocks
@@ -980,6 +1058,42 @@ mod tests {
     }
 
     #[test]
+    fn ordinal_advances_even_when_an_item_only_contains_a_table() {
+        // Finding 1: an ordered item whose only content is a table still
+        // legitimately occupies its slot in the sequence — the table itself
+        // renders as its own Block::Table; only the item's bullet
+        // marker/text is suppressed by the empty-block guard. A guarded
+        // increment (advance the counter only when a Block::Bullet is
+        // actually pushed) would silently skip a number here, mis-numbering
+        // every later sibling.
+        let src = "1. first\n2.\n   | a | b |\n   | - | - |\n   | 1 | 2 |\n3. third\n";
+        let blocks = parse(src);
+
+        let tables = blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Table { .. }))
+            .count();
+        assert_eq!(
+            tables, 1,
+            "the table-only item must still produce a Block::Table"
+        );
+
+        let ordinals: Vec<Option<usize>> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Bullet { ordinal, .. } => Some(*ordinal),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ordinals,
+            vec![Some(1), Some(3)],
+            "the table-only item must consume ordinal 2 (no Block::Bullet appears for it), \
+             so the next sibling is still numbered 3"
+        );
+    }
+
+    #[test]
     fn nested_list_inside_blockquote_retains_intro_prose() {
         // Additional required fix: Start(Tag::Item) unconditionally cleared
         // `runs`, so a blockquote's leading prose was wiped the moment its
@@ -998,6 +1112,63 @@ mod tests {
             bullet_texts(&blocks),
             vec!["Item text"],
             "the nested list item must still render as its own bullet"
+        );
+    }
+
+    #[test]
+    fn blockquote_prose_inside_an_ordered_item_types_as_quote_not_bullet() {
+        // Finding 2: `in_bullet`/`in_quote` were independent booleans, and
+        // `Start(Tag::BlockQuote)` never cleared `in_bullet` on entry, so
+        // blockquote prose nested inside an *ordered* list item was
+        // mistyped as Block::Bullet — stealing an ordinal that belonged to
+        // the next sibling.
+        let src = "1. one\n   > quoted\n   > - deep\n2. two\n";
+        let blocks = parse(src);
+
+        assert_eq!(
+            quote_texts(&blocks),
+            vec!["quoted"],
+            "blockquote prose nested in a list item must render as Block::Quote, not Block::Bullet"
+        );
+
+        let bullets: Vec<(String, Option<usize>)> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Bullet { runs, ordinal, .. } => {
+                    Some((runs.iter().map(|r| r.text.as_str()).collect(), *ordinal))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bullets,
+            vec![
+                ("one".to_string(), Some(1)),
+                ("deep".to_string(), None),
+                ("two".to_string(), Some(2)),
+            ],
+            "the blockquote's nested unordered item ('deep') must not consume an ordinal meant \
+             for 'two'"
+        );
+    }
+
+    #[test]
+    fn nested_blockquotes_inside_a_bullet_all_type_as_quote() {
+        // Finding 2, unordered case: the same `in_bullet`-priority bug
+        // mistyped blockquote prose nested inside a bullet item, including a
+        // doubly nested blockquote.
+        let src = "- a\n  > q1\n  > > q2\n";
+        let blocks = parse(src);
+
+        assert_eq!(
+            bullet_texts(&blocks),
+            vec!["a"],
+            "the list item's own prose must still render as Block::Bullet"
+        );
+        assert_eq!(
+            quote_texts(&blocks),
+            vec!["q1", "q2"],
+            "both the blockquote and its nested blockquote must render as Block::Quote"
         );
     }
 }
