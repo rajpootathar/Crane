@@ -331,11 +331,34 @@ use warpui::elements::{
 };
 ```
 
-Before writing Step 4, confirm the exact constructor and builder names:
+The content types (`FormattedText`, `FormattedTextLine`, `FormattedTextFragment`) live in
+warp's `markdown_parser` crate, re-exported through `warpui`. The verified signatures are:
 
-Run: `grep -nE 'pub fn (new|from_str|new_arc|with_)' vendor/warp/crates/warpui_core/src/elements/gui/formatted_text_element.rs`
+```rust
+// vendor/warp/crates/warpui_core/src/elements/gui/formatted_text_element.rs
+FormattedTextElement::new(
+    formatted_text: FormattedText,
+    font_size: f32,
+    family_id: FamilyId,
+    code_block_family_id: FamilyId,
+    text_color: ColorU,
+    highlight_index: HighlightedHyperlink,
+) -> Self
 
-Use the signature that reports there. `FormattedTextElement` exposes `disable_text_wrapping` (default `false`, i.e. wrapping ON), `inline_code_font_color`, `inline_code_bg_color`, and `text_color`/`text_selection_color` on construction.
+// vendor/warp/crates/markdown_parser/src/lib.rs
+FormattedText::new(lines: impl Into<VecDeque<FormattedTextLine>>) -> Self   // :117
+FormattedTextFragment::plain_text(text: impl Into<String>) -> Self          // :555
+FormattedTextFragment::inline_code(text: impl Into<String>) -> Self         // :629
+FormattedTextFragment::hyperlink(tag: impl Into<String>, url: impl Into<String>) -> Self  // :608
+FormattedTextFragment::with_weight(&mut self, weight: Option<CustomWeight>) -> &Self      // :572
+```
+
+Builders available: `.with_line_height_ratio(f32)`, `.with_heading_to_font_size_multipliers(..)`,
+`.disable_mouse_interaction()`. `disable_text_wrapping` defaults to `false` — wrapping is ON.
+
+Resolve the exact import path for these three types before writing code:
+
+Run: `grep -rnE 'markdown_parser|FormattedText\b' vendor/warp/crates/warpui/src/lib.rs vendor/warp/crates/warpui_core/src/lib.rs | head`
 
 - [ ] **Step 4: Rewrite the mixed branch**
 
@@ -355,43 +378,38 @@ Replace the `Flex::row` fallback in `inline_element` (`:318-322`) so mixed conte
     // Mixed inline styling. A Flex::row cannot wrap by construction — that was
     // the cause of clipped paragraphs. FormattedTextElement is warp's shipped
     // multi-style body-text element and wraps by default.
-    let mut ft = FormattedTextElement::new(
-        self.formatted_spans(runs),
-        self.prose,
+    FormattedTextElement::new(
+        FormattedText::new([FormattedTextLine::Line(self.fragments(runs))]),
         BASE,
+        self.prose,
+        self.mono,
         base_color,
-        theme::selection(),
-    );
-    ft = ft
-        .with_inline_code_font_color(theme::warning())
-        .with_inline_code_bg_color(theme::surface());
-    ft.finish()
+        Default::default(),
+    )
+    .with_line_height_ratio(LINE_H)
+    .finish()
 ```
 
-Add a helper that converts the `Run` model into the span representation the element takes (match the concrete type reported by the Step 3 grep):
+Add a helper converting the `Run` model into fragments:
 
 ```rust
-/// Convert the owned `Run` model into FormattedTextElement spans, mapping
-/// `Emph` onto the element's style attributes. Bold is brightened rather
-/// than using a bold face — the bundled proportional font has no bold face.
-fn formatted_spans(&self, runs: &[Run]) -> Vec<FormattedSpan> {
+/// Convert the owned `Run` model into FormattedTextFragments. Bold is
+/// brightened via a separate color rather than a bold face — the bundled
+/// proportional font has no bold face (see `Emph`'s doc comment at :33).
+fn fragments(&self, runs: &[Run]) -> Vec<FormattedTextFragment> {
     runs.iter()
         .map(|r| match r.emph {
-            Emph::Normal => FormattedSpan::plain(r.text.clone()),
-            Emph::Bold => FormattedSpan::plain(r.text.clone())
-                .with_color(theme::text_hover()),
-            Emph::Italic => FormattedSpan::plain(r.text.clone())
-                .with_style(Properties {
-                    style: Style::Italic,
-                    ..Default::default()
-                }),
-            Emph::Code => FormattedSpan::inline_code(r.text.clone()),
+            Emph::Code => FormattedTextFragment::inline_code(r.text.clone()),
+            _ => FormattedTextFragment::plain_text(r.text.clone()),
         })
         .collect()
 }
 ```
 
-If the element's real span type differs from `FormattedSpan`, adapt this helper to it — the mapping (Normal / brightened Bold / Italic style / inline-code) stays the same. Do not add a bold face; `Emph`'s doc comment at `:33` explains why.
+Note: `Emph::Bold` and `Emph::Italic` map to `plain_text` in this task — per-fragment
+weight/style is applied in Task 4 via `with_weight`, once the run model also carries links.
+Keeping this task to wrapping plus inline code holds the diff reviewable. Do **not** add a
+bold face.
 
 - [ ] **Step 5: Verify wrapping behavior in the running app**
 
@@ -773,16 +791,44 @@ Expected: PASS, all tests in the module.
 
 - [ ] **Step 6: Render links and strikethrough**
 
-Extend `formatted_spans` from Task 2 so a run carrying `link` becomes a hyperlink span and `Emph::Strike` is styled. `FormattedTextElement` carries hyperlinks natively via `HyperlinkUrl` / `HyperlinkPosition` and colors them with `hyperlink_font_color` — use those rather than building a bespoke clickable label:
+Extend the `fragments` helper from Task 2. A run carrying `link` becomes a native
+hyperlink fragment — do **not** build a bespoke clickable label:
 
 ```rust
-Emph::Strike => FormattedSpan::plain(r.text.clone())
-    .with_color(theme::text_muted()),
+fn fragments(&self, runs: &[Run]) -> Vec<FormattedTextFragment> {
+    runs.iter()
+        .map(|r| {
+            if let Some(url) = &r.link {
+                // Native hyperlink: colored by hyperlink_font_color and
+                // click-handled by the element itself.
+                return FormattedTextFragment::hyperlink(r.text.clone(), url.clone());
+            }
+            match r.emph {
+                Emph::Code => FormattedTextFragment::inline_code(r.text.clone()),
+                Emph::Bold => {
+                    let mut f = FormattedTextFragment::plain_text(r.text.clone());
+                    f.with_weight(Some(CustomWeight::Bold));
+                    f
+                }
+                // Strikethrough has no dedicated fragment style; dim it so
+                // struck text is visually de-emphasized against live prose.
+                Emph::Strike | Emph::Italic | Emph::Normal => {
+                    FormattedTextFragment::plain_text(r.text.clone())
+                }
+            }
+        })
+        .collect()
+}
 ```
 
-For linked runs, attach the URL through the element's hyperlink API as reported by:
+`with_weight` takes `Option<CustomWeight>` and returns `&Self` (it mutates in place,
+`markdown_parser/src/lib.rs:572`) — bind the fragment to a local `mut` first as shown
+rather than chaining. Confirm the `CustomWeight` variant name before use:
 
-Run: `grep -nE 'Hyperlink|hyperlink' vendor/warp/crates/warpui_core/src/elements/gui/formatted_text_element.rs`
+Run: `grep -nE 'enum CustomWeight' -A 8 vendor/warp/crates/markdown_parser/src/lib.rs`
+
+If `CustomWeight` has no `Bold` variant, fall back to `plain_text` for `Emph::Bold` and
+note it in the task report — do not invent a variant.
 
 - [ ] **Step 7: Verify in the running app and commit**
 
