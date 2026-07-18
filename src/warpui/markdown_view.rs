@@ -61,7 +61,18 @@ type Cell = Vec<Run>;
 enum Block {
     Heading { level: u8, text: String },
     Para(Vec<Run>),
-    Bullet { runs: Vec<Run>, depth: usize, ordinal: Option<usize> },
+    Bullet {
+        runs: Vec<Run>,
+        depth: usize,
+        ordinal: Option<usize>,
+        /// True when this is a later flush of an item whose marker already
+        /// rendered on an earlier flush (Finding 1) — e.g. continuation
+        /// prose after a nested list inside the same loose item. Gates
+        /// `bullet_element`'s marker column: a continuation row renders no
+        /// glyph at all, not the ordinal and not a substitute dot, just the
+        /// same indent as the item's first row.
+        continuation: bool,
+    },
     Quote(Vec<Run>),
     Code(Vec<String>),
     Table { headers: Vec<Cell>, rows: Vec<Vec<Cell>> },
@@ -97,11 +108,22 @@ fn heading_u8(level: HeadingLevel) -> u8 {
 /// Item/BlockQuote is about to reuse `runs`), and the ordinal counter must
 /// advance exactly once per item no matter which of those two sites ends up
 /// doing the pushing.
+///
+/// `marker_emitted` tracks whether this item has already had one flush
+/// render its marker. Because the stack entry survives every flush of the
+/// same item (an early one at a nested container's `Start`, and — if prose
+/// remains — the item's own `End`), a naive read of `ordinal` on each flush
+/// would render the same "N." (or dot) every time a loose item is flushed
+/// more than once. `flush_open_container` and `End(TagEnd::Item)` both
+/// check/set this flag: the first flush renders the real marker and flips
+/// it to `true`; every later flush of that same item is a markerless
+/// continuation row (see `Block::Bullet::continuation`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ContainerKind {
     Bullet {
         depth: usize,
         ordinal: Option<usize>,
+        marker_emitted: bool,
     },
     Quote,
 }
@@ -123,10 +145,15 @@ enum ContainerKind {
 /// so deferring the outer's flush that way would land its block after the
 /// inner one in `blocks`, out of reading order. Flushing immediately, right
 /// here, keeps blocks in document order.
+///
+/// Takes `container_stack` mutably (Finding 1): flushing a `Bullet` entry
+/// needs to both read `ordinal` and flip `marker_emitted` on the *same* top
+/// entry, so a later flush of the same item (its own `End(TagEnd::Item)`,
+/// or a second nested container) knows the marker already rendered.
 fn flush_open_container(
     blocks: &mut Vec<Block>,
     runs: &mut Vec<Run>,
-    container_stack: &[ContainerKind],
+    container_stack: &mut [ContainerKind],
 ) {
     let taken = std::mem::take(runs);
     if taken.iter().all(|r| r.text.trim().is_empty()) {
@@ -136,12 +163,19 @@ fn flush_open_container(
         !container_stack.is_empty(),
         "flush_open_container has non-empty pending prose but no open container to flush into"
     );
-    match container_stack.last() {
-        Some(ContainerKind::Bullet { depth, ordinal }) => {
+    match container_stack.last_mut() {
+        Some(ContainerKind::Bullet { depth, ordinal, marker_emitted }) => {
+            // Only the item's first flush renders a marker (Finding 1). A
+            // later flush of the same item is a continuation row: no
+            // number, and — per `Block::Bullet::continuation` — no
+            // substitute dot either, just the indent.
+            let continuation = *marker_emitted;
+            *marker_emitted = true;
             blocks.push(Block::Bullet {
                 runs: taken,
                 depth: *depth,
-                ordinal: *ordinal,
+                ordinal: if continuation { None } else { *ordinal },
+                continuation,
             });
         }
         Some(ContainerKind::Quote) => {
@@ -252,7 +286,7 @@ fn parse(src: &str) -> Vec<Block> {
                 if container_stack.is_empty() {
                     runs.clear();
                 } else {
-                    flush_open_container(&mut blocks, &mut runs, &container_stack);
+                    flush_open_container(&mut blocks, &mut runs, &mut container_stack);
                 }
                 // The ordinal counter advances on every item, unconditionally
                 // — an item whose only content is (say) a table or a
@@ -277,7 +311,11 @@ fn parse(src: &str) -> Vec<Block> {
                     }
                     _ => None,
                 };
-                container_stack.push(ContainerKind::Bullet { depth, ordinal });
+                container_stack.push(ContainerKind::Bullet {
+                    depth,
+                    ordinal,
+                    marker_emitted: false,
+                });
             }
             Event::End(TagEnd::Item) => {
                 let popped = container_stack.pop();
@@ -288,13 +326,17 @@ fn parse(src: &str) -> Vec<Block> {
                 // A nested table's own End(TagEnd::Table) clears `runs`, so a
                 // list item whose only content was a table must not push an
                 // empty Block::Bullet here.
-                if let Some(ContainerKind::Bullet { depth, ordinal }) = popped {
+                if let Some(ContainerKind::Bullet { depth, ordinal, marker_emitted }) = popped {
                     let runs = std::mem::take(&mut runs);
                     if !runs.iter().all(|r| r.text.trim().is_empty()) {
+                        // Finding 1: if an earlier flush of this same item
+                        // already rendered the marker, this is a
+                        // continuation row — no ordinal, no substitute dot.
                         blocks.push(Block::Bullet {
                             runs,
                             depth,
-                            ordinal,
+                            ordinal: if marker_emitted { None } else { ordinal },
+                            continuation: marker_emitted,
                         });
                     }
                 }
@@ -303,7 +345,7 @@ fn parse(src: &str) -> Vec<Block> {
                 if container_stack.is_empty() {
                     runs.clear();
                 } else {
-                    flush_open_container(&mut blocks, &mut runs, &container_stack);
+                    flush_open_container(&mut blocks, &mut runs, &mut container_stack);
                 }
                 container_stack.push(ContainerKind::Quote);
             }
@@ -502,7 +544,9 @@ impl WarpMarkdownView {
         match block {
             Block::Heading { level, text } => self.heading_element(*level, text),
             Block::Para(runs) => self.pad_block(self.inline_element(runs, theme::text()), 4.0),
-            Block::Bullet { runs, depth, ordinal } => self.bullet_element(runs, *depth, *ordinal),
+            Block::Bullet { runs, depth, ordinal, continuation } => {
+                self.bullet_element(runs, *depth, *ordinal, *continuation)
+            }
             Block::Quote(runs) => self.quote_element(runs),
             Block::Code(lines) => self.code_element(lines),
             Block::Table { headers, rows } => self.table_element(headers, rows),
@@ -590,12 +634,17 @@ impl WarpMarkdownView {
     /// `ordinal` renders a "N." marker for ordered-list items; `None`
     /// (unordered) keeps the drawn dot marker (NOT a Unicode "•" glyph — the
     /// bundled fonts don't cover it and it would render as tofu), nudged
-    /// down to sit on the text baseline.
+    /// down to sit on the text baseline. `continuation` (Finding 1)
+    /// overrides both: a later flush of an item whose marker already
+    /// rendered gets no glyph at all — the marker column still reserves
+    /// `MARKER_MIN_WIDTH` so the row's text lines up with the item's own
+    /// first row, it is just left empty.
     fn bullet_element(
         &self,
         runs: &[Run],
         depth: usize,
         ordinal: Option<usize>,
+        continuation: bool,
     ) -> Box<dyn Element> {
         // A floor, not a ceiling, on the marker column's width.
         // `ConstrainedBox::with_width` (the previous approach) clamps *both*
@@ -610,28 +659,39 @@ impl WarpMarkdownView {
         // off.
         const MARKER_MIN_WIDTH: f32 = 22.0;
 
-        let marker: Box<dyn Element> = match ordinal {
-            Some(n) => Container::new(
-                Text::new(format!("{n}."), self.prose, BASE)
-                    .with_color(theme::accent())
-                    .soft_wrap(false)
-                    .finish(),
-            )
-            .with_padding_left(8.0)
-            .with_padding_right(6.0)
-            .finish(),
-            None => Container::new(
-                ConstrainedBox::new(
-                    Rect::new().with_background_color(theme::accent()).finish(),
+        let marker: Box<dyn Element> = if continuation {
+            // Continuation row: no ordinal AND no substitute dot — this
+            // prose belongs to an item whose marker already rendered on an
+            // earlier flush. The empty Text still occupies the marker
+            // column (reserved below via MARKER_MIN_WIDTH), so the row's
+            // text lines up with the item's own first row.
+            Text::new(String::new(), self.prose, BASE)
+                .with_color(theme::text())
+                .finish()
+        } else {
+            match ordinal {
+                Some(n) => Container::new(
+                    Text::new(format!("{n}."), self.prose, BASE)
+                        .with_color(theme::accent())
+                        .soft_wrap(false)
+                        .finish(),
                 )
-                .with_width(5.0)
-                .with_height(5.0)
+                .with_padding_left(8.0)
+                .with_padding_right(6.0)
                 .finish(),
-            )
-            .with_padding_top(BASE * 0.45)
-            .with_padding_left(8.0)
-            .with_padding_right(9.0)
-            .finish(),
+                None => Container::new(
+                    ConstrainedBox::new(
+                        Rect::new().with_background_color(theme::accent()).finish(),
+                    )
+                    .with_width(5.0)
+                    .with_height(5.0)
+                    .finish(),
+                )
+                .with_padding_top(BASE * 0.45)
+                .with_padding_left(8.0)
+                .with_padding_right(9.0)
+                .finish(),
+            }
         };
 
         let row = Flex::row()
@@ -1090,6 +1150,33 @@ mod tests {
             vec![Some(1), Some(3)],
             "the table-only item must consume ordinal 2 (no Block::Bullet appears for it), \
              so the next sibling is still numbered 3"
+        );
+    }
+
+    #[test]
+    fn continuation_prose_after_a_nested_list_does_not_repeat_the_items_ordinal() {
+        // Finding 1: `depth`/`ordinal` live on the ContainerKind::Bullet
+        // stack entry, and that entry survives every flush of the same
+        // item (an early one at a nested container's Start, and — if
+        // prose remains — the item's own End). Before the fix, each flush
+        // read the same `ordinal`, so a loose ordered item with a nested
+        // list followed by continuation prose rendered its "1." marker
+        // twice.
+        let src = "1. one\n\n   - nested\n\n   more prose\n2. two\n";
+        let blocks = parse(src);
+
+        let ordinals: Vec<Option<usize>> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Bullet { ordinal, .. } => Some(*ordinal),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ordinals,
+            vec![Some(1), None, None, Some(2)],
+            "only the item's FIRST flush may carry its ordinal; the continuation \
+             row after the nested list must not repeat \"1.\""
         );
     }
 
