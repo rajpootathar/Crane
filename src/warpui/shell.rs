@@ -2160,6 +2160,14 @@ impl CraneShellView {
         )
     }
 
+    /// Test-only view of the pane-identity hazard: `(ws_of_pane(id),
+    /// is_files_pane(id))`. Both must answer for the Workspace that OWNS `id`,
+    /// regardless of which Workspace is currently selected.
+    #[cfg(test)]
+    pub(crate) fn pane_ws_for_test(&self, id: PaneId) -> (Option<(usize, usize)>, bool) {
+        (self.ws_of_pane(id), self.is_files_pane(id))
+    }
+
     /// Test-only `(project_idx, worktree_idx)` for a Project's root path — lets
     /// a test address a Workspace without hard-coding the order
     /// `load_projects_shallow` happens to return Projects in.
@@ -16554,6 +16562,32 @@ mod restore_wiring_integration_tests {
                         vctx,
                     );
                     v.open_file(doc_b2.clone(), vctx);
+
+                    // THE HAZARD: Workspace B is selected right now, but
+                    // Workspace A's Files Pane is still a live leaf of A's
+                    // layout and can render at any time. Both `ws_of_pane` and
+                    // `is_files_pane` must answer for the pane's OWN Workspace
+                    // — resolving them against the selected Workspace would
+                    // hand A's pane B's identity (and B's File Tab strip).
+                    let (fp_a, paths_a_raw, _) = v.files_pane_state_for_test(ws_a);
+                    let fp_a = fp_a.expect("Workspace A must own a Files Pane");
+                    assert_eq!(!paths_a_raw.is_empty(), true);
+                    assert_eq!(
+                        v.pane_ws_for_test(fp_a),
+                        (Some(ws_a), true),
+                        "A's Files Pane must resolve to Workspace A and still read as a \
+                         Files Pane while Workspace B is the selected one"
+                    );
+                    let fp_b = v
+                        .files_pane_state_for_test(ws_b)
+                        .0
+                        .expect("Workspace B must own a Files Pane");
+                    assert_ne!(fp_a, fp_b, "each Workspace gets its OWN Files Pane leaf");
+                    assert_eq!(
+                        v.pane_ws_for_test(fp_b),
+                        (Some(ws_b), true),
+                        "B's Files Pane resolves to Workspace B"
+                    );
 
                     let (_, paths_b, active_b) = v.files_pane_state_for_test(ws_b);
                     assert_eq!(
