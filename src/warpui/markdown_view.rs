@@ -31,27 +31,27 @@ const RENDER_BLOCKS: usize = 400;
 
 // ── Owned block model (parsed once, rendered each frame) ─────────────────────
 
-/// Inline emphasis for one text run. Bold and Italic are currently rendered
-/// identically to Normal prose — `fragments()` maps both to a plain-text
-/// fragment, so no visual distinction exists yet between the three. This is a
-/// deliberate, accepted scope cut (not a regression to fix here): per-fragment
-/// weight/style is deferred to a later task via `FormattedTextFragment`'s
-/// `with_weight` support. The shipped proportional font has no bold face
-/// regardless, so any future bold treatment must still avoid a bold font face
-/// (same rationale as old egui's markdown view) and use a color/style cue
-/// instead.
+/// Inline emphasis for one text run. Each variant maps to its own
+/// `FormattedTextFragment` constructor in `fragments()` (bold/italic/code/
+/// strikethrough all render distinctly — see that method's doc comment for
+/// the bold-face finding on this app's prose font).
 #[derive(Clone, Copy, PartialEq)]
 enum Emph {
     Normal,
     Bold,
     Italic,
     Code,
+    Strike,
 }
 
 /// One styled inline run inside a block.
 struct Run {
     text: String,
     emph: Emph,
+    /// Destination URL when this run sits inside a Markdown link. Wins over
+    /// `emph` in `fragments()`: a linked run always renders as a hyperlink
+    /// fragment regardless of any emphasis also active on it.
+    link: Option<String>,
 }
 
 /// One table cell's inline content.
@@ -230,9 +230,16 @@ fn parse(src: &str) -> Vec<Block> {
     // restored into `runs` at `End(TagEnd::Table)`, once cell processing is
     // done.
     let mut pending_container_runs: Vec<Run> = Vec::new();
+    // Destination URL of the innermost open link, if any. `Some` between
+    // `Start(Tag::Link)` and `End(TagEnd::Link)`; cleared on the End tag.
+    let mut link_url: Option<String> = None;
+    // Whether a `~~...~~` span is currently open.
+    let mut strike = false;
 
-    let emph_now = |bold: bool, italic: bool| {
-        if bold {
+    let emph_now = |bold: bool, italic: bool, strike: bool| {
+        if strike {
+            Emph::Strike
+        } else if bold {
             Emph::Bold
         } else if italic {
             Emph::Italic
@@ -389,6 +396,7 @@ fn parse(src: &str) -> Vec<Block> {
                 runs.push(Run {
                     text: text.into_string(),
                     emph: Emph::Code,
+                    link: None,
                 });
             }
             Event::Text(text) => {
@@ -399,7 +407,8 @@ fn parse(src: &str) -> Vec<Block> {
                 } else {
                     runs.push(Run {
                         text: text.into_string(),
-                        emph: emph_now(bold, italic),
+                        emph: emph_now(bold, italic, strike),
+                        link: link_url.clone(),
                     });
                 }
             }
@@ -412,8 +421,26 @@ fn parse(src: &str) -> Vec<Block> {
                     runs.push(Run {
                         text: " ".to_string(),
                         emph: Emph::Normal,
+                        link: None,
                     });
                 }
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                link_url = Some(dest_url.to_string());
+            }
+            Event::End(TagEnd::Link) => {
+                link_url = None;
+            }
+            Event::Start(Tag::Strikethrough) => strike = true,
+            Event::End(TagEnd::Strikethrough) => strike = false,
+            Event::TaskListMarker(done) => {
+                // Drawn as text, not a Unicode checkbox glyph — the bundled
+                // fonts don't cover that range and it would render as tofu.
+                runs.push(Run {
+                    text: if done { "[x] ".to_string() } else { "[ ] ".to_string() },
+                    emph: Emph::Code,
+                    link: None,
+                });
             }
             Event::Rule => blocks.push(Block::Rule),
             Event::Start(Tag::Table(_)) => {
@@ -512,6 +539,7 @@ impl WarpMarkdownView {
             Err(e) => vec![Block::Para(vec![Run {
                 text: format!("Cannot read {}: {e}", path.display()),
                 emph: Emph::Normal,
+                link: None,
             }])],
         };
         Self {
@@ -1246,6 +1274,66 @@ mod tests {
             ],
             "the blockquote's nested unordered item ('deep') must not consume an ordinal meant \
              for 'two'"
+        );
+    }
+
+    #[test]
+    fn link_url_is_captured_on_the_run() {
+        let src = "See [the docs](https://example.com/guide) for more.\n";
+        let blocks = parse(src);
+        let runs = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Para(runs) => Some(runs),
+                _ => None,
+            })
+            .expect("one paragraph");
+        let linked = runs
+            .iter()
+            .find(|r| r.link.is_some())
+            .expect("a run must carry the link URL");
+        assert_eq!(linked.text, "the docs");
+        assert_eq!(linked.link.as_deref(), Some("https://example.com/guide"));
+    }
+
+    #[test]
+    fn strikethrough_is_captured() {
+        let src = "This is ~~gone~~ now.\n";
+        let blocks = parse(src);
+        let runs = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Para(runs) => Some(runs),
+                _ => None,
+            })
+            .expect("one paragraph");
+        assert!(
+            runs.iter().any(|r| matches!(r.emph, Emph::Strike) && r.text == "gone"),
+            "struck text must be an Emph::Strike run"
+        );
+    }
+
+    #[test]
+    fn task_list_markers_render_as_checkboxes() {
+        let src = "- [x] done\n- [ ] pending\n";
+        let blocks = parse(src);
+        let texts: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Bullet { runs, .. } => {
+                    Some(runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 2, "two task items");
+        assert_eq!(
+            texts[0], "[x] done",
+            "the checked marker must render as literal \"[x] \" text, not be silently dropped"
+        );
+        assert_eq!(
+            texts[1], "[ ] pending",
+            "the unchecked marker must render as literal \"[ ] \" text, not be silently dropped"
         );
     }
 
