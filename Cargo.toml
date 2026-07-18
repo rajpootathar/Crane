@@ -77,6 +77,12 @@ anyhow = "1"
 # replaces the hand-rolled FileView so the file pane is warp-quality.
 warp_editor = { path = "vendor/warp/crates/editor" }
 string-offset = { path = "vendor/warp/crates/string-offset" }
+# Warp's markdown content model (FormattedText / FormattedTextFragment).
+# Not re-exported through warpui/warpui_core — those crates depend on it
+# internally but keep it private, so the markdown view depends on it
+# directly to build FormattedTextElement content for wrapping mixed-style
+# paragraphs (src/warpui/markdown_view.rs).
+markdown_parser = { path = "vendor/warp/crates/markdown_parser" }
 rangemap = "1.7"
 log = "0.4"
 env_logger = "0.11"

@@ -7,14 +7,15 @@
 
 use std::path::PathBuf;
 
+use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use warpui::color::ColorU;
 use warpui::elements::{
     ConstrainedBox, Container, DispatchEventResult, Element, EventHandler, Expanded, Flex,
-    ParentElement, Rect, Stack, Text,
+    FormattedTextElement, ParentElement, Rect, Stack, Text,
 };
-use warpui::fonts::{FamilyId, Properties, Style};
+use warpui::fonts::FamilyId;
 use warpui::{AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext};
 
 use crate::warpui::theme;
@@ -382,9 +383,10 @@ impl WarpMarkdownView {
 
     /// One inline block. Fast path: a single soft-wrapping `Text` when the block
     /// is uniform prose (no inline code, no emphasis) — the common case, and the
-    /// only path that wraps long paragraphs correctly. Mixed blocks fall back to
-    /// a `Flex::row` of styled pieces (inline code becomes a bg-tinted chip); a
-    /// row does not soft-wrap, the accepted v1 tradeoff for inline styling.
+    /// cheapest path. Mixed blocks (inline code, bold, or italic) build a
+    /// `FormattedTextElement`, warp's multi-style body-text element, which wraps
+    /// by default and renders inline code as a chip natively — replacing the old
+    /// `Flex::row` fallback, which could not wrap by construction.
     fn inline_element(&self, runs: &[Run], base_color: ColorU) -> Box<dyn Element> {
         if runs.is_empty() {
             return Text::new(String::new(), self.prose, BASE)
@@ -402,44 +404,32 @@ impl WarpMarkdownView {
                 .soft_wrap(true)
                 .finish();
         }
-        let mut row = Flex::row();
-        for r in runs {
-            row = row.with_child(self.run_element(r, base_color));
-        }
-        row.finish()
+
+        // Mixed inline styling. A Flex::row cannot wrap by construction — that
+        // was the cause of clipped paragraphs. FormattedTextElement is warp's
+        // shipped multi-style body-text element and wraps by default.
+        FormattedTextElement::new(
+            FormattedText::new([FormattedTextLine::Line(self.fragments(runs))]),
+            BASE,
+            self.prose,
+            self.mono,
+            base_color,
+            Default::default(),
+        )
+        .with_line_height_ratio(LINE_H)
+        .finish()
     }
 
-    fn run_element(&self, run: &Run, base_color: ColorU) -> Box<dyn Element> {
-        match run.emph {
-            Emph::Normal => Text::new(run.text.clone(), self.prose, BASE)
-                .with_color(base_color)
-                .soft_wrap(false)
-                .finish(),
-            // Bold has no dedicated face — brighten instead (see `Emph`).
-            Emph::Bold => Text::new(run.text.clone(), self.prose, BASE)
-                .with_color(theme::text_hover())
-                .soft_wrap(false)
-                .finish(),
-            Emph::Italic => Text::new(run.text.clone(), self.prose, BASE)
-                .with_color(base_color)
-                .with_style(Properties {
-                    style: Style::Italic,
-                    ..Default::default()
-                })
-                .soft_wrap(false)
-                .finish(),
-            // Inline code: mono glyphs on a surface-tinted chip.
-            Emph::Code => Container::new(
-                Text::new(run.text.clone(), self.mono, BASE - 1.0)
-                    .with_color(theme::warning())
-                    .soft_wrap(false)
-                    .finish(),
-            )
-            .with_background_color(theme::surface())
-            .with_padding_left(3.0)
-            .with_padding_right(3.0)
-            .finish(),
-        }
+    /// Convert the owned `Run` model into FormattedTextFragments. Bold is
+    /// brightened via a separate color rather than a bold face — the bundled
+    /// proportional font has no bold face (see `Emph`'s doc comment above).
+    fn fragments(&self, runs: &[Run]) -> Vec<FormattedTextFragment> {
+        runs.iter()
+            .map(|r| match r.emph {
+                Emph::Code => FormattedTextFragment::inline_code(r.text.clone()),
+                _ => FormattedTextFragment::plain_text(r.text.clone()),
+            })
+            .collect()
     }
 
     fn bullet_element(&self, runs: &[Run]) -> Box<dyn Element> {
@@ -797,6 +787,30 @@ mod tests {
         assert!(
             quote_texts(&blocks).is_empty(),
             "a blockquote containing only a table must not produce an empty Block::Quote"
+        );
+    }
+
+    #[test]
+    fn mixed_runs_produce_wrapping_inline_content() {
+        // A paragraph mixing prose and inline code is the common technical case
+        // and is exactly what the old Flex::row path failed to wrap.
+        let src = "Set `CRANE_GPU_TERM=1` in the environment to enable the renderer.\n";
+        let blocks = parse(src);
+        let runs = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Para(runs) => Some(runs),
+                _ => None,
+            })
+            .expect("one paragraph");
+
+        assert!(
+            runs.iter().any(|r| matches!(r.emph, Emph::Code)),
+            "the code span must survive parsing as an Emph::Code run"
+        );
+        assert!(
+            runs.iter().any(|r| matches!(r.emph, Emph::Normal)),
+            "surrounding prose must survive as Normal runs"
         );
     }
 }
