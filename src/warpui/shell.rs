@@ -11242,13 +11242,19 @@ impl CraneShellView {
     /// deliberately NOT part of it: File Tabs belong to the Workspace, not to
     /// one Tab, so splitting a new Tab keeps the same Files Pane list.
     ///
-    /// Derived from `active_tab` rather than `selected` because `split_with_at`
-    /// (which creates the Files Pane) splits inside `active_tab`'s layout. The
-    /// two agree in the common case, but clicking a Workspace row in the Left
-    /// Panel moves `selected` without moving `active_tab`; keying off
-    /// `selected` there would file the pane under a Workspace whose layout does
-    /// not contain it, and every `pane -> Workspace` lookup below would then
-    /// disagree with it. `selected` is the fallback for the no-active-Tab case.
+    /// Derived from `active_tab` rather than `selected` because
+    /// `split_with_at` (which creates the Files Pane) opens with `let tab =
+    /// self.active_tab?` and splits inside THAT Tab's layout. Keying this off
+    /// `active_tab` means the Workspace it returns and the Workspace
+    /// `split_with_at` actually splits into are read from the exact same
+    /// field, so they are structurally incapable of disagreeing — every
+    /// `pane -> Workspace` lookup below stays consistent with where the pane
+    /// was actually created. Keying off `selected` instead would only be
+    /// correct by convention (every call site that writes `selected` today
+    /// happens to also write `active_tab` to the same key in the same
+    /// block), and that convention would silently break the moment a future
+    /// call site moved one without the other. `selected` is the fallback for
+    /// the no-active-Tab case.
     fn ws_key(&self) -> (usize, usize) {
         self.active_tab
             .map(|(pi, wi, _)| (pi, wi))
