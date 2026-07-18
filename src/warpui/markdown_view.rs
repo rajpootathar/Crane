@@ -397,11 +397,15 @@ fn parse(src: &str) -> Vec<Block> {
                 }
             }
             Event::Code(text) => {
-                runs.push(Run {
-                    text: text.into_string(),
-                    emph: Emph::Code,
-                    link: None,
-                });
+                if heading.is_some() {
+                    head_buf.push_str(&text);
+                } else {
+                    runs.push(Run {
+                        text: text.into_string(),
+                        emph: Emph::Code,
+                        link: None,
+                    });
+                }
             }
             Event::Text(text) => {
                 if in_code {
@@ -1005,6 +1009,69 @@ impl View for WarpMarkdownView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heading_with_inline_code_preserves_the_code_text() {
+        // Event::Code (the inline-code arm) had no `heading.is_some()` guard,
+        // so a code span inside a heading pushed straight into `runs` instead
+        // of `head_buf` — the code text was then silently dropped (`runs`
+        // is never read while a heading is open, and nothing flushes it
+        // here since a heading has no enclosing container at the top
+        // level).
+        let src = "## Use `foo` here\n";
+        let blocks = parse(src);
+        let heading_text = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Heading { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("one heading");
+        assert_eq!(
+            heading_text, "Use foo here",
+            "an inline code span inside a heading must contribute its literal text to \
+             the heading, not be silently dropped"
+        );
+    }
+
+    #[test]
+    fn heading_with_inline_code_inside_a_list_item_does_not_leak_into_a_bullet() {
+        // Same defect, list-item case: with the code span misrouted into
+        // `runs`, the first item's End(TagEnd::Item) then flushed that
+        // leftover "foo" run as a phantom Block::Bullet — content that
+        // belongs to the heading leaking into an unrelated sibling block.
+        //
+        // Once the code span correctly lands in `head_buf` instead, `runs`
+        // stays empty for the whole first item (its only content is the
+        // heading), so the item produces no Block::Bullet at all — the
+        // same pre-existing empty-block guard this file already uses for
+        // an item whose only content is a table (see
+        // `bullet_containing_only_a_table_produces_no_empty_bullet_block`).
+        // Only the second item's own bullet remains.
+        let src = "- ## Use `foo` here\n- second\n";
+        let blocks = parse(src);
+
+        let heading_text = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Heading { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("one heading");
+        assert_eq!(
+            heading_text, "Use foo here",
+            "the heading nested in the first list item must still capture the inline \
+             code span's text"
+        );
+
+        assert_eq!(
+            bullet_texts(&blocks),
+            vec!["second".to_string()],
+            "the first item's only content is consumed by its heading and must not leave \
+             a phantom Block::Bullet behind (\"foo\") — only the second item's own bullet \
+             may remain"
+        );
+    }
 
     fn para_texts(blocks: &[Block]) -> Vec<String> {
         blocks
