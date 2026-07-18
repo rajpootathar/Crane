@@ -326,8 +326,16 @@ fn parse(src: &str) -> Vec<Block> {
                 // A nested table's own End(TagEnd::Table) clears `runs`, so a
                 // list item whose only content was a table must not push an
                 // empty Block::Bullet here.
+                //
+                // The take is unconditional (Finding 3), not nested inside
+                // the `if let Some(Bullet)` guard below: on a kind mismatch
+                // (unreachable in practice — the debug_assert above already
+                // flags it) a conditional take would leave stale `runs` to
+                // leak into the next block in release builds while debug
+                // builds panic instead. Draining here keeps both profiles
+                // in agreement on this impossible state.
+                let runs = std::mem::take(&mut runs);
                 if let Some(ContainerKind::Bullet { depth, ordinal, marker_emitted }) = popped {
-                    let runs = std::mem::take(&mut runs);
                     if !runs.iter().all(|r| r.text.trim().is_empty()) {
                         // Finding 1: if an earlier flush of this same item
                         // already rendered the marker, this is a
@@ -358,8 +366,13 @@ fn parse(src: &str) -> Vec<Block> {
                 // Same guard as Item above: a nested table's End(TagEnd::Table)
                 // clears `runs`, so a blockquote whose only content was a
                 // table must not push an empty Block::Quote here.
+                //
+                // Take is unconditional (Finding 3) for the same reason as
+                // End(TagEnd::Item) above: debug and release must agree on
+                // the (should-be unreachable) kind-mismatch case instead of
+                // one panicking and the other silently leaking stale `runs`.
+                let runs = std::mem::take(&mut runs);
                 if matches!(popped, Some(ContainerKind::Quote)) {
-                    let runs = std::mem::take(&mut runs);
                     if !runs.iter().all(|r| r.text.trim().is_empty()) {
                         blocks.push(Block::Quote(runs));
                     }
