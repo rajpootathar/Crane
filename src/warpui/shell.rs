@@ -10715,6 +10715,15 @@ impl CraneShellView {
     /// the dock edge is computed 1:1 from the cursor position (`dock_zone`),
     /// shown as a half-pane preview, and applied on drop (edge=split, center=swap).
     fn render_pane(&self, id: PaneId, app: &AppContext) -> Box<dyn Element> {
+        // Resolve the Workspace that owns THIS pane ONCE per frame — `ws_of_pane`
+        // is an O(layouts) scan, and both the file-tab-strip check below and
+        // `pane_header`'s title used to each re-resolve it independently
+        // (three scans total per pane per frame). `is_file_pane` is derived
+        // from this single resolution and threaded into `pane_header` instead
+        // of letting it call `is_files_pane` (which would re-resolve `ws` a
+        // second time) on its own.
+        let ws = self.ws_of_pane(id);
+        let is_file_pane = ws.map(|k| self.files_pane.get(&k) == Some(&id)).unwrap_or(false);
         let inner: Box<dyn Element> = match self.panes.get(&id) {
             Some(PaneContent::Terminal(h)) => ChildView::new(h).finish(),
             Some(PaneContent::File(h)) => ChildView::new(h).finish(),
@@ -10792,7 +10801,7 @@ impl CraneShellView {
         let rects = self.pane_rects.clone();
         let preview_drag = self.drop_preview.clone();
         let preview_drop = self.drop_preview.clone();
-        let header = Draggable::new(state, self.pane_header(id, app))
+        let header = Draggable::new(state, self.pane_header(id, app, is_file_pane))
             .on_drag_start(move |ctx, _app, _rect| {
                 ctx.dispatch_typed_action(CraneShellAction::FocusPane(id));
             })
@@ -10831,9 +10840,12 @@ impl CraneShellView {
         let mut col = Flex::column().with_child(header);
         // Resolve against the Workspace that owns THIS pane, not the selected
         // one — a background Tab's pane can render while another Workspace is
-        // on screen, and it must show its own Workspace's File Tabs.
-        if let Some(ws) = self.ws_of_pane(id).filter(|_| self.is_files_pane(id)) {
-            col = col.with_child(self.file_tab_strip(ws, app));
+        // on screen, and it must show its own Workspace's File Tabs. Reuses
+        // the `ws` / `is_file_pane` resolved once at the top of this method.
+        if is_file_pane {
+            if let Some(ws) = ws {
+                col = col.with_child(self.file_tab_strip(ws, app));
+            }
         }
         let content = col
             .with_child(Expanded::new(1.0, body).finish())
@@ -11112,15 +11124,17 @@ impl CraneShellView {
     }
 
     /// Pane header: title (click to focus) + expand-to-full + close.
-    fn pane_header(&self, id: PaneId, app: &AppContext) -> Box<dyn Element> {
+    /// `is_file_pane` is resolved ONCE by the caller (`render_pane`, which
+    /// already needs `ws_of_pane(id)` for the tab strip) rather than
+    /// re-resolved here — avoids a second `O(layouts)` scan per pane per
+    /// frame.
+    fn pane_header(&self, id: PaneId, app: &AppContext, is_file_pane: bool) -> Box<dyn Element> {
         let focused = self.focused == Some(id);
         let bg = if focused { theme::surface() } else { theme::topbar_bg() };
         // Selected pane's heading is painted in the accent — the same colour that
         // marks the active tab in the left panel — so the focused pane and its tab
         // read as one selection.
         let fg = if focused { theme::accent() } else { theme::text_muted() };
-        // Same Workspace-of-this-pane resolution as `render_pane`'s tab strip.
-        let is_file_pane = self.is_files_pane(id);
 
         // Row 1 is plain pane chrome (icon + title). The File pane's tab strip
         // now renders as a SECOND row beneath this header (see `file_tab_strip`),
