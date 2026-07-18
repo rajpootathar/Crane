@@ -533,6 +533,51 @@ fn needs_formatted_text(runs: &[Run]) -> bool {
         .any(|r| !matches!(r.emph, Emph::Normal) || r.link.is_some())
 }
 
+/// Convert the owned `Run` model into `FormattedTextFragment`s, one distinct
+/// fragment kind per `Emph` variant (`FormattedTextFragment` ships a
+/// purpose-built constructor for each — see
+/// `vendor/warp/crates/markdown_parser/src/lib.rs`, `plain_text`/`bold`/
+/// `italic`/`hyperlink`/`inline_code`/`strikethrough`). A run's `link` wins
+/// over its `emph`: hyperlink fragments are colored by
+/// `hyperlink_font_color`, and are only made clickable at all by
+/// `inline_element`'s explicit `.register_default_click_handlers(...)` call
+/// — `FormattedTextElement` does not wire up hyperlink click handling (or
+/// the `hyperlink_font_color` highlight) on its own, so a linked run always
+/// renders as a hyperlink fragment regardless of any emphasis also active on
+/// it, but is inert without that registration.
+///
+/// A free function, not a method — like `needs_formatted_text` above, this
+/// doesn't use `&self`, so it can be unit-tested directly without standing
+/// up a `WarpMarkdownView` or a font instance. That matters here in
+/// particular: `fragments()` used to be a private method with zero test
+/// coverage, so deleting either the click-handler registration in
+/// `inline_element` or the `link`-wins-over-`emph` early return below left
+/// all tests green — see the `fragments` test module below.
+///
+/// Model limitation, out of scope here: `Emph` is a flat enum, so
+/// `***bold italic***` collapses to whichever of Bold/Italic wins in
+/// `emph_now` and can never reach `FormattedTextFragment::bold_italic`. The
+/// same flattening means `~~**both**~~` collapses to a single `Emph::Strike`
+/// run — strike wins `emph_now`'s precedence chain over bold/italic — so
+/// bold-and-struck text renders as struck-only, never
+/// `FormattedTextFragment::bold`+strikethrough combined.
+fn fragments(runs: &[Run]) -> Vec<FormattedTextFragment> {
+    runs.iter()
+        .map(|r| {
+            if let Some(url) = &r.link {
+                return FormattedTextFragment::hyperlink(r.text.clone(), url.clone());
+            }
+            match r.emph {
+                Emph::Code => FormattedTextFragment::inline_code(r.text.clone()),
+                Emph::Bold => FormattedTextFragment::bold(r.text.clone()),
+                Emph::Italic => FormattedTextFragment::italic(r.text.clone()),
+                Emph::Strike => FormattedTextFragment::strikethrough(r.text.clone()),
+                Emph::Normal => FormattedTextFragment::plain_text(r.text.clone()),
+            }
+        })
+        .collect()
+}
+
 /// Scheme allowlist for hyperlink clicks opened via the OS `open`/`xdg-open`
 /// command. Markdown files come from untrusted repositories, and `open` will
 /// launch arbitrary URL schemes — `file://` to reveal local paths, or a
@@ -681,7 +726,7 @@ impl WarpMarkdownView {
         // was the cause of clipped paragraphs. FormattedTextElement is warp's
         // shipped multi-style body-text element and wraps by default.
         FormattedTextElement::new(
-            FormattedText::new([FormattedTextLine::Line(self.fragments(runs))]),
+            FormattedText::new([FormattedTextLine::Line(fragments(runs))]),
             BASE,
             self.prose,
             self.mono,
@@ -704,43 +749,6 @@ impl WarpMarkdownView {
             let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
         })
         .finish()
-    }
-
-    /// Convert the owned `Run` model into `FormattedTextFragment`s, one
-    /// distinct fragment kind per `Emph` variant (`FormattedTextFragment`
-    /// ships a purpose-built constructor for each — see
-    /// `vendor/warp/crates/markdown_parser/src/lib.rs`, `plain_text`/`bold`/
-    /// `italic`/`hyperlink`/`inline_code`/`strikethrough`). A run's `link`
-    /// wins over its `emph`: hyperlink fragments are colored by
-    /// `hyperlink_font_color`, and are only made clickable at all by
-    /// `inline_element`'s explicit `.register_default_click_handlers(...)`
-    /// call — `FormattedTextElement` does not wire up hyperlink click
-    /// handling (or the `hyperlink_font_color` highlight) on its own, so a
-    /// linked run always renders as a hyperlink fragment regardless of any
-    /// emphasis also active on it, but is inert without that registration.
-    ///
-    /// Model limitation, out of scope here: `Emph` is a flat enum, so
-    /// `***bold italic***` collapses to whichever of Bold/Italic wins in
-    /// `emph_now` and can never reach `FormattedTextFragment::bold_italic`.
-    /// The same flattening means `~~**both**~~` collapses to a single
-    /// `Emph::Strike` run — strike wins `emph_now`'s precedence chain over
-    /// bold/italic — so bold-and-struck text renders as struck-only, never
-    /// `FormattedTextFragment::bold`+strikethrough combined.
-    fn fragments(&self, runs: &[Run]) -> Vec<FormattedTextFragment> {
-        runs.iter()
-            .map(|r| {
-                if let Some(url) = &r.link {
-                    return FormattedTextFragment::hyperlink(r.text.clone(), url.clone());
-                }
-                match r.emph {
-                    Emph::Code => FormattedTextFragment::inline_code(r.text.clone()),
-                    Emph::Bold => FormattedTextFragment::bold(r.text.clone()),
-                    Emph::Italic => FormattedTextFragment::italic(r.text.clone()),
-                    Emph::Strike => FormattedTextFragment::strikethrough(r.text.clone()),
-                    Emph::Normal => FormattedTextFragment::plain_text(r.text.clone()),
-                }
-            })
-            .collect()
     }
 
     /// `depth` (0 = top-level) indents the whole row under its parent —
@@ -1539,6 +1547,61 @@ mod tests {
             needs_formatted_text(&runs),
             "a Normal-emph run carrying a link must still force FormattedTextElement, \
              or hyperlink styling/clicks silently disappear"
+        );
+    }
+
+    // ── fragments (extracted to a free function so it can be exercised here
+    // without a `WarpMarkdownView`/font instance — previously a private
+    // method with zero test coverage: deleting
+    // `.register_default_click_handlers(...)` in `inline_element`, or
+    // deleting the `if let Some(url) = &r.link { return
+    // FormattedTextFragment::hyperlink(...) }` early return below, left all
+    // other tests green) ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_link_wins_over_emphasis() {
+        // The regression this test exists to catch: a run can carry both a
+        // link AND emphasis (e.g. **[bold link](url)**). `fragments()` must
+        // still emit a hyperlink fragment, not a bold one — deleting the
+        // `link`-checking early return would silently fall through to the
+        // `match r.emph` arm below and produce
+        // `FormattedTextFragment::bold(...)` instead.
+        let runs = vec![Run {
+            text: "click me".to_string(),
+            emph: Emph::Bold,
+            link: Some("https://example.com".to_string()),
+        }];
+        assert_eq!(
+            fragments(&runs),
+            vec![FormattedTextFragment::hyperlink(
+                "click me",
+                "https://example.com"
+            )],
+            "a linked run must produce a hyperlink fragment even when it also carries \
+             Emph::Bold — link wins over emphasis"
+        );
+    }
+
+    #[test]
+    fn each_emph_variant_maps_to_its_intended_fragment_constructor() {
+        let runs = vec![
+            Run { text: "code".to_string(), emph: Emph::Code, link: None },
+            Run { text: "bold".to_string(), emph: Emph::Bold, link: None },
+            Run { text: "italic".to_string(), emph: Emph::Italic, link: None },
+            Run { text: "struck".to_string(), emph: Emph::Strike, link: None },
+            Run { text: "plain".to_string(), emph: Emph::Normal, link: None },
+        ];
+        assert_eq!(
+            fragments(&runs),
+            vec![
+                FormattedTextFragment::inline_code("code"),
+                FormattedTextFragment::bold("bold"),
+                FormattedTextFragment::italic("italic"),
+                FormattedTextFragment::strikethrough("struck"),
+                FormattedTextFragment::plain_text("plain"),
+            ],
+            "each Emph variant must map to its own dedicated FormattedTextFragment \
+             constructor, not collapse into a shared one"
         );
     }
 
