@@ -1075,11 +1075,13 @@ fn is_markdown_path(path: &std::path::Path) -> bool {
 }
 
 /// File extensions Crane renders in a read-only Image pane instead of the
-/// Editor. THE single definition — `diff_view::is_image_path_str` (the diff
-/// view's binary-file guard) delegates to `is_image_path` below rather than
-/// keeping its own copy, so the routing decision and the diff guard can never
-/// drift into disagreeing about what counts as an image. `svg` is included
-/// because warpui's image cache rasterises SVG alongside the raster formats.
+/// Editor. THE single definition for PANE ROUTING — `open_file_route` below
+/// is the only reader. `svg` is included because warpui's image cache
+/// rasterises SVG alongside the raster formats, so it renders fine in the
+/// Image pane. NOT used by `diff_view`'s binary guard — see
+/// `DIFF_RASTER_IMAGE_EXTS` right below, defined next to this list on
+/// purpose so the one intentional difference between the two (svg) stays a
+/// visible, single-place decision instead of two lists silently drifting.
 pub(crate) const IMAGE_EXTS: &[&str] =
     &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "svg"];
 
@@ -1092,6 +1094,30 @@ pub(crate) fn is_image_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// RASTER subset of `IMAGE_EXTS` — what `diff_view`'s binary guard
+/// (`diff_view::is_image_path_str`, delegating to `is_raster_image_path`
+/// below) treats as "no text diff". Deliberately narrower than `IMAGE_EXTS`
+/// by exactly one entry: `svg` is XML text, not a raster/binary format, so a
+/// changed `.svg` still gets a real syntax-highlighted text diff even though
+/// it opens in the read-only Image pane like every other entry here. Before
+/// `IMAGE_EXTS` was hoisted out of `diff_view.rs`, that file kept its own
+/// private list without `svg` for exactly this reason; this const preserves
+/// that behavior explicitly instead of leaving it to a second copy that can
+/// drift out of sync with `IMAGE_EXTS` again.
+pub(crate) const DIFF_RASTER_IMAGE_EXTS: &[&str] =
+    &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
+
+/// Whether `path` is a RASTER image by extension — `diff_view`'s binary
+/// guard, NOT pane routing (see `is_image_path` for that). Exact peer of
+/// `is_image_path` but over `DIFF_RASTER_IMAGE_EXTS`, so `.svg` reads as
+/// `false` here even though `is_image_path("*.svg")` is `true`.
+pub(crate) fn is_raster_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| DIFF_RASTER_IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
 }
 
@@ -16573,7 +16599,8 @@ mod diff_chip_tests {
 mod restore_pane_kind_tests {
     use super::{
         editor_paths_for_restore, files_pane_bookkeeping, image_path_set, is_image_path,
-        is_markdown_path, markdown_path_set, restored_pane_kind, PaneId, RestoredPaneKind,
+        is_markdown_path, is_raster_image_path, markdown_path_set, restored_pane_kind, PaneId,
+        RestoredPaneKind,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -16621,18 +16648,42 @@ mod restore_pane_kind_tests {
         );
     }
 
-    /// `is_image_path` is the SINGLE definition — `diff_view::is_image_path_str`
-    /// delegates to it. Pins the extensions the diff view's binary guard used
-    /// to carry in its own private copy, so folding that copy in here didn't
-    /// silently narrow what the diff view treats as an image.
+    /// `IMAGE_EXTS` (pane routing, via `is_image_path`) and
+    /// `DIFF_RASTER_IMAGE_EXTS` (the diff view's binary guard, via
+    /// `is_raster_image_path`) must agree on every RASTER format, and must
+    /// deliberately DISAGREE on `svg`. A prior version of this test asserted
+    /// `is_image_path(Path::new("a.svg"))` alone and called that "covers
+    /// every diff view case" — but `is_image_path` is the pane-routing
+    /// check, not the diff view's; asserting only that pinned `svg` routing
+    /// to the Image pane while saying nothing about whether `svg` still gets
+    /// a text diff. It shipped alongside a real regression: `svg` losing its
+    /// text diff to a "no text diff" placeholder. See
+    /// `diff_view::svg_is_not_treated_as_an_undiffable_raster_image` for the
+    /// diff-view-side half of this guard.
     #[test]
-    fn the_hoisted_image_extension_list_still_covers_every_diff_view_case() {
+    fn svg_routes_to_the_image_pane_but_is_excluded_from_the_diff_views_raster_guard() {
+        // Routing: every image extension, `svg` included, opens in the
+        // read-only Image pane.
         for name in ["a.png", "a.jpg", "a.jpeg", "a.gif", "a.bmp", "a.webp", "a.ico", "a.svg"] {
-            assert!(is_image_path(Path::new(name)), "{name} must be classified as an image");
+            assert!(is_image_path(Path::new(name)), "{name} must route to the Image pane");
         }
         assert!(!is_image_path(Path::new("src/main.rs")));
         assert!(!is_image_path(Path::new("Makefile")));
         assert!(!is_image_path(Path::new("notes.md")));
+
+        // Diff guard: every RASTER extension is treated as undiffable...
+        for name in ["a.png", "a.jpg", "a.jpeg", "a.gif", "a.bmp", "a.webp", "a.ico"] {
+            assert!(
+                is_raster_image_path(Path::new(name)),
+                "{name} must still be treated as undiffable by the diff view"
+            );
+        }
+        // ...but svg — XML text, not a raster format — must NOT be, even
+        // though it routes to the Image pane exactly like the formats above.
+        assert!(
+            !is_raster_image_path(Path::new("a.svg")),
+            "svg is XML text — the diff view's binary guard must not swallow its text diff"
+        );
     }
 
     /// REQUIRED regression test: the real saved shape `open_file` actually
