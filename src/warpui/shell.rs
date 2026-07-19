@@ -302,6 +302,10 @@ pub struct CraneShellView {
     /// so each rendered doc preserves its own scroll offset (peer of
     /// `editor_views`; a Markdown pane shows the one for the active file tab).
     markdown_views: HashMap<PathBuf, ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>>,
+    /// Live Image panes keyed by source path — peer of `markdown_views`, and
+    /// cached for the same reason: every pane showing the same image shares
+    /// one decoded view rather than re-reading the file per pane.
+    image_views: HashMap<PathBuf, ViewHandle<crate::warpui::image_view::WarpImageView>>,
     /// Cached terminal snapshots (cwd + ANSI scrollback) for persistence.
     /// Refreshed on every action but time-debounced so per-keystroke cost stays
     /// low while still capturing recent command output.
@@ -923,6 +927,10 @@ pub enum PaneContent {
     Welcome(ViewHandle<WarpWelcomeView>),
     /// Read-only rendered Markdown document (`.md` / `.markdown`).
     Markdown(ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>),
+    /// Read-only rendered raster/vector image (see `IMAGE_EXTS`). Peer of
+    /// `Markdown`: a document pane that owns the shared Files Pane slot the
+    /// same way, so it persists and restores through the same machinery.
+    Image(ViewHandle<crate::warpui::image_view::WarpImageView>),
     /// Read-only unified diff (HEAD vs working copy) for a changed file.
     Diff(ViewHandle<crate::warpui::diff_view::WarpDiffView>),
     /// Embedded browser: the view draws tab strip / URL toolbar / footer and
@@ -1064,6 +1072,53 @@ fn is_markdown_path(path: &std::path::Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
         .unwrap_or(false)
+}
+
+/// File extensions Crane renders in a read-only Image pane instead of the
+/// Editor. THE single definition — `diff_view::is_image_path_str` (the diff
+/// view's binary-file guard) delegates to `is_image_path` below rather than
+/// keeping its own copy, so the routing decision and the diff guard can never
+/// drift into disagreeing about what counts as an image. `svg` is included
+/// because warpui's image cache rasterises SVG alongside the raster formats.
+pub(crate) const IMAGE_EXTS: &[&str] =
+    &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "svg"];
+
+/// Whether `path` is an image by extension — the check `open_file` uses to
+/// route a file to the Image pane instead of the Editor. Exact peer of
+/// `is_markdown_path` above.
+pub(crate) fn is_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Which kind of pane `open_file` routes a path to, decided purely by
+/// extension. Extracted from `open_file`'s branch ladder — which needs a
+/// `&mut self`, a `ViewContext` and a real file on disk to reach at all — so
+/// the routing decision itself is unit-testable on its own. Same motive as
+/// `restored_pane_kind` and `needs_formatted_text` in `markdown_view.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenFileRoute {
+    Markdown,
+    Image,
+    /// Everything else — including files with no extension. Text is the
+    /// fallback, and `open_file`'s binary guard catches non-UTF-8 content that
+    /// slips through with an unrecognised extension.
+    Editor,
+}
+
+/// The pane `open_file` opens `path` in. Markdown is tested first only
+/// because the two extension sets are disjoint and one of them has to go
+/// first; neither claims the other's suffixes.
+fn open_file_route(path: &std::path::Path) -> OpenFileRoute {
+    if is_markdown_path(path) {
+        OpenFileRoute::Markdown
+    } else if is_image_path(path) {
+        OpenFileRoute::Image
+    } else {
+        OpenFileRoute::Editor
+    }
 }
 
 /// Every path that must restore into a Markdown pane rather than an Editor.
@@ -2106,6 +2161,7 @@ impl CraneShellView {
             file_pane_active: restored_active,
             editor_views: restored_editor_views,
             markdown_views: restored_markdown_views,
+            image_views: HashMap::new(),
             term_cache: RefCell::new(restored_term_cache),
             last_term_snapshot: std::cell::Cell::new(None),
             term_cleared: RefCell::new(HashSet::new()),
@@ -2278,6 +2334,7 @@ impl CraneShellView {
             PaneContent::Editor(_) => "Editor",
             PaneContent::Welcome(_) => "Welcome",
             PaneContent::Markdown(_) => "Markdown",
+            PaneContent::Image(_) => "Image",
             PaneContent::Diff(_) => "Diff",
             PaneContent::Browser(_) => "Browser",
         })
@@ -10882,6 +10939,7 @@ impl CraneShellView {
             Some(PaneContent::Welcome(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Browser(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Markdown(h)) => ChildView::new(h).finish(),
+            Some(PaneContent::Image(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Diff(h)) => ChildView::new(h).finish(),
             None => Rect::new().with_background_color(theme::bg()).finish(),
         };
@@ -11303,6 +11361,13 @@ impl CraneShellView {
                     Some(PaneContent::Markdown(h)) => {
                         (icons::FILE_TEXT, h.as_ref(app).title().to_string())
                     }
+                    // `icons::FILE` (plain sheet) rather than FILE_TEXT (lined
+                    // sheet), which reads as prose — `icons.rs` carries no
+                    // image glyph, and a raw Unicode one would render as tofu
+                    // in the bundled fonts.
+                    Some(PaneContent::Image(h)) => {
+                        (icons::FILE, h.as_ref(app).title().to_string())
+                    }
                     Some(PaneContent::Diff(h)) => {
                         (icons::GIT_DIFF, format!("Diff: {}", h.as_ref(app).title()))
                     }
@@ -11574,6 +11639,7 @@ impl CraneShellView {
         // buffer alive regardless.
         self.editor_views.retain(|p, _| !p.starts_with(path));
         self.markdown_views.retain(|p, _| !p.starts_with(path));
+        self.image_views.retain(|p, _| !p.starts_with(path));
     }
 
     /// Insert `content` beside the focused pane (even split). Returns the id.
@@ -11618,6 +11684,7 @@ impl CraneShellView {
             Some(PaneContent::Editor(_))
                 | Some(PaneContent::File(_))
                 | Some(PaneContent::Markdown(_))
+                | Some(PaneContent::Image(_))
         );
         let in_active = self
             .active_tab
@@ -11645,10 +11712,13 @@ impl CraneShellView {
             paths.len() - 1
         };
         self.file_pane_active.insert(ws, active);
+        // ONE extension decision for all three branches below (`open_file_route`
+        // is pure and unit-tested) rather than an `is_x_path` call per branch,
+        // so the Markdown / Image / Editor partition can't drift apart here.
+        let route = open_file_route(&path);
         // Markdown files render read-only in a Markdown pane instead of the
         // editor (peer of the editor path below, same placement / reuse logic).
-        let is_md = is_markdown_path(&path);
-        if is_md {
+        if route == OpenFileRoute::Markdown {
             let handle = if let Some(h) = self.markdown_views.get(&path) {
                 h.clone()
             } else {
@@ -11669,6 +11739,34 @@ impl CraneShellView {
             }
             self.files_pane.remove(&ws); // stale (closed or on another tab)
             if let Some(fp) = self.split_with_at(PaneContent::Markdown(handle), false, 0.35) {
+                self.files_pane.insert(ws, fp);
+            }
+            ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
+            return;
+        }
+        // Images render read-only in an Image pane. This branch must stay
+        // AHEAD of the editor path below: an image reaching that path hits its
+        // binary guard, which undoes the tab bookkeeping above and toasts
+        // "not a text file" — correct before this pane existed, wrong now.
+        if route == OpenFileRoute::Image {
+            let handle = if let Some(h) = self.image_views.get(&path) {
+                h.clone()
+            } else {
+                let p = path.clone();
+                let h = ctx.add_typed_action_view(move |ctx| {
+                    crate::warpui::image_view::WarpImageView::new(ctx, p)
+                });
+                self.image_views.insert(path.clone(), h.clone());
+                h
+            };
+            // Identical placement / reuse logic to the Markdown branch above.
+            if let Some(fp) = self.reusable_files_pane() {
+                self.panes.insert(fp, PaneContent::Image(handle));
+                self.focused = Some(fp);
+                return;
+            }
+            self.files_pane.remove(&ws); // stale (closed or on another tab)
+            if let Some(fp) = self.split_with_at(PaneContent::Image(handle), false, 0.35) {
                 self.files_pane.insert(ws, fp);
             }
             ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
@@ -11800,7 +11898,9 @@ impl CraneShellView {
     /// The pane content to show for an open file-tab `path`: a Markdown pane for
     /// `.md` docs (tracked in `markdown_views`), else the live Editor pane.
     fn file_tab_pane(&self, path: &PathBuf) -> Option<PaneContent> {
-        if let Some(h) = self.markdown_views.get(path) {
+        if let Some(h) = self.image_views.get(path) {
+            Some(PaneContent::Image(h.clone()))
+        } else if let Some(h) = self.markdown_views.get(path) {
             Some(PaneContent::Markdown(h.clone()))
         } else {
             self.editor_views
@@ -14540,6 +14640,7 @@ impl CraneShellView {
                         if !still_open {
                             self.editor_views.remove(&removed);
                             self.markdown_views.remove(&removed);
+                            self.image_views.remove(&removed);
                         }
                         if self.ws_file_paths(ws).is_empty() {
                             // Last tab closed — close the whole editor pane.
@@ -16360,10 +16461,60 @@ mod diff_chip_tests {
 #[cfg(test)]
 mod restore_pane_kind_tests {
     use super::{
-        editor_paths_for_restore, files_pane_bookkeeping, is_markdown_path, markdown_path_set,
-        restored_pane_kind, PaneId, RestoredPaneKind,
+        editor_paths_for_restore, files_pane_bookkeeping, is_image_path, is_markdown_path,
+        markdown_path_set, restored_pane_kind, PaneId, RestoredPaneKind,
     };
     use std::path::{Path, PathBuf};
+
+    /// `open_file`'s extension routing, at the decision itself: an image goes
+    /// to the Image pane, a `.rs` file still goes to the Editor, and a `.md`
+    /// file still goes to Markdown. The last two are the regression half —
+    /// adding the Image branch must not steal either of the routes that
+    /// already worked.
+    #[test]
+    fn open_file_routes_images_to_the_image_pane_and_nothing_else() {
+        use super::{open_file_route, OpenFileRoute};
+
+        assert_eq!(open_file_route(Path::new("/tmp/logo.png")), OpenFileRoute::Image);
+        assert_eq!(open_file_route(Path::new("/tmp/shot.jpeg")), OpenFileRoute::Image);
+        // `svg` is in `IMAGE_EXTS` on purpose — warpui's image cache
+        // rasterises it, and without this entry an SVG would land in the
+        // Editor as markup.
+        assert_eq!(open_file_route(Path::new("/tmp/icon.svg")), OpenFileRoute::Image);
+        // Extension matching is case-insensitive (`.PNG` off a camera / an
+        // APFS case-insensitive volume must still route to the Image pane).
+        assert_eq!(open_file_route(Path::new("/tmp/PHOTO.PNG")), OpenFileRoute::Image);
+
+        assert_eq!(
+            open_file_route(Path::new("/tmp/main.rs")),
+            OpenFileRoute::Editor,
+            "a code file must still open in the Editor"
+        );
+        assert_eq!(
+            open_file_route(Path::new("/tmp/Makefile")),
+            OpenFileRoute::Editor,
+            "an extensionless file must still open in the Editor"
+        );
+        assert_eq!(
+            open_file_route(Path::new("/tmp/notes.md")),
+            OpenFileRoute::Markdown,
+            "the pre-existing Markdown route must not regress"
+        );
+    }
+
+    /// `is_image_path` is the SINGLE definition — `diff_view::is_image_path_str`
+    /// delegates to it. Pins the extensions the diff view's binary guard used
+    /// to carry in its own private copy, so folding that copy in here didn't
+    /// silently narrow what the diff view treats as an image.
+    #[test]
+    fn the_hoisted_image_extension_list_still_covers_every_diff_view_case() {
+        for name in ["a.png", "a.jpg", "a.jpeg", "a.gif", "a.bmp", "a.webp", "a.ico", "a.svg"] {
+            assert!(is_image_path(Path::new(name)), "{name} must be classified as an image");
+        }
+        assert!(!is_image_path(Path::new("src/main.rs")));
+        assert!(!is_image_path(Path::new("Makefile")));
+        assert!(!is_image_path(Path::new("notes.md")));
+    }
 
     /// REQUIRED regression test: the real saved shape `open_file` actually
     /// writes for a markdown file opened as the very first Files-pane tab —
@@ -16389,6 +16540,11 @@ mod restore_pane_kind_tests {
             "a markdown file saved as the Files pane's tab must restore as Markdown, not Editor"
         );
     }
+
+
+
+
+
 
     /// A markdown file that is NOT the shared Files pane — a standalone
     /// Markdown pane elsewhere — still restores as Markdown via its own
@@ -16793,6 +16949,90 @@ mod restore_wiring_integration_tests {
             });
         });
     }
+
+    /// TASK 2, end to end through the LIVE path: opening an image file puts a
+    /// `PaneContent::Image` on screen. The pure `open_file_route` test proves
+    /// the decision; this proves `open_file` actually acts on it — including
+    /// that the image does NOT fall through to the editor path, whose binary
+    /// guard would reject it with a "not a text file" toast and roll the File
+    /// Tab back off the strip.
+    ///
+    /// The seed leaf is a Markdown pane on purpose: a bare leaf restores as a
+    /// fresh Terminal and would spawn a real PTY inside the test process.
+    #[test]
+    fn opening_an_image_file_creates_an_image_pane_end_to_end() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let project_path = project_dir.path().to_string_lossy().into_owned();
+        let seed = project_dir.path().join("seed.md");
+        std::fs::write(&seed, "# seed\n").expect("write seed md");
+        // A real 1x1 PNG so nothing downstream trips over a zero-byte file.
+        let img = project_dir.path().join("logo.png");
+        const PNG_1X1: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&img, PNG_1X1).expect("write temp png");
+
+        const PID: PaneId = 21;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 22;
+        st.added_projects =
+            vec![AddedProject { name: "proj".to_string(), path: project_path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            project_path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID),
+                focus: Some(PID),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((project_path, 0));
+        st.markdowns = vec![(PID, SMarkdown { path: seed, editing: false })];
+
+        let img2 = img.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    v.open_file(img2.clone(), vctx);
+
+                    // Single Project / Workspace in this test, same as the
+                    // markdown end-to-end case above.
+                    let (files_pane, paths, _) = v.files_pane_state_for_test((0, 0));
+                    let fp = files_pane.expect("opening an image must assign a Files Pane");
+                    assert_eq!(
+                        v.pane_kind_for_test(fp),
+                        Some("Image"),
+                        "opening a .png must produce PaneContent::Image — not an Editor, and not \
+                         a rejected open"
+                    );
+                    assert!(
+                        paths.contains(&img2),
+                        "the image must stay on the File Tab strip — reaching the editor path's \
+                         binary guard would have rolled this back off"
+                    );
+                });
+            });
+        });
+    }
+
+
+
 
     /// The user-reported bug, end to end: "I opened a new project and then
     /// opened a md file in it — somehow its file editor opened other projects'

@@ -63,9 +63,6 @@ const MINIMAP_W: f32 = 10.0;
 /// yet (value matches egui_phosphor 0.12 regular, same as the other consts).
 const CHECK_CIRCLE: &str = "\u{E184}";
 
-/// Image extensions the old egui diff view special-cased (`file_util::IMAGE_EXTS`).
-const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
-
 /// Blend `c` down to alpha `a` for a translucent row tint (mirrors the way
 /// `theme::drop_zone` derives a wash from `accent`).
 fn tint(c: ColorU, a: u8) -> ColorU {
@@ -139,12 +136,12 @@ impl DiffComputed {
 }
 
 /// True when `path`'s extension marks an image (old `file_util::is_image_path`).
+/// The extension list itself lives in `shell::IMAGE_EXTS` — the same one that
+/// routes a file to an Image pane — so this diff guard and that routing
+/// decision can never disagree about what an image is. This wrapper exists
+/// only to take a `&str` (git gives paths as strings here).
 fn is_image_path_str(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    crate::warpui::shell::is_image_path(Path::new(path))
 }
 
 /// Content-sniff for binary data: a NUL in the first 8 KB (the classic git
