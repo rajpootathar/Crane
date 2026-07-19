@@ -111,6 +111,28 @@ pub struct SMarkdown {
     pub editing: bool,
 }
 
+/// One Workspace's File Tabs: the pane that IS its Files Pane, that pane's
+/// open File Tab paths, and which of them was active.
+///
+/// `pane` is part of the record rather than a separate map because a saved
+/// leaf only restores as a document pane (Editor / Markdown) when restore can
+/// recognise it as that Workspace's Files Pane — see `restored_pane_kind` in
+/// `shell.rs`. The old flat schema carried exactly one such id
+/// (`WarpuiState::files_pane`), which is precisely why only one Workspace's
+/// File Tabs could ever come back.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SFileTabs {
+    /// The Files Pane's leaf id in this Workspace (None if it had none).
+    #[serde(default)]
+    pub pane: Option<PaneId>,
+    /// Files open as File Tabs in that pane, in tab order.
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    /// The active File Tab index within `paths`.
+    #[serde(default)]
+    pub active: usize,
+}
+
 /// A project added via the warpui "Add Project" flow (not sourced from session.json).
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct AddedProject {
@@ -160,14 +182,26 @@ pub struct WarpuiState {
     #[serde(default)]
     pub next_pane_id: PaneId,
     /// The File pane's leaf id (so it's restored as a File pane, not a terminal).
+    /// LEGACY — one flat record for the whole session, so only ONE Workspace's
+    /// File Tabs survived a restart. See `file_tabs_by_path`, which restore
+    /// prefers. Still written (from the selected Workspace) so an older binary
+    /// reading this file finds something sane, and still READ as the migration
+    /// source for state files that predate `file_tabs_by_path`.
     #[serde(default)]
     pub files_pane: Option<PaneId>,
-    /// Files open in the File pane, restored as tabs.
+    /// Files open in the File pane, restored as tabs. LEGACY — see `files_pane`.
     #[serde(default)]
     pub file_pane_paths: Vec<PathBuf>,
-    /// The active file tab index within `file_pane_paths`.
+    /// The active file tab index within `file_pane_paths`. LEGACY — see
+    /// `files_pane`.
     #[serde(default)]
     pub file_pane_active: usize,
+    /// Per worktree checkout PATH: that Workspace's File Tabs. Path-keyed for
+    /// the same reason as `worktree_tabs_by_path` — indices shift when projects
+    /// are added, removed or reordered between runs; checkout paths do not, so
+    /// each Workspace's File Tabs land back in the RIGHT Workspace.
+    #[serde(default)]
+    pub file_tabs_by_path: Vec<(String, SFileTabs)>,
     /// Per terminal pane: cwd + ANSI scrollback snapshot, keyed by pane id.
     #[serde(default)]
     pub terminals: Vec<(PaneId, STerminal)>,

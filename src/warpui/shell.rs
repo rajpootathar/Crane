@@ -1415,12 +1415,11 @@ impl CraneShellView {
         let mut files_tab = false;
         let mut expanded_projects: HashSet<usize> = HashSet::from([0]);
         let mut expanded_worktrees: HashSet<(usize, usize)> = HashSet::from([(0, 0)]);
-        // Per-Workspace Files-Pane bookkeeping, keyed like `worktree_tabs`. The
-        // persisted state is still FLAT (one `files_pane` / `file_pane_paths` /
-        // `file_pane_active`), so at most one Workspace — the one owning the
-        // saved pane id — gets an entry here. Path-keyed persistence that can
-        // restore several Workspaces' File Tabs is a separate change; this one
-        // is runtime state only.
+        // Per-Workspace Files-Pane bookkeeping, keyed like `worktree_tabs`.
+        // Filled from the path-keyed `file_tabs_by_path` (one entry per
+        // Workspace that had File Tabs open), or — for state files written
+        // before that field existed — from the legacy FLAT trio, migrated onto
+        // a single Workspace below.
         let mut restored_files_pane: HashMap<(usize, usize), PaneId> = HashMap::new();
         let mut restored_file_paths: HashMap<(usize, usize), Vec<PathBuf>> = HashMap::new();
         let mut restored_active: HashMap<(usize, usize), usize> = HashMap::new();
@@ -1438,7 +1437,6 @@ impl CraneShellView {
             PathBuf,
             ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>,
         > = HashMap::new();
-        let mut saved_active: usize = 0;
 
         // Ensure built-in theme TOML files are written to ~/.crane/themes/ on
         // first launch so users have a working template for each palette.
@@ -1498,9 +1496,6 @@ impl CraneShellView {
             };
             next_tab_id = st.next_tab_id;
             next_pane_id = st.next_pane_id;
-            let saved_files_pane = st.files_pane;
-            let saved_paths = st.file_pane_paths.clone();
-            saved_active = st.file_pane_active;
             restored_term_cache = st.terminals.iter().cloned().collect();
             restored_browsers = st.browsers.iter().cloned().collect();
             restored_markdowns = st.markdowns.iter().cloned().collect();
@@ -1538,18 +1533,97 @@ impl CraneShellView {
                     reachable_pids.extend(leaves);
                 }
             }
-            // The Files pane's saved tab list only matters if the leaf that
-            // was the Files pane will itself restore; otherwise treat it as
-            // empty for the purposes of the handle-building pre-pass below
-            // (the per-leaf loop never reaches an unreachable pid either, so
-            // this can't desync from `restored_pane_kind`'s own decisions).
-            let empty_saved_paths: Vec<PathBuf> = Vec::new();
-            let effective_saved_paths: &[PathBuf] =
-                if saved_files_pane.is_some_and(|p| reachable_pids.contains(&p)) {
-                    &saved_paths
-                } else {
-                    &empty_saved_paths
+            // Per-Workspace File Tabs. The path-keyed field wins (stable across
+            // project add/remove/reorder, exactly like `worktree_tabs_by_path`);
+            // resolving each entry through `wt_index` drops Workspaces whose
+            // checkout no longer exists.
+            let mut ws_file_tabs: HashMap<(usize, usize), crate::warpui::persist::SFileTabs> = st
+                .file_tabs_by_path
+                .iter()
+                .filter_map(|(path, ft)| wt_index.get(path.as_str()).map(|k| (*k, ft.clone())))
+                .collect();
+            // MIGRATION — state files written before `file_tabs_by_path`
+            // existed carry ONE flat Files-Pane record (`files_pane` /
+            // `file_pane_paths` / `file_pane_active`) for the whole session.
+            // Fold it in as a single Workspace's File Tabs so upgrading never
+            // silently drops the user's open files. Target, in order:
+            //   1. the Workspace whose restored Layout actually contains the
+            //      saved Files Pane leaf — where the flat schema's one pane
+            //      genuinely lived, so this reproduces the pre-migration
+            //      restore exactly; failing that,
+            //   2. the default Workspace — the one owning the active Tab if it
+            //      resolves, else the first restorable Workspace — so the tab
+            //      list survives even when its pane id no longer does.
+            if ws_file_tabs.is_empty() && !st.file_pane_paths.is_empty() {
+                let restorable = |k: &(usize, usize)| {
+                    projects.get(k.0).and_then(|p| p.worktrees.get(k.1)).is_some()
                 };
+                let owner = st.files_pane.and_then(|fp| {
+                    effective_tabs
+                        .iter()
+                        .find(|(k, stabs)| {
+                            restorable(k)
+                                && stabs.iter().any(|s| {
+                                    let mut leaves = Vec::new();
+                                    s.layout.leaves(&mut leaves);
+                                    leaves.contains(&fp)
+                                })
+                        })
+                        .map(|(k, _)| *k)
+                });
+                let default_ws = st
+                    .active_tab_path
+                    .as_ref()
+                    .and_then(|(path, _)| wt_index.get(path.as_str()).copied())
+                    .or_else(|| st.active_tab.map(|(pi, wi, _)| (pi, wi)))
+                    .filter(|k| restorable(k) && effective_tabs.iter().any(|(ek, _)| ek == k))
+                    .or_else(|| effective_tabs.iter().map(|(k, _)| *k).find(|k| restorable(k)));
+                if let Some(key) = owner.or(default_ws) {
+                    ws_file_tabs.insert(
+                        key,
+                        crate::warpui::persist::SFileTabs {
+                            pane: st.files_pane,
+                            paths: st.file_pane_paths.clone(),
+                            active: st.file_pane_active,
+                        },
+                    );
+                }
+            }
+            // Seed the runtime maps from every Workspace's saved tab list up
+            // front. The per-leaf loop below re-asserts these for the
+            // Workspaces whose Files Pane leaf actually restores; seeding here
+            // additionally preserves a tab list whose pane id no longer
+            // resolves (a migrated record, or a Layout edited by an older
+            // build) rather than discarding the user's open files outright.
+            for (key, ft) in &ws_file_tabs {
+                if ft.paths.is_empty() {
+                    continue;
+                }
+                restored_file_paths.insert(*key, ft.paths.clone());
+                restored_active.insert(*key, clamped_active_index(ft.active, ft.paths.len()));
+            }
+            // A Workspace's saved tab list only needs view handles if the leaf
+            // that was its Files Pane will itself restore; otherwise treat it
+            // as empty for the handle-building pre-pass below (the per-leaf
+            // loop never reaches an unreachable pid either, so this can't
+            // desync from `restored_pane_kind`'s own decisions). Unioned across
+            // Workspaces because handles are cached per PATH, not per pane.
+            let effective_saved_paths: Vec<PathBuf> = {
+                let mut seen: HashSet<PathBuf> = HashSet::new();
+                let mut out = Vec::new();
+                for ft in ws_file_tabs.values() {
+                    if !ft.pane.is_some_and(|p| reachable_pids.contains(&p)) {
+                        continue;
+                    }
+                    for p in &ft.paths {
+                        if seen.insert(p.clone()) {
+                            out.push(p.clone());
+                        }
+                    }
+                }
+                out
+            };
+            let effective_saved_paths: &[PathBuf] = &effective_saved_paths;
             // Pre-pass: classify every path this restore can reference
             // (Markdown vs Editor, see `markdown_path_set`) and build its
             // view handle exactly ONCE, before the per-tab leaf loop below
@@ -1602,6 +1676,14 @@ impl CraneShellView {
                 else {
                     continue;
                 };
+                // THIS Workspace's own File Tabs — never the flat, session-wide
+                // list the old schema had. Reading another Workspace's record
+                // here is exactly the leak this pass exists to prevent.
+                let ws_files = ws_file_tabs.get(&(*pi, *wi));
+                let saved_files_pane = ws_files.and_then(|f| f.pane);
+                let saved_paths: &[PathBuf] =
+                    ws_files.map(|f| f.paths.as_slice()).unwrap_or(&[]);
+                let saved_active = ws_files.map(|f| f.active).unwrap_or(0);
                 let mut metas = Vec::new();
                 for stab in stabs {
                     let mut leaves = Vec::new();
@@ -1620,7 +1702,7 @@ impl CraneShellView {
                         let kind = restored_pane_kind(
                             pid,
                             saved_files_pane,
-                            &saved_paths,
+                            saved_paths,
                             saved_active,
                             &md_paths,
                             markdown_path,
@@ -1746,7 +1828,7 @@ impl CraneShellView {
                         // (`(*pi, *wi)`) rather than globally — that is exactly
                         // the scoping this pass exists to establish.
                         if let Some((fp, paths, active)) =
-                            files_pane_bookkeeping(&kind, pid, &saved_paths, saved_active)
+                            files_pane_bookkeeping(&kind, pid, saved_paths, saved_active)
                         {
                             restored_files_pane.insert((*pi, *wi), fp);
                             restored_file_paths.insert((*pi, *wi), paths);
@@ -2391,6 +2473,28 @@ impl CraneShellView {
             .iter()
             .filter_map(|((pi, wi), tabs)| wt_path(*pi, *wi).map(|p| (p, tabs.clone())))
             .collect();
+        // Every Workspace's File Tabs, keyed by its checkout PATH — the whole
+        // point being that Workspace B's open files come back in B and nowhere
+        // else. Sorted so the written file is stable between saves that only
+        // differ by HashMap iteration order.
+        let mut file_tabs_by_path: Vec<(String, crate::warpui::persist::SFileTabs)> = self
+            .file_pane_paths
+            .iter()
+            .filter(|(_, paths)| !paths.is_empty())
+            .filter_map(|(k, paths)| {
+                wt_path(k.0, k.1).map(|p| {
+                    (
+                        p,
+                        crate::warpui::persist::SFileTabs {
+                            pane: self.files_pane.get(k).copied(),
+                            paths: paths.clone(),
+                            active: self.ws_file_active(*k),
+                        },
+                    )
+                })
+            })
+            .collect();
+        file_tabs_by_path.sort_by(|a, b| a.0.cmp(&b.0));
         let active_tab_path = self
             .active_tab
             .and_then(|(pi, wi, tid)| wt_path(pi, wi).map(|p| (p, tid)));
@@ -2420,13 +2524,15 @@ impl CraneShellView {
             expanded_worktree_paths,
             next_tab_id: self.next_tab_id,
             next_pane_id: self.next_pane_id,
-            // The persisted schema is still flat (one Files Pane for the whole
-            // session), so save the Workspace currently on screen. Persisting
-            // every Workspace's File Tabs needs a path-keyed schema + migration
-            // and is handled separately; this pass is runtime state only.
+            // Every Workspace's File Tabs live in `file_tabs_by_path`, which
+            // restore prefers. The flat trio below is kept written — populated
+            // from the Workspace currently on screen — purely so a DOWNGRADE to
+            // a build that predates the path-keyed field still finds a sane
+            // session rather than no open files at all.
             files_pane: self.files_pane.get(&self.ws_key()).copied(),
             file_pane_paths: self.ws_file_paths(self.ws_key()).to_vec(),
             file_pane_active: self.ws_file_active(self.ws_key()),
+            file_tabs_by_path,
             terminals,
             window_w,
             window_h,
