@@ -1149,6 +1149,15 @@ fn clamped_active_index(saved_active: usize, saved_paths_len: usize) -> usize {
 /// this function, for every pid, consults the SAME `md_paths` set, it also
 /// guarantees a path never simultaneously wants an Editor view from one pane
 /// and a Markdown view from another.
+///
+/// `!is_browser && !is_terminal` guards the files-pane branch against a
+/// stale `pid` in a corrupt or hand-edited state file: a `saved_files_pane`
+/// id that now names a leaf ALSO present in `restored_browsers` or
+/// `restored_term_cache` must still restore as that Browser/Terminal, not
+/// get reinterpreted as a document pane and lose the real restored
+/// scrollback/tabs. Self-consistent state files never hit this — a pid is
+/// only ever one of files-pane / browser / terminal — so this only matters
+/// for corrupted input.
 fn restored_pane_kind(
     pid: PaneId,
     saved_files_pane: Option<PaneId>,
@@ -1159,7 +1168,7 @@ fn restored_pane_kind(
     is_browser: bool,
     is_terminal: bool,
 ) -> RestoredPaneKind {
-    if Some(pid) == saved_files_pane && !saved_paths.is_empty() {
+    if Some(pid) == saved_files_pane && !saved_paths.is_empty() && !is_browser && !is_terminal {
         let active = clamped_active_index(saved_active, saved_paths.len());
         let path = saved_paths[active].clone();
         if md_paths.contains(&path) {
@@ -1551,10 +1560,27 @@ impl CraneShellView {
             //      saved Files Pane leaf — where the flat schema's one pane
             //      genuinely lived, so this reproduces the pre-migration
             //      restore exactly; failing that,
-            //   2. the default Workspace — the one owning the active Tab if it
+            //   2. the Workspace whose checkout path is the longest matching
+            //      prefix of a saved (absolute) File Tab path — the saved
+            //      leaf id didn't resolve, but the paths themselves usually
+            //      still say which checkout they came from; failing that,
+            //   3. the default Workspace — the one owning the active Tab if it
             //      resolves, else the first restorable Workspace — so the tab
-            //      list survives even when its pane id no longer does.
-            if ws_file_tabs.is_empty() && !st.file_pane_paths.is_empty() {
+            //      list survives even when neither of the above pins it down.
+            //
+            // Gated on `st.file_tabs_by_path` — the RAW persisted field —
+            // rather than `ws_file_tabs` — the map AFTER resolving each entry
+            // through `wt_index` — on purpose. A state file written by a
+            // CURRENT binary whose File-Tab-holding Workspaces have all
+            // become unresolvable (project removed, worktree pruned, checkout
+            // renamed) still has a non-empty `file_tabs_by_path`; gating on
+            // the resolved (and therefore possibly emptied-out) map would
+            // wrongly fall through into this legacy migration and dump the
+            // flat trio onto a Workspace that never had those files — the
+            // exact cross-Project leak this whole path-keyed field exists to
+            // prevent. Gating on the raw field means this migration only ever
+            // runs for a genuinely pre-`file_tabs_by_path` state file.
+            if st.file_tabs_by_path.is_empty() && !st.file_pane_paths.is_empty() {
                 let restorable = |k: &(usize, usize)| {
                     projects.get(k.0).and_then(|p| p.worktrees.get(k.1)).is_some()
                 };
@@ -1571,6 +1597,29 @@ impl CraneShellView {
                         })
                         .map(|(k, _)| *k)
                 });
+                // Second-choice target when `owner` above comes back `None`
+                // (the saved Files Pane leaf id isn't in any surviving Tab).
+                // Saved File Tab paths are absolute, so the surviving
+                // Workspace whose checkout path is the longest matching
+                // prefix of one of them is almost certainly the Workspace
+                // they were opened in — strictly better evidence than the
+                // active-Tab guess below. Longest (not merely any) prefix so
+                // a worktree nested under another picks the inner one.
+                let path_owner = || -> Option<(usize, usize)> {
+                    let mut best: Option<(usize, (usize, usize))> = None;
+                    for (checkout, key) in wt_index.iter() {
+                        if !restorable(key) || !effective_tabs.iter().any(|(ek, _)| ek == key) {
+                            continue;
+                        }
+                        let checkout_path = std::path::Path::new(*checkout);
+                        let is_prefix =
+                            st.file_pane_paths.iter().any(|p| p.starts_with(checkout_path));
+                        if is_prefix && best.map_or(true, |(blen, _)| checkout.len() > blen) {
+                            best = Some((checkout.len(), *key));
+                        }
+                    }
+                    best.map(|(_, k)| k)
+                };
                 let default_ws = st
                     .active_tab_path
                     .as_ref()
@@ -1578,7 +1627,7 @@ impl CraneShellView {
                     .or_else(|| st.active_tab.map(|(pi, wi, _)| (pi, wi)))
                     .filter(|k| restorable(k) && effective_tabs.iter().any(|(ek, _)| ek == k))
                     .or_else(|| effective_tabs.iter().map(|(k, _)| *k).find(|k| restorable(k)));
-                if let Some(key) = owner.or(default_ws) {
+                if let Some(key) = owner.or_else(path_owner).or(default_ws) {
                     ws_file_tabs.insert(
                         key,
                         crate::warpui::persist::SFileTabs {
