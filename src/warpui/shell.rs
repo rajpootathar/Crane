@@ -909,6 +909,13 @@ pub enum RenameTarget {
 /// variants (Browser, GitLog) follow.
 pub enum PaneContent {
     Terminal(ViewHandle<TerminalView>),
+    /// v0 File pane, superseded by `Editor` below (see `editor_view.rs`'s
+    /// module doc). Nothing constructs this variant anymore; `file_at()`
+    /// and its several call sites are the dormant plumbing that would read
+    /// it. Kept rather than torn out — that's a larger, separate cleanup
+    /// than a dead-code-warning pass (removing `PaneContent::File` means
+    /// also touching every `file_at()` call site in this file).
+    #[allow(dead_code)]
     File(ViewHandle<FileView>),
     /// Warp's real text editor (warp_editor) — warp-quality file editing.
     Editor(ViewHandle<crate::warpui::editor_view::WarpEditorView>),
@@ -8797,24 +8804,6 @@ impl CraneShellView {
             .finish()
     }
 
-    fn header(&self, text: &'static str) -> Box<dyn Element> {
-        Container::new(
-            Text::new(text, self.ui_font, 11.0)
-                .with_color(theme::text_header())
-                .finish(),
-        )
-        .with_uniform_padding(8.0)
-        .finish()
-    }
-
-    fn row(&self, text: &'static str, color: warpui::color::ColorU) -> Box<dyn Element> {
-        Container::new(Text::new(text, self.ui_font, 13.0).with_color(color).finish())
-            .with_padding_left(12.0)
-            .with_padding_top(3.0)
-            .with_padding_bottom(3.0)
-            .finish()
-    }
-
     /// A project-tree row at a given indent (owns its text — from session.json).
     fn tree_row(&self, text: &str, size: f32, color: warpui::color::ColorU, pad_left: f32) -> Box<dyn Element> {
         Container::new(
@@ -8852,12 +8841,6 @@ impl CraneShellView {
                 .finish()
         })
         .finish()
-    }
-
-    fn divider(&self) -> Box<dyn Element> {
-        ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
-            .with_width(1.0)
-            .finish()
     }
 
     fn left_sidebar(&self, app: &AppContext) -> Box<dyn Element> {
@@ -11287,6 +11270,11 @@ impl CraneShellView {
 
     /// True when `id` is the Files Pane of the Workspace that owns it. The
     /// Workspace-correct replacement for the old `self.files_pane == Some(id)`.
+    /// The perf fix in the render-path (resolving a pane's Workspace once per
+    /// frame) inlined this logic there, so this is unused under a plain
+    /// `cargo build`. It's still live under `cargo test`: the pane-identity-
+    /// hazard regression tests call it through `pane_ws_for_test`.
+    #[allow(dead_code)]
     fn is_files_pane(&self, id: PaneId) -> bool {
         self.ws_of_pane(id)
             .and_then(|k| self.files_pane.get(&k))
@@ -13679,7 +13667,6 @@ pub enum CraneShellAction {
     ToggleDir(PathBuf),
     SelectFile(PathBuf),
     ToggleProject(usize),
-    ToggleWorktree(usize, usize),
     /// Toggle collapse/expand of a folder group, keyed by its shared parent
     /// directory path (`ProjectNode::group_path`).
     ToggleGroup(String),
@@ -13700,7 +13687,12 @@ pub enum CraneShellAction {
     ClosePane(PaneId),
     /// Toggle expand-to-full for a pane (header maximize button).
     ToggleMaximize(PaneId),
-    /// Split a specific pane (header split buttons).
+    /// Split a specific pane (header split buttons). No caller yet — the
+    /// pane header only wires up ToggleMaximize/ClosePane today; kept for
+    /// when split buttons join them there. The new-pane "+" menu's Split
+    /// items use `SplitFocused` instead, which always targets the
+    /// currently-focused pane.
+    #[allow(dead_code)]
     SplitPane(PaneId, Dir),
     /// Drag-rearrange: dock `src` at `edge` of `target` (split).
     DockPane {
@@ -13760,6 +13752,7 @@ pub enum CraneShellAction {
     OpenFileAtPath {
         path: PathBuf,
         line: Option<u32>,
+        #[allow(dead_code)]
         col: Option<u32>,
     },
     /// A desktop notification (OSC 9 / OSC 777) drained from a Terminal pane and
@@ -14987,12 +14980,6 @@ impl CraneShellView {
             CraneShellAction::ToggleProject(i) => {
                 if !self.expanded_projects.remove(i) {
                     self.expanded_projects.insert(*i);
-                }
-            }
-            CraneShellAction::ToggleWorktree(p, w) => {
-                let k = (*p, *w);
-                if !self.expanded_worktrees.remove(&k) {
-                    self.expanded_worktrees.insert(k);
                 }
             }
             CraneShellAction::ToggleGroup(g) => {
