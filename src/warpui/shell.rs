@@ -16604,6 +16604,56 @@ mod restore_pane_kind_tests {
             None
         );
     }
+
+    /// Sharp-edge guard: a `pid` that matches `saved_files_pane` (and has
+    /// non-empty `saved_paths`) must NOT take the files-pane branch when that
+    /// same `pid` is also present in `restored_term_cache` (`is_terminal`
+    /// here). A corrupt or hand-edited state file could name the same leaf id
+    /// as both the saved Files pane AND a saved terminal snapshot; without
+    /// this guard the files-pane check runs first and the restored terminal
+    /// (with its real scrollback) is silently discarded in favor of an Editor
+    /// pane. Unreachable from a self-consistent `warpui-state.json` — a pid
+    /// is only ever one of files-pane / browser / terminal there — but cheap
+    /// to guard against corrupted input.
+    #[test]
+    fn a_files_pane_pid_that_is_also_a_saved_terminal_restores_as_terminal() {
+        let code = PathBuf::from("/tmp/main.rs");
+        let p: PaneId = 11;
+        let saved_paths = vec![code];
+        let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
+
+        let kind =
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, None, false, true);
+
+        assert_eq!(
+            kind,
+            RestoredPaneKind::Terminal,
+            "a pid present in restored_term_cache must restore as Terminal even if it also \
+             matches the saved Files pane id — the terminal's real scrollback must not be \
+             discarded for a document pane"
+        );
+    }
+
+    /// Same guard, for the Browser side: a `pid` that matches `saved_files_pane`
+    /// but is also present in `restored_browsers` (`is_browser` here) must
+    /// restore as Browser, not Editor/Markdown.
+    #[test]
+    fn a_files_pane_pid_that_is_also_a_saved_browser_restores_as_browser() {
+        let doc = PathBuf::from("/tmp/doc.md");
+        let p: PaneId = 12;
+        let saved_paths = vec![doc.clone()];
+        let md_paths = markdown_path_set([&doc], &saved_paths);
+
+        let kind =
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, None, true, false);
+
+        assert_eq!(
+            kind,
+            RestoredPaneKind::Browser,
+            "a pid present in restored_browsers must restore as Browser even if it also \
+             matches the saved Files pane id"
+        );
+    }
 }
 
 // ── Restore wiring, end to end ───────────────────────────────────────────────
