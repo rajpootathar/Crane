@@ -17,8 +17,13 @@ use std::thread;
 #[derive(Clone, Debug)]
 pub enum DownloadState {
     NotStarted,
+    // Constructed by `start_download` (below), which has no caller yet —
+    // the auto-download prompt/progress UI hasn't been rebuilt in warpui
+    // since the legacy egui frontend was dropped. Kept for when it is.
+    #[allow(dead_code)]
     Downloading { progress_bytes: u64 },
     Ready(PathBuf),
+    #[allow(dead_code)]
     Failed(String),
 }
 
@@ -77,6 +82,7 @@ impl Downloader {
         }
     }
 
+    #[allow(dead_code)] // install-prompt copy for the not-yet-rebuilt auto-install UI.
     pub fn runtime_missing_hint(key: ServerKey) -> Option<&'static str> {
         match key {
             ServerKey::TypeScript
@@ -93,6 +99,7 @@ impl Downloader {
         }
     }
 
+    #[allow(dead_code)] // called by LspManager::accept_install, itself staged for the not-yet-rebuilt install prompt.
     pub fn start_download(&self, key: ServerKey, wake: crate::lsp::Wake) {
         {
             let mut g = self.states.lock();
@@ -205,6 +212,7 @@ fn which_on_path(bin: &str) -> Option<PathBuf> {
     None
 }
 
+#[allow(dead_code)] // reachable only via `start_download`, staged for the not-yet-rebuilt install prompt.
 fn download_rust_analyzer(
     states: &Arc<Mutex<HashMap<ServerKey, DownloadState>>>,
     key: ServerKey,
@@ -285,6 +293,7 @@ fn download_rust_analyzer(
     Ok(expected)
 }
 
+#[allow(dead_code)] // reachable only via `start_download`, staged for the not-yet-rebuilt install prompt.
 fn install_npm_server(
     key: ServerKey,
     install_subdir: &str,
@@ -331,6 +340,7 @@ fn install_npm_server(
     Ok(expected)
 }
 
+#[allow(dead_code)] // reachable only via `download_rust_analyzer`, staged for the not-yet-rebuilt install prompt.
 fn target_triple() -> Option<&'static str> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -356,6 +366,10 @@ fn target_triple() -> Option<&'static str> {
     None
 }
 
+/// Formats `DownloadState::Downloading { progress_bytes }` for display,
+/// mirroring the pattern already used for `warpui/update.rs`'s download
+/// progress row. No caller yet — same not-yet-rebuilt install UI.
+#[allow(dead_code)]
 pub fn human_bytes(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
