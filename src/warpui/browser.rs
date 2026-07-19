@@ -215,14 +215,6 @@ pub fn queue_action(key: SlotKey, action: Action) {
     BRIDGE.with(|b| b.borrow_mut().actions.push((key, action)));
 }
 
-pub fn report_pane(key: SlotKey, rect: RectF, url: &str) {
-    BRIDGE.with(|b| b.borrow_mut().alive.push((key, rect, url.to_string())));
-}
-
-pub fn report_inactive(key: SlotKey, url: &str) {
-    BRIDGE.with(|b| b.borrow_mut().inactive.push((key, url.to_string())));
-}
-
 pub fn take_bridge() -> Bridge {
     BRIDGE.with(|b| std::mem::take(&mut *b.borrow_mut()))
 }

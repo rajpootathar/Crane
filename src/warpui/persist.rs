@@ -5,7 +5,6 @@
 //! (terminals are respawned in the worktree cwd).
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -337,20 +336,6 @@ fn write_bytes(path: &std::path::Path, bytes: &[u8]) {
         }
         let _ = std::fs::rename(&tmp, path);
     }
-}
-
-/// Helper to rebuild HashMap fields from the flat Vecs.
-pub fn worktree_tabs_map(state: &WarpuiState) -> HashMap<(usize, usize), Vec<STab>> {
-    state.worktree_tabs.iter().cloned().collect()
-}
-
-pub fn expanded_sets(
-    state: &WarpuiState,
-) -> (HashSet<usize>, HashSet<(usize, usize)>) {
-    (
-        state.expanded_projects.iter().copied().collect(),
-        state.expanded_worktrees.iter().copied().collect(),
-    )
 }
 
 #[cfg(test)]
