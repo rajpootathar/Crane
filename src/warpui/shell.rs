@@ -12032,8 +12032,13 @@ impl CraneShellView {
         }
     }
 
-    /// The pane content to show for an open file-tab `path`: a Markdown pane for
-    /// `.md` docs (tracked in `markdown_views`), else the live Editor pane.
+    /// The pane content to show for an open file-tab `path`: an Image pane for
+    /// an image (tracked in `image_views`), a Markdown pane for `.md` docs
+    /// (tracked in `markdown_views`), else the live Editor pane. Checked in
+    /// that order because `FileTabSelect` — the sole caller — must swap the
+    /// shared Files Pane to whichever kind this path actually is; returning
+    /// `None` here leaves the pane showing the PREVIOUSLY selected tab's
+    /// content while the tab strip highlights the new one.
     fn file_tab_pane(&self, path: &PathBuf) -> Option<PaneContent> {
         if let Some(h) = self.image_views.get(path) {
             Some(PaneContent::Image(h.clone()))
@@ -17107,7 +17112,7 @@ mod restore_pane_kind_tests {
 // `markdown_view.rs`'s layout tests already use to get a real `ViewContext`.
 #[cfg(test)]
 mod restore_wiring_integration_tests {
-    use super::{CraneShellView, PaneId};
+    use super::{CraneShellAction, CraneShellView, PaneId};
     use crate::warpui::persist::{AddedProject, SImage, SMarkdown, SNode, STab, WarpuiState};
 
     /// Overrides `HOME` for the scope of one test. `new_with_state` still
@@ -17524,6 +17529,95 @@ mod restore_wiring_integration_tests {
                     );
                     assert_eq!(paths.len(), 1, "file_pane_paths must carry the saved image tab");
                     assert_eq!(active, 0);
+                });
+            });
+        });
+    }
+
+    /// FINDING 2 regression guard: `file_tab_pane`'s Image branch is the only
+    /// thing that lets `FileTabSelect` (the tab-strip click handler) swap the
+    /// shared Files Pane back to an already-open image tab. Deleting that
+    /// branch leaves every other test green — `open_file` itself never calls
+    /// `file_tab_pane`, so this path is the sole way to reach it.
+    ///
+    /// Two files land on the SAME Files Pane slot (`open_file` reuses it for
+    /// the second open): a `.rs` file at tab 0, an image at tab 1 — so right
+    /// after both opens the pane already shows the image via `open_file`'s
+    /// own Image branch, not `file_tab_pane`. Selecting tab 0 first forces
+    /// the pane to Editor; ONLY THEN does reselecting tab 1 have to go
+    /// through `file_tab_pane`'s `image_views` lookup to bring the pane back
+    /// to `PaneContent::Image` — `open_file` is not in the call path for a
+    /// `FileTabSelect` dispatch.
+    #[test]
+    fn selecting_an_image_file_tab_swaps_the_pane_to_image() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let project_path = project_dir.path().to_string_lossy().into_owned();
+        let doc = project_dir.path().join("notes.rs");
+        std::fs::write(&doc, "fn main() {}\n").expect("write temp rs file");
+        let img = project_dir.path().join("logo.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").expect("write temp png");
+
+        const PID: PaneId = 95;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 96;
+        st.added_projects =
+            vec![AddedProject { name: "proj".to_string(), path: project_path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            project_path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID),
+                focus: Some(PID),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((project_path, 0));
+
+        let doc2 = doc.clone();
+        let img2 = img.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    v.open_file(doc2.clone(), vctx);
+                    v.open_file(img2.clone(), vctx);
+
+                    let (files_pane, paths, active) = v.files_pane_state_for_test((0, 0));
+                    let fp = files_pane.expect("opening a file must assign a Files Pane");
+                    assert_eq!(paths.len(), 2, "both files must land on the same tab strip");
+                    assert_eq!(active, 1, "the image is the most recently opened tab");
+
+                    // Force the shared pane away from Image by selecting the
+                    // text tab — `file_tab_pane`'s Editor arm handles this one.
+                    v.handle_action_impl(&CraneShellAction::FileTabSelect(0), vctx);
+                    assert_eq!(
+                        v.pane_kind_for_test(fp),
+                        Some("Editor"),
+                        "selecting tab 0 must swap the shared pane back to the text file"
+                    );
+
+                    // The regression: reselecting the image tab must swap the
+                    // pane BACK to Image. `open_file` never runs again here —
+                    // only `file_tab_pane`'s image branch can do this.
+                    v.handle_action_impl(&CraneShellAction::FileTabSelect(1), vctx);
+                    assert_eq!(
+                        v.pane_kind_for_test(fp),
+                        Some("Image"),
+                        "selecting the image's File Tab must swap PaneContent::Image into the \
+                         shared pane, not leave the previous file showing while the tab strip \
+                         highlights the image"
+                    );
                 });
             });
         });
