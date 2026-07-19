@@ -17878,4 +17878,425 @@ mod restore_wiring_integration_tests {
             });
         });
     }
+
+    // ── Legacy migration hardening ───────────────────────────────────────────
+    //
+    // The four tests below pin the review findings against the migration
+    // block directly above `ws_file_tabs`'s per-leaf restore loop
+    // (`shell.rs`, the `if st.file_tabs_by_path.is_empty() && ...` block).
+
+    /// FINDING 1 regression. A state file written by the CURRENT binary —
+    /// its raw `file_tabs_by_path` is non-empty — whose only File-Tab-holding
+    /// Workspace has become unresolvable (its Project removed / worktree
+    /// pruned between runs) must NOT fall through into the legacy flat-trio
+    /// migration and dump those files onto some other, unrelated surviving
+    /// Workspace.
+    ///
+    /// Before the fix, the migration gated on `ws_file_tabs.is_empty()` — the
+    /// map AFTER resolving `file_tabs_by_path` through `wt_index` — which is
+    /// empty here for a completely different reason than "this predates
+    /// `file_tabs_by_path`": every entry in the (non-empty) raw field failed
+    /// to resolve. That let the still-present legacy flat trio (`files_pane`
+    /// / `file_pane_paths`, which `build_state` always writes alongside the
+    /// path-keyed field) migrate onto Workspace B below — reintroducing the
+    /// user's originally reported symptom (one Project's Files Pane listing
+    /// another Project's file).
+    #[test]
+    fn a_new_format_state_with_unresolvable_workspaces_does_not_migrate_onto_a_stranger() {
+        use crate::warpui::persist::SFileTabs;
+        use std::path::PathBuf;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        // Workspace B: the only Project that actually survives into this
+        // session, unrelated to the vanished Workspace A referenced below.
+        // It must come back with NO File Tabs of its own.
+        let proj_b = tempfile::tempdir().expect("project b tempdir");
+        let path_b = proj_b.path().to_string_lossy().into_owned();
+        let seed_b = proj_b.path().join("seed-b.md");
+        std::fs::write(&seed_b, "# seed b\n").expect("write seed b");
+
+        const PID_B: PaneId = 90;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 91;
+        st.added_projects =
+            vec![AddedProject { name: "proj-b".to_string(), path: path_b.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            path_b.clone(),
+            vec![STab {
+                id: 0,
+                name: "B".to_string(),
+                layout: SNode::Leaf(PID_B),
+                focus: Some(PID_B),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((path_b.clone(), 0));
+        st.markdowns = vec![(PID_B, SMarkdown { path: seed_b, editing: false })];
+
+        // THE NEW-FORMAT SHAPE: `file_tabs_by_path` names a checkout
+        // ("proj-a") that is no longer in `added_projects` at all — removed
+        // between runs — so `wt_index` (built from the CURRENT project list)
+        // has no entry for it and this record resolves to nothing.
+        let vanished_path = "/tmp/crane-test-vanished-proj-a".to_string();
+        st.file_tabs_by_path = vec![(
+            vanished_path,
+            SFileTabs {
+                pane: Some(200),
+                paths: vec![PathBuf::from("/tmp/crane-test-vanished-proj-a/only-in-a.md")],
+                active: 0,
+            },
+        )];
+        // The legacy flat trio is ALSO present, exactly like a real save
+        // (`build_state` always writes both). This is what the buggy gate
+        // used to key off once `ws_file_tabs` came back empty.
+        st.files_pane = Some(200);
+        st.file_pane_paths =
+            vec![PathBuf::from("/tmp/crane-test-vanished-proj-a/only-in-a.md")];
+        st.file_pane_active = 0;
+
+        let path_b2 = path_b.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    let ws_b = v.ws_key_for_path_for_test(&path_b2).expect("Workspace B");
+                    let (files_pane, paths, _) = v.files_pane_state_for_test(ws_b);
+                    assert!(
+                        paths.is_empty(),
+                        "Workspace B must NOT inherit File Tabs from the vanished Workspace's \
+                         flat trio — got {paths:?}"
+                    );
+                    assert!(
+                        files_pane.is_none(),
+                        "Workspace B must not have a Files Pane assigned by the migration either"
+                    );
+                    assert_eq!(
+                        v.pane_kind_for_test(PID_B),
+                        Some("Markdown"),
+                        "Workspace B's own leaf must be unaffected"
+                    );
+                });
+            });
+        });
+    }
+
+    /// FINDING 2 (the `owner` lookup, `shell.rs` review lines 1561-1573). A
+    /// fixture with at least two Workspaces where the saved `files_pane` leaf
+    /// belongs to the SECOND Workspace, not the default (active-Tab) one —
+    /// `a_legacy_flat_file_list_migrates_without_losing_any_pane` above can't
+    /// distinguish this branch because its fixture has only one Workspace, so
+    /// `owner` and the active-Tab default always coincide. Forcing
+    /// `owner = None` leaves the rest of the suite green; this test exists to
+    /// catch exactly that.
+    ///
+    /// The shared file lives in a THIRD directory outside both checkouts, so
+    /// Finding 3's checkout-path-prefix fallback cannot also resolve this —
+    /// this test isolates the leaf-containment lookup specifically.
+    #[test]
+    fn legacy_migration_targets_the_workspace_that_actually_owns_the_saved_files_pane_leaf() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj_a = tempfile::tempdir().expect("project a tempdir");
+        let proj_b = tempfile::tempdir().expect("project b tempdir");
+        // Neither Project's checkout — proves the migration can only have
+        // found Workspace B via the saved leaf's Tab membership, not by
+        // matching this path's directory against a checkout prefix.
+        let content_dir = tempfile::tempdir().expect("unrelated content tempdir");
+        let path_a = proj_a.path().to_string_lossy().into_owned();
+        let path_b = proj_b.path().to_string_lossy().into_owned();
+
+        let seed_a = proj_a.path().join("seed-a.md");
+        std::fs::write(&seed_a, "# seed a\n").expect("write seed a");
+        // The shared file, opened in B's Files pane before the save.
+        // Markdown, so `PID_FILES` restores as a harmless standalone
+        // Markdown pane (never a real terminal/PTY) even in the broken
+        // scenario this test guards against, where the migration attaches
+        // to the wrong Workspace.
+        let shared = content_dir.path().join("shared.md");
+        std::fs::write(&shared, "# shared\n").expect("write shared doc");
+
+        const PID_A_MD: PaneId = 100;
+        const PID_FILES: PaneId = 101;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 102;
+        st.added_projects = vec![
+            AddedProject { name: "proj-a".to_string(), path: path_a.clone() },
+            AddedProject { name: "proj-b".to_string(), path: path_b.clone() },
+        ];
+        st.worktree_tabs_by_path = vec![
+            (
+                path_a.clone(),
+                vec![STab {
+                    id: 0,
+                    name: "A".to_string(),
+                    layout: SNode::Leaf(PID_A_MD),
+                    focus: Some(PID_A_MD),
+                    renamed: false,
+                }],
+            ),
+            (
+                path_b.clone(),
+                vec![STab {
+                    id: 1,
+                    name: "B".to_string(),
+                    layout: SNode::Leaf(PID_FILES),
+                    focus: Some(PID_FILES),
+                    renamed: false,
+                }],
+            ),
+        ];
+        // The active Tab is A — the "default" this migration must NOT fall
+        // back to, since the saved Files pane leaf genuinely lives in B.
+        st.active_tab_path = Some((path_a.clone(), 0));
+        st.markdowns = vec![
+            (PID_A_MD, SMarkdown { path: seed_a, editing: false }),
+            (PID_FILES, SMarkdown { path: shared.clone(), editing: false }),
+        ];
+        // THE LEGACY SHAPE: `file_tabs_by_path` absent; the flat trio names
+        // PID_FILES, which is B's leaf, not A's.
+        st.files_pane = Some(PID_FILES);
+        st.file_pane_paths = vec![shared.clone()];
+        st.file_pane_active = 0;
+        assert!(st.file_tabs_by_path.is_empty(), "this blob must be the pre-migration shape");
+
+        let (path_a2, path_b2, shared2) = (path_a.clone(), path_b.clone(), shared.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    let ws_a = v.ws_key_for_path_for_test(&path_a2).expect("Workspace A");
+                    let ws_b = v.ws_key_for_path_for_test(&path_b2).expect("Workspace B");
+
+                    let (fp_b, paths_b, _) = v.files_pane_state_for_test(ws_b);
+                    assert_eq!(
+                        fp_b,
+                        Some(PID_FILES),
+                        "the migrated Files pane must land on Workspace B, which actually owns \
+                         the saved leaf — not the default/active Workspace A"
+                    );
+                    assert_eq!(paths_b, [shared2.clone()]);
+
+                    let (fp_a, paths_a, _) = v.files_pane_state_for_test(ws_a);
+                    assert!(
+                        paths_a.is_empty(),
+                        "Workspace A (the default/active Workspace) must NOT receive the \
+                         migrated File Tabs that actually belong to B — got {paths_a:?}"
+                    );
+                    assert!(
+                        fp_a.is_none(),
+                        "Workspace A must not get a Files pane from this migration"
+                    );
+
+                    assert_eq!(
+                        v.pane_kind_for_test(PID_FILES),
+                        Some("Markdown"),
+                        "the migrated Files Pane, a markdown file, must restore as Markdown"
+                    );
+                });
+            });
+        });
+    }
+
+    /// FINDING 2 (the up-front seeding loop, `shell.rs` review lines
+    /// 1598-1604). A Workspace's saved File Tab list in the CURRENT-format
+    /// `file_tabs_by_path` field — no legacy migration involved at all —
+    /// whose recorded Files Pane leaf id is no longer present in that
+    /// Workspace's restored Tab layout (an orphaned pane id, the shape a
+    /// hand-edited or older-build Layout can produce) must still have its
+    /// saved paths preserved rather than silently dropped. Removing the
+    /// seeding loop leaves the rest of the suite green; this test exists to
+    /// catch exactly that.
+    #[test]
+    fn a_file_tabs_list_whose_pane_no_longer_resolves_still_preserves_its_paths() {
+        use crate::warpui::persist::SFileTabs;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let path = proj.path().to_string_lossy().into_owned();
+        let seed = proj.path().join("seed.md");
+        let orphaned = proj.path().join("orphaned.md");
+        std::fs::write(&seed, "# seed\n").expect("write seed md");
+        std::fs::write(&orphaned, "# orphaned\n").expect("write orphaned md");
+
+        const PID_MD: PaneId = 110;
+        // A pane id that is NOT a leaf of any restored Tab layout below — the
+        // orphaned "Files Pane" reference.
+        const PHANTOM_PID: PaneId = 999;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 111;
+        st.added_projects = vec![AddedProject { name: "proj".to_string(), path: path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID_MD),
+                focus: Some(PID_MD),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((path.clone(), 0));
+        st.markdowns = vec![(PID_MD, SMarkdown { path: seed, editing: false })];
+        // THE CURRENT-FORMAT SHAPE — no migration involved.
+        st.file_tabs_by_path = vec![(
+            path.clone(),
+            SFileTabs { pane: Some(PHANTOM_PID), paths: vec![orphaned.clone()], active: 0 },
+        )];
+
+        let (path2, orphaned2) = (path.clone(), orphaned.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    let ws = v.ws_key_for_path_for_test(&path2).expect("the Workspace");
+                    let (files_pane, paths, active) = v.files_pane_state_for_test(ws);
+                    assert_eq!(
+                        paths,
+                        [orphaned2.clone()],
+                        "the saved File Tab list must survive even though its recorded Files \
+                         Pane pane id no longer resolves to any leaf in the restored Tab layout"
+                    );
+                    assert_eq!(active, 0);
+                    assert!(
+                        files_pane.is_none(),
+                        "no leaf in this Workspace matches the orphaned pane id, so `files_pane` \
+                         itself correctly stays unset — only the tab-list metadata is preserved"
+                    );
+                    assert_eq!(
+                        v.pane_kind_for_test(PID_MD),
+                        Some("Markdown"),
+                        "the Workspace's real (unrelated) leaf must restore normally"
+                    );
+                });
+            });
+        });
+    }
+
+    /// FINDING 3. When the saved Files pane leaf id doesn't resolve to any
+    /// surviving Tab — here, `files_pane` itself is `None`, so `owner` is
+    /// trivially `None` — prefer the Workspace whose checkout path is the
+    /// longest matching prefix of the saved (absolute) File Tab paths over
+    /// blindly guessing the active/first Workspace. The saved paths are
+    /// absolute, so this is real evidence, not a guess.
+    #[test]
+    fn legacy_migration_prefers_the_checkout_path_prefix_over_the_active_tab_guess() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj_a = tempfile::tempdir().expect("project a tempdir");
+        let proj_b = tempfile::tempdir().expect("project b tempdir");
+        let path_a = proj_a.path().to_string_lossy().into_owned();
+        let path_b = proj_b.path().to_string_lossy().into_owned();
+
+        let seed_a = proj_a.path().join("seed-a.md");
+        let seed_b = proj_b.path().join("seed-b.md");
+        std::fs::write(&seed_a, "# seed a\n").expect("write seed a");
+        std::fs::write(&seed_b, "# seed b\n").expect("write seed b");
+        // The saved File Tab's path — genuinely inside B's checkout — is the
+        // ONLY evidence available for where it belongs; there is no saved
+        // Files pane id at all.
+        let doc_in_b = proj_b.path().join("doc-in-b.md");
+        std::fs::write(&doc_in_b, "# doc in b\n").expect("write doc in b");
+
+        const PID_A_MD: PaneId = 120;
+        const PID_B_MD: PaneId = 121;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 122;
+        st.added_projects = vec![
+            AddedProject { name: "proj-a".to_string(), path: path_a.clone() },
+            AddedProject { name: "proj-b".to_string(), path: path_b.clone() },
+        ];
+        st.worktree_tabs_by_path = vec![
+            (
+                path_a.clone(),
+                vec![STab {
+                    id: 0,
+                    name: "A".to_string(),
+                    layout: SNode::Leaf(PID_A_MD),
+                    focus: Some(PID_A_MD),
+                    renamed: false,
+                }],
+            ),
+            (
+                path_b.clone(),
+                vec![STab {
+                    id: 1,
+                    name: "B".to_string(),
+                    layout: SNode::Leaf(PID_B_MD),
+                    focus: Some(PID_B_MD),
+                    renamed: false,
+                }],
+            ),
+        ];
+        // A is the active Tab — the WRONG naive default this test proves the
+        // prefix match must override.
+        st.active_tab_path = Some((path_a.clone(), 0));
+        st.markdowns = vec![
+            (PID_A_MD, SMarkdown { path: seed_a, editing: false }),
+            (PID_B_MD, SMarkdown { path: seed_b, editing: false }),
+        ];
+        // No saved Files pane id at all — `owner` is trivially `None`, so
+        // the ONLY way to land on B is the checkout-path-prefix fallback.
+        st.files_pane = None;
+        st.file_pane_paths = vec![doc_in_b.clone()];
+        st.file_pane_active = 0;
+        assert!(st.file_tabs_by_path.is_empty(), "this blob must be the pre-migration shape");
+
+        let (path_a2, path_b2, doc_in_b2) = (path_a.clone(), path_b.clone(), doc_in_b.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    let ws_a = v.ws_key_for_path_for_test(&path_a2).expect("Workspace A");
+                    let ws_b = v.ws_key_for_path_for_test(&path_b2).expect("Workspace B");
+
+                    let (_, paths_b, _) = v.files_pane_state_for_test(ws_b);
+                    assert_eq!(
+                        paths_b,
+                        [doc_in_b2.clone()],
+                        "the checkout-path-prefix match must land the migrated File Tab on \
+                         Workspace B, whose checkout the saved path is actually under"
+                    );
+
+                    let (_, paths_a, _) = v.files_pane_state_for_test(ws_a);
+                    assert!(
+                        paths_a.is_empty(),
+                        "Workspace A (the naive active-Tab default) must NOT receive a File Tab \
+                         that lives under Workspace B's checkout — got {paths_a:?}"
+                    );
+                });
+            });
+        });
+    }
 }
