@@ -776,22 +776,9 @@ impl Theme {
             Self::high_contrast_light(),
         ]
     }
-
-    /// Perceived luminance of the background — used to adapt diff-marker
-    /// colours for light vs dark themes without per-theme overrides.
-    pub fn is_dark(&self) -> bool {
-        let lum = 0.299 * self.bg.r as f32
-            + 0.587 * self.bg.g as f32
-            + 0.114 * self.bg.b as f32;
-        lum < 128.0
-    }
 }
 
 static CURRENT: RwLock<Option<Theme>> = RwLock::new(None);
-
-pub fn init(theme: Theme) {
-    *CURRENT.write() = Some(theme);
-}
 
 pub fn set(theme: Theme) {
     *CURRENT.write() = Some(theme);

@@ -26,6 +26,9 @@ pub struct Change {
     /// Source side of a rename/copy, if any. Only set when the record
     /// is an `R`/`C` — `path` holds the new name, `old_path` the old
     /// name — so the shell can show `old -> new` and stage correctly.
+    /// Parsed and populated below but not read yet — the Changes tree
+    /// doesn't render the rename arrow yet. Kept for when it does.
+    #[allow(dead_code)]
     pub old_path: Option<String>,
     /// True if the change is staged (index column X is set).
     pub staged: bool,
@@ -293,24 +296,6 @@ pub fn cherry_pick(repo: &Path, sha: &str) -> Result<(), String> {
 /// opening an editor (context-menu "Revert").
 pub fn revert(repo: &Path, sha: &str) -> Result<(), String> {
     run(repo, &["revert", "--no-edit", sha])
-}
-
-/// `git show <ref>:<path>` — raw content of `path` at the given ref.
-/// Empty bytes on missing (e.g. a newly-added file queried at the parent
-/// commit). Port of old Crane `git.rs::show_at`.
-pub fn show_at(repo: &Path, reference: &str, path: &Path) -> Vec<u8> {
-    let arg = format!("{reference}:{}", path.display());
-    let out = match Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["show", &arg])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    out.stdout
 }
 
 /// `git init` in `dir` — turns a loose folder into a git repository.
@@ -729,24 +714,6 @@ pub fn changes(root: &Path) -> Vec<Change> {
         });
     }
     result
-}
-
-/// Working-tree changes as a flat `(path, staged, status_char)` tuple list,
-/// sorted by path so the Right Panel can group them into a directory tree
-/// trivially. Thin projection over [`changes`] — the shell groups by the
-/// leading path components and paints the status glyph from `status_char`.
-/// `status_char` is the single normalized porcelain letter ('M', 'A', 'D',
-/// 'R', 'C', 'U', or '?'); ' ' when the status string is empty.
-pub fn changes_flat(root: &Path) -> Vec<(String, bool, char)> {
-    let mut rows: Vec<(String, bool, char)> = changes(root)
-        .into_iter()
-        .map(|c| {
-            let ch = c.status.chars().next().unwrap_or(' ');
-            (c.path, c.staged, ch)
-        })
-        .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    rows
 }
 
 /// `git pull --ff-only` (1:1 old Crane `git.rs::pull`). Network op — call
