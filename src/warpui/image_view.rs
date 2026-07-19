@@ -231,9 +231,15 @@ mod tests {
     fn content_version_is_resolved_once_at_construction_for_an_existing_file() {
         // The hot-path guard: `new` must eagerly resolve a content-version
         // fingerprint (blocking `stat`) for a file that actually exists on
-        // disk, and never leave it as `None` (`None` means "no invalidation
-        // on disk change" — silently stale caching). `render` takes `&self`
-        // and can only ever read this already-resolved field.
+        // disk, and never leave it as `None`. `render` takes `&self` and can
+        // only ever read this already-resolved field, so this buys
+        // correctness ACROSS CONSTRUCTIONS — a fresh app restart, or this
+        // view being torn down and rebuilt, picks up whatever is on disk at
+        // that moment — NOT live invalidation of an already-open pane: a
+        // file edited while this instance stays mounted keeps serving the
+        // version resolved here at open time. `None` would be strictly
+        // worse (no fingerprint at all, so the asset cache never busts even
+        // across a restart), not better.
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("photo.png");
         std::fs::write(&file, TINY_PNG).expect("write fixture png");
@@ -252,7 +258,9 @@ mod tests {
                     assert!(
                         v.content_version.is_some(),
                         "an existing file must resolve a Some(_) content version at \
-                         construction, or an edited-on-disk file would be served stale"
+                         construction — so a FRESH pane (next restart, or this view \
+                         rebuilt) reflects on-disk changes since the last one; it does \
+                         NOT make an already-open pane live-reload on edit"
                     );
                 });
             });
