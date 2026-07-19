@@ -111,6 +111,22 @@ pub struct SMarkdown {
     pub editing: bool,
 }
 
+/// Persisted Image Pane: the image file it renders. Restored as an Image (or
+/// Editor) pane rather than a terminal.
+///
+/// A separate record from `SMarkdown` rather than one generalised
+/// document-pane struct with a kind tag: `SMarkdown` carries an `editing`
+/// flag that has no image analogue, and unifying them would require migrating
+/// the user's live `~/.crane/warpui-state.json` — real risk of dropping
+/// already-persisted `markdowns` entries — to deduplicate a two-field struct.
+/// Adding a field is purely additive: older state files parse (serde default),
+/// and an older binary reading a newer file simply ignores this one.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SImage {
+    #[serde(default)]
+    pub path: PathBuf,
+}
+
 /// One Workspace's File Tabs: the pane that IS its Files Pane, that pane's
 /// open File Tab paths, and which of them was active.
 ///
@@ -213,6 +229,11 @@ pub struct WarpuiState {
     /// loop rebuilds a Markdown pane (not a terminal) at that leaf.
     #[serde(default)]
     pub markdowns: Vec<(PaneId, SMarkdown)>,
+    /// Per Image pane: the file it renders, keyed by pane id, so the restore
+    /// loop rebuilds an Image pane (not a terminal) at that leaf. Exact peer
+    /// of `markdowns` — see `SImage` for why it is a separate field.
+    #[serde(default)]
+    pub images: Vec<(PaneId, SImage)>,
     /// Projects the user added via "Add Project" (not from session.json).
     #[serde(default)]
     pub added_projects: Vec<AddedProject>,
@@ -503,5 +524,39 @@ mod tests {
         let legacy = r#"{}"#;
         let st: WarpuiState = serde_json::from_str(legacy).expect("legacy state must load");
         assert!(st.markdowns.is_empty());
+    }
+
+    /// An Image pane's saved file must survive a serialize → deserialize round
+    /// trip, keyed by pane id, exactly like `markdowns` / `browsers`. Without
+    /// this field the pane restores as a fresh terminal.
+    #[test]
+    fn image_panes_survive_a_state_round_trip() {
+        let mut st = WarpuiState::default();
+        st.images = vec![(7, SImage { path: PathBuf::from("/tmp/logo.png") })];
+        let json = serde_json::to_string(&st).expect("serialize");
+        let back: WarpuiState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.images.len(), 1, "image panes must survive a round trip");
+        assert_eq!(back.images[0].0, 7, "the pane id keys the restore lookup");
+        assert_eq!(back.images[0].1.path, PathBuf::from("/tmp/logo.png"));
+    }
+
+    /// THE compatibility guarantee for the user's live session file: a state
+    /// file written before `images` existed must still load, with `images`
+    /// defaulting to empty AND every previously-persisted `markdowns` entry
+    /// intact. Adding a document-pane field must never cost the user the
+    /// document panes they already had.
+    #[test]
+    fn a_state_file_predating_images_still_loads_and_keeps_its_markdowns() {
+        let legacy = r#"{
+            "show_left": true,
+            "markdowns": [[3, {"path": "/tmp/doc.md", "editing": false}]],
+            "files_pane": 3,
+            "file_pane_paths": ["/tmp/doc.md"]
+        }"#;
+        let st: WarpuiState = serde_json::from_str(legacy).expect("legacy state must load");
+        assert!(st.images.is_empty(), "the new field defaults to empty");
+        assert_eq!(st.markdowns.len(), 1, "existing markdown panes must NOT be dropped");
+        assert_eq!(st.markdowns[0].1.path, PathBuf::from("/tmp/doc.md"));
+        assert_eq!(st.files_pane, Some(3), "the rest of the legacy state must survive too");
     }
 }

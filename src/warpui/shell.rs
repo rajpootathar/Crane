@@ -1085,7 +1085,9 @@ pub(crate) const IMAGE_EXTS: &[&str] =
 
 /// Whether `path` is an image by extension — the check `open_file` uses to
 /// route a file to the Image pane instead of the Editor. Exact peer of
-/// `is_markdown_path` above.
+/// `is_markdown_path` above, and load-bearing for the same reason: restore
+/// has no live `PaneContent` to inspect for a background File Tab, so the
+/// extension is its only signal (see `image_path_set`).
 pub(crate) fn is_image_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -1121,6 +1123,38 @@ fn open_file_route(path: &std::path::Path) -> OpenFileRoute {
     }
 }
 
+/// Shared body of `markdown_path_set` / `image_path_set`: the union of the
+/// paths a LIVE pane of that kind recorded at save time (`recorded`) and
+/// every `saved_paths` entry whose extension marks it as that kind
+/// (`by_extension`). Empty paths — stale/corrupt `SMarkdown` / `SImage`
+/// defaults — are dropped, mirroring the terminal restore arm's `st.cwd`
+/// guard. One body rather than two near-identical ones so a fix to the
+/// document-classification rule can't land in only half of it.
+fn document_path_set<'a>(
+    recorded: impl IntoIterator<Item = &'a PathBuf>,
+    saved_paths: &[PathBuf],
+    by_extension: fn(&std::path::Path) -> bool,
+) -> HashSet<PathBuf> {
+    let mut set: HashSet<PathBuf> = recorded
+        .into_iter()
+        .filter(|p| !p.as_os_str().is_empty())
+        .cloned()
+        .collect();
+    set.extend(saved_paths.iter().filter(|p| by_extension(p.as_path())).cloned());
+    set
+}
+
+/// Every path that must restore into an Image pane rather than an Editor.
+/// Exact peer of `markdown_path_set` below — see its doc comment for why the
+/// union of "recorded by a live pane" and "classified by extension" is what
+/// makes background File Tabs restore correctly.
+fn image_path_set<'a>(
+    image_paths: impl IntoIterator<Item = &'a PathBuf>,
+    saved_paths: &[PathBuf],
+) -> HashSet<PathBuf> {
+    document_path_set(image_paths, saved_paths, is_image_path)
+}
+
 /// Every path that must restore into a Markdown pane rather than an Editor.
 /// Union of:
 ///  - `markdown_paths` — the paths recorded by a LIVE Markdown pane at save
@@ -1141,26 +1175,31 @@ fn markdown_path_set<'a>(
     markdown_paths: impl IntoIterator<Item = &'a PathBuf>,
     saved_paths: &[PathBuf],
 ) -> HashSet<PathBuf> {
-    let mut set: HashSet<PathBuf> = markdown_paths
-        .into_iter()
-        .filter(|p| !p.as_os_str().is_empty())
-        .cloned()
-        .collect();
-    set.extend(saved_paths.iter().filter(|p| is_markdown_path(p.as_path())).cloned());
-    set
+    document_path_set(markdown_paths, saved_paths, is_markdown_path)
 }
 
 /// The Files-pane saved paths that must get an EDITOR handle at restore —
-/// every `saved_paths` entry except the ones in `md_paths` (those get a
-/// Markdown handle instead, built from `md_paths` directly). Its own
-/// function — not inlined at each call site — so there is exactly one place
-/// that decides the Editor/Markdown partition of `saved_paths` and exactly
-/// one place a future change could break it back apart.
+/// every `saved_paths` entry except the ones in `md_paths` / `img_paths`
+/// (those get a Markdown / Image handle instead, built from those sets
+/// directly). Its own function — not inlined at each call site — so there is
+/// exactly one place that decides the Editor/Markdown/Image partition of
+/// `saved_paths` and exactly one place a future change could break it back
+/// apart.
+///
+/// `img_paths` matters beyond tidiness: without it a restored image would
+/// ALSO get a `WarpEditorView` built from `read_to_string(p).unwrap_or_default()`
+/// — an EMPTY editable buffer over a binary file, which a reflexive Cmd+S
+/// would then write back as zero bytes. `open_file` already refuses that on
+/// the live path (see its binary guard); this keeps restore consistent.
 fn editor_paths_for_restore<'a>(
     saved_paths: &'a [PathBuf],
     md_paths: &HashSet<PathBuf>,
+    img_paths: &HashSet<PathBuf>,
 ) -> Vec<&'a PathBuf> {
-    saved_paths.iter().filter(|p| !md_paths.contains(*p)).collect()
+    saved_paths
+        .iter()
+        .filter(|p| !md_paths.contains(*p) && !img_paths.contains(*p))
+        .collect()
 }
 
 /// Outcome of `restored_pane_kind`. `Markdown.is_files_pane` tells the
@@ -1171,6 +1210,10 @@ fn editor_paths_for_restore<'a>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RestoredPaneKind {
     Markdown { path: PathBuf, is_files_pane: bool },
+    /// Peer of `Markdown` — `is_files_pane` carries the same meaning, because
+    /// `open_file` assigns an Image pane to the shared Files Pane slot exactly
+    /// the way it assigns a Markdown one.
+    Image { path: PathBuf, is_files_pane: bool },
     Editor { path: PathBuf },
     Browser,
     Terminal,
@@ -1219,20 +1262,33 @@ fn restored_pane_kind(
     saved_paths: &[PathBuf],
     saved_active: usize,
     md_paths: &HashSet<PathBuf>,
+    img_paths: &HashSet<PathBuf>,
     markdown_path: Option<&PathBuf>,
+    image_path: Option<&PathBuf>,
     is_browser: bool,
     is_terminal: bool,
 ) -> RestoredPaneKind {
     if Some(pid) == saved_files_pane && !saved_paths.is_empty() && !is_browser && !is_terminal {
         let active = clamped_active_index(saved_active, saved_paths.len());
         let path = saved_paths[active].clone();
-        if md_paths.contains(&path) {
+        // Image is consulted here, INSIDE the files-pane branch, for exactly
+        // the reason Markdown is: an image pane persists into BOTH `images`
+        // and the files-pane record (`open_file` assigns it the shared Files
+        // Pane slot), so an `Editor` fallthrough here would make the Image
+        // restore arm below unreachable and bring the file back as an empty
+        // text buffer. The two sets are disjoint by extension, so their
+        // relative order is a tiebreak only for a corrupt state file.
+        if img_paths.contains(&path) {
+            RestoredPaneKind::Image { path, is_files_pane: true }
+        } else if md_paths.contains(&path) {
             RestoredPaneKind::Markdown { path, is_files_pane: true }
         } else {
             RestoredPaneKind::Editor { path }
         }
     } else if is_browser {
         RestoredPaneKind::Browser
+    } else if let Some(path) = image_path.filter(|p| !p.as_os_str().is_empty()) {
+        RestoredPaneKind::Image { path: path.clone(), is_files_pane: false }
     } else if let Some(path) = markdown_path.filter(|p| !p.as_os_str().is_empty()) {
         RestoredPaneKind::Markdown { path: path.clone(), is_files_pane: false }
     } else if is_terminal {
@@ -1269,7 +1325,8 @@ fn files_pane_bookkeeping(
     saved_active: usize,
 ) -> Option<(PaneId, Vec<PathBuf>, usize)> {
     let is_files_pane = match kind {
-        RestoredPaneKind::Markdown { is_files_pane, .. } => *is_files_pane,
+        RestoredPaneKind::Markdown { is_files_pane, .. }
+        | RestoredPaneKind::Image { is_files_pane, .. } => *is_files_pane,
         RestoredPaneKind::Editor { .. } => true,
         RestoredPaneKind::Browser | RestoredPaneKind::Terminal | RestoredPaneKind::FreshTerminal => {
             false
@@ -1501,6 +1558,11 @@ impl CraneShellView {
             PathBuf,
             ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>,
         > = HashMap::new();
+        let mut restored_images: HashMap<PaneId, crate::warpui::persist::SImage> = HashMap::new();
+        let mut restored_image_views: HashMap<
+            PathBuf,
+            ViewHandle<crate::warpui::image_view::WarpImageView>,
+        > = HashMap::new();
 
         // Ensure built-in theme TOML files are written to ~/.crane/themes/ on
         // first launch so users have a working template for each palette.
@@ -1563,6 +1625,7 @@ impl CraneShellView {
             restored_term_cache = st.terminals.iter().cloned().collect();
             restored_browsers = st.browsers.iter().cloned().collect();
             restored_markdowns = st.markdowns.iter().cloned().collect();
+            restored_images = st.images.iter().cloned().collect();
             // Tab lists: prefer the path-keyed field (stable across project
             // reordering); fall back to the legacy index-keyed one for state
             // files written before `worktree_tabs_by_path` existed.
@@ -1752,10 +1815,25 @@ impl CraneShellView {
                 });
                 restored_markdown_views.insert(p.clone(), h);
             }
+            // Same pre-pass, same reasoning, for Image panes.
+            let img_paths = image_path_set(
+                restored_images
+                    .iter()
+                    .filter(|(pid, _)| reachable_pids.contains(pid))
+                    .map(|(_, si)| &si.path),
+                effective_saved_paths,
+            );
+            for p in &img_paths {
+                let pc = p.clone();
+                let h = ctx.add_typed_action_view(move |ctx| {
+                    crate::warpui::image_view::WarpImageView::new(ctx, pc)
+                });
+                restored_image_views.insert(p.clone(), h);
+            }
             if !effective_saved_paths.is_empty() {
                 let mono = warpui::fonts::Cache::handle(ctx)
                     .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
-                for p in editor_paths_for_restore(effective_saved_paths, &md_paths) {
+                for p in editor_paths_for_restore(effective_saved_paths, &md_paths, &img_paths) {
                     let content = std::fs::read_to_string(p).unwrap_or_default();
                     let pc = p.clone();
                     let goto = Self::lsp_goto_cb(p.clone());
@@ -1801,6 +1879,7 @@ impl CraneShellView {
                         // silently drift from the pre-pass above that built the
                         // handles this match reuses.
                         let markdown_path = restored_markdowns.get(&pid).map(|sm| &sm.path);
+                        let image_path = restored_images.get(&pid).map(|si| &si.path);
                         let is_browser = restored_browsers.contains_key(&pid);
                         let is_terminal = restored_term_cache.contains_key(&pid);
                         let kind = restored_pane_kind(
@@ -1809,7 +1888,9 @@ impl CraneShellView {
                             saved_paths,
                             saved_active,
                             &md_paths,
+                            &img_paths,
                             markdown_path,
+                            image_path,
                             is_browser,
                             is_terminal,
                         );
@@ -1835,6 +1916,24 @@ impl CraneShellView {
                                     continue;
                                 };
                                 panes.insert(pid, PaneContent::Markdown(h));
+                            }
+                            RestoredPaneKind::Image { path, .. } => {
+                                // Same lockstep assumption as the Markdown arm
+                                // above, for the image pre-pass — degrade to a
+                                // fresh terminal rather than panic on user data.
+                                let Some(h) = restored_image_views.get(path).cloned() else {
+                                    panes.insert(
+                                        pid,
+                                        PaneContent::Terminal(Self::spawn_terminal(
+                                            ctx,
+                                            wpath.clone(),
+                                            ui_wake.clone(),
+                                        )),
+                                    );
+                                    drag_states.insert(pid, DraggableState::default());
+                                    continue;
+                                };
+                                panes.insert(pid, PaneContent::Image(h));
                             }
                             RestoredPaneKind::Editor { path } => {
                                 // Same lockstep assumption as the Markdown arm
@@ -2161,7 +2260,7 @@ impl CraneShellView {
             file_pane_active: restored_active,
             editor_views: restored_editor_views,
             markdown_views: restored_markdown_views,
-            image_views: HashMap::new(),
+            image_views: restored_image_views,
             term_cache: RefCell::new(restored_term_cache),
             last_term_snapshot: std::cell::Cell::new(None),
             term_cleared: RefCell::new(HashSet::new()),
@@ -2543,6 +2642,17 @@ impl CraneShellView {
                 _ => None,
             })
             .collect();
+        let images: Vec<(PaneId, crate::warpui::persist::SImage)> = self
+            .panes
+            .iter()
+            .filter_map(|(id, pc)| match pc {
+                PaneContent::Image(h) => h
+                    .as_ref(app)
+                    .path()
+                    .map(|p| (*id, crate::warpui::persist::SImage { path: p.to_path_buf() })),
+                _ => None,
+            })
+            .collect();
         let worktree_tabs: Vec<((usize, usize), Vec<STab>)> = self
             .worktree_tabs
             .iter()
@@ -2635,6 +2745,7 @@ impl CraneShellView {
             expanded_projects: self.expanded_projects.iter().copied().collect(),
             browsers,
             markdowns,
+            images,
             expanded_worktrees: self.expanded_worktrees.iter().copied().collect(),
             worktree_tabs,
             worktree_tabs_by_path,
@@ -16461,10 +16572,18 @@ mod diff_chip_tests {
 #[cfg(test)]
 mod restore_pane_kind_tests {
     use super::{
-        editor_paths_for_restore, files_pane_bookkeeping, is_image_path, is_markdown_path,
-        markdown_path_set, restored_pane_kind, PaneId, RestoredPaneKind,
+        editor_paths_for_restore, files_pane_bookkeeping, image_path_set, is_image_path,
+        is_markdown_path, markdown_path_set, restored_pane_kind, PaneId, RestoredPaneKind,
     };
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
+
+    /// "No image panes were saved" — the shape every pre-Image-pane test case
+    /// asserts against, so those cases keep pinning the Markdown/Editor ladder
+    /// unchanged rather than accidentally routing through the new arm.
+    fn no_images() -> HashSet<PathBuf> {
+        HashSet::new()
+    }
 
     /// `open_file`'s extension routing, at the decision itself: an image goes
     /// to the Image pane, a `.rs` file still goes to the Editor, and a `.md`
@@ -16532,7 +16651,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, Some(&doc), false, false);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), Some(&doc), None, false, false);
 
         assert_eq!(
             kind,
@@ -16541,10 +16660,116 @@ mod restore_pane_kind_tests {
         );
     }
 
+    /// DEFECT SHAPE 1, for images: `open_file` assigns an Image pane the
+    /// shared Files Pane slot exactly the way it assigns a Markdown one, so
+    /// the saved shape for "opened a .png as the first Files-pane tab" is
+    /// `files_pane = Some(P)` + `file_pane_paths = [logo.png]` +
+    /// `images = [(P, logo.png)]` — the pid is BOTH. If the files-pane branch
+    /// didn't consult `img_paths`, it would return `Editor` and the Image
+    /// restore arm below it would be unreachable dead code, bringing the
+    /// image back as an empty text buffer. This is the exact defect that
+    /// shipped for markdown and was caught only at review.
+    #[test]
+    fn a_saved_image_pane_that_is_also_the_files_pane_restores_as_image() {
+        let img = PathBuf::from("/tmp/logo.png");
+        let p: PaneId = 7;
+        let saved_paths = vec![img.clone()];
+        let img_paths = image_path_set([&img], &saved_paths);
+        let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
+        let kind = restored_pane_kind(
+            p, Some(p), &saved_paths, 0, &md_paths, &img_paths, None, Some(&img), false, false,
+        );
 
+        assert_eq!(
+            kind,
+            RestoredPaneKind::Image { path: img, is_files_pane: true },
+            "an image saved as the Files pane's tab must restore as Image, not Editor"
+        );
+    }
 
+    /// DEFECT SHAPE 2, for images: the restored Image leaf that IS the saved
+    /// Files pane must still get the files-pane bookkeeping. Omitting it left
+    /// `files_pane` as `None`, so the next file open split a SECOND pane
+    /// instead of reusing this one — the duplicate-pane defect from the
+    /// markdown round.
+    #[test]
+    fn a_restored_image_files_pane_still_claims_the_files_pane_bookkeeping() {
+        let img = PathBuf::from("/tmp/logo.png");
+        let pid: PaneId = 7;
+        let saved_paths = vec![img.clone()];
+        let kind = RestoredPaneKind::Image { path: img, is_files_pane: true };
 
+        assert_eq!(
+            files_pane_bookkeeping(&kind, pid, &saved_paths, 0),
+            Some((pid, saved_paths.clone(), 0)),
+            "an Image leaf that is also the saved Files pane must claim the bookkeeping, or the \
+             next open splits a duplicate pane"
+        );
+
+        // ...and a STANDALONE image pane must NOT claim it — it isn't the
+        // shared Files pane, and hijacking the slot would retarget the File
+        // Tab strip onto a pane that owns no tabs.
+        let standalone =
+            RestoredPaneKind::Image { path: PathBuf::from("/tmp/other.png"), is_files_pane: false };
+        assert_eq!(files_pane_bookkeeping(&standalone, pid, &saved_paths, 0), None);
+    }
+
+    /// A standalone Image pane (not the shared Files pane) restores from its
+    /// own per-pid `images` record — peer of the markdown case below.
+    #[test]
+    fn a_standalone_image_pane_restores_as_image() {
+        let img = PathBuf::from("/tmp/diagram.png");
+        let saved_paths: Vec<PathBuf> = Vec::new();
+        let img_paths = image_path_set([&img], &saved_paths);
+        let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
+
+        let kind = restored_pane_kind(
+            3, None, &saved_paths, 0, &md_paths, &img_paths, None, Some(&img), false, false,
+        );
+
+        assert_eq!(kind, RestoredPaneKind::Image { path: img, is_files_pane: false });
+    }
+
+    /// An image path must never ALSO get an editor handle. Beyond tidiness:
+    /// the editor pre-pass builds its buffer with
+    /// `read_to_string(p).unwrap_or_default()`, which turns a PNG into an
+    /// EMPTY editable buffer that a reflexive Cmd+S would write back as zero
+    /// bytes — destroying the user's image.
+    #[test]
+    fn a_restored_image_path_never_also_gets_an_editor_buffer() {
+        let img = PathBuf::from("/tmp/logo.png");
+        let code = PathBuf::from("/tmp/main.rs");
+        let saved_paths = vec![img.clone(), code.clone()];
+        let img_paths = image_path_set(std::iter::empty(), &saved_paths);
+        let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
+
+        let editor_paths = editor_paths_for_restore(&saved_paths, &md_paths, &img_paths);
+
+        assert!(
+            !editor_paths.contains(&&img),
+            "an image must never be handed to the editor pre-pass — read_to_string on a PNG \
+             yields an empty buffer that Cmd+S would write back over the real file"
+        );
+        assert!(editor_paths.contains(&&code), "a code file must still get its editor buffer");
+    }
+
+    /// A stale/corrupt `SImage` with an empty (default) path must fall
+    /// through rather than restoring an Image pane that can't read anything —
+    /// same guard the Markdown and terminal arms carry.
+    #[test]
+    fn an_empty_saved_image_path_falls_through_instead_of_rendering() {
+        let empty = PathBuf::new();
+        let saved_paths: Vec<PathBuf> = Vec::new();
+        let img_paths = image_path_set([&empty], &saved_paths);
+        assert!(img_paths.is_empty(), "an empty path must never enter the image set");
+
+        let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
+        let kind = restored_pane_kind(
+            5, None, &saved_paths, 0, &md_paths, &img_paths, None, Some(&empty), false, true,
+        );
+        assert_eq!(kind, RestoredPaneKind::Terminal);
+    }
 
     /// A markdown file that is NOT the shared Files pane — a standalone
     /// Markdown pane elsewhere — still restores as Markdown via its own
@@ -16556,7 +16781,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
         let kind =
-            restored_pane_kind(3, None, &saved_paths, 0, &md_paths, Some(&doc), false, false);
+            restored_pane_kind(3, None, &saved_paths, 0, &md_paths, &no_images(), Some(&doc), None, false, false);
 
         assert_eq!(kind, RestoredPaneKind::Markdown { path: doc, is_files_pane: false });
     }
@@ -16572,7 +16797,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, None, false, false);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), None, None, false, false);
 
         assert_eq!(kind, RestoredPaneKind::Editor { path: code });
     }
@@ -16591,12 +16816,12 @@ mod restore_pane_kind_tests {
         // No files-pane match, no browser, empty markdown path → falls
         // through to the terminal-cache arm (here: true → Terminal).
         let kind =
-            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, Some(&empty), false, true);
+            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), Some(&empty), None, false, true);
         assert_eq!(kind, RestoredPaneKind::Terminal);
 
         // And with no terminal cache entry either, all the way to fresh.
         let kind =
-            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, Some(&empty), false, false);
+            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), Some(&empty), None, false, false);
         assert_eq!(kind, RestoredPaneKind::FreshTerminal);
     }
 
@@ -16634,11 +16859,11 @@ mod restore_pane_kind_tests {
         // the very same doc.md. Unaffected by the files-pane branch since
         // p1 != p2 == saved_files_pane.
         let k1 =
-            restored_pane_kind(p1, Some(p2), &saved_paths, 1, &md_paths, Some(&doc), false, false);
+            restored_pane_kind(p1, Some(p2), &saved_paths, 1, &md_paths, &no_images(), Some(&doc), None, false, false);
         assert_eq!(k1, RestoredPaneKind::Markdown { path: doc.clone(), is_files_pane: false });
 
         // P2: the shared Files pane, active tab (index 1) = doc.md itself.
-        let k2 = restored_pane_kind(p2, Some(p2), &saved_paths, 1, &md_paths, None, false, false);
+        let k2 = restored_pane_kind(p2, Some(p2), &saved_paths, 1, &md_paths, &no_images(), None, None, false, false);
         assert_eq!(
             k2,
             RestoredPaneKind::Markdown { path: doc, is_files_pane: true },
@@ -16659,7 +16884,7 @@ mod restore_pane_kind_tests {
         // doc.md is recorded as a live Markdown pane's path (e.g. pane P1)
         // even though it ALSO sits in the shared Files pane's saved tab list.
         let md_paths = markdown_path_set([&doc], &saved_paths);
-        let editor_paths = editor_paths_for_restore(&saved_paths, &md_paths);
+        let editor_paths = editor_paths_for_restore(&saved_paths, &md_paths, &no_images());
 
         assert!(
             !editor_paths.contains(&&doc),
@@ -16779,7 +17004,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, None, false, true);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), None, None, false, true);
 
         assert_eq!(
             kind,
@@ -16801,7 +17026,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, None, true, false);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), None, None, true, false);
 
         assert_eq!(
             kind,
@@ -16832,7 +17057,7 @@ mod restore_pane_kind_tests {
 #[cfg(test)]
 mod restore_wiring_integration_tests {
     use super::{CraneShellView, PaneId};
-    use crate::warpui::persist::{AddedProject, SMarkdown, SNode, STab, WarpuiState};
+    use crate::warpui::persist::{AddedProject, SImage, SMarkdown, SNode, STab, WarpuiState};
 
     /// Overrides `HOME` for the scope of one test. `new_with_state` still
     /// reaches several HOME-derived paths that have nothing to do with the
@@ -17031,8 +17256,227 @@ mod restore_wiring_integration_tests {
         });
     }
 
+    /// The case where the per-pid `images` record is the ONLY thing that can
+    /// bring the pane back: a STANDALONE Image pane — one that is not the
+    /// Workspace's Files Pane.
+    ///
+    /// This is reachable in normal use. Open image A (it becomes the Files
+    /// Pane), split, then open image B; B now owns the Files Pane slot and
+    /// `file_pane_active` points at B, so the saved Files-Pane record says
+    /// nothing about pane A. Only `images[A] = a.png` does. Every other image
+    /// test here has the pane doubling as the Files Pane, where
+    /// `image_path_set`'s extension pass over `file_pane_paths` would restore
+    /// it even if the `st.images` read were deleted outright — so without this
+    /// test, deleting that read is a mutation nothing catches.
+    #[test]
+    fn a_standalone_image_pane_restores_from_its_own_images_record() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
 
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
 
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let project_path = project_dir.path().to_string_lossy().into_owned();
+        let solo = project_dir.path().join("solo.png");
+        std::fs::write(&solo, b"\x89PNG\r\n\x1a\n").expect("write temp png");
+
+        const PID: PaneId = 55;
+
+        let mut st = WarpuiState::default();
+        st.added_projects =
+            vec![AddedProject { name: "proj".to_string(), path: project_path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            project_path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID),
+                focus: Some(PID),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((project_path, 0));
+        // Deliberately NO files_pane / file_pane_paths: `images` is the sole
+        // record of this pane, exactly as for a non-Files-Pane image leaf.
+        st.images = vec![(PID, SImage { path: solo })];
+
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    assert_eq!(
+                        v.pane_kind_for_test(PID),
+                        Some("Image"),
+                        "a standalone Image pane must restore from its `images` record alone — \
+                         with no Files-Pane record to fall back on, a fresh terminal is the bug"
+                    );
+                });
+            });
+        });
+    }
+
+    /// The FULL loop, closing the gap a restore-only test leaves open: open an
+    /// image, SAVE via the real `build_state`, then restore that saved state
+    /// into a brand-new shell. A restore-only test passes against a hand-built
+    /// `WarpuiState` even if `build_state` never writes `images` at all — in
+    /// which case the real app still loses every image pane on quit. This
+    /// asserts the save side records the pane AND that what it recorded is
+    /// sufficient to bring it back as an Image rather than a terminal.
+    #[test]
+    fn save_then_restore_round_trips_an_image_pane() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let project_path = project_dir.path().to_string_lossy().into_owned();
+        let seed = project_dir.path().join("seed.md");
+        std::fs::write(&seed, "# seed\n").expect("write seed md");
+        let img = project_dir.path().join("chart.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").expect("write temp png");
+
+        const PID: PaneId = 31;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 32;
+        st.added_projects =
+            vec![AddedProject { name: "proj".to_string(), path: project_path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            project_path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID),
+                focus: Some(PID),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((project_path, 0));
+        st.markdowns = vec![(PID, SMarkdown { path: seed, editing: false })];
+
+        let img2 = img.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+
+            // SESSION 1: open the image, then save through the real collector.
+            let saved = app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    v.open_file(img2.clone(), vctx);
+                    v.build_state(&*vctx)
+                })
+            });
+            let img_pane = saved
+                .images
+                .iter()
+                .find(|(_, si)| si.path == img)
+                .map(|(pid, _)| *pid)
+                .expect("build_state must record the open Image pane in `images`");
+
+            // SESSION 2: restore that saved state into a brand-new shell.
+            let (_window_id2, view2) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(saved))
+            });
+            app.update(move |ctx| {
+                view2.update(ctx, |v, _vctx| {
+                    let kind = v.pane_kind_for_test(img_pane);
+                    assert_ne!(
+                        kind,
+                        Some("Terminal"),
+                        "a saved-then-restored Image pane must NOT come back as a fresh terminal"
+                    );
+                    assert_eq!(
+                        kind,
+                        Some("Image"),
+                        "the pane the save recorded in `images` must restore as PaneContent::Image"
+                    );
+                });
+            });
+        });
+    }
+
+    /// TASK 3, the whole point: a saved Image pane comes back as an Image
+    /// pane and NOT as a fresh terminal. Mirrors
+    /// `a_saved_markdown_files_pane_restores_as_markdown_end_to_end` with the
+    /// shape `build_state` actually writes for an open image — one pid that is
+    /// BOTH the saved `files_pane` (with the image as `file_pane_paths[0]`)
+    /// AND has an `images` entry for it. Also asserts the files-pane
+    /// bookkeeping landed, covering defect shape 2 through the real wiring.
+    #[test]
+    fn a_saved_image_pane_restores_as_an_image_pane_not_a_terminal() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let project_path = project_dir.path().to_string_lossy().into_owned();
+        let img = project_dir.path().join("diagram.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").expect("write temp png");
+
+        const PID: PaneId = 42;
+
+        let mut st = WarpuiState::default();
+        st.added_projects =
+            vec![AddedProject { name: "proj".to_string(), path: project_path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            project_path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID),
+                focus: Some(PID),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((project_path, 0));
+        st.files_pane = Some(PID);
+        st.file_pane_paths = vec![img.clone()];
+        st.file_pane_active = 0;
+        st.images = vec![(PID, SImage { path: img })];
+
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    let kind = v.pane_kind_for_test(PID);
+                    assert_ne!(
+                        kind,
+                        Some("Terminal"),
+                        "a saved Image pane must NOT regress to a fresh terminal — the exact bug \
+                         this persistence exists to prevent"
+                    );
+                    assert_eq!(
+                        kind,
+                        Some("Image"),
+                        "a pane that is both the saved Files pane and has an `images` entry must \
+                         restore as PaneContent::Image, not Editor"
+                    );
+                    let (files_pane, paths, active) = v.files_pane_state_for_test((0, 0));
+                    assert_eq!(
+                        files_pane,
+                        Some(PID),
+                        "the restored Image leaf must claim the Files Pane bookkeeping, or the \
+                         next open splits a duplicate pane"
+                    );
+                    assert_eq!(paths.len(), 1, "file_pane_paths must carry the saved image tab");
+                    assert_eq!(active, 0);
+                });
+            });
+        });
+    }
 
     /// The user-reported bug, end to end: "I opened a new project and then
     /// opened a md file in it — somehow its file editor opened other projects'
