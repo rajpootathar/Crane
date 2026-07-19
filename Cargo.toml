@@ -108,6 +108,11 @@ trash = "5"
 # Project; a single debouncer thread coalesces bursts. See
 # src/warpui/file_watcher.rs. 8.x is the latest stable line.
 notify = "8"
+# warpui_core's own `Image` element takes its animation start time as an
+# `instant::Instant` (src/warpui/image_view.rs), not `std::time::Instant` —
+# same crate vendor/warp's workspace already pins (0.1.12), unified by cargo
+# into the same dependency graph since warpui is a path dependency.
+instant = "0.1.12"
 
 [dev-dependencies]
 tempfile = "3"

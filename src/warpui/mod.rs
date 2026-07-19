@@ -32,6 +32,7 @@ pub mod grid_element;
 pub mod gutter_element;
 pub mod scrollbar_element;
 pub mod icons;
+pub mod image_view;
 pub mod input;
 pub mod layout;
 pub mod line_edit;
