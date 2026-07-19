@@ -1213,10 +1213,14 @@ fn markdown_path_set<'a>(
 /// apart.
 ///
 /// `img_paths` matters beyond tidiness: without it a restored image would
-/// ALSO get a `WarpEditorView` built from `read_to_string(p).unwrap_or_default()`
-/// — an EMPTY editable buffer over a binary file, which a reflexive Cmd+S
-/// would then write back as zero bytes. `open_file` already refuses that on
-/// the live path (see its binary guard); this keeps restore consistent.
+/// ALSO get a `WarpEditorView` built over binary content — an image is
+/// never valid UTF-8, so it would hit the editor pre-pass's own UTF-8 guard
+/// (see the call site in `new`, next to `std::fs::read(p).map(String::from_utf8)`)
+/// and skip entirely rather than restore at all. Excluding it here instead
+/// means an image gets its dedicated `WarpImageView` handle, same as
+/// `open_file` routes it on the live path. Belt and braces: either guard
+/// alone would keep an image out of the Editor, but both catch different
+/// failure shapes (extension routing here, content sniffing there).
 fn editor_paths_for_restore<'a>(
     saved_paths: &'a [PathBuf],
     md_paths: &HashSet<PathBuf>,
@@ -1860,7 +1864,22 @@ impl CraneShellView {
                 let mono = warpui::fonts::Cache::handle(ctx)
                     .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
                 for p in editor_paths_for_restore(effective_saved_paths, &md_paths, &img_paths) {
-                    let content = std::fs::read_to_string(p).unwrap_or_default();
+                    // Mirror `open_file`'s binary guard (see its own comment
+                    // next to `std::fs::read(&path).map(String::from_utf8)`):
+                    // `read_to_string(p).unwrap_or_default()` used to turn any
+                    // file that fails to read as UTF-8 into an EMPTY editable
+                    // buffer — not just an image (those are already excluded
+                    // above via `img_paths`), but ANY file that was valid text
+                    // when last saved and became binary on disk before this
+                    // restart. A reflexive Cmd+S on that empty buffer would
+                    // then write zero bytes over the real content. Skip this
+                    // path instead: no handle here means the match below
+                    // degrades this leaf to a fresh terminal, the same
+                    // graceful fallback the Markdown/Image arms already use
+                    // for a corrupt or unreadable saved state.
+                    let Ok(Ok(content)) = std::fs::read(p).map(String::from_utf8) else {
+                        continue;
+                    };
                     let pc = p.clone();
                     let goto = Self::lsp_goto_cb(p.clone());
                     let h = ctx.add_typed_action_view(move |ctx| {
@@ -16788,10 +16807,10 @@ mod restore_pane_kind_tests {
     }
 
     /// An image path must never ALSO get an editor handle. Beyond tidiness:
-    /// the editor pre-pass builds its buffer with
-    /// `read_to_string(p).unwrap_or_default()`, which turns a PNG into an
-    /// EMPTY editable buffer that a reflexive Cmd+S would write back as zero
-    /// bytes — destroying the user's image.
+    /// a PNG is never valid UTF-8, so without this exclusion it would hit the
+    /// editor pre-pass's own UTF-8 guard and silently restore as NEITHER an
+    /// Editor nor an Image pane — degrading to a fresh terminal instead of
+    /// the dedicated image preview `open_file` gives it on the live path.
     #[test]
     fn a_restored_image_path_never_also_gets_an_editor_buffer() {
         let img = PathBuf::from("/tmp/logo.png");
@@ -17617,6 +17636,86 @@ mod restore_wiring_integration_tests {
                         "selecting the image's File Tab must swap PaneContent::Image into the \
                          shared pane, not leave the previous file showing while the tab strip \
                          highlights the image"
+                    );
+                });
+            });
+        });
+    }
+
+    /// FINDING 3 regression guard: the restore pre-pass used to build every
+    /// editor buffer with `std::fs::read_to_string(p).unwrap_or_default()`,
+    /// which silently turns ANY file that fails to read as valid UTF-8 into
+    /// an EMPTY editable buffer — not just images (those already had their
+    /// own `img_paths` exclusion set). Concretely reachable: a file that was
+    /// valid UTF-8 when it was last saved as a File Tab and became binary on
+    /// disk before the next launch restores with real content silently
+    /// replaced by nothing, and a reflexive Cmd+S then writes zero bytes over
+    /// it. `open_file` already refused this on the live path via its own
+    /// UTF-8 guard; the restore pre-pass lacked the equivalent.
+    ///
+    /// A `.rs` extension (not `.png`/`.svg`/etc, so `img_paths` plays no part
+    /// here) whose on-disk bytes are genuinely invalid UTF-8, saved as the
+    /// Files Pane's sole open tab. Restoring must NOT produce
+    /// `PaneContent::Editor` — that would mean an empty buffer masking real
+    /// binary content — and must instead degrade to a fresh terminal, the
+    /// same graceful fallback already used when the Markdown/Image pre-pass
+    /// can't build a handle for a corrupt saved state.
+    #[test]
+    fn a_saved_files_pane_path_with_invalid_utf8_never_restores_an_editor_buffer() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let project_path = project_dir.path().to_string_lossy().into_owned();
+        let doc = project_dir.path().join("corrupted.rs");
+        // Genuinely invalid UTF-8 (a lone continuation byte), simulating a
+        // text file that went binary on disk after it was last saved as a
+        // File Tab.
+        std::fs::write(&doc, [b'f', b'n', 0x80, b' ', b'x', b'('])
+            .expect("write invalid-utf8 fixture");
+
+        const PID: PaneId = 77;
+
+        let mut st = WarpuiState::default();
+        st.added_projects =
+            vec![AddedProject { name: "proj".to_string(), path: project_path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            project_path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID),
+                focus: Some(PID),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((project_path, 0));
+        st.files_pane = Some(PID);
+        st.file_pane_paths = vec![doc];
+        st.file_pane_active = 0;
+
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    let kind = v.pane_kind_for_test(PID);
+                    assert_ne!(
+                        kind,
+                        Some("Editor"),
+                        "a file that fails the UTF-8 guard must never restore as an Editor pane \
+                         — that would be an empty buffer silently masking real binary content"
+                    );
+                    assert_eq!(
+                        kind,
+                        Some("Terminal"),
+                        "the restore pre-pass must degrade this leaf to a fresh terminal, same as \
+                         the Markdown/Image arms do when their own pre-pass can't build a handle"
                     );
                 });
             });
