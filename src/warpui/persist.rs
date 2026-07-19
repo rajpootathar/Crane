@@ -423,6 +423,64 @@ mod tests {
         assert!(st.expanded_project_paths.is_empty());
     }
 
+    /// Every Workspace's File Tabs must survive a serialize → deserialize
+    /// round trip, each keyed by its own worktree checkout PATH. This is the
+    /// field that makes "Workspace B's open files come back in B" possible at
+    /// all — the legacy flat trio could only ever carry ONE Workspace's.
+    #[test]
+    fn file_tabs_by_path_round_trips_every_workspace() {
+        let mut st = WarpuiState::default();
+        st.file_tabs_by_path = vec![
+            (
+                "/tmp/wt-a".into(),
+                SFileTabs {
+                    pane: Some(4),
+                    paths: vec![PathBuf::from("/tmp/wt-a/lib.rs"), PathBuf::from("/tmp/wt-a/x.md")],
+                    active: 1,
+                },
+            ),
+            (
+                "/tmp/wt-b".into(),
+                SFileTabs {
+                    pane: Some(9),
+                    paths: vec![PathBuf::from("/tmp/wt-b/main.rs")],
+                    active: 0,
+                },
+            ),
+        ];
+        let bytes = serde_json::to_vec(&st).unwrap();
+        let back: WarpuiState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.file_tabs_by_path.len(), 2, "both Workspaces' File Tabs must survive");
+        assert_eq!(back.file_tabs_by_path[0].0, "/tmp/wt-a");
+        assert_eq!(back.file_tabs_by_path[0].1.pane, Some(4));
+        assert_eq!(
+            back.file_tabs_by_path[0].1.paths,
+            vec![PathBuf::from("/tmp/wt-a/lib.rs"), PathBuf::from("/tmp/wt-a/x.md")],
+            "tab order and contents must round trip exactly"
+        );
+        assert_eq!(back.file_tabs_by_path[0].1.active, 1, "the active File Tab index must survive");
+        assert_eq!(back.file_tabs_by_path[1].0, "/tmp/wt-b");
+        assert_eq!(back.file_tabs_by_path[1].1.pane, Some(9));
+        assert_eq!(back.file_tabs_by_path[1].1.paths, vec![PathBuf::from("/tmp/wt-b/main.rs")]);
+    }
+
+    /// The user's real `~/.crane/warpui-state.json` predates `file_tabs_by_path`
+    /// and carries the legacy FLAT Files-Pane trio. It must still parse, with
+    /// the flat fields intact (restore migrates them) and the new field empty.
+    #[test]
+    fn legacy_flat_file_pane_fields_still_parse() {
+        let legacy = r#"{
+            "files_pane": 12,
+            "file_pane_paths": ["/tmp/wt-a/lib.rs", "/tmp/wt-a/x.md"],
+            "file_pane_active": 1
+        }"#;
+        let st: WarpuiState = serde_json::from_str(legacy).expect("legacy state must load");
+        assert_eq!(st.files_pane, Some(12), "the legacy Files Pane id is the migration source");
+        assert_eq!(st.file_pane_paths.len(), 2, "the legacy open files must not be dropped");
+        assert_eq!(st.file_pane_active, 1);
+        assert!(st.file_tabs_by_path.is_empty(), "the path-keyed field defaults to empty");
+    }
+
     /// A Markdown pane's saved file + mode must survive a serialize →
     /// deserialize round trip, keyed by pane id, the same as `browsers`.
     #[test]

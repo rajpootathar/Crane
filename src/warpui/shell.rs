@@ -2249,6 +2249,19 @@ impl CraneShellView {
         )
     }
 
+    /// Test-only peek at a restored terminal's persisted snapshot. Lets a
+    /// restore test prove `WarpuiState::terminals` survived a migration
+    /// WITHOUT making the terminal a live leaf — restoring one spawns a real
+    /// PTY (and a real shell process) inside the test process, which this
+    /// module deliberately never does.
+    #[cfg(test)]
+    pub(crate) fn term_snapshot_for_test(
+        &self,
+        pid: PaneId,
+    ) -> Option<crate::warpui::persist::STerminal> {
+        self.term_cache.borrow().get(&pid).cloned()
+    }
+
     /// Test-only view of the pane-identity hazard: `(ws_of_pane(id),
     /// is_files_pane(id))`. Both must answer for the Workspace that OWNS `id`,
     /// regardless of which Workspace is currently selected.
@@ -17336,6 +17349,432 @@ mod restore_wiring_integration_tests {
                     assert_eq!(paths0, [doc0], "wi=0 keeps its own File Tab list");
                     assert_eq!(paths1, [doc1], "wi=1 keeps a SEPARATE File Tab list");
                     assert_ne!(fp0, fp1, "wi=0 and wi=1 get distinct Files Pane ids");
+                });
+            });
+        });
+    }
+
+    // ── Per-Workspace File Tab persistence (`file_tabs_by_path`) ─────────────
+
+    /// UPGRADE SAFETY. A realistic state file written by a build that predates
+    /// `file_tabs_by_path`: one flat Files-Pane record (`files_pane` /
+    /// `file_pane_paths` / `file_pane_active`) alongside a Markdown pane, a
+    /// Browser pane, a saved terminal snapshot and a path-keyed tab list.
+    ///
+    /// Restoring it must (a) land the flat file list on a Workspace — the one
+    /// whose Layout actually contains the saved Files Pane leaf — so the user
+    /// does not lose their open files on upgrade, and (b) leave every OTHER
+    /// pane type exactly as it was. A migration that drops panes would be a
+    /// worse bug than the one this field fixes.
+    ///
+    /// The saved terminal is deliberately NOT a live leaf: restoring one
+    /// spawns a real PTY (and a real shell process) inside the test process.
+    /// Its snapshot landing in `term_cache` is what proves `terminals` came
+    /// through the migration untouched.
+    #[test]
+    fn a_legacy_flat_file_list_migrates_without_losing_any_pane() {
+        use crate::warpui::persist::{SBrowser, STerminal};
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let path = proj.path().to_string_lossy().into_owned();
+        let seed = proj.path().join("seed.md");
+        // A NON-markdown file, so the migrated Files Pane restores as an
+        // Editor — the arm `files_pane_bookkeeping` drives unconditionally.
+        let doc = proj.path().join("lib.rs");
+        std::fs::write(&seed, "# seed\n").expect("write seed md");
+        std::fs::write(&doc, "fn main() {}\n").expect("write rs file");
+
+        const PID_FILES: PaneId = 60;
+        const PID_MD: PaneId = 61;
+        const PID_BROWSER: PaneId = 62;
+        // A terminal whose pane was closed before the save; its snapshot is
+        // still in `terminals` (the cache is not pruned on close).
+        const PID_TERM: PaneId = 63;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 64;
+        st.added_projects = vec![AddedProject { name: "proj".to_string(), path: path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Split {
+                    vertical: false,
+                    ratio: 0.5,
+                    first: Box::new(SNode::Leaf(PID_FILES)),
+                    second: Box::new(SNode::Split {
+                        vertical: true,
+                        ratio: 0.5,
+                        first: Box::new(SNode::Leaf(PID_MD)),
+                        second: Box::new(SNode::Leaf(PID_BROWSER)),
+                    }),
+                },
+                focus: Some(PID_FILES),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((path.clone(), 0));
+        // THE LEGACY SHAPE: flat trio, and `file_tabs_by_path` absent entirely.
+        st.files_pane = Some(PID_FILES);
+        st.file_pane_paths = vec![doc.clone()];
+        st.file_pane_active = 0;
+        assert!(st.file_tabs_by_path.is_empty(), "this blob must be the pre-migration shape");
+        st.markdowns = vec![(PID_MD, SMarkdown { path: seed.clone(), editing: false })];
+        st.browsers = vec![(
+            PID_BROWSER,
+            SBrowser {
+                tabs: vec![("https://example.com/".to_string(), "Example".to_string())],
+                active: 0,
+            },
+        )];
+        st.terminals = vec![(
+            PID_TERM,
+            STerminal { cwd: proj.path().to_path_buf(), history: "$ echo hi\r\nhi\r\n".to_string() },
+        )];
+
+        let (path2, doc2, seed2) = (path.clone(), doc.clone(), seed.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, _vctx| {
+                    let ws = v
+                        .ws_key_for_path_for_test(&path2)
+                        .expect("the project must resolve to a Workspace");
+
+                    // (a) The legacy flat file list survived the upgrade.
+                    let (files_pane, paths, active) = v.files_pane_state_for_test(ws);
+                    assert_eq!(
+                        files_pane,
+                        Some(PID_FILES),
+                        "the legacy flat `files_pane` must migrate onto the Workspace whose \
+                         Layout owns that leaf"
+                    );
+                    assert_eq!(
+                        paths,
+                        [doc2.clone()],
+                        "a state file that predates `file_tabs_by_path` must keep its open \
+                         files after upgrading — losing them is the worst outcome here"
+                    );
+                    assert_eq!(active, 0, "the legacy active File Tab index must migrate too");
+                    assert_eq!(
+                        v.pane_kind_for_test(PID_FILES),
+                        Some("Editor"),
+                        "the migrated Files Pane must restore as a document pane, not a terminal"
+                    );
+
+                    // (b) Every other pane type came through untouched.
+                    assert_eq!(
+                        v.pane_kind_for_test(PID_MD),
+                        Some("Markdown"),
+                        "the Markdown pane must survive the migration"
+                    );
+                    assert_eq!(
+                        v.pane_kind_for_test(PID_BROWSER),
+                        Some("Browser"),
+                        "the Browser pane must survive the migration"
+                    );
+                    let term = v
+                        .term_snapshot_for_test(PID_TERM)
+                        .expect("the saved terminal snapshot must survive the migration");
+                    assert_eq!(
+                        term.history, "$ echo hi\r\nhi\r\n",
+                        "the terminal's ANSI scrollback must come through byte for byte"
+                    );
+                    // And the Tab itself, with all three leaves.
+                    assert_eq!(
+                        v.pane_kind_for_test(PID_MD).is_some()
+                            && v.pane_kind_for_test(PID_BROWSER).is_some()
+                            && v.pane_kind_for_test(PID_FILES).is_some(),
+                        true,
+                        "all three saved leaves must restore"
+                    );
+                    assert_eq!(seed2.exists(), true, "sanity: the markdown source file exists");
+                });
+            });
+        });
+    }
+
+    /// THE USER'S BUG, ACROSS A RESTART. Two Workspaces with different files
+    /// open; save (`build_state`) and restore into a fresh shell. Each
+    /// Workspace must come back with ONLY its own File Tabs.
+    ///
+    /// While persistence was a single flat list, `build_state` could only ever
+    /// write the SELECTED Workspace's tabs, so on restart every Workspace's
+    /// File Tabs collapsed into one — the persistence half of "its file editor
+    /// opened other projects' open files too".
+    #[test]
+    fn each_workspace_restores_only_its_own_file_tabs() {
+        use crate::warpui::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj_a = tempfile::tempdir().expect("project a tempdir");
+        let proj_b = tempfile::tempdir().expect("project b tempdir");
+        let path_a = proj_a.path().to_string_lossy().into_owned();
+        let path_b = proj_b.path().to_string_lossy().into_owned();
+
+        let seed_a = proj_a.path().join("seed-a.md");
+        let seed_b = proj_b.path().join("seed-b.md");
+        let doc_a = proj_a.path().join("only-in-a.md");
+        let doc_b = proj_b.path().join("only-in-b.md");
+        for p in [&seed_a, &seed_b, &doc_a, &doc_b] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID_A: PaneId = 70;
+        const PID_B: PaneId = 71;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 72;
+        st.added_projects = vec![
+            AddedProject { name: "proj-a".to_string(), path: path_a.clone() },
+            AddedProject { name: "proj-b".to_string(), path: path_b.clone() },
+        ];
+        st.worktree_tabs_by_path = vec![
+            (
+                path_a.clone(),
+                vec![STab {
+                    id: 0,
+                    name: "A".to_string(),
+                    layout: SNode::Leaf(PID_A),
+                    focus: Some(PID_A),
+                    renamed: false,
+                }],
+            ),
+            (
+                path_b.clone(),
+                vec![STab {
+                    id: 1,
+                    name: "B".to_string(),
+                    layout: SNode::Leaf(PID_B),
+                    focus: Some(PID_B),
+                    renamed: false,
+                }],
+            ),
+        ];
+        st.active_tab_path = Some((path_a.clone(), 0));
+        st.markdowns = vec![
+            (PID_A, SMarkdown { path: seed_a, editing: false }),
+            (PID_B, SMarkdown { path: seed_b, editing: false }),
+        ];
+
+        let (path_a2, path_b2) = (path_a.clone(), path_b.clone());
+        let (doc_a2, doc_b2) = (doc_a.clone(), doc_b.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            // SESSION 1: open a different file in each Workspace, then save.
+            let saved = app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws_a = v.ws_key_for_path_for_test(&path_a2).expect("Workspace A");
+                    let ws_b = v.ws_key_for_path_for_test(&path_b2).expect("Workspace B");
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws_a.0, ws_a.1, 0),
+                            path: std::path::PathBuf::from(&path_a2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(doc_a2.clone(), vctx);
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws_b.0, ws_b.1, 1),
+                            path: std::path::PathBuf::from(&path_b2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(doc_b2.clone(), vctx);
+                    v.build_state(&*vctx)
+                })
+            });
+            assert_eq!(
+                saved.file_tabs_by_path.len(),
+                2,
+                "the save must record BOTH Workspaces' File Tabs, not just the selected one"
+            );
+
+            // SESSION 2: restore that state into a brand-new shell.
+            let (path_a3, path_b3) = (path_a.clone(), path_b.clone());
+            let (doc_a3, doc_b3) = (doc_a.clone(), doc_b.clone());
+            let (_window_id2, view2) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(saved))
+            });
+            app.update(move |ctx| {
+                view2.update(ctx, |v, _vctx| {
+                    let ws_a = v.ws_key_for_path_for_test(&path_a3).expect("Workspace A");
+                    let ws_b = v.ws_key_for_path_for_test(&path_b3).expect("Workspace B");
+                    assert_ne!(ws_a, ws_b, "the two Projects must restore as distinct Workspaces");
+
+                    let (fp_a, paths_a, _) = v.files_pane_state_for_test(ws_a);
+                    let (fp_b, paths_b, _) = v.files_pane_state_for_test(ws_b);
+                    assert_eq!(
+                        paths_a,
+                        [doc_a3.clone()],
+                        "Workspace A must restore ONLY the file that was open in A"
+                    );
+                    assert_eq!(
+                        paths_b,
+                        [doc_b3.clone()],
+                        "Workspace B must restore ONLY the file that was open in B — a flat \
+                         persisted list collapsed every Workspace's File Tabs into one"
+                    );
+                    assert!(fp_a.is_some(), "Workspace A must restore its Files Pane leaf");
+                    assert!(fp_b.is_some(), "Workspace B must restore its Files Pane leaf");
+                    assert_ne!(fp_a, fp_b, "each Workspace keeps its OWN Files Pane leaf");
+                });
+            });
+        });
+    }
+
+    /// PATH STABILITY, ACROSS A RESTART. The same save as the test above, but
+    /// the Projects come back in the OPPOSITE order — the everyday case of a
+    /// Project added, removed or dragged in the sidebar between runs.
+    ///
+    /// Each Workspace's File Tabs must follow its worktree checkout PATH to
+    /// its new index. Keyed by index instead, Workspace A's open files would
+    /// restore into Workspace B — reintroducing the exact cross-Project leak
+    /// this whole change exists to prevent.
+    #[test]
+    fn restored_file_tabs_follow_the_worktree_path_not_the_index() {
+        use crate::warpui::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj_a = tempfile::tempdir().expect("project a tempdir");
+        let proj_b = tempfile::tempdir().expect("project b tempdir");
+        let path_a = proj_a.path().to_string_lossy().into_owned();
+        let path_b = proj_b.path().to_string_lossy().into_owned();
+
+        let seed_a = proj_a.path().join("seed-a.md");
+        let seed_b = proj_b.path().join("seed-b.md");
+        let doc_a = proj_a.path().join("only-in-a.md");
+        let doc_b = proj_b.path().join("only-in-b.md");
+        for p in [&seed_a, &seed_b, &doc_a, &doc_b] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID_A: PaneId = 80;
+        const PID_B: PaneId = 81;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 82;
+        st.added_projects = vec![
+            AddedProject { name: "proj-a".to_string(), path: path_a.clone() },
+            AddedProject { name: "proj-b".to_string(), path: path_b.clone() },
+        ];
+        st.worktree_tabs_by_path = vec![
+            (
+                path_a.clone(),
+                vec![STab {
+                    id: 0,
+                    name: "A".to_string(),
+                    layout: SNode::Leaf(PID_A),
+                    focus: Some(PID_A),
+                    renamed: false,
+                }],
+            ),
+            (
+                path_b.clone(),
+                vec![STab {
+                    id: 1,
+                    name: "B".to_string(),
+                    layout: SNode::Leaf(PID_B),
+                    focus: Some(PID_B),
+                    renamed: false,
+                }],
+            ),
+        ];
+        st.active_tab_path = Some((path_a.clone(), 0));
+        st.markdowns = vec![
+            (PID_A, SMarkdown { path: seed_a, editing: false }),
+            (PID_B, SMarkdown { path: seed_b, editing: false }),
+        ];
+
+        let (path_a2, path_b2) = (path_a.clone(), path_b.clone());
+        let (doc_a2, doc_b2) = (doc_a.clone(), doc_b.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            let mut saved = app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws_a = v.ws_key_for_path_for_test(&path_a2).expect("Workspace A");
+                    let ws_b = v.ws_key_for_path_for_test(&path_b2).expect("Workspace B");
+                    assert_eq!(ws_a, (0, 0), "Project A is first before the reorder");
+                    assert_eq!(ws_b, (1, 0), "Project B is second before the reorder");
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws_a.0, ws_a.1, 0),
+                            path: std::path::PathBuf::from(&path_a2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(doc_a2.clone(), vctx);
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws_b.0, ws_b.1, 1),
+                            path: std::path::PathBuf::from(&path_b2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(doc_b2.clone(), vctx);
+                    v.build_state(&*vctx)
+                })
+            });
+            // BETWEEN RUNS: the user reorders the sidebar (or removes and
+            // re-adds a Project), so B now loads first. Every (project_idx,
+            // worktree_idx) from the previous run is now stale. `sidebar_order`
+            // is the field a sidebar drag actually persists, and it is what
+            // decides Project order on the next load.
+            saved.sidebar_order.reverse();
+            saved.added_projects.reverse();
+
+            let (path_a3, path_b3) = (path_a.clone(), path_b.clone());
+            let (doc_a3, doc_b3) = (doc_a.clone(), doc_b.clone());
+            let (_window_id2, view2) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(saved))
+            });
+            app.update(move |ctx| {
+                view2.update(ctx, |v, _vctx| {
+                    let ws_a = v.ws_key_for_path_for_test(&path_a3).expect("Workspace A");
+                    let ws_b = v.ws_key_for_path_for_test(&path_b3).expect("Workspace B");
+                    // Guards against a vacuous pass: the indices really did
+                    // swap, so index-keyed restore CANNOT accidentally agree
+                    // with path-keyed restore here.
+                    assert_eq!(ws_b, (0, 0), "Project B now loads first");
+                    assert_eq!(ws_a, (1, 0), "Project A now loads second");
+
+                    let (_, paths_a, _) = v.files_pane_state_for_test(ws_a);
+                    let (_, paths_b, _) = v.files_pane_state_for_test(ws_b);
+                    assert_eq!(
+                        paths_a,
+                        [doc_a3.clone()],
+                        "Workspace A's File Tabs must follow its checkout PATH to the new \
+                         index — keyed by index they would land in Workspace B"
+                    );
+                    assert_eq!(
+                        paths_b,
+                        [doc_b3.clone()],
+                        "Workspace B's File Tabs must follow its checkout PATH to the new index"
+                    );
                 });
             });
         });
