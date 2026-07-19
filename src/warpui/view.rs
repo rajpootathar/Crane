@@ -320,6 +320,7 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
+    #[allow(dead_code)] // callers currently use `new_with` directly (they need the shared requested_cwd/wake/rx).
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
         let (tx, rx) = async_channel::bounded::<()>(1);
         let wake: Wake = Arc::new(move || {

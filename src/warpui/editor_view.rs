@@ -1062,18 +1062,30 @@ impl WarpEditorView {
     }
 
     // ── Preview / read-only ──────────────────────────────────────────────────
+    //
+    // Both flags are already live internally: `preview` gates the
+    // promote-to-permanent-on-first-edit logic below, and `read_only` gates
+    // every mutating action. Nothing calls these setters yet to ever turn
+    // either flag on — the shell currently tracks preview-tab status itself
+    // (a separate `PaneId`-keyed map) rather than through this view's own
+    // flag. Kept `#[allow(dead_code)]` rather than deleted: whichever side
+    // ends up owning preview/read-only state, this is real, working API for
+    // it, not a discarded first draft.
 
     /// True while this editor is a preview tab (see `preview` field).
+    #[allow(dead_code)]
     pub fn is_preview(&self) -> bool {
         self.preview
     }
     /// Mark / unmark this editor as a preview tab.
+    #[allow(dead_code)]
     pub fn set_preview(&mut self, preview: bool, ctx: &mut ViewContext<Self>) {
         self.preview = preview;
         ctx.notify();
     }
     /// Promote a preview tab to permanent (clears the preview flag). Returns
     /// `true` if it was a preview tab (the shell can then re-style the tab).
+    #[allow(dead_code)]
     pub fn clear_preview(&mut self, ctx: &mut ViewContext<Self>) -> bool {
         let was = self.preview;
         if was {
@@ -1083,10 +1095,12 @@ impl WarpEditorView {
         was
     }
     /// True when the editor is read-only (mutating actions are no-ops).
+    #[allow(dead_code)]
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
     /// Enable / disable read-only mode.
+    #[allow(dead_code)]
     pub fn set_read_only(&mut self, read_only: bool, ctx: &mut ViewContext<Self>) {
         self.read_only = read_only;
         ctx.notify();
@@ -1094,7 +1108,10 @@ impl WarpEditorView {
 
     // ── Word wrap ────────────────────────────────────────────────────────────
 
-    /// True when soft word-wrap is on.
+    /// True when soft word-wrap is on. No caller yet — the shell tracks its
+    /// own `word_wrap_default` for the menu checkmark instead of querying
+    /// the view. Kept `#[allow(dead_code)]`, same reasoning as above.
+    #[allow(dead_code)]
     pub fn word_wrap(&self) -> bool {
         self.word_wrap
     }
@@ -1491,6 +1508,7 @@ impl WarpEditorView {
     /// Setter form of `with_goto`, for wiring the callback after construction
     /// (e.g. `handle.update(ctx, |v, _| v.set_goto(cb))`).
     #[allow(clippy::type_complexity)]
+    #[allow(dead_code)] // callers currently use `with_goto` at construction instead.
     pub fn set_goto(
         &mut self,
         cb: std::rc::Rc<dyn Fn(u32, u32, &mut ViewContext<WarpEditorView>)>,
