@@ -32,14 +32,37 @@
 CRANE_ZDOTDIR="${ZDOTDIR:-$HOME}"
 CRANE_USER_ZDOTDIR="${CRANE_USER_ZDOTDIR:-${CRANE_OLD_ZDOTDIR:-$HOME}}"
 
+# Self-reference guard. If the "user" directory resolves to Crane's own — a
+# nested Crane shell handing its inherited ZDOTDIR down as CRANE_OLD_ZDOTDIR,
+# say — then every `source "$CRANE_USER_ZDOTDIR/.zsh*"` below sources the shim
+# that is running it. zsh does not stop that; it recurses until it hits
+# "job table full or recursion limit exceeded", after which add-zsh-hook fails
+# and integration is dead. $HOME is the correct fallback: it is where zsh would
+# have looked with no ZDOTDIR at all.
+[[ "$CRANE_USER_ZDOTDIR" == "$CRANE_ZDOTDIR" ]] && CRANE_USER_ZDOTDIR="$HOME"
+
 if [[ -f "$CRANE_USER_ZDOTDIR/.zshenv" ]]; then
-  ZDOTDIR="$CRANE_USER_ZDOTDIR"
+  # ZDOTDIR must look to the user's .zshenv exactly as it would have without
+  # Crane, and the documented way to relocate zsh config is to set it from
+  # there — commonly in a guarded form (`${ZDOTDIR:-$HOME/.config/zsh}`, or a
+  # `[[ -z "$ZDOTDIR" ]]` test). Leaving a value in place makes those guards
+  # skip, the relocation never happens, and the shell ends up pointed at a
+  # directory with no .zshrc: no prompt, no aliases, no completions. So unset
+  # it, and only pre-set it when Crane was told the real directory outright.
+  if [[ -n "${CRANE_OLD_ZDOTDIR:-}" ]]; then
+    ZDOTDIR="$CRANE_USER_ZDOTDIR"
+  else
+    unset ZDOTDIR
+  fi
   source "$CRANE_USER_ZDOTDIR/.zshenv"
   # The user's own .zshenv may have relocated ZDOTDIR — that new value is
   # where the rest of their startup files live.
   CRANE_USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
+  [[ "$CRANE_USER_ZDOTDIR" == "$CRANE_ZDOTDIR" ]] && CRANE_USER_ZDOTDIR="$HOME"
 fi
 
 # Hand zsh back to Crane's directory so .zprofile / .zshrc / .zlogin resolve to
-# the shims rather than straight to the user's originals.
-ZDOTDIR="$CRANE_ZDOTDIR"
+# the shims rather than straight to the user's originals. `export`, not a plain
+# assignment: the `unset` above drops the export attribute, and without it a
+# nested zsh no longer inherits ZDOTDIR and loses shell integration entirely.
+export ZDOTDIR="$CRANE_ZDOTDIR"

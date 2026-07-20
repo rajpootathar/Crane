@@ -20,6 +20,10 @@ __crane_escape() {
 # reference to these (before their first assignment) into a hard error.
 __crane_executing=""
 __crane_in_precmd=""
+# History bookkeeping, see __crane_read_history / __crane_command_line below.
+__crane_hist_num=""
+__crane_hist_cur=""
+__crane_line=""
 
 # Reports the just-finished command's exit code, then the new cwd and the
 # prompt-start / command-start markers. Takes the exit code as an argument
@@ -27,6 +31,13 @@ __crane_in_precmd=""
 __crane_precmd() {
   local exit="$1"
   if [[ -n "$__crane_executing" ]]; then __crane_osc "D;$exit"; __crane_executing=""; fi
+  # Re-baseline the history counter while sitting at a prompt: whatever
+  # `history 1` reports now is the PREVIOUS command, so anything the next
+  # DEBUG trap sees under that same number was never recorded. Doing it here
+  # rather than once at load time also covers the first command of a session,
+  # which would otherwise be compared against an empty baseline and wrongly
+  # accept the last line restored from HISTFILE.
+  __crane_read_history && __crane_hist_num="$__crane_hist_cur"
   __crane_osc "P;Cwd=$PWD"; __crane_osc "A"; __crane_osc "B"
 }
 
@@ -44,7 +55,14 @@ __crane_precmd() {
 #
 # History is only enabled for interactive shells; anywhere else this comes back
 # empty and the caller falls back to $BASH_COMMAND.
-__crane_command_line() {
+#
+# Splits `history 1` into its entry number (__crane_hist_cur) and its text
+# (__crane_line). Sets globals instead of printing because the staleness check
+# in __crane_command_line has to carry state across calls, and a command
+# substitution would run the whole thing in a subshell and discard it.
+__crane_read_history() {
+  __crane_hist_cur=""
+  __crane_line=""
   local h
   h=$(HISTTIMEFORMAT= LC_ALL=C builtin history 1 2>/dev/null) || return 1
   [[ -n "$h" ]] || return 1
@@ -52,11 +70,32 @@ __crane_command_line() {
   # expansion rather than sed so it costs no extra fork, and unlike a regex it
   # keeps every line of a multi-line entry ('.' would not match the newlines).
   h=${h#"${h%%[![:space:]]*}"}   # leading blanks
-  h=${h#"${h%%[![:digit:]]*}"}   # history number
+  __crane_hist_cur=${h%%[![:digit:]]*}
+  h=${h#"$__crane_hist_cur"}     # history number
   h=${h#\*}                      # "entry was modified" marker
   h=${h#"${h%%[![:space:]]*}"}   # blanks between number and command
-  [[ -n "$h" ]] || return 1
-  printf '%s' "$h"
+  [[ -n "$__crane_hist_cur" && -n "$h" ]] || return 1
+  __crane_line="$h"
+}
+
+# The line the user just typed, in __crane_line — but only when bash actually
+# recorded it.
+#
+# HISTCONTROL / HISTIGNORE let bash decline: `HISTCONTROL=ignoreboth` is the
+# stock default in Debian/Ubuntu's /etc/skel/.bashrc and drops any line with a
+# leading space or one identical to its predecessor. `history 1` then still
+# succeeds — it just returns the PRIOR entry, so the previous command gets
+# reported as the current one, and a deliberately space-hidden line is
+# attributed to whatever came before it.
+#
+# The entry number is the tell: a recorded line advances it past the baseline
+# __crane_precmd took at the prompt, a dropped one leaves it untouched. `!=`
+# rather than `-gt` so a `history -c` (which restarts numbering low) reads as a
+# fresh entry instead of wedging the check forever.
+__crane_command_line() {
+  __crane_read_history || return 1
+  [[ "$__crane_hist_cur" != "$__crane_hist_num" ]] || return 1
+  __crane_hist_num="$__crane_hist_cur"
 }
 
 # DEBUG fires before every simple command bash runs — including each one inside
@@ -81,8 +120,10 @@ __crane_debug() {
   esac
   [[ -n "$__crane_in_precmd" ]] && return
   [[ -n "$__crane_executing" ]] && return
+  # Called directly, never as `$(...)`: __crane_command_line carries the
+  # history counter across invocations and a subshell would throw it away.
   local line
-  line=$(__crane_command_line) || line="$BASH_COMMAND"
+  if __crane_command_line; then line="$__crane_line"; else line="$BASH_COMMAND"; fi
   __crane_osc "E;$(__crane_escape "$line")"
   __crane_osc "C"
   __crane_executing=1

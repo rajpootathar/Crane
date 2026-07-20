@@ -8,6 +8,9 @@
 
 CRANE_ZDOTDIR="${CRANE_ZDOTDIR:-${ZDOTDIR:-$HOME}}"
 CRANE_USER_ZDOTDIR="${CRANE_USER_ZDOTDIR:-${CRANE_OLD_ZDOTDIR:-$HOME}}"
+# See .zshenv: a "user" directory equal to Crane's makes this shim source
+# itself, recursing until zsh gives up.
+[[ "$CRANE_USER_ZDOTDIR" == "$CRANE_ZDOTDIR" ]] && CRANE_USER_ZDOTDIR="$HOME"
 
 if [[ -f "$CRANE_USER_ZDOTDIR/.zshrc" ]]; then
   ZDOTDIR="$CRANE_USER_ZDOTDIR"
@@ -15,7 +18,9 @@ if [[ -f "$CRANE_USER_ZDOTDIR/.zshrc" ]]; then
   CRANE_USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
 fi
 
-ZDOTDIR="$CRANE_ZDOTDIR"
+# `export` — .zshenv unsets ZDOTDIR to let the user's own file relocate it, so
+# the export attribute has to be re-applied wherever it is set back.
+export ZDOTDIR="$CRANE_ZDOTDIR"
 
 # Crane's integration loads last so its hooks see the final shell state.
 if [[ -f "$CRANE_ZDOTDIR/crane-init.zsh" ]]; then
