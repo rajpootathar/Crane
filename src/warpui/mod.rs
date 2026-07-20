@@ -42,6 +42,7 @@ pub mod platform_menu;
 pub mod projects;
 pub mod rect_probe;
 pub mod shell;
+pub mod shell_init;
 pub mod split;
 pub mod theme;
 pub mod update;

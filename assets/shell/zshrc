@@ -1,0 +1,16 @@
+# Crane ZDOTDIR shim. Crane points ZDOTDIR here so it can load its shell
+# integration WITHOUT editing the user's own ~/.zshrc. We restore the real
+# ZDOTDIR, source the user's normal startup files, then load Crane's hooks.
+
+CRANE_ZDOTDIR="$ZDOTDIR"
+if [[ -n "$CRANE_OLD_ZDOTDIR" ]]; then
+  export ZDOTDIR="$CRANE_OLD_ZDOTDIR"
+else
+  unset ZDOTDIR
+fi
+
+# Source the user's real interactive rc (best effort).
+[[ -f "${ZDOTDIR:-$HOME}/.zshrc" ]] && source "${ZDOTDIR:-$HOME}/.zshrc"
+
+# Load Crane's integration last so its hooks win.
+[[ -f "$CRANE_ZDOTDIR/crane-init.zsh" ]] && source "$CRANE_ZDOTDIR/crane-init.zsh"

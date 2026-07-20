@@ -50,6 +50,8 @@ pub struct TerminalController {
 
 impl TerminalController {
     pub fn new(cols: usize, rows: usize, cwd: Option<&Path>, wake: Wake) -> std::io::Result<Self> {
+        crate::warpui::shell_init::ensure_installed();
+
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
