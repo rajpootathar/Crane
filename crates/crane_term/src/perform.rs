@@ -21,7 +21,7 @@
 //! drives both adapters from the same byte stream so the existing
 //! grid/scrollback parse path is unchanged.
 
-use crate::handler::Handler;
+use crate::handler::{Handler, ShellIntegrationEvent};
 
 pub struct Bridge<'a, H: Handler> {
     pub inner: &'a mut H,
@@ -328,6 +328,37 @@ impl<H: Handler> vte::Perform for OscWatcher<'_, H> {
                     }
                 }
             }
+            // OSC 633 — VS Code shell-integration. Reports prompt boundaries,
+            // the command line, cwd, and exit code so Crane can record history.
+            b"633" => {
+                let Some(sub) = params.get(1).and_then(|p| p.first().copied()) else {
+                    return;
+                };
+                let event = match sub {
+                    b'A' => Some(ShellIntegrationEvent::PromptStart),
+                    b'B' => Some(ShellIntegrationEvent::CommandStart),
+                    b'C' => Some(ShellIntegrationEvent::PreExec),
+                    b'D' => {
+                        let exit = params
+                            .get(2)
+                            .and_then(|p| std::str::from_utf8(p).ok())
+                            .and_then(|s| s.trim().parse::<i32>().ok());
+                        Some(ShellIntegrationEvent::CommandFinished { exit })
+                    }
+                    b'E' => params
+                        .get(2)
+                        .map(|p| ShellIntegrationEvent::CommandLine(unescape_osc633(p))),
+                    b'P' => params.get(2).and_then(|p| {
+                        let s = String::from_utf8_lossy(p);
+                        s.strip_prefix("Cwd=")
+                            .map(|cwd| ShellIntegrationEvent::Cwd(cwd.to_string()))
+                    }),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    self.inner.shell_integration(event);
+                }
+            }
             _ => {}
         }
     }
@@ -344,15 +375,54 @@ fn join_params_utf8(parts: &[&[u8]]) -> String {
     out
 }
 
+/// Reverse VS Code's OSC 633 payload escaping: `\xHH` hex escapes back to
+/// their byte, so a command line containing `;` (encoded `\x3b`) or a newline
+/// (`\x0a`) round-trips intact. Unknown/malformed escapes are passed through
+/// literally.
+fn unescape_osc633(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if chars.peek() == Some(&'x') {
+                chars.next();
+                let h1 = chars.next();
+                let h2 = chars.next();
+                if let (Some(a), Some(b)) = (h1, h2) {
+                    if let Ok(byte) = u8::from_str_radix(&format!("{a}{b}"), 16) {
+                        out.push(byte as char);
+                        continue;
+                    }
+                }
+                // Malformed escape — emit what we consumed literally.
+                out.push('\\');
+                out.push('x');
+                if let Some(a) = h1 { out.push(a); }
+                if let Some(b) = h2 { out.push(b); }
+                continue;
+            }
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+                out.push('\\');
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod osc_tests {
     use super::*;
-    use crate::handler::Handler;
+    use crate::handler::{Handler, ShellIntegrationEvent};
 
     #[derive(Default)]
     struct Collector {
         events: Vec<(String, bool)>,
         color_queries: Vec<u16>,
+        shell_events: Vec<ShellIntegrationEvent>,
     }
 
     impl Handler for Collector {
@@ -361,6 +431,9 @@ mod osc_tests {
         }
         fn osc_color_query(&mut self, index: u16) {
             self.color_queries.push(index);
+        }
+        fn shell_integration(&mut self, event: ShellIntegrationEvent) {
+            self.shell_events.push(event);
         }
     }
 
@@ -378,6 +451,14 @@ mod osc_tests {
         let mut watcher = OscWatcher { inner: &mut sink };
         parser.advance(&mut watcher, bytes);
         sink.color_queries
+    }
+
+    fn run_shell_events(bytes: &[u8]) -> Vec<ShellIntegrationEvent> {
+        let mut parser = vte::Parser::new();
+        let mut sink = Collector::default();
+        let mut watcher = OscWatcher { inner: &mut sink };
+        parser.advance(&mut watcher, bytes);
+        sink.shell_events
     }
 
     #[test]
@@ -443,5 +524,43 @@ mod osc_tests {
     fn osc9_inline_with_text_emits_once() {
         let evts = run(b"hello \x1b]9;ping\x07 world");
         assert_eq!(evts, vec![("ping".into(), false)]);
+    }
+
+    #[test]
+    fn osc633_boundaries_and_payloads_decode() {
+        use ShellIntegrationEvent::*;
+        assert!(matches!(run_shell_events(b"\x1b]633;A\x07").as_slice(), [PromptStart]));
+        assert!(matches!(run_shell_events(b"\x1b]633;B\x07").as_slice(), [CommandStart]));
+        assert!(matches!(run_shell_events(b"\x1b]633;C\x07").as_slice(), [PreExec]));
+        assert!(matches!(
+            run_shell_events(b"\x1b]633;D;0\x07").as_slice(),
+            [CommandFinished { exit: Some(0) }]
+        ));
+        assert!(matches!(
+            run_shell_events(b"\x1b]633;D;130\x07").as_slice(),
+            [CommandFinished { exit: Some(130) }]
+        ));
+        assert_eq!(
+            run_shell_events(b"\x1b]633;E;git commit\x07"),
+            vec![CommandLine("git commit".into())]
+        );
+        assert_eq!(
+            run_shell_events(b"\x1b]633;P;Cwd=/Users/x/proj\x07"),
+            vec![Cwd("/Users/x/proj".into())]
+        );
+    }
+
+    #[test]
+    fn osc633_command_line_unescapes_semicolons_and_newlines() {
+        // VS Code encodes ; as \x3b, newline as \x0a, backslash as \x5c.
+        assert_eq!(
+            run_shell_events(b"\x1b]633;E;echo a\\x3bb\\x0ac\x07"),
+            vec![ShellIntegrationEvent::CommandLine("echo a;b\nc".into())]
+        );
+    }
+
+    #[test]
+    fn osc633_unknown_subcommand_ignored() {
+        assert!(run_shell_events(b"\x1b]633;Z;whatever\x07").is_empty());
     }
 }

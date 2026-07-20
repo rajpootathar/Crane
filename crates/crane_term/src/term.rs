@@ -4,7 +4,7 @@
 
 use crate::cell::{Cell, Color, Flags, NamedColor};
 use crate::grid::{Cursor, Grid};
-use crate::handler::{CursorStyle, Handler, ProcessorInput, ScrollDelta};
+use crate::handler::{CursorStyle, Handler, ProcessorInput, ScrollDelta, ShellIntegrationEvent};
 use crate::index::{Column, Line, Point};
 use crate::mode::TermMode;
 use crate::row::Row;
@@ -57,6 +57,9 @@ pub struct Term {
     /// App-level toast queue. Bounded loosely by drop-after-32 so a
     /// runaway emitter can't pin unbounded heap if the UI is paused.
     notifications: Vec<TermNotification>,
+    /// OSC 633 shell-integration events buffered for the reader thread to drain
+    /// into the history store. Same pattern as `notifications`.
+    shell_events: Vec<ShellIntegrationEvent>,
     /// Whether full-screen redraws on this Term should be treated as
     /// ephemeral frames (the live grid is mutable surface, never
     /// history) or as scrollback-producing output (the default Bash /
@@ -140,6 +143,7 @@ impl Term {
             selection: None,
             pty_replies: Vec::new(),
             notifications: Vec::new(),
+            shell_events: Vec::new(),
             full_grid_clear_behavior: FullGridClearBehavior::default(),
             cursor_style: CursorStyle::default(),
             window_title: None,
@@ -190,6 +194,12 @@ impl Term {
     /// loop each frame; returns an empty Vec when nothing is pending.
     pub fn take_notifications(&mut self) -> Vec<TermNotification> {
         std::mem::take(&mut self.notifications)
+    }
+
+    /// Drain buffered OSC 633 shell-integration events. Called by the PTY
+    /// reader each pass; empty when the shell has no integration sourced.
+    pub fn take_shell_events(&mut self) -> Vec<ShellIntegrationEvent> {
+        std::mem::take(&mut self.shell_events)
     }
 
     /// One-way switch: tell this Term to treat primary-screen frame
@@ -1428,6 +1438,10 @@ impl Handler for Term {
             urgent,
         });
     }
+
+    fn shell_integration(&mut self, event: ShellIntegrationEvent) {
+        self.shell_events.push(event);
+    }
 }
 
 #[cfg(test)]
@@ -2294,6 +2308,17 @@ mod tests {
         t.goto(0, 0);
         t.insert_blank_lines(2);
         assert_eq!(t.scrollback.len(), before);
+    }
+
+    #[test]
+    fn shell_events_buffer_and_drain() {
+        use crate::handler::ShellIntegrationEvent::*;
+        let mut t = Term::new(5, 10);
+        t.shell_integration(PromptStart);
+        t.shell_integration(CommandLine("ls -la".into()));
+        let drained = t.take_shell_events();
+        assert_eq!(drained, vec![PromptStart, CommandLine("ls -la".into())]);
+        assert!(t.take_shell_events().is_empty(), "drain must empty the queue");
     }
 }
 
