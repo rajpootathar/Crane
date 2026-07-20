@@ -73,7 +73,8 @@ pub struct GridCell {
     pub italic: bool,
     /// SGR underline (draw 1px line under glyph).
     pub underline: bool,
-    /// SGR dim (reduce fg alpha to ~50%).
+    /// SGR dim / faint — blend the glyph ~38% toward its background (see the
+    /// paint path); readable on light and dark themes.
     pub dim: bool,
     /// SGR hidden / conceal (suppress glyph rendering).
     pub hidden: bool,
@@ -365,7 +366,20 @@ impl Element for GridElement {
                 // translucent overlay painted *after* this pass — no inversion).
                 let mut fg = cell.fg;
                 if cell.dim {
-                    fg = ColorU::new(fg.r, fg.g, fg.b, fg.a / 2);
+                    // SGR faint: de-emphasise by blending the glyph a fixed
+                    // fraction toward its OWN background, opaquely. The old
+                    // code halved the alpha, which composites ~50% toward
+                    // whatever is painted behind — fine on a dark bg, but on a
+                    // light theme that fades text toward white until it is
+                    // unreadable. A 38% RGB blend keeps enough of the glyph's
+                    // colour to stay legible on light and dark alike.
+                    let mix = |f: u8, b: u8| (f as f32 * 0.62 + b as f32 * 0.38) as u8;
+                    fg = ColorU::new(
+                        mix(fg.r, cell.bg.r),
+                        mix(fg.g, cell.bg.g),
+                        mix(fg.b, cell.bg.b),
+                        fg.a,
+                    );
                 }
 
                 // Select the appropriate font variant for bold / italic.

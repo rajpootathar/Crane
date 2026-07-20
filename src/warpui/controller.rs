@@ -75,6 +75,19 @@ impl TerminalController {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Crane");
         cmd.env_remove("VTE_VERSION");
+        // COLORFGBG is the static (env-var) counterpart to the OSC 11 query
+        // above: the rxvt convention many CLIs read at startup to detect a
+        // light vs dark terminal. Format "<fg>;<bg>" as ANSI indices; the bg
+        // field is what matters — index 15 (white) → light, 0 (black) → dark.
+        // Fixed at spawn (a live theme switch won't update it, but apps read it
+        // once at launch anyway; the OSC 11 path covers the live case).
+        {
+            let th = crate::theme::current();
+            let lum = 0.299 * th.terminal_bg.r as f32
+                + 0.587 * th.terminal_bg.g as f32
+                + 0.114 * th.terminal_bg.b as f32;
+            cmd.env("COLORFGBG", if lum > 128.0 { "0;15" } else { "15;0" });
+        }
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         } else if let Some(home) = std::env::var_os("HOME") {
@@ -98,6 +111,16 @@ impl TerminalController {
         ));
 
         let term = Arc::new(Mutex::new(Term::new(rows, cols)));
+        // Seed the Term with the active theme's colours so OSC 10/11/12 queries
+        // answer with the truth — an app that asks "is the background light or
+        // dark?" gets the real answer and picks readable text, instead of
+        // assuming dark and rendering light-on-light on a light theme.
+        {
+            let th = crate::theme::current();
+            let fg = (th.terminal_fg.r, th.terminal_fg.g, th.terminal_fg.b);
+            let bg = (th.terminal_bg.r, th.terminal_bg.g, th.terminal_bg.b);
+            term.lock().set_default_colors(fg, bg, fg);
+        }
         let parser = Arc::new(Mutex::new(Processor::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let bell = Arc::new(AtomicBool::new(false));

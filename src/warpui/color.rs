@@ -10,6 +10,21 @@ use warpui::color::ColorU;
 /// The 256-color palette (16 ANSI + 6×6×6 cube + grayscale ramp).
 /// Identical to `view.rs::palette`.
 pub fn palette(idx: u8) -> (u8, u8, u8) {
+    // The 16 ANSI slots are tuned for a DARK background: colours 7 ("white")
+    // and 15 ("bright white") are light greys so they read as near-white on
+    // black. On a LIGHT theme those become near-invisible (light grey on a
+    // near-white bg), so any app emitting `\e[37m` / `\e[97m` — a very common
+    // choice for de-emphasised text — turns unreadable. On a light background
+    // remap that "white" pair to dark greys so it stays legible; the chromatic
+    // slots are mid-tone and read acceptably on either polarity, so they are
+    // left alone to preserve each app's intended hues.
+    if is_light_bg() {
+        match idx {
+            7 => return (0x56, 0x5a, 0x66),
+            15 => return (0x24, 0x28, 0x34),
+            _ => {}
+        }
+    }
     match idx {
         0 => (0x1a, 0x1c, 0x28),
         1 => (0xcc, 0x55, 0x55),
@@ -44,6 +59,15 @@ pub fn palette(idx: u8) -> (u8, u8, u8) {
 #[inline]
 fn rgb(t: (u8, u8, u8)) -> ColorU {
     ColorU::new(t.0, t.1, t.2, 255)
+}
+
+/// True when the active theme's terminal background is light (perceptual
+/// luminance > 128 — the same threshold `theme::wash_base` uses). Drives the
+/// light-theme ANSI remap in `palette`.
+#[inline]
+fn is_light_bg() -> bool {
+    let c = crate::theme::current().terminal_bg;
+    0.299 * c.r as f32 + 0.587 * c.g as f32 + 0.114 * c.b as f32 > 128.0
 }
 
 #[inline]
