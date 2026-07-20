@@ -2,8 +2,11 @@
 # can record per-directory, session-scoped command history. Safe to source in
 # any zsh; a non-Crane terminal simply ignores the escape sequences.
 
-# Guard against double-sourcing.
-if [[ -n "$CRANE_SHELL_INTEGRATION" ]]; then
+# Guard against double-sourcing. `:-` matters: the user's rc may have run
+# `setopt nounset` before we load, which would make a bare reference to an
+# unset parameter a hard error and abort this file on its first line — no
+# integration at all, and an error printed into their shell.
+if [[ -n "${CRANE_SHELL_INTEGRATION:-}" ]]; then
   return 0
 fi
 CRANE_SHELL_INTEGRATION=1
@@ -40,15 +43,14 @@ __crane_preexec() {
   __crane_executing=1
 }
 
+# Plain append. zsh restores `lastval` around every element of a hook array —
+# `man zshmisc`, "Hook Functions": each function runs "in the same context and
+# with the same arguments and same initial value of $? as the basic function".
+# So an earlier precmd hook shelling out (a git prompt running `git status`)
+# cannot clobber $? for ours, and there is no reason to force ourselves to the
+# front of precmd_functions. Running last is also the better order: hooks that
+# print (direnv, nvm, conda notices) then emit their output BEFORE our
+# 633;A/633;B markers rather than inside the marked prompt region.
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd __crane_precmd
 add-zsh-hook preexec __crane_preexec
-
-# zsh runs precmd_functions in array order and $? is a single global shared
-# by all of them. Since our .zshrc shim sources the user's own rc (and any
-# prompt framework it installs) BEFORE loading us, add-zsh-hook would append
-# us last — meaning an earlier hook's own internal commands (e.g. a git
-# prompt shelling out to `git status`) could overwrite $? before we ever
-# read it, reporting the wrong exit code. Move ourselves to the front so we
-# capture $? before any other precmd hook gets a chance to touch it.
-precmd_functions=(__crane_precmd ${precmd_functions:#__crane_precmd})

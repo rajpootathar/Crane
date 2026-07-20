@@ -1,0 +1,19 @@
+# Crane ZDOTDIR shim — .zlogin.
+#
+# Read only for login shells, after .zshrc. Inert for Crane's normal
+# interactive non-login panes; present so a login zsh started inside Crane
+# still gets the user's own .zlogin rather than losing it to Crane's ZDOTDIR
+# redirect.
+#
+# See .zshenv for what CRANE_ZDOTDIR / CRANE_USER_ZDOTDIR mean.
+
+CRANE_ZDOTDIR="${CRANE_ZDOTDIR:-${ZDOTDIR:-$HOME}}"
+CRANE_USER_ZDOTDIR="${CRANE_USER_ZDOTDIR:-${CRANE_OLD_ZDOTDIR:-$HOME}}"
+
+if [[ -f "$CRANE_USER_ZDOTDIR/.zlogin" ]]; then
+  ZDOTDIR="$CRANE_USER_ZDOTDIR"
+  source "$CRANE_USER_ZDOTDIR/.zlogin"
+  CRANE_USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
+fi
+
+ZDOTDIR="$CRANE_ZDOTDIR"

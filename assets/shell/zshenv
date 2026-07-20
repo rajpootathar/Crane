@@ -1,0 +1,45 @@
+# Crane ZDOTDIR shim — .zshenv.
+#
+# Crane points ZDOTDIR at this directory so it can load its shell integration
+# WITHOUT editing the user's own startup files. The catch is that ZDOTDIR
+# redirects EVERY per-user file zsh reads, not just .zshrc — so this directory
+# ships a shim for all four (.zshenv, .zprofile, .zshrc, .zlogin), each one
+# sourcing the user's real counterpart. Shipping only .zshrc silently dropped
+# the user's ~/.zshenv, taking any PATH / EDITOR / env it exports with it.
+#
+# .zshenv is the first file zsh reads, so all the ZDOTDIR bookkeeping lives
+# here:
+#
+#   CRANE_ZDOTDIR       this directory. ZDOTDIR has to point back here after
+#                       every shim or the remaining shims never load.
+#   CRANE_USER_ZDOTDIR  where the user's real startup files live: whatever
+#                       ZDOTDIR held before Crane repointed it (handed over as
+#                       CRANE_OLD_ZDOTDIR), else $HOME.
+#
+# The subtlety this file exists for: the documented way to relocate zsh config
+# is to set ZDOTDIR from inside ~/.zshenv. Crane's GUI process never sees that
+# value — zsh sets it at shell startup, it is not inherited by a GUI app — so
+# CRANE_OLD_ZDOTDIR is unset for exactly the users who need it most. Sourcing
+# the user's ~/.zshenv below and then re-reading ZDOTDIR recovers their real
+# directory; restoring ZDOTDIR to Crane's afterwards keeps the later shims
+# loading, so each one still knows where to find its user counterpart.
+#
+# Every source is guarded so a missing file is a no-op, and each is done at
+# top level rather than inside a helper function: sourcing an rc from within a
+# function would scope its `local` / `typeset` declarations to that function
+# and quietly discard them.
+
+CRANE_ZDOTDIR="${ZDOTDIR:-$HOME}"
+CRANE_USER_ZDOTDIR="${CRANE_USER_ZDOTDIR:-${CRANE_OLD_ZDOTDIR:-$HOME}}"
+
+if [[ -f "$CRANE_USER_ZDOTDIR/.zshenv" ]]; then
+  ZDOTDIR="$CRANE_USER_ZDOTDIR"
+  source "$CRANE_USER_ZDOTDIR/.zshenv"
+  # The user's own .zshenv may have relocated ZDOTDIR — that new value is
+  # where the rest of their startup files live.
+  CRANE_USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
+fi
+
+# Hand zsh back to Crane's directory so .zprofile / .zshrc / .zlogin resolve to
+# the shims rather than straight to the user's originals.
+ZDOTDIR="$CRANE_ZDOTDIR"
