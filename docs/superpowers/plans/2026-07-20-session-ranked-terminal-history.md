@@ -8,6 +8,20 @@
 
 **Tech Stack:** Rust edition 2024, `crane_term` crate, `portable-pty`, `serde`/`serde_json`, `parking_lot::Mutex`, `std::time::SystemTime`. No new dependencies. No async runtime.
 
+## Execution Order (amended 2026-07-20)
+
+Run **Tasks 1 → 2 → 3 → 4 → 6, then Task 5 last.** Task 5 is the only task that must
+edit `src/warpui/shell.rs`, which currently carries unrelated uncommitted work; it is
+deferred until that file is free. Task 4 adds a `restored_session_ids()` accessor
+returning empty so Task 6 does not depend on Task 5 — until Task 5 lands, ranked
+history works within the live session, and only the survives-a-restart behaviour waits.
+
+**Agent constraints (standing, from prior incidents):**
+- NEVER run `osascript`, `kill`, or `pkill` — an agent once killed the user's running Crane by process name.
+- NEVER launch the GUI app. No agent here can see a macOS window.
+- NEVER write to the real `~/.crane`. Tests MUST redirect `HOME` to a temp dir (see Task 3's test) or use `std::env::temp_dir()` (Task 2's).
+- Manual smoke-test steps (Task 4 Step 8, Task 6 Step 8) are for the HUMAN. Skip them; report them as needing human verification.
+
 ## Global Constraints
 
 - **No new dependencies.** Timestamps use `std::time::SystemTime` → u64 unix-millis (no `chrono`). Serialization uses the already-present `serde` / `serde_json`. — from spec "lean-deps".
@@ -762,7 +776,7 @@ pub fn install_shell_scripts() {
 }
 ```
 
-- [ ] **Step 7: Register the module + call install at startup**
+- [ ] **Step 7: Register the module + install lazily on first PTY spawn**
 
 In `src/warpui/mod.rs`:
 
@@ -770,10 +784,23 @@ In `src/warpui/mod.rs`:
 pub mod shell_init;
 ```
 
-Find where the app initializes (the `CraneShellView::new` / `new_with_state` entry, `shell.rs`) and add near the top of construction:
+Install from `controller.rs` — NOT from `shell.rs`. (`shell.rs` carries unrelated
+uncommitted work; keeping this task off that file keeps the commit clean. Installing
+on first spawn is also the moment the scripts are actually needed.) Add to
+`shell_init.rs`:
 
 ```rust
-        crate::warpui::shell_init::install_shell_scripts();
+/// Install once per process, on first use. Cheap enough to call per PTY spawn.
+pub fn ensure_installed() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(install_shell_scripts);
+}
+```
+
+Call it at the top of `TerminalController::new` in `controller.rs`:
+
+```rust
+        crate::warpui::shell_init::ensure_installed();
 ```
 
 - [ ] **Step 8: Run the test + build**
@@ -934,13 +961,24 @@ Add shell-integration env (mirror the `crane-init` loader) after the existing `c
         cmd.env("CRANE_SESSION_ID", session_id.to_string());
 ```
 
-Store `session_id` on the returned `Self` (add the field to the struct + the constructor tail), and add the accessor:
+Store `session_id` on the returned `Self` (add the field to the struct + the constructor tail),
+and add BOTH accessors. `restored_session_ids` stays empty here — Task 5 populates it from
+persistence. It exists now so Task 6 can call it without depending on Task 5:
 
 ```rust
     pub fn session_id(&self) -> u64 {
         self.session_id
     }
+
+    /// Session ids this terminal inherited from earlier runs of the same pane.
+    /// Empty until Task 5 wires persistence; ranked-history treats these as
+    /// current-session so a restored terminal shows its own prior commands.
+    pub fn restored_session_ids(&self) -> &[u64] {
+        &self.restored_session_ids
+    }
 ```
+
+Add the field `restored_session_ids: Vec<u64>` to the struct, initialized `Vec::new()`.
 
 Note: `shell` is currently a `let shell = ...` inside the `#[cfg(unix)]` block; hoist it so it is in scope where the env is set (bind it once above the `CommandBuilder` match).
 
