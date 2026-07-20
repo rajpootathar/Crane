@@ -12,11 +12,77 @@ use std::thread;
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
-use crane_term::{Processor, Term, TermNotification};
+use crane_term::{Processor, ShellIntegrationEvent, Term, TermNotification};
+
+use crate::warpui::history_store::{now_ms, HistoryEntry};
 
 /// Called from the reader thread when the grid changes and the UI should
 /// repaint. Must be cheap and thread-safe (e.g. send on a channel).
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Folds a terminal's OSC 633 event stream into completed [`HistoryEntry`]s.
+///
+/// The shell hooks report a command in two halves: `preexec` emits the command
+/// line (`E`) and `PreExec` (`C`), then the *next* `precmd` emits the exit code
+/// (`D`) followed by the new cwd (`P;Cwd=`). So the cwd standing when `D`
+/// arrives is still the directory the command actually ran in — recording it
+/// then, before the next `Cwd` event lands, is what makes `cd /tmp` attribute
+/// to where it was typed rather than to where it landed.
+///
+/// A finish with no command in flight (the user pressed Enter on an empty
+/// line, or integration loaded mid-command) yields nothing.
+struct ShellRecorder {
+    session_id: u64,
+    cwd: String,
+    pending_command: Option<String>,
+    start_ms: u64,
+}
+
+impl ShellRecorder {
+    fn new(session_id: u64) -> Self {
+        Self {
+            session_id,
+            cwd: String::new(),
+            pending_command: None,
+            start_ms: 0,
+        }
+    }
+
+    /// Feed one event; returns a completed entry on `CommandFinished` (if a
+    /// command was in flight), else `None`.
+    fn feed(&mut self, event: ShellIntegrationEvent) -> Option<HistoryEntry> {
+        match event {
+            ShellIntegrationEvent::Cwd(p) => {
+                self.cwd = p;
+                None
+            }
+            ShellIntegrationEvent::CommandLine(c) => {
+                self.pending_command = Some(c);
+                self.start_ms = now_ms();
+                None
+            }
+            ShellIntegrationEvent::CommandFinished { exit } => {
+                let command = self.pending_command.take()?;
+                let trimmed = command.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                Some(HistoryEntry {
+                    command: trimmed.to_string(),
+                    pwd: self.cwd.clone(),
+                    exit_code: exit,
+                    session_id: self.session_id,
+                    start_ms: self.start_ms,
+                    end_ms: now_ms(),
+                })
+            }
+            // Prompt boundaries carry no data we persist directly.
+            ShellIntegrationEvent::PromptStart
+            | ShellIntegrationEvent::CommandStart
+            | ShellIntegrationEvent::PreExec => None,
+        }
+    }
+}
 
 pub struct TerminalController {
     pub term: Arc<Mutex<Term>>,
@@ -46,6 +112,14 @@ pub struct TerminalController {
     /// The directory the shell was spawned in — persisted so a restored
     /// session reopens the terminal in the same place (old Crane parity).
     pub cwd: std::path::PathBuf,
+    /// Identifies this shell session in the history log. Stamped onto every
+    /// entry the reader thread records so ranking can tell "this terminal"
+    /// apart from every other one.
+    session_id: u64,
+    /// Session ids earlier incarnations of this pane used, recovered from
+    /// persistence. Empty for now — populated when session restore learns to
+    /// carry the id across a relaunch.
+    restored_session_ids: Vec<u64>,
 }
 
 impl TerminalController {
@@ -62,11 +136,15 @@ impl TerminalController {
             })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+        // Bound outside the `CommandBuilder` match because the shell-integration
+        // env below has to know which shell it is configuring.
+        #[cfg(unix)]
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+
         let mut cmd = {
             #[cfg(unix)]
             {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-                CommandBuilder::new(shell)
+                CommandBuilder::new(&shell)
             }
             #[cfg(not(unix))]
             {
@@ -90,6 +168,55 @@ impl TerminalController {
                 + 0.114 * th.terminal_bg.b as f32;
             cmd.env("COLORFGBG", if lum > 128.0 { "0;15" } else { "15;0" });
         }
+
+        // A unique id for THIS shell session, stamped onto every command it
+        // records so ranking can float the current session's history to the
+        // top of up-arrow. Monotonic per process; uniqueness across restarts
+        // comes from the wall-clock component.
+        let session_id = {
+            use std::sync::atomic::AtomicU64;
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            crate::warpui::history_store::now_ms().wrapping_shl(16)
+                | (SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff)
+        };
+
+        // Load Crane's shell integration without touching the user's rc files.
+        //
+        // zsh: point ZDOTDIR at our shim dir, whose .zshrc sources the user's
+        // real rc and then our hooks. `CRANE_OLD_ZDOTDIR` is forwarded only
+        // when the inherited ZDOTDIR is genuinely the user's — see
+        // `shell_init::inherited_user_zdotdir` for why handing over Crane's own
+        // (the nested-Crane case) strands the user with an unconfigured shell.
+        //
+        // bash: `--rcfile`, which is an argument rather than env. It applies to
+        // interactive non-login shells, which is what a bare `bash` on a PTY
+        // is; crane-init.bash sources the user's ~/.bashrc itself, since
+        // --rcfile replaces it. Deliberately no `--norc` — that would suppress
+        // --rcfile too.
+        //
+        // Any other shell (fish, nu, …) simply spawns unchanged and records no
+        // history, rather than getting env it cannot interpret.
+        #[cfg(unix)]
+        {
+            match std::path::Path::new(&shell)
+                .file_name()
+                .and_then(|n| n.to_str())
+            {
+                Some("zsh") => {
+                    if let Some(old) = crate::warpui::shell_init::inherited_user_zdotdir() {
+                        cmd.env("CRANE_OLD_ZDOTDIR", old);
+                    }
+                    cmd.env("ZDOTDIR", crate::warpui::shell_init::zsh_zdotdir());
+                }
+                Some("bash") => {
+                    cmd.arg("--rcfile");
+                    cmd.arg(crate::warpui::shell_init::bash_rcfile());
+                }
+                _ => {}
+            }
+        }
+        cmd.env("CRANE_SESSION_ID", session_id.to_string());
+
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         } else if let Some(home) = std::env::var_os("HOME") {
@@ -144,11 +271,12 @@ impl TerminalController {
                 let mut buf = [0u8; 8192];
                 let mut last_epoch = 0u64;
                 let mut last_cursor = (usize::MAX, usize::MAX);
+                let mut recorder = ShellRecorder::new(session_id);
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            let (replies, epoch, cursor, rang, notes);
+                            let (replies, epoch, cursor, rang, notes, shell_events);
                             {
                                 let mut p = parser.lock();
                                 let mut t = term.lock();
@@ -164,6 +292,11 @@ impl TerminalController {
                                 // the same reason: a bare notification may not
                                 // dirty the grid, so buffer + force a wake below.
                                 notes = t.take_notifications();
+                                // OSC 633 command-history events. Drained under
+                                // the same lock, folded into entries below —
+                                // outside it, so no file write ever happens
+                                // while the grid is held.
+                                shell_events = t.take_shell_events();
                             }
                             // Write replies BEFORE the next read (P10k workaround).
                             if !replies.is_empty() {
@@ -183,6 +316,16 @@ impl TerminalController {
                                 last_epoch = epoch;
                                 last_cursor = cursor;
                                 wake();
+                            }
+                            // Record AFTER the wake: a completed command costs
+                            // one small append, and the repaint should never
+                            // wait on the disk. `append` is best-effort and
+                            // infallible by contract, so this can neither block
+                            // meaningfully nor panic the reader.
+                            for ev in shell_events {
+                                if let Some(entry) = recorder.feed(ev) {
+                                    crate::warpui::history_store::store().lock().append(entry);
+                                }
                             }
                         }
                     }
@@ -210,7 +353,22 @@ impl TerminalController {
             bell_notify,
             notif_queue,
             cwd,
+            session_id,
+            restored_session_ids: Vec::new(),
         })
+    }
+
+    /// This terminal's history session id.
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Session ids this terminal inherited from earlier runs of the same pane.
+    /// Empty until session restore carries the id across a relaunch; ranked
+    /// history treats these as current-session so a restored terminal still
+    /// shows its own prior commands at the top of up-arrow.
+    pub fn restored_session_ids(&self) -> &[u64] {
+        &self.restored_session_ids
     }
 
     /// Drain the desktop notifications (OSC 9 / OSC 777) buffered by the reader
@@ -341,6 +499,34 @@ impl TerminalController {
             // Ask the shell to repaint its prompt at row 0.
             self.write_input(b"\x0c");
         }
+    }
+}
+
+#[cfg(test)]
+mod recorder_tests {
+    use super::*;
+    use crane_term::ShellIntegrationEvent::*;
+
+    #[test]
+    fn recorder_emits_one_entry_per_completed_command() {
+        let mut rec = ShellRecorder::new(42);
+        // Prompt, cwd, command typed, executes, finishes.
+        rec.feed(Cwd("/proj".into()));
+        rec.feed(CommandLine("cargo build".into()));
+        rec.feed(PreExec);
+        let out = rec.feed(CommandFinished { exit: Some(0) });
+        let e = out.expect("a completed command yields an entry");
+        assert_eq!(e.command, "cargo build");
+        assert_eq!(e.pwd, "/proj");
+        assert_eq!(e.exit_code, Some(0));
+        assert_eq!(e.session_id, 42);
+    }
+
+    #[test]
+    fn recorder_ignores_a_finish_with_no_command() {
+        let mut rec = ShellRecorder::new(1);
+        // A bare prompt with no command typed (user hit Enter on empty line).
+        assert!(rec.feed(CommandFinished { exit: Some(0) }).is_none());
     }
 }
 

@@ -38,6 +38,52 @@ pub fn zsh_zdotdir_at(root: &Path) -> PathBuf {
     root.join("zsh")
 }
 
+/// The value to hand a spawned zsh as `CRANE_OLD_ZDOTDIR`: the `ZDOTDIR` this
+/// process inherited, but ONLY when it is genuinely the user's own.
+///
+/// Inside a Crane terminal, `ZDOTDIR` already points at [`zsh_zdotdir`], and
+/// that value is inherited by anything launched from there — including another
+/// Crane. Passing it straight through would tell the shim that Crane's own
+/// directory *is* the user's, so every `source "$CRANE_USER_ZDOTDIR/.zsh*"`
+/// would source the shim running it. The shim guards against that, but the
+/// guard's fallback is `$HOME`, and the mere presence of `CRANE_OLD_ZDOTDIR`
+/// also makes the shim pre-set `ZDOTDIR` before sourcing the user's `.zshenv`
+/// — which defeats the guarded `export ZDOTDIR="${ZDOTDIR:-…}"` idiom users
+/// relocate their config with, leaving them at a prompt with no rc at all.
+///
+/// `None` is the useful answer in that case: it routes the shim down its
+/// `unset ZDOTDIR` path, which is exactly what a shell launched outside Crane
+/// would have seen.
+pub fn inherited_user_zdotdir() -> Option<std::ffi::OsString> {
+    user_zdotdir_excluding(std::env::var_os("ZDOTDIR"), &zsh_zdotdir())
+}
+
+/// [`inherited_user_zdotdir`] against an explicit "Crane's own" directory, so
+/// the comparison is testable without touching `HOME` or the real install.
+fn user_zdotdir_excluding(
+    inherited: Option<std::ffi::OsString>,
+    crane: &Path,
+) -> Option<std::ffi::OsString> {
+    let value = inherited?;
+    // An empty ZDOTDIR means "$HOME" to zsh, and the shim already defaults
+    // there; forwarding it would only flip on the pre-set branch above.
+    if value.is_empty() || same_dir(Path::new(&value), crane) {
+        return None;
+    }
+    Some(value)
+}
+
+/// Whether two paths name the same directory. Literal equality first (works
+/// before the install exists), then `canonicalize` so a trailing slash, a `..`,
+/// or a symlinked `HOME` can't smuggle Crane's own dir past the check.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+}
+
 /// The `--rcfile` Crane starts bash with.
 pub fn bash_rcfile() -> PathBuf {
     bash_rcfile_at(&shell_root())
@@ -165,6 +211,53 @@ mod tests {
             .filter(|n| n.contains("crane-tmp"))
             .collect();
         assert!(debris.is_empty(), "temp files left behind: {debris:?}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The nested-Crane trap: a Crane launched from inside a Crane terminal
+    /// inherits `ZDOTDIR` already pointing at the shim dir. Forwarding it as
+    /// `CRANE_OLD_ZDOTDIR` would make the shim treat its own directory as the
+    /// user's; `None` routes it down the `unset ZDOTDIR` path instead.
+    #[test]
+    fn crane_own_zdotdir_is_never_forwarded_as_the_users() {
+        let crane = PathBuf::from("/home/u/.crane/shell/zsh");
+
+        assert_eq!(
+            user_zdotdir_excluding(Some(crane.clone().into_os_string()), &crane),
+            None,
+            "nested Crane must not hand its own ZDOTDIR back as the user's"
+        );
+        assert_eq!(user_zdotdir_excluding(None, &crane), None);
+        assert_eq!(user_zdotdir_excluding(Some("".into()), &crane), None);
+    }
+
+    /// A genuinely user-set ZDOTDIR still reaches the shim — without it, a user
+    /// who relocated their config outside `.zshenv` loses it entirely.
+    #[test]
+    fn a_users_own_zdotdir_is_forwarded() {
+        let crane = PathBuf::from("/home/u/.crane/shell/zsh");
+        assert_eq!(
+            user_zdotdir_excluding(Some("/home/u/.config/zsh".into()), &crane),
+            Some("/home/u/.config/zsh".into())
+        );
+    }
+
+    /// Symlink/trailing-slash spellings of Crane's own directory are still
+    /// Crane's own directory.
+    #[test]
+    fn crane_zdotdir_is_matched_through_a_symlink() {
+        let root = temp_root("symlink");
+        let crane = zsh_zdotdir_at(&root);
+        std::fs::create_dir_all(&crane).unwrap();
+        let link = root.join("link-to-zsh");
+        std::os::unix::fs::symlink(&crane, &link).unwrap();
+
+        assert_eq!(
+            user_zdotdir_excluding(Some(link.into_os_string()), &crane),
+            None,
+            "a symlink to Crane's shim dir is still Crane's shim dir"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
