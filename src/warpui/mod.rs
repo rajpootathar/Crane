@@ -31,6 +31,7 @@ pub mod markdown_view;
 pub mod grid_element;
 pub mod gutter_element;
 pub mod scrollbar_element;
+pub mod history_store;
 pub mod icons;
 pub mod image_view;
 pub mod input;
