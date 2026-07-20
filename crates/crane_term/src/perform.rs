@@ -379,9 +379,19 @@ fn join_params_utf8(parts: &[&[u8]]) -> String {
 /// their byte, so a command line containing `;` (encoded `\x3b`) or a newline
 /// (`\x0a`) round-trips intact. Unknown/malformed escapes are passed through
 /// literally.
+///
+/// Decoded output is accumulated as **bytes**, not `char`s: VS Code escapes
+/// non-ASCII text byte-by-byte, so a single multi-byte UTF-8 character (e.g.
+/// `é` = `\xc3\xa9`) arrives as a sequence of single-byte escapes. Pushing
+/// each decoded byte through `byte as char` would reinterpret it as a
+/// Latin-1 codepoint and produce mojibake (`Ã©`) instead of reconstructing
+/// the original character. Buffering raw bytes and converting once at the
+/// end with `String::from_utf8_lossy` lets adjacent escapes recombine into
+/// their intended multi-byte sequence; genuinely invalid UTF-8 degrades to
+/// replacement characters instead of silently wrong text.
 fn unescape_osc633(raw: &[u8]) -> String {
     let s = String::from_utf8_lossy(raw);
-    let mut out = String::with_capacity(s.len());
+    let mut buf: Vec<u8> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -391,26 +401,30 @@ fn unescape_osc633(raw: &[u8]) -> String {
                 let h2 = chars.next();
                 if let (Some(a), Some(b)) = (h1, h2) {
                     if let Ok(byte) = u8::from_str_radix(&format!("{a}{b}"), 16) {
-                        out.push(byte as char);
+                        buf.push(byte);
                         continue;
                     }
                 }
                 // Malformed escape — emit what we consumed literally.
-                out.push('\\');
-                out.push('x');
-                if let Some(a) = h1 { out.push(a); }
-                if let Some(b) = h2 { out.push(b); }
+                buf.push(b'\\');
+                buf.push(b'x');
+                if let Some(a) = h1 {
+                    buf.extend_from_slice(a.encode_utf8(&mut [0u8; 4]).as_bytes());
+                }
+                if let Some(b) = h2 {
+                    buf.extend_from_slice(b.encode_utf8(&mut [0u8; 4]).as_bytes());
+                }
                 continue;
             }
             if chars.peek() == Some(&'\\') {
                 chars.next();
-                out.push('\\');
+                buf.push(b'\\');
                 continue;
             }
         }
-        out.push(c);
+        buf.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
     }
-    out
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[cfg(test)]
@@ -562,5 +576,28 @@ mod osc_tests {
     #[test]
     fn osc633_unknown_subcommand_ignored() {
         assert!(run_shell_events(b"\x1b]633;Z;whatever\x07").is_empty());
+    }
+
+    #[test]
+    fn osc633_command_line_unescapes_backslash() {
+        // VS Code encodes a literal backslash as \x5c. Nothing previously
+        // pinned this third escape — a refactor of `unescape_osc633` could
+        // silently regress it.
+        assert_eq!(
+            run_shell_events(b"\x1b]633;E;echo a\\x5cb\x07"),
+            vec![ShellIntegrationEvent::CommandLine("echo a\\b".into())]
+        );
+    }
+
+    #[test]
+    fn osc633_command_line_reconstructs_multibyte_utf8() {
+        // \xc3\xa9 is 'é' UTF-8-encoded and then escaped byte-by-byte, the
+        // way VS Code escapes non-ASCII text. The two escapes must
+        // recombine into the original UTF-8 sequence, not decode as two
+        // separate Latin-1 codepoints (`Ã©`).
+        assert_eq!(
+            run_shell_events(b"\x1b]633;E;echo \\xc3\\xa9\x07"),
+            vec![ShellIntegrationEvent::CommandLine("echo é".into())]
+        );
     }
 }

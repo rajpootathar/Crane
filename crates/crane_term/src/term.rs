@@ -11,6 +11,20 @@ use crate::row::Row;
 use crate::scrollback::Scrollback;
 use crate::selection::Selection;
 
+/// Hard cap on buffered [`ShellIntegrationEvent`]s between drains.
+///
+/// Deliberately far more generous than `notifications`'s cap (32): dropping
+/// an old desktop-notification toast is harmless, but dropping a shell
+/// event can break command/exit-code pairing downstream and silently lose
+/// a recorded command. In normal operation the PTY reader drains
+/// `shell_events` every parse pass, so this ceiling is never approached —
+/// it exists only so a `Term` nobody drains (e.g. before the reader-thread
+/// wiring lands) cannot grow its heap without bound. On overflow the
+/// oldest event is evicted first; the resulting possibly-lost command
+/// record is an accepted cost because shell-integration history recording
+/// is best-effort and must never be allowed to leak memory.
+const SHELL_EVENT_QUEUE_MAX: usize = 1024;
+
 #[derive(Debug)]
 pub struct Term {
     pub grid: Grid,
@@ -57,8 +71,12 @@ pub struct Term {
     /// App-level toast queue. Bounded loosely by drop-after-32 so a
     /// runaway emitter can't pin unbounded heap if the UI is paused.
     notifications: Vec<TermNotification>,
-    /// OSC 633 shell-integration events buffered for the reader thread to drain
-    /// into the history store. Same pattern as `notifications`.
+    /// OSC 633 shell-integration events buffered for the reader thread to
+    /// drain into the history store. Bounded at [`SHELL_EVENT_QUEUE_MAX`],
+    /// evicting the oldest event first when full — unlike `notifications`,
+    /// where evicting an old toast is harmless, evicting here means a
+    /// lost command record; see the constant's doc comment for why that
+    /// tradeoff is acceptable and why the cap is set so much higher.
     shell_events: Vec<ShellIntegrationEvent>,
     /// Whether full-screen redraws on this Term should be treated as
     /// ephemeral frames (the live grid is mutable surface, never
@@ -1440,6 +1458,12 @@ impl Handler for Term {
     }
 
     fn shell_integration(&mut self, event: ShellIntegrationEvent) {
+        // See `SHELL_EVENT_QUEUE_MAX`'s doc comment: bounded so an
+        // undrained Term can't leak memory, oldest-first eviction so the
+        // most recent (most actionable) events survive.
+        if self.shell_events.len() >= SHELL_EVENT_QUEUE_MAX {
+            self.shell_events.remove(0);
+        }
         self.shell_events.push(event);
     }
 }
@@ -2319,6 +2343,33 @@ mod tests {
         let drained = t.take_shell_events();
         assert_eq!(drained, vec![PromptStart, CommandLine("ls -la".into())]);
         assert!(t.take_shell_events().is_empty(), "drain must empty the queue");
+    }
+
+    /// An undrained `Term` must never grow `shell_events` past
+    /// `SHELL_EVENT_QUEUE_MAX`, and overflow must evict the *oldest*
+    /// events first so the most recent (most actionable) ones survive.
+    #[test]
+    fn shell_events_queue_bounded_evicts_oldest() {
+        use crate::handler::ShellIntegrationEvent::CommandFinished;
+        let mut t = Term::new(5, 10);
+        let overflow = 10;
+        for i in 0..(SHELL_EVENT_QUEUE_MAX + overflow) {
+            t.shell_integration(CommandFinished { exit: Some(i as i32) });
+        }
+        let events = t.take_shell_events();
+        assert_eq!(events.len(), SHELL_EVENT_QUEUE_MAX, "queue must be capped");
+        assert_eq!(
+            events.first(),
+            Some(&CommandFinished { exit: Some(overflow as i32) }),
+            "the oldest `overflow` events must have been evicted"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&CommandFinished {
+                exit: Some((SHELL_EVENT_QUEUE_MAX + overflow - 1) as i32)
+            }),
+            "the newest event must survive"
+        );
     }
 }
 
