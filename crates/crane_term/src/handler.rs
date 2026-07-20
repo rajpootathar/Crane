@@ -179,6 +179,15 @@ pub trait Handler {
     /// `false` for plain OSC 9.
     fn osc_notification(&mut self, _body: &str, _urgent: bool) {}
 
+    /// OSC 10 / 11 / 12 with a `?` payload — an app is *querying* the
+    /// default foreground (10), background (11), or cursor (12) colour so
+    /// it can adapt its own palette to a light vs dark terminal. `index`
+    /// is 10, 11, or 12. The implementation should push an
+    /// `\e]<index>;rgb:RRRR/GGGG/BBBB\a` reply onto its outbound queue.
+    /// Default impl is a no-op (a non-answering terminal makes apps guess,
+    /// which on a light theme yields unreadable light-on-light text).
+    fn osc_color_query(&mut self, _index: u16) {}
+
     // ---- queries the parser asks us to answer back to the PTY ----
 
     /// CSI Ps n. The implementation should push the appropriate

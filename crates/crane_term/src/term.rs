@@ -91,6 +91,14 @@ pub struct Term {
     /// [`Term::take_bell`] once per frame so the UI can flash / chime
     /// exactly once per bell burst.
     bell_pending: bool,
+    /// The active theme's default foreground / background / cursor colours,
+    /// as 8-bit RGB. Injected by Crane via [`Term::set_default_colors`]; used
+    /// only to answer OSC 10 / 11 / 12 colour queries so apps can adapt to a
+    /// light vs dark theme. Defaults to a light-grey-on-near-black scheme so a
+    /// pre-injection query still reads as "dark terminal".
+    default_fg_rgb: (u8, u8, u8),
+    default_bg_rgb: (u8, u8, u8),
+    default_cursor_rgb: (u8, u8, u8),
 }
 
 /// Resize / full-clear policy for the primary screen. See the
@@ -136,7 +144,26 @@ impl Term {
             cursor_style: CursorStyle::default(),
             window_title: None,
             bell_pending: false,
+            default_fg_rgb: (0xb0, 0xb4, 0xc0),
+            default_bg_rgb: (0x0e, 0x10, 0x18),
+            default_cursor_rgb: (0xb0, 0xb4, 0xc0),
         }
+    }
+
+    /// Tell this Term the active theme's default foreground / background /
+    /// cursor colours, so OSC 10 / 11 / 12 queries answer with the truth. Crane
+    /// calls this at PTY spawn and whenever the theme changes; an app that
+    /// queries `OSC 11 ; ?` then learns the real background and picks readable
+    /// text instead of assuming dark and rendering light-on-light.
+    pub fn set_default_colors(
+        &mut self,
+        fg: (u8, u8, u8),
+        bg: (u8, u8, u8),
+        cursor: (u8, u8, u8),
+    ) {
+        self.default_fg_rgb = fg;
+        self.default_bg_rgb = bg;
+        self.default_cursor_rgb = cursor;
     }
 
     /// Cursor presentation last requested by the PTY via DECSCUSR
@@ -1359,6 +1386,24 @@ impl Handler for Term {
         self.window_title = title;
     }
 
+    fn osc_color_query(&mut self, index: u16) {
+        // Answer OSC 10/11/12 `?` queries with the active theme's colour so
+        // apps adapt to a light vs dark terminal. xterm's reply format is
+        //   \e]<index>;rgb:RRRR/GGGG/BBBB\a
+        // with 16-bit channels; we replicate each 8-bit byte into 4 hex digits
+        // (0xAB -> "abab"), which every consumer accepts. Terminated with BEL.
+        let (r, g, b) = match index {
+            10 => self.default_fg_rgb,
+            11 => self.default_bg_rgb,
+            12 => self.default_cursor_rgb,
+            _ => return,
+        };
+        let reply = format!(
+            "\x1b]{index};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x07"
+        );
+        self.reply(reply.as_bytes());
+    }
+
     fn bell(&mut self) {
         // BEL (0x07). Latch until the UI drains it via `take_bell`.
         self.bell_pending = true;
@@ -1998,6 +2043,41 @@ mod tests {
         let mut t = Term::new(5, 10);
         t.identify_terminal(None);
         assert_eq!(t.take_pty_replies(), b"\x1b[?6c");
+    }
+
+    #[test]
+    fn osc11_query_replies_with_injected_background() {
+        let mut t = Term::new(5, 10);
+        // Light theme background (crane-light: 248,249,252).
+        t.set_default_colors((36, 40, 52), (248, 249, 252), (36, 40, 52));
+        t.osc_color_query(11);
+        assert_eq!(
+            t.take_pty_replies(),
+            b"\x1b]11;rgb:f8f8/f9f9/fcfc\x07".as_slice()
+        );
+    }
+
+    #[test]
+    fn osc10_and_osc12_query_use_fg_and_cursor() {
+        let mut t = Term::new(5, 10);
+        t.set_default_colors((0x24, 0x28, 0x34), (0xf8, 0xf9, 0xfc), (0xaa, 0xbb, 0xcc));
+        t.osc_color_query(10);
+        assert_eq!(
+            t.take_pty_replies(),
+            b"\x1b]10;rgb:2424/2828/3434\x07".as_slice()
+        );
+        t.osc_color_query(12);
+        assert_eq!(
+            t.take_pty_replies(),
+            b"\x1b]12;rgb:aaaa/bbbb/cccc\x07".as_slice()
+        );
+    }
+
+    #[test]
+    fn osc_color_query_ignores_unknown_index() {
+        let mut t = Term::new(5, 10);
+        t.osc_color_query(99);
+        assert!(t.take_pty_replies().is_empty());
     }
 
     #[test]

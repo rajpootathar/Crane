@@ -310,6 +310,24 @@ impl<H: Handler> vte::Perform for OscWatcher<'_, H> {
                 };
                 self.inner.osc_notification(&combined, true);
             }
+            // OSC 10 / 11 / 12 — dynamic colour query. When an app sends
+            //   OSC 11 ; ? ST
+            // it is asking for the terminal's default background so it can
+            // pick readable text for a light vs dark theme. We only answer the
+            // *query* form (a `?` payload); the set form (an app changing our
+            // colours) is ignored. Without this reply, apps assume a dark
+            // background and render light text — unreadable on a light theme.
+            b"10" | b"11" | b"12" => {
+                if params.get(1).map(|p| *p == b"?").unwrap_or(false) {
+                    // SAFETY: matched literals above are valid ASCII digits.
+                    let index = std::str::from_utf8(params[0])
+                        .ok()
+                        .and_then(|s| s.parse::<u16>().ok());
+                    if let Some(index) = index {
+                        self.inner.osc_color_query(index);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -334,11 +352,15 @@ mod osc_tests {
     #[derive(Default)]
     struct Collector {
         events: Vec<(String, bool)>,
+        color_queries: Vec<u16>,
     }
 
     impl Handler for Collector {
         fn osc_notification(&mut self, body: &str, urgent: bool) {
             self.events.push((body.to_string(), urgent));
+        }
+        fn osc_color_query(&mut self, index: u16) {
+            self.color_queries.push(index);
         }
     }
 
@@ -348,6 +370,14 @@ mod osc_tests {
         let mut watcher = OscWatcher { inner: &mut sink };
         parser.advance(&mut watcher, bytes);
         sink.events
+    }
+
+    fn run_color_queries(bytes: &[u8]) -> Vec<u16> {
+        let mut parser = vte::Parser::new();
+        let mut sink = Collector::default();
+        let mut watcher = OscWatcher { inner: &mut sink };
+        parser.advance(&mut watcher, bytes);
+        sink.color_queries
     }
 
     #[test]
@@ -378,6 +408,23 @@ mod osc_tests {
     fn unrelated_osc_codes_ignored() {
         let evts = run(b"\x1b]2;new title\x07\x1b]4;1;rgb:ff/00/00\x07");
         assert!(evts.is_empty());
+    }
+
+    #[test]
+    fn osc11_background_query_surfaced() {
+        assert_eq!(run_color_queries(b"\x1b]11;?\x07"), vec![11]);
+    }
+
+    #[test]
+    fn osc10_and_osc12_queries_surfaced() {
+        assert_eq!(run_color_queries(b"\x1b]10;?\x1b\\"), vec![10]);
+        assert_eq!(run_color_queries(b"\x1b]12;?\x07"), vec![12]);
+    }
+
+    #[test]
+    fn osc11_set_form_is_not_a_query() {
+        // An app *setting* the background (no `?`) must not trigger a reply.
+        assert!(run_color_queries(b"\x1b]11;rgb:00/00/00\x07").is_empty());
     }
 
     #[test]
