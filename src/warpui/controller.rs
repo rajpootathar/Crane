@@ -138,10 +138,12 @@ impl TerminalController {
         // caller is the reader thread, so without this the whole load happens
         // there at the first completed command — during which nothing is
         // draining the PTY, the buffer backs up and the shell blocks on write.
-        // The log has no cap, so that stall grows with months of use. Paying
-        // the cost at spawn makes it invisible. Do not remove as "unused": the
-        // return value is deliberately discarded, the initialization is the
-        // point.
+        // The log is capped at HISTORY_MAX entries (compacted on load), so
+        // this warm-up cost is bounded rather than growing with months of
+        // use — but it still belongs on the spawning thread, not the reader
+        // thread. Paying the cost at spawn makes it invisible. Do not remove
+        // as "unused": the return value is deliberately discarded, the
+        // initialization is the point.
         let _ = crate::warpui::history_store::store();
 
         let pty_system = NativePtySystem::default();

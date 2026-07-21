@@ -20,6 +20,14 @@ use serde::{Deserialize, Serialize};
 /// retaining plenty of history for up-arrow recall.
 const HISTORY_MAX: usize = 5000;
 
+/// Extra headroom above `HISTORY_MAX` the in-memory `entries` Vec is allowed
+/// to grow to before `append` trims it back down. Batching the trim over
+/// `HISTORY_TRIM_SLACK` appends — instead of re-capping to exactly
+/// `HISTORY_MAX` on every single append past the cap — makes the O(n)
+/// front-drain genuinely amortized O(1) per append. The on-disk file is
+/// unaffected: `load()`'s compaction still caps it at exactly `HISTORY_MAX`.
+const HISTORY_TRIM_SLACK: usize = 512;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct HistoryEntry {
     pub command: String,
@@ -80,10 +88,14 @@ impl HistoryStore {
     ///
     /// The disk file is left untouched past `HISTORY_MAX` — it's only
     /// compacted at the next `load()` — but the in-memory `entries` Vec is
-    /// trimmed back down whenever it exceeds the cap, so `rank()`'s sort
-    /// never grows unbounded within a running session. Trimming only kicks in
-    /// once the cap is exceeded (not on every append), so the common case
-    /// (well under `HISTORY_MAX`) is a plain `push`.
+    /// soft-capped at `HISTORY_MAX + HISTORY_TRIM_SLACK`: once it grows past
+    /// that, a single `drain` trims the front back down to exactly
+    /// `HISTORY_MAX`. Batching the trim over `HISTORY_TRIM_SLACK` appends
+    /// this way (rather than re-capping to exactly `HISTORY_MAX` on every
+    /// append past the cap, which degenerates to a `remove(0)`-equivalent
+    /// full-tail memmove each time) makes the front-drain genuinely
+    /// amortized O(1) per append. `rank()` briefly sorting a few hundred
+    /// extra entries between trims is negligible.
     pub fn append(&mut self, entry: HistoryEntry) {
         if let Ok(line) = serde_json::to_string(&entry) {
             if let Some(parent) = self.path.parent() {
@@ -98,7 +110,7 @@ impl HistoryStore {
             }
         }
         self.entries.push(entry);
-        if self.entries.len() > HISTORY_MAX {
+        if self.entries.len() > HISTORY_MAX + HISTORY_TRIM_SLACK {
             let excess = self.entries.len() - HISTORY_MAX;
             self.entries.drain(0..excess);
         }
@@ -135,13 +147,26 @@ impl HistoryStore {
 
 /// Best-effort rewrite of `path` to hold exactly `entries` (one JSON line
 /// each), used once at `load()` time to compact a file that grew past
-/// `HISTORY_MAX`. Writes to a sibling temp file and renames it over `path`
-/// rather than truncating in place, so a concurrent appender (another Crane
-/// process writing via `O_APPEND`) can never observe a half-written file —
-/// same atomic tmp-then-rename discipline as `persist.rs::write_bytes`.
-/// Every failure path (serialize, write, rename) is swallowed: this is a
-/// housekeeping nicety, not something that may ever fail the load it runs
-/// inside of.
+/// `HISTORY_MAX`. Writes to a sibling temp file — named with this process's
+/// pid plus a per-process sequence number, so two Crane processes compacting
+/// at the same moment can never collide on the same temp path — and renames
+/// it over `path` rather than truncating in place, so a concurrent appender
+/// (another Crane process writing via `O_APPEND`) can never observe a
+/// half-written file — same atomic tmp-then-rename discipline as
+/// `persist.rs::write_bytes`. If the rename fails, the temp file is removed
+/// so a failed compaction never leaves a stray `history.jsonl.tmp*` file
+/// behind. Every failure path (serialize, write, rename, cleanup) is
+/// swallowed: this is a housekeeping nicety, not something that may ever
+/// fail the load it runs inside of.
+///
+/// Known accepted race (not fixed here): the pid+seq temp name only
+/// prevents two processes' *temp files* from colliding. It does not close a
+/// narrower window where a second Crane process compacts this same
+/// oversized file at startup in the exact instant a first process appends a
+/// line — that appended line can be lost from disk (it still survives in
+/// the first process's in-memory `entries` for the rest of its session).
+/// Closing that gap needs advisory file locking, a larger change (and a new
+/// dependency) than this fix warrants; left as a follow-up.
 fn rewrite_compacted(path: &std::path::Path, entries: &[HistoryEntry]) {
     let mut buf = String::new();
     for e in entries {
@@ -153,9 +178,10 @@ fn rewrite_compacted(path: &std::path::Path, entries: &[HistoryEntry]) {
     let _ = std::fs::create_dir_all(parent);
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_extension(format!("jsonl.tmp{n}"));
-    if std::fs::write(&tmp, buf.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+    let pid = std::process::id();
+    let tmp = path.with_extension(format!("jsonl.tmp.{pid}.{n}"));
+    if std::fs::write(&tmp, buf.as_bytes()).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -266,19 +292,30 @@ mod tests {
     }
 
     #[test]
-    fn append_past_history_max_keeps_only_the_newest_entries_in_memory() {
+    fn append_past_history_max_plus_slack_batches_the_trim_back_to_history_max() {
         let dir = std::env::temp_dir().join(format!("crane-hist-test-cap-{}", now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("history.jsonl");
         let mut s = HistoryStore::load(path.clone());
-        for i in 0..HISTORY_MAX + 10 {
+        // One append past HISTORY_MAX + HISTORY_TRIM_SLACK is the first point
+        // at which append's soft cap actually fires the front-drain.
+        let total = HISTORY_MAX + HISTORY_TRIM_SLACK + 1;
+        for i in 0..total {
             s.append(entry(&format!("cmd{i}"), "/proj", 1, i as u64));
         }
-        assert_eq!(s.entries.len(), HISTORY_MAX, "in-memory entries stay capped at HISTORY_MAX");
-        assert_eq!(s.entries[0].command, "cmd10", "the oldest 10 entries were dropped from the front");
+        assert_eq!(
+            s.entries.len(),
+            HISTORY_MAX,
+            "in-memory entries are trimmed back down to exactly HISTORY_MAX once the slack is exceeded"
+        );
+        assert_eq!(
+            s.entries[0].command,
+            format!("cmd{}", HISTORY_TRIM_SLACK + 1),
+            "the oldest HISTORY_TRIM_SLACK + 1 entries were dropped from the front"
+        );
         assert_eq!(
             s.entries[HISTORY_MAX - 1].command,
-            format!("cmd{}", HISTORY_MAX + 9),
+            format!("cmd{}", total - 1),
             "the newest entry is retained"
         );
         std::fs::remove_dir_all(&dir).ok();
