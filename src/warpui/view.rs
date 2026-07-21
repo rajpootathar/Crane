@@ -317,6 +317,10 @@ pub struct TerminalView {
     /// attention on the *source* tab (not the active one). `None` until the shell
     /// first syncs it.
     owner_key: Rc<StdCell<Option<(usize, usize, usize)>>>,
+    /// Up/Down cursor over ranked shell history for this terminal. Interior-
+    /// mutable (like `dimmed`) so `write_keystroke` can advance it through
+    /// `&self`. Reset whenever a non-arrow key is typed.
+    history_nav: RefCell<HistoryNav>,
 }
 
 impl TerminalView {
@@ -407,6 +411,7 @@ impl TerminalView {
             link_pressed: Rc::new(RefCell::new(None)),
             url_did_drag: Rc::new(StdCell::new(false)),
             owner_key: Rc::new(StdCell::new(None)),
+            history_nav: RefCell::new(HistoryNav::new()),
         }
     }
 
@@ -967,6 +972,54 @@ impl View for TerminalView {
     }
 }
 
+/// Per-terminal up/down cursor over a ranked history list. `-1` means "on the
+/// user's original (unsubmitted) line"; `0..n` indexes the ranked list
+/// (newest-first). `up` moves toward older, clamping at the oldest; `down`
+/// moves toward the original line and returns `""` when it lands back on it,
+/// then `None` once already there.
+struct HistoryNav {
+    idx: i32,
+}
+
+impl Default for HistoryNav {
+    // Derived Default would leave `idx` at 0 — "on the newest ranked entry" —
+    // which is not the resting state. The resting state is the original line
+    // (`-1`), so Default must go through `new`.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HistoryNav {
+    fn new() -> Self {
+        Self { idx: -1 }
+    }
+
+    fn reset(&mut self) {
+        self.idx = -1;
+    }
+
+    fn up<'a>(&mut self, ranked: &'a [String]) -> Option<&'a str> {
+        if ranked.is_empty() {
+            return None;
+        }
+        self.idx = (self.idx + 1).min(ranked.len() as i32 - 1);
+        ranked.get(self.idx as usize).map(|s| s.as_str())
+    }
+
+    fn down<'a>(&mut self, ranked: &'a [String]) -> Option<&'a str> {
+        if self.idx < 0 {
+            return None;
+        }
+        self.idx -= 1;
+        if self.idx < 0 {
+            Some("")
+        } else {
+            ranked.get(self.idx as usize).map(|s| s.as_str())
+        }
+    }
+}
+
 impl TerminalView {
     /// Write a keystroke to THIS terminal's PTY (called by the shell for the
     /// focused pane).
@@ -975,10 +1028,55 @@ impl TerminalView {
         if !ctrl.is_alive() {
             return;
         }
+
+        // Ranked-history interception. Only for a bare Up/Down at an active
+        // shell prompt — never in a full-screen app, and never in vi keymap
+        // (its ^E/^U mean something else). Any guard failing falls through to
+        // the normal cursor-key escape below, so a terminal without shell
+        // integration, or one running vim/less/htop, behaves exactly as before.
+        let is_up = ks.key == "up" && !ks.ctrl && !ks.alt && !ks.shift;
+        let is_down = ks.key == "down" && !ks.ctrl && !ks.alt && !ks.shift;
+        if (is_up || is_down)
+            && ctrl.shell_integration_active()
+            && !ctrl.term.lock().is_app_cursor()
+        {
+            let pwd = ctrl.cwd.to_string_lossy().into_owned();
+            // Take the store lock, rank, clone the commands we need into owned
+            // Strings, and DROP the guard — all inside this block — before
+            // touching any other lock or writing to the PTY. `rank` hands back
+            // references borrowed from inside the store, and parking_lot is not
+            // reentrant while the reader thread's `append` holds this same lock
+            // across disk I/O, so the guard must never outlive this scope.
+            let ranked: Vec<String> = {
+                let s = crate::warpui::history_store::store().lock();
+                let restored: std::collections::HashSet<u64> =
+                    ctrl.restored_session_ids().iter().copied().collect();
+                s.rank(ctrl.session_id(), &restored, &pwd)
+                    .iter()
+                    .map(|e| e.command.clone())
+                    .collect()
+            };
+            let mut nav = self.history_nav.borrow_mut();
+            let chosen = if is_up { nav.up(&ranked) } else { nav.down(&ranked) };
+            if let Some(text) = chosen {
+                // Clear the current line, then type the chosen command. ^E (end)
+                // + ^U (kill to start) is the emacs keymap (zsh default); the vi
+                // keymap is excluded by the modifier guard above.
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(b"\x05\x15"); // ^E ^U
+                bytes.extend_from_slice(text.as_bytes());
+                ctrl.write_input(&bytes);
+            }
+            return;
+        }
+
         let app_cursor = ctrl.term.lock().is_app_cursor();
         if let Some(bytes) = keystroke_to_pty_bytes(ks, app_cursor) {
             ctrl.write_input(&bytes);
         }
+        // Any non-arrow key ends a history walk: editing a recalled command and
+        // pressing Up again should restart from the top of the ranked list.
+        self.history_nav.borrow_mut().reset();
     }
 
     /// Paste text into THIS terminal (bracketed when the app requested it).
@@ -1048,4 +1146,30 @@ fn write_pasted_image(image: &warpui::clipboard::ImageData) -> Option<String> {
     let path = dir.join(format!("{id}.{ext}"));
     std::fs::write(&path, &image.data).ok()?;
     Some(path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod history_nav_tests {
+    use super::*;
+
+    #[test]
+    fn up_walks_back_through_ranked_list_then_stops_at_oldest() {
+        let ranked = vec!["c".to_string(), "b".to_string(), "a".to_string()]; // newest-first
+        let mut nav = HistoryNav::new();
+        assert_eq!(nav.up(&ranked), Some("c"));
+        assert_eq!(nav.up(&ranked), Some("b"));
+        assert_eq!(nav.up(&ranked), Some("a"));
+        assert_eq!(nav.up(&ranked), Some("a"), "past the oldest, stay on oldest");
+    }
+
+    #[test]
+    fn down_returns_toward_the_original_line_then_clears() {
+        let ranked = vec!["c".to_string(), "b".to_string()];
+        let mut nav = HistoryNav::new();
+        nav.up(&ranked);
+        nav.up(&ranked); // at "b"
+        assert_eq!(nav.down(&ranked), Some("c"));
+        assert_eq!(nav.down(&ranked), Some(""), "below newest → the (empty) original line");
+        assert_eq!(nav.down(&ranked), None, "already at the original line");
+    }
 }

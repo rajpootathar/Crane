@@ -120,6 +120,12 @@ pub struct TerminalController {
     /// persistence. Empty for now — populated when session restore learns to
     /// carry the id across a relaunch.
     restored_session_ids: Vec<u64>,
+    /// Latched true the first time the reader thread drains any OSC 633 shell
+    /// event, i.e. the shell is actually instrumented. Gates the ranked-history
+    /// up/down interception: without proof of integration we leave the arrow
+    /// keys alone so an uninstrumented shell (bare `ssh`, fish, …) behaves
+    /// exactly as before.
+    shell_integration_active: Arc<AtomicBool>,
 }
 
 impl TerminalController {
@@ -276,6 +282,7 @@ impl TerminalController {
         let alive = Arc::new(AtomicBool::new(true));
         let bell = Arc::new(AtomicBool::new(false));
         let bell_notify = Arc::new(AtomicBool::new(false));
+        let shell_integration_active = Arc::new(AtomicBool::new(false));
         let notif_queue: Arc<Mutex<Vec<TermNotification>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Reader thread: PTY -> crane_term, write back replies, wake the UI.
@@ -287,6 +294,7 @@ impl TerminalController {
             let alive = alive.clone();
             let bell = bell.clone();
             let bell_notify = bell_notify.clone();
+            let shell_integration_active = shell_integration_active.clone();
             let notif_queue = notif_queue.clone();
             Some(thread::spawn(move || {
                 let mut reader = reader;
@@ -339,6 +347,13 @@ impl TerminalController {
                                 last_cursor = cursor;
                                 wake();
                             }
+                            // Seeing any OSC 633 event proves the shell is
+                            // instrumented — latch it so the UI thread can gate
+                            // the up/down history interception on real
+                            // integration.
+                            if !shell_events.is_empty() {
+                                shell_integration_active.store(true, Ordering::Relaxed);
+                            }
                             // Record AFTER the wake: a completed command costs
                             // one small append, and the repaint should never
                             // wait on the disk. `append` is best-effort and
@@ -377,6 +392,7 @@ impl TerminalController {
             cwd,
             session_id,
             restored_session_ids: Vec::new(),
+            shell_integration_active,
         })
     }
 
@@ -391,6 +407,13 @@ impl TerminalController {
     /// shows its own prior commands at the top of up-arrow.
     pub fn restored_session_ids(&self) -> &[u64] {
         &self.restored_session_ids
+    }
+
+    /// True once this shell has emitted at least one OSC 633 event, i.e. Crane's
+    /// shell integration is live in it. Used to gate ranked-history up/down
+    /// interception — an uninstrumented shell keeps its native arrow behaviour.
+    pub fn shell_integration_active(&self) -> bool {
+        self.shell_integration_active.load(Ordering::Relaxed)
     }
 
     /// Drain the desktop notifications (OSC 9 / OSC 777) buffered by the reader
