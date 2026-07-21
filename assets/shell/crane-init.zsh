@@ -33,6 +33,18 @@ __crane_precmd() {
     __crane_executing=""
   fi
   __crane_osc "P;Cwd=$PWD"
+  # Report the line-editor keymap so Crane can disable its emacs-only (^E^U)
+  # up/down history interception in vi mode and let zsh's own vi history run.
+  # Emitted every prompt so a mid-session `bindkey -v` / `set -o vi` is caught.
+  # `bindkey -lL main` prints the keymap `main` is linked to (`viins` for vi via
+  # either `bindkey -v` OR `set -o vi`, `emacs` otherwise) — `[[ -o vi ]]` alone
+  # would miss `bindkey -v`. Best-effort: if `bindkey` misbehaves the match just
+  # falls through to emacs and never aborts the prompt.
+  if [[ "$(bindkey -lL main)" == *vi* ]]; then
+    __crane_osc "P;Keymap=vi"
+  else
+    __crane_osc "P;Keymap=emacs"
+  fi
   __crane_osc "A"   # prompt start
   __crane_osc "B"   # command start
 }

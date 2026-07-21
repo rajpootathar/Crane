@@ -96,6 +96,9 @@ pub enum ShellIntegrationEvent {
     CommandLine(String),
     /// 633;P;Cwd=<path> — the shell's current working directory.
     Cwd(String),
+    /// 633;P;Keymap=<vi|emacs> — the shell's line-editor keymap, reported once
+    /// per prompt so a mid-session `set -o vi` / `bindkey -v` is picked up.
+    Keymap(String),
 }
 
 /// Trait the [`crate::processor::Processor`] drives. v1 is

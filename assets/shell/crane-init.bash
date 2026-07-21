@@ -38,7 +38,14 @@ __crane_precmd() {
   # which would otherwise be compared against an empty baseline and wrongly
   # accept the last line restored from HISTFILE.
   __crane_read_history && __crane_hist_num="$__crane_hist_cur"
-  __crane_osc "P;Cwd=$PWD"; __crane_osc "A"; __crane_osc "B"
+  __crane_osc "P;Cwd=$PWD"
+  # Report the line-editor keymap so Crane can disable its emacs-only (^E^U)
+  # up/down history interception in vi mode and let bash's own vi history run.
+  # Emitted every prompt so a mid-session `set -o vi` is caught. `[[ -o vi ]]`
+  # reliably reports bash's vi editing mode; best-effort — it references no
+  # variable, so it is `set -u`-safe and never aborts the prompt.
+  if [[ -o vi ]]; then __crane_osc "P;Keymap=vi"; else __crane_osc "P;Keymap=emacs"; fi
+  __crane_osc "A"; __crane_osc "B"
 }
 
 # $BASH_COMMAND is only the current SIMPLE command, so `foo && bar` records as

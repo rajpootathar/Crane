@@ -76,10 +76,12 @@ impl ShellRecorder {
                     end_ms: now_ms(),
                 })
             }
-            // Prompt boundaries carry no data we persist directly.
+            // Prompt boundaries carry no data we persist directly; the keymap is
+            // tracked out-of-band by the reader loop's atomic, not recorded here.
             ShellIntegrationEvent::PromptStart
             | ShellIntegrationEvent::CommandStart
-            | ShellIntegrationEvent::PreExec => None,
+            | ShellIntegrationEvent::PreExec
+            | ShellIntegrationEvent::Keymap(_) => None,
         }
     }
 }
@@ -145,6 +147,12 @@ pub struct TerminalController {
     /// ranked-history "current directory" tie-break should actually use, since
     /// the user `cd`s around after spawn.
     live_cwd: Arc<Mutex<String>>,
+    /// True when the shell's line editor is in the vi keymap, updated by the
+    /// reader thread from each OSC 633 `P;Keymap=` event (emitted once per
+    /// prompt). Gates OUT the ranked-history up/down interception: the `^E^U`
+    /// line-clear it sends is an emacs-keymap sequence, so in vi we leave the
+    /// arrows alone and the shell's own native vi history takes over.
+    keymap_is_vi: Arc<AtomicBool>,
 }
 
 impl TerminalController {
@@ -306,6 +314,7 @@ impl TerminalController {
         let shell_integration_active = Arc::new(AtomicBool::new(false));
         let notif_queue: Arc<Mutex<Vec<TermNotification>>> = Arc::new(Mutex::new(Vec::new()));
         let live_cwd = Arc::new(Mutex::new(String::new()));
+        let keymap_is_vi = Arc::new(AtomicBool::new(false));
 
         // Reader thread: PTY -> crane_term, write back replies, wake the UI.
         // Lock order is ALWAYS parser-then-term (deadlock-critical).
@@ -319,6 +328,7 @@ impl TerminalController {
             let shell_integration_active = shell_integration_active.clone();
             let notif_queue = notif_queue.clone();
             let live_cwd = live_cwd.clone();
+            let keymap_is_vi = keymap_is_vi.clone();
             Some(thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -391,6 +401,13 @@ impl TerminalController {
                                 if let ShellIntegrationEvent::Cwd(p) = &ev {
                                     *live_cwd.lock() = p.clone();
                                 }
+                                // Track the shell's line-editor keymap for the UI
+                                // thread's up/down interception gate. Same
+                                // by-reference, single-atomic pattern as the live
+                                // cwd above — no term or store lock held here.
+                                if let ShellIntegrationEvent::Keymap(k) = &ev {
+                                    keymap_is_vi.store(k == "vi", Ordering::Relaxed);
+                                }
                                 if let Some(entry) = recorder.feed(ev) {
                                     crate::warpui::history_store::store().lock().append(entry);
                                 }
@@ -425,6 +442,7 @@ impl TerminalController {
             restored_session_ids: Vec::new(),
             shell_integration_active,
             live_cwd,
+            keymap_is_vi,
         })
     }
 
@@ -446,6 +464,14 @@ impl TerminalController {
     /// interception — an uninstrumented shell keeps its native arrow behaviour.
     pub fn shell_integration_active(&self) -> bool {
         self.shell_integration_active.load(Ordering::Relaxed)
+    }
+
+    /// True when the shell reported (via OSC 633 `P;Keymap=vi`) that its line
+    /// editor is in the vi keymap. A plain atomic load — cheap, lock-free, safe
+    /// on the UI hot path. Gates OUT the ranked-history up/down interception so
+    /// a vi user keeps the shell's own native arrow-key history.
+    pub fn keymap_is_vi(&self) -> bool {
+        self.keymap_is_vi.load(Ordering::Relaxed)
     }
 
     /// The shell's live cwd as of the most recent OSC 633 `P;Cwd=` event, or

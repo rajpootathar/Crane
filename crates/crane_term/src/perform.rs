@@ -349,9 +349,17 @@ impl<H: Handler> vte::Perform for OscWatcher<'_, H> {
                         .get(2)
                         .map(|p| ShellIntegrationEvent::CommandLine(unescape_osc633(p))),
                     b'P' => params.get(2).and_then(|p| {
+                        // 633;P carries `<key>=<value>` properties. `Cwd=` and
+                        // `Keymap=` are the two we consume; any other property
+                        // (VS Code emits several) falls through to `None` and is
+                        // silently ignored.
                         let s = String::from_utf8_lossy(p);
-                        s.strip_prefix("Cwd=")
-                            .map(|cwd| ShellIntegrationEvent::Cwd(cwd.to_string()))
+                        if let Some(cwd) = s.strip_prefix("Cwd=") {
+                            Some(ShellIntegrationEvent::Cwd(cwd.to_string()))
+                        } else {
+                            s.strip_prefix("Keymap=")
+                                .map(|k| ShellIntegrationEvent::Keymap(k.to_string()))
+                        }
                     }),
                     _ => None,
                 };
@@ -562,6 +570,21 @@ mod osc_tests {
             run_shell_events(b"\x1b]633;P;Cwd=/Users/x/proj\x07"),
             vec![Cwd("/Users/x/proj".into())]
         );
+        assert_eq!(
+            run_shell_events(b"\x1b]633;P;Keymap=vi\x07"),
+            vec![Keymap("vi".into())]
+        );
+        assert_eq!(
+            run_shell_events(b"\x1b]633;P;Keymap=emacs\x07"),
+            vec![Keymap("emacs".into())]
+        );
+    }
+
+    #[test]
+    fn osc633_unknown_p_property_ignored() {
+        // A `P;<other>=` property Crane does not consume (VS Code emits several)
+        // must decode to nothing rather than erroring or mis-classifying.
+        assert!(run_shell_events(b"\x1b]633;P;IsWindows=True\x07").is_empty());
     }
 
     #[test]

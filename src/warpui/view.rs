@@ -1034,10 +1034,13 @@ impl TerminalView {
         // (its ^E/^U mean something else). Any guard failing falls through to
         // the normal cursor-key escape below, so a terminal without shell
         // integration, or one running vim/less/htop, behaves exactly as before.
-        let is_up = ks.key == "up" && !ks.ctrl && !ks.alt && !ks.shift;
-        let is_down = ks.key == "down" && !ks.ctrl && !ks.alt && !ks.shift;
+        let is_up =
+            ks.key == "up" && !ks.ctrl && !ks.alt && !ks.shift && !ks.cmd && !ks.meta;
+        let is_down =
+            ks.key == "down" && !ks.ctrl && !ks.alt && !ks.shift && !ks.cmd && !ks.meta;
         if (is_up || is_down)
             && ctrl.shell_integration_active()
+            && !ctrl.keymap_is_vi()
             && !ctrl.term.lock().is_app_cursor()
         {
             let pwd = ctrl
@@ -1063,7 +1066,8 @@ impl TerminalView {
             if let Some(text) = chosen {
                 // Clear the current line, then type the chosen command. ^E (end)
                 // + ^U (kill to start) is the emacs keymap (zsh default); the vi
-                // keymap is excluded by the modifier guard above.
+                // keymap is excluded by the `keymap_is_vi()` guard above, so a vi
+                // user never reaches this ^E^U path and keeps native arrow history.
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(b"\x05\x15"); // ^E ^U
                 bytes.extend_from_slice(text.as_bytes());
