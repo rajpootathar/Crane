@@ -126,6 +126,18 @@ impl TerminalController {
     pub fn new(cols: usize, rows: usize, cwd: Option<&Path>, wake: Wake) -> std::io::Result<Self> {
         crate::warpui::shell_init::ensure_installed();
 
+        // Warm the history store HERE, on the spawning (UI) thread, before the
+        // reader thread below exists. `store()` is a OnceLock whose initializer
+        // reads and JSON-parses every line of history.jsonl; its only other
+        // caller is the reader thread, so without this the whole load happens
+        // there at the first completed command — during which nothing is
+        // draining the PTY, the buffer backs up and the shell blocks on write.
+        // The log has no cap, so that stall grows with months of use. Paying
+        // the cost at spawn makes it invisible. Do not remove as "unused": the
+        // return value is deliberately discarded, the initialization is the
+        // point.
+        let _ = crate::warpui::history_store::store();
+
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
@@ -194,6 +206,12 @@ impl TerminalController {
         // --rcfile replaces it. Deliberately no `--norc` — that would suppress
         // --rcfile too.
         //
+        // BOTH mechanisms replace the user's startup files rather than adding
+        // to them, so both are gated on the install actually being on disk:
+        // `ensure_installed` above is best-effort and never retries, and
+        // pointing a shell at shims that were never written costs the user
+        // their entire environment. No install → spawn exactly as before.
+        //
         // Any other shell (fish, nu, …) simply spawns unchanged and records no
         // history, rather than getting env it cannot interpret.
         #[cfg(unix)]
@@ -203,14 +221,18 @@ impl TerminalController {
                 .and_then(|n| n.to_str())
             {
                 Some("zsh") => {
-                    if let Some(old) = crate::warpui::shell_init::inherited_user_zdotdir() {
-                        cmd.env("CRANE_OLD_ZDOTDIR", old);
+                    if let Some(zdotdir) = crate::warpui::shell_init::installed_zsh_zdotdir() {
+                        if let Some(old) = crate::warpui::shell_init::inherited_user_zdotdir() {
+                            cmd.env("CRANE_OLD_ZDOTDIR", old);
+                        }
+                        cmd.env("ZDOTDIR", zdotdir);
                     }
-                    cmd.env("ZDOTDIR", crate::warpui::shell_init::zsh_zdotdir());
                 }
                 Some("bash") => {
-                    cmd.arg("--rcfile");
-                    cmd.arg(crate::warpui::shell_init::bash_rcfile());
+                    if let Some(rcfile) = crate::warpui::shell_init::installed_bash_rcfile() {
+                        cmd.arg("--rcfile");
+                        cmd.arg(rcfile);
+                    }
                 }
                 _ => {}
             }

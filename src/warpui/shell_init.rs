@@ -20,6 +20,17 @@ const ZSH_RC: &str = include_str!("../../assets/shell/zshrc");
 const ZSH_LOGIN: &str = include_str!("../../assets/shell/zlogin");
 const BASH_INIT: &str = include_str!("../../assets/shell/crane-init.bash");
 
+/// Every file the zsh shim directory must contain. `ZDOTDIR` *replaces* the
+/// set of startup files zsh reads from `$HOME`, so each missing name here is
+/// one of the user's own startup files silently no longer loading.
+const ZSH_SHIM_FILES: [&str; 5] = [
+    "crane-init.zsh",
+    ".zshenv",
+    ".zprofile",
+    ".zshrc",
+    ".zlogin",
+];
+
 fn shell_root() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -36,6 +47,30 @@ pub fn zsh_zdotdir() -> PathBuf {
 /// [`zsh_zdotdir`] against an explicit install root.
 pub fn zsh_zdotdir_at(root: &Path) -> PathBuf {
     root.join("zsh")
+}
+
+/// The `ZDOTDIR` to hand a spawned zsh — `None` when the shims are not on
+/// disk, which is the *only* safe answer in that case.
+///
+/// [`install_shell_scripts`] is best-effort: a read-only or full `$HOME`, a
+/// sandboxed home, or an unset `HOME` (which makes [`shell_root`] relative)
+/// all leave it having written nothing, and [`ensure_installed`] never
+/// retries. Because `ZDOTDIR` replaces the user's startup files rather than
+/// adding to them, exporting it at a directory that does not exist yields a
+/// shell with no prompt, no aliases and no PATH additions — strictly worse
+/// than not integrating at all. Degrading to a plain, fully-working shell is
+/// the contract.
+pub fn installed_zsh_zdotdir() -> Option<PathBuf> {
+    installed_zsh_zdotdir_at(&shell_root())
+}
+
+/// [`installed_zsh_zdotdir`] against an explicit install root.
+fn installed_zsh_zdotdir_at(root: &Path) -> Option<PathBuf> {
+    let dir = zsh_zdotdir_at(root);
+    ZSH_SHIM_FILES
+        .iter()
+        .all(|name| dir.join(name).is_file())
+        .then_some(dir)
 }
 
 /// The value to hand a spawned zsh as `CRANE_OLD_ZDOTDIR`: the `ZDOTDIR` this
@@ -67,7 +102,8 @@ fn user_zdotdir_excluding(
     let value = inherited?;
     // An empty ZDOTDIR means "$HOME" to zsh, and the shim already defaults
     // there; forwarding it would only flip on the pre-set branch above.
-    if value.is_empty() || same_dir(Path::new(&value), crane) {
+    let path = Path::new(&value);
+    if value.is_empty() || same_dir(path, crane) || is_crane_shim_dir(path) {
         return None;
     }
     Some(value)
@@ -84,14 +120,38 @@ fn same_dir(a: &Path, b: &Path) -> bool {
         }
 }
 
-/// The `--rcfile` Crane starts bash with.
-pub fn bash_rcfile() -> PathBuf {
-    bash_rcfile_at(&shell_root())
+/// Whether `dir` is *some* Crane's zsh shim directory, judged by content
+/// rather than by path.
+///
+/// [`same_dir`] compares against this process's [`zsh_zdotdir`], which is
+/// `HOME`-derived — so a Crane running under a different `HOME` (`sudo -E`, a
+/// second install, a sandboxed home) has a shim dir neither the literal nor
+/// the canonical compare recognises. Forwarding that as `CRANE_OLD_ZDOTDIR`
+/// tells our shim that a shim directory is the user's config, stranding the
+/// real one exactly as the nested-Crane case does. `crane-init.zsh` is ours
+/// and is never a file a user's own ZDOTDIR would hold.
+fn is_crane_shim_dir(dir: &Path) -> bool {
+    dir.join("crane-init.zsh").is_file()
 }
 
-/// [`bash_rcfile`] against an explicit install root.
-pub fn bash_rcfile_at(root: &Path) -> PathBuf {
+/// The `--rcfile` Crane starts bash with, against an explicit install root.
+fn bash_rcfile_at(root: &Path) -> PathBuf {
     root.join("crane-init.bash")
+}
+
+/// The `--rcfile` to start bash with — `None` when it was never written.
+/// `--rcfile` replaces `~/.bashrc` rather than adding to it (our script
+/// sources the user's itself), so aiming it at a missing file is the same
+/// self-inflicted breakage as a missing `ZDOTDIR`; see
+/// [`installed_zsh_zdotdir`].
+pub fn installed_bash_rcfile() -> Option<PathBuf> {
+    installed_bash_rcfile_at(&shell_root())
+}
+
+/// [`installed_bash_rcfile`] against an explicit install root.
+fn installed_bash_rcfile_at(root: &Path) -> Option<PathBuf> {
+    let file = bash_rcfile_at(root);
+    file.is_file().then_some(file)
 }
 
 /// Write (or overwrite) the bundled scripts under the real `~/.crane/shell`.
@@ -176,13 +236,7 @@ mod tests {
 
         let zdot = zsh_zdotdir_at(&root);
         assert_eq!(zdot, root.join("zsh"));
-        for name in [
-            "crane-init.zsh",
-            ".zshenv",
-            ".zprofile",
-            ".zshrc",
-            ".zlogin",
-        ] {
+        for name in ZSH_SHIM_FILES {
             assert!(zdot.join(name).exists(), "missing {name}");
         }
         assert_eq!(bash_rcfile_at(&root), root.join("crane-init.bash"));
@@ -230,6 +284,67 @@ mod tests {
         );
         assert_eq!(user_zdotdir_excluding(None, &crane), None);
         assert_eq!(user_zdotdir_excluding(Some("".into()), &crane), None);
+    }
+
+    /// A *different* Crane's shim dir (second install, or `sudo -E crane`
+    /// under another `HOME`) matches neither the literal nor the canonical
+    /// compare against this process's `HOME`-derived dir, so it has to be
+    /// recognised by its contents — otherwise it gets forwarded as the user's
+    /// and strands their real config exactly like the nested-Crane case.
+    #[test]
+    fn another_cranes_shim_dir_is_not_mistaken_for_the_users() {
+        let root = temp_root("other-crane");
+        install_shell_scripts_at(&root);
+        let other = zsh_zdotdir_at(&root);
+        // "Our" dir is somewhere else entirely — a different HOME.
+        let ours = PathBuf::from("/home/someone-else/.crane/shell/zsh");
+
+        assert_eq!(
+            user_zdotdir_excluding(Some(other.clone().into_os_string()), &ours),
+            None,
+            "a shim dir belonging to another Crane is still not the user's"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// FIX: without an existence guard, a failed install (read-only `$HOME`,
+    /// quota, sandboxed or unset `HOME`) still had Crane export `ZDOTDIR` /
+    /// pass `--rcfile` at paths that were never written. Both mechanisms
+    /// REPLACE the user's startup files, so the shell came up with no prompt,
+    /// no aliases and no PATH — worse than no integration. Missing install
+    /// must mean "spawn a plain shell".
+    #[test]
+    fn a_missing_install_yields_no_shell_env_at_all() {
+        let root = temp_root("missing");
+        assert!(!root.exists());
+
+        assert_eq!(installed_zsh_zdotdir_at(&root), None);
+        assert_eq!(installed_bash_rcfile_at(&root), None);
+
+        // A partial install is just as fatal: ZDOTDIR redirects *every* startup
+        // file, so one shim missing is one of the user's rc files silently
+        // never loading. All-or-nothing.
+        let zdot = zsh_zdotdir_at(&root);
+        std::fs::create_dir_all(&zdot).unwrap();
+        for name in ZSH_SHIM_FILES.iter().skip(1) {
+            std::fs::write(zdot.join(name), "x").unwrap();
+        }
+        assert_eq!(
+            installed_zsh_zdotdir_at(&root),
+            None,
+            "a shim dir missing one file must not be used"
+        );
+
+        // And a real install is accepted.
+        install_shell_scripts_at(&root);
+        assert_eq!(installed_zsh_zdotdir_at(&root), Some(zdot));
+        assert_eq!(
+            installed_bash_rcfile_at(&root),
+            Some(bash_rcfile_at(&root))
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A genuinely user-set ZDOTDIR still reaches the shim — without it, a user
