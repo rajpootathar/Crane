@@ -84,6 +84,19 @@ impl ShellRecorder {
     }
 }
 
+/// Translates the `live_cwd` cell's raw contents (empty string is the
+/// "no `Cwd` event yet" sentinel) into the `Option` shape `live_cwd()`
+/// hands callers. Split out from the accessor so the empty-vs-populated
+/// behavior is unit-testable without spinning up a full PTY-backed
+/// `TerminalController`.
+fn empty_to_none(raw: String) -> Option<String> {
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
 pub struct TerminalController {
     pub term: Arc<Mutex<Term>>,
     pub parser: Arc<Mutex<Processor>>,
@@ -126,6 +139,12 @@ pub struct TerminalController {
     /// keys alone so an uninstrumented shell (bare `ssh`, fish, …) behaves
     /// exactly as before.
     shell_integration_active: Arc<AtomicBool>,
+    /// The shell's live cwd, updated by the reader thread whenever an OSC 633
+    /// `P;Cwd=` event arrives. Empty until the first such event. Distinct from
+    /// `cwd` (the spawn directory, which never changes): this is what the
+    /// ranked-history "current directory" tie-break should actually use, since
+    /// the user `cd`s around after spawn.
+    live_cwd: Arc<Mutex<String>>,
 }
 
 impl TerminalController {
@@ -286,6 +305,7 @@ impl TerminalController {
         let bell_notify = Arc::new(AtomicBool::new(false));
         let shell_integration_active = Arc::new(AtomicBool::new(false));
         let notif_queue: Arc<Mutex<Vec<TermNotification>>> = Arc::new(Mutex::new(Vec::new()));
+        let live_cwd = Arc::new(Mutex::new(String::new()));
 
         // Reader thread: PTY -> crane_term, write back replies, wake the UI.
         // Lock order is ALWAYS parser-then-term (deadlock-critical).
@@ -298,6 +318,7 @@ impl TerminalController {
             let bell_notify = bell_notify.clone();
             let shell_integration_active = shell_integration_active.clone();
             let notif_queue = notif_queue.clone();
+            let live_cwd = live_cwd.clone();
             Some(thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -362,6 +383,14 @@ impl TerminalController {
                             // infallible by contract, so this can neither block
                             // meaningfully nor panic the reader.
                             for ev in shell_events {
+                                // Publish the live cwd for the UI thread's
+                                // ranked-history tie-break. Inspect by reference
+                                // (feed() moves ev) and lock only this cell —
+                                // never the term or store locks at the same
+                                // time.
+                                if let ShellIntegrationEvent::Cwd(p) = &ev {
+                                    *live_cwd.lock() = p.clone();
+                                }
                                 if let Some(entry) = recorder.feed(ev) {
                                     crate::warpui::history_store::store().lock().append(entry);
                                 }
@@ -395,6 +424,7 @@ impl TerminalController {
             session_id,
             restored_session_ids: Vec::new(),
             shell_integration_active,
+            live_cwd,
         })
     }
 
@@ -416,6 +446,14 @@ impl TerminalController {
     /// interception — an uninstrumented shell keeps its native arrow behaviour.
     pub fn shell_integration_active(&self) -> bool {
         self.shell_integration_active.load(Ordering::Relaxed)
+    }
+
+    /// The shell's live cwd as of the most recent OSC 633 `P;Cwd=` event, or
+    /// `None` if none has arrived yet (caller should fall back to the spawn
+    /// `cwd`). Locks, clones, and drops immediately — never held across
+    /// another lock.
+    pub fn live_cwd(&self) -> Option<String> {
+        empty_to_none(self.live_cwd.lock().clone())
     }
 
     /// Drain the desktop notifications (OSC 9 / OSC 777) buffered by the reader
@@ -574,6 +612,29 @@ mod recorder_tests {
         let mut rec = ShellRecorder::new(1);
         // A bare prompt with no command typed (user hit Enter on empty line).
         assert!(rec.feed(CommandFinished { exit: Some(0) }).is_none());
+    }
+}
+
+#[cfg(test)]
+mod live_cwd_tests {
+    use super::*;
+
+    #[test]
+    fn empty_cell_reports_no_live_cwd() {
+        // Mirrors the cell's initial state from `TerminalController::new`
+        // before any OSC 633 `P;Cwd=` event has arrived — callers must fall
+        // back to the spawn cwd rather than treat "" as a real directory.
+        assert_eq!(empty_to_none(String::new()), None);
+    }
+
+    #[test]
+    fn populated_cell_reports_the_live_cwd() {
+        // Mirrors the reader thread's `*live_cwd.lock() = p.clone()` update
+        // once a `Cwd` event has been observed.
+        assert_eq!(
+            empty_to_none("/tmp/project".to_string()),
+            Some("/tmp/project".to_string())
+        );
     }
 }
 

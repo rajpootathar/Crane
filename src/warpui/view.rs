@@ -1040,7 +1040,9 @@ impl TerminalView {
             && ctrl.shell_integration_active()
             && !ctrl.term.lock().is_app_cursor()
         {
-            let pwd = ctrl.cwd.to_string_lossy().into_owned();
+            let pwd = ctrl
+                .live_cwd()
+                .unwrap_or_else(|| ctrl.cwd.to_string_lossy().into_owned());
             // Take the store lock, rank, clone the commands we need into owned
             // Strings, and DROP the guard — all inside this block — before
             // touching any other lock or writing to the PTY. `rank` hands back
