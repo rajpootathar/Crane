@@ -637,9 +637,15 @@ impl WarpMarkdownView {
         }
     }
 
-    /// Render raw Markdown `text` under `title` (e.g. an in-memory doc / preview).
-    /// Kept for future callers (git-log / markdown preview); not yet wired.
-    #[allow(dead_code)]
+    /// Render raw Markdown `text` under `title` — an in-memory document with NO
+    /// backing file. The resulting view reports `path() == None`, which means
+    /// the shell's save-side collector (`build_state`'s `markdowns` pass, which
+    /// skips a pathless view) CANNOT persist it: the pane would come back as a
+    /// terminal after a restart.
+    ///
+    /// So: never build a view for a REAL file with this constructor. Use
+    /// `from_file_source` below, which takes the same in-memory text but binds
+    /// it to the path it came from.
     pub fn from_source(ctx: &mut ViewContext<Self>, title: String, text: String) -> Self {
         let (prose, mono) = Self::fonts(ctx);
         Self {
@@ -650,6 +656,26 @@ impl WarpMarkdownView {
             scroll: 0,
             path: None,
         }
+    }
+
+    /// Render `text` as the rendered preview of the file at `path`, WITHOUT
+    /// re-reading that file from disk. This is what the Markdown pane's
+    /// edit→preview toggle uses: the text comes from the editor's LIVE buffer,
+    /// so unsaved edits show up in the preview immediately.
+    ///
+    /// The important half is that the view still carries `path` — a preview of
+    /// a real file built through `from_source` alone would be pathless and
+    /// therefore unpersistable (see `from_source`'s doc comment). Binding the
+    /// path here, inside the constructor, is what makes that impossible to
+    /// forget at a call site.
+    pub fn from_file_source(ctx: &mut ViewContext<Self>, path: PathBuf, text: String) -> Self {
+        let title = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let mut view = Self::from_source(ctx, title, text);
+        view.path = Some(path);
+        view
     }
 
     pub fn title(&self) -> &str {

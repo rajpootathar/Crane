@@ -306,6 +306,15 @@ pub struct CraneShellView {
     /// cached for the same reason: every pane showing the same image shares
     /// one decoded view rather than re-reading the file per pane.
     image_views: HashMap<PathBuf, ViewHandle<crate::warpui::image_view::WarpImageView>>,
+    /// `.md` paths the user switched into EDIT mode via the pane header's
+    /// toggle. Absent = the rendered preview (the default for every `.md`
+    /// file); present = the raw source in a `WarpEditorView`.
+    ///
+    /// Keyed by PATH, not by pane, for the same reason `markdown_views` /
+    /// `editor_views` are: the mode is a property of the document, so it
+    /// follows the file across panes, across File Tab switches, and — via
+    /// `SMarkdown::editing` — across restarts.
+    md_edit_mode: HashSet<PathBuf>,
     /// Cached terminal snapshots (cwd + ANSI scrollback) for persistence.
     /// Refreshed on every action but time-debounced so per-keystroke cost stays
     /// low while still capturing recent command output.
@@ -1204,6 +1213,46 @@ fn markdown_path_set<'a>(
     document_path_set(markdown_paths, saved_paths, is_markdown_path)
 }
 
+/// The `.md` paths the user left in EDIT mode, read back off the saved
+/// `markdowns` records (`SMarkdown::editing`). Empty paths are dropped for the
+/// same reason `document_path_set` drops them: a stale/corrupt default names no
+/// document.
+///
+/// This is the restore-side twin of the live `md_edit_mode` set, and it feeds
+/// straight into it — which is what makes the preview/edit choice survive a
+/// restart in BOTH directions.
+fn markdown_edit_path_set<'a>(
+    markdowns: impl IntoIterator<Item = &'a crate::warpui::persist::SMarkdown>,
+) -> HashSet<PathBuf> {
+    markdowns
+        .into_iter()
+        .filter(|sm| sm.editing && !sm.path.as_os_str().is_empty())
+        .map(|sm| sm.path.clone())
+        .collect()
+}
+
+/// `markdown_path_set` MINUS every path left in edit mode — i.e. the paths that
+/// restore as a rendered Markdown pane, as opposed to every path that merely IS
+/// markdown.
+///
+/// Doing the subtraction here, once, rather than at each consumer is what keeps
+/// the three restore decisions in agreement:
+///  - `editor_paths_for_restore` excludes `md_paths`, so removing an edit-mode
+///    path from that set is exactly what earns it an editor buffer in the
+///    pre-pass (without this, an edit-mode `.md` file would be excluded from
+///    the editor pre-pass AND resolve to Editor in the ladder, so its handle
+///    lookup would miss and the leaf would degrade to a fresh terminal);
+///  - `restored_pane_kind`'s files-pane branch consults `md_paths` and now
+///    falls through to `Editor` for an edit-mode path; and
+///  - the markdown-view pre-pass iterates `md_paths`, so an edit-mode path
+///    correctly never gets a `markdown_views` handle it wouldn't show.
+fn markdown_preview_path_set(
+    md_paths: HashSet<PathBuf>,
+    md_edit: &HashSet<PathBuf>,
+) -> HashSet<PathBuf> {
+    md_paths.into_iter().filter(|p| !md_edit.contains(p)).collect()
+}
+
 /// The Files-pane saved paths that must get an EDITOR handle at restore —
 /// every `saved_paths` entry except the ones in `md_paths` / `img_paths`
 /// (those get a Markdown / Image handle instead, built from those sets
@@ -1244,7 +1293,13 @@ enum RestoredPaneKind {
     /// `open_file` assigns an Image pane to the shared Files Pane slot exactly
     /// the way it assigns a Markdown one.
     Image { path: PathBuf, is_files_pane: bool },
-    Editor { path: PathBuf },
+    /// `is_files_pane` carries the same meaning as its `Markdown` / `Image`
+    /// peers. It used to be implicit — `Editor` was reachable ONLY from the
+    /// files-pane branch, so `files_pane_bookkeeping` could hardcode `true`.
+    /// Markdown edit mode broke that: a standalone Markdown pane (one that is
+    /// not its Workspace's Files Pane) left in edit mode now restores as an
+    /// Editor too, and it must NOT claim the Files Pane slot.
+    Editor { path: PathBuf, is_files_pane: bool },
     Browser,
     Terminal,
     FreshTerminal,
@@ -1260,6 +1315,44 @@ enum RestoredPaneKind {
 /// caller lifts that guard.
 fn clamped_active_index(saved_active: usize, saved_paths_len: usize) -> usize {
     saved_active.min(saved_paths_len.saturating_sub(1))
+}
+
+/// The `(project, workspace, tab)` a Ctrl+` project-cycle lands on.
+///
+/// `projects[pi][wi]` is the first tab id of that workspace, or `None` when the
+/// workspace owns no tab. Walks from `cur` in the chosen direction (`backward`
+/// = Ctrl+Shift+`), wrapping, and returns the first workspace of the first
+/// project that owns a tab — so a not-yet-populated project is stepped over
+/// rather than dead-ending the cycle. `None` when there is nowhere to go: fewer
+/// than two projects, or no *other* project owns a tab.
+///
+/// Pure so the wrap-around / skip / direction logic is pinned without a live
+/// shell; the handler feeds it a snapshot of `worktree_tabs` and resolves the
+/// returned key back to a workspace path.
+fn cycle_project_landing(
+    projects: &[Vec<Option<usize>>],
+    cur: usize,
+    backward: bool,
+) -> Option<(usize, usize, usize)> {
+    let n = projects.len();
+    if n <= 1 {
+        return None;
+    }
+    for step in 1..n {
+        let target = if backward {
+            (cur + n - step) % n
+        } else {
+            (cur + step) % n
+        };
+        if let Some(project) = projects.get(target) {
+            for (wi, first) in project.iter().enumerate() {
+                if let Some(tid) = first {
+                    return Some((target, wi, *tid));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The pane content a saved leaf `pid` should restore as, decided entirely
@@ -1293,6 +1386,7 @@ fn restored_pane_kind(
     saved_active: usize,
     md_paths: &HashSet<PathBuf>,
     img_paths: &HashSet<PathBuf>,
+    md_edit: &HashSet<PathBuf>,
     markdown_path: Option<&PathBuf>,
     image_path: Option<&PathBuf>,
     is_browser: bool,
@@ -1311,16 +1405,30 @@ fn restored_pane_kind(
         if img_paths.contains(&path) {
             RestoredPaneKind::Image { path, is_files_pane: true }
         } else if md_paths.contains(&path) {
+            // `md_paths` is the PREVIEW set (`markdown_preview_path_set`), so an
+            // edit-mode `.md` file is already absent from it and falls through
+            // to the Editor arm below — which is exactly right: it is a Files
+            // Pane showing a text buffer.
             RestoredPaneKind::Markdown { path, is_files_pane: true }
         } else {
-            RestoredPaneKind::Editor { path }
+            RestoredPaneKind::Editor { path, is_files_pane: true }
         }
     } else if is_browser {
         RestoredPaneKind::Browser
     } else if let Some(path) = image_path.filter(|p| !p.as_os_str().is_empty()) {
         RestoredPaneKind::Image { path: path.clone(), is_files_pane: false }
     } else if let Some(path) = markdown_path.filter(|p| !p.as_os_str().is_empty()) {
-        RestoredPaneKind::Markdown { path: path.clone(), is_files_pane: false }
+        // A STANDALONE `.md` pane (reachable: open a doc in Tab 1, then open a
+        // second file in Tab 2 — the Files Pane slot moves, this pane keeps only
+        // its per-pid `markdowns` record). If the user left it in edit mode it
+        // must come back as an Editor, NOT as a preview and — critically — not
+        // as a fresh terminal, which is what filtering it out of `markdown_path`
+        // at the call site would have produced.
+        if md_edit.contains(path) {
+            RestoredPaneKind::Editor { path: path.clone(), is_files_pane: false }
+        } else {
+            RestoredPaneKind::Markdown { path: path.clone(), is_files_pane: false }
+        }
     } else if is_terminal {
         RestoredPaneKind::Terminal
     } else {
@@ -1330,10 +1438,16 @@ fn restored_pane_kind(
 
 /// Files-pane bookkeeping for a restored leaf: the pane id that becomes the
 /// Files Pane, its tab list, and the clamped active index. `Some` for an
-/// Editor leaf and for a Markdown leaf that is also the saved Files pane
-/// (`RestoredPaneKind::Markdown { is_files_pane: true, .. }`); `None` for a
-/// standalone Markdown leaf, a Browser leaf, a Terminal leaf, or a
-/// FreshTerminal leaf — none of those are the shared Files pane.
+/// Editor / Markdown / Image leaf that is also the saved Files pane
+/// (`is_files_pane: true`); `None` for a standalone document leaf, a Browser
+/// leaf, a Terminal leaf, or a FreshTerminal leaf — none of those are the
+/// shared Files pane.
+///
+/// `Editor` used to be `true` unconditionally, because the ladder could only
+/// reach it from the files-pane branch. Markdown edit mode added a second route
+/// (a standalone `.md` pane left in edit mode), so the flag is now read off the
+/// variant like its peers — a standalone editor must not hijack the Files Pane
+/// slot and retarget the File Tab strip onto a pane that owns no tabs.
 ///
 /// This is the half of the fix for "files_pane came back None, so the next
 /// open split a duplicate pane" that actually performs the assignment
@@ -1356,8 +1470,8 @@ fn files_pane_bookkeeping(
 ) -> Option<(PaneId, Vec<PathBuf>, usize)> {
     let is_files_pane = match kind {
         RestoredPaneKind::Markdown { is_files_pane, .. }
-        | RestoredPaneKind::Image { is_files_pane, .. } => *is_files_pane,
-        RestoredPaneKind::Editor { .. } => true,
+        | RestoredPaneKind::Image { is_files_pane, .. }
+        | RestoredPaneKind::Editor { is_files_pane, .. } => *is_files_pane,
         RestoredPaneKind::Browser | RestoredPaneKind::Terminal | RestoredPaneKind::FreshTerminal => {
             false
         }
@@ -1588,6 +1702,9 @@ impl CraneShellView {
             PathBuf,
             ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>,
         > = HashMap::new();
+        // `.md` paths the saved state says were left in EDIT mode — seeds the
+        // live `md_edit_mode` set so the preview/edit choice survives a restart.
+        let mut restored_md_edit: HashSet<PathBuf> = HashSet::new();
         let mut restored_images: HashMap<PaneId, crate::warpui::persist::SImage> = HashMap::new();
         let mut restored_image_views: HashMap<
             PathBuf,
@@ -1831,12 +1948,24 @@ impl CraneShellView {
             // pane sharing a path pointed at the SAME live view instance
             // (matching how `open_file` shares handles across panes at
             // runtime). See `restored_pane_kind` for the per-pane decision.
-            let md_paths = markdown_path_set(
-                restored_markdowns
-                    .iter()
-                    .filter(|(pid, _)| reachable_pids.contains(pid))
-                    .map(|(_, sm)| &sm.path),
-                effective_saved_paths,
+            // Which `.md` documents the user left in EDIT mode. Read from every
+            // saved `markdowns` record (not just the reachable ones): the mode
+            // is keyed by PATH, so a record whose pane id no longer resolves
+            // still tells us how the user wants that document shown.
+            restored_md_edit = markdown_edit_path_set(restored_markdowns.values());
+            // The paths that restore as a RENDERED preview: every markdown path
+            // minus the edit-mode ones. See `markdown_preview_path_set` for why
+            // this single subtraction is what keeps the pre-passes and the
+            // per-pane ladder in agreement.
+            let md_paths = markdown_preview_path_set(
+                markdown_path_set(
+                    restored_markdowns
+                        .iter()
+                        .filter(|(pid, _)| reachable_pids.contains(pid))
+                        .map(|(_, sm)| &sm.path),
+                    effective_saved_paths,
+                ),
+                &restored_md_edit,
             );
             for p in &md_paths {
                 let pc = p.clone();
@@ -1860,10 +1989,30 @@ impl CraneShellView {
                 });
                 restored_image_views.insert(p.clone(), h);
             }
-            if !effective_saved_paths.is_empty() {
+            // Every path the editor pre-pass must consider: the Files-Pane tab
+            // lists, PLUS every reachable `.md` pane the user left in edit mode.
+            // The second half matters for a STANDALONE markdown pane — one that
+            // is not its Workspace's Files Pane, so it has no `file_pane_paths`
+            // entry at all. `restored_pane_kind` now resolves such a leaf to
+            // `Editor`, and without a handle built here that lookup would miss
+            // and the pane would degrade to a fresh terminal.
+            let editor_source_paths: Vec<PathBuf> = {
+                let mut out = effective_saved_paths.to_vec();
+                let mut seen: HashSet<PathBuf> = out.iter().cloned().collect();
+                for (pid, sm) in &restored_markdowns {
+                    if reachable_pids.contains(pid)
+                        && restored_md_edit.contains(&sm.path)
+                        && seen.insert(sm.path.clone())
+                    {
+                        out.push(sm.path.clone());
+                    }
+                }
+                out
+            };
+            if !editor_source_paths.is_empty() {
                 let mono = warpui::fonts::Cache::handle(ctx)
                     .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
-                for p in editor_paths_for_restore(effective_saved_paths, &md_paths, &img_paths) {
+                for p in editor_paths_for_restore(&editor_source_paths, &md_paths, &img_paths) {
                     // Mirror `open_file`'s binary guard (see its own comment
                     // next to `std::fs::read(&path).map(String::from_utf8)`):
                     // `read_to_string(p).unwrap_or_default()` used to turn any
@@ -1934,6 +2083,7 @@ impl CraneShellView {
                             saved_active,
                             &md_paths,
                             &img_paths,
+                            &restored_md_edit,
                             markdown_path,
                             image_path,
                             is_browser,
@@ -1980,7 +2130,7 @@ impl CraneShellView {
                                 };
                                 panes.insert(pid, PaneContent::Image(h));
                             }
-                            RestoredPaneKind::Editor { path } => {
+                            RestoredPaneKind::Editor { path, .. } => {
                                 // Same lockstep assumption as the Markdown arm
                                 // above, for the editor pre-pass / `editor_views`.
                                 let Some(h) = restored_editor_views.get(path).cloned() else {
@@ -2306,6 +2456,7 @@ impl CraneShellView {
             editor_views: restored_editor_views,
             markdown_views: restored_markdown_views,
             image_views: restored_image_views,
+            md_edit_mode: restored_md_edit,
             term_cache: RefCell::new(restored_term_cache),
             last_term_snapshot: std::cell::Cell::new(None),
             term_cleared: RefCell::new(HashSet::new()),
@@ -2671,20 +2822,41 @@ impl CraneShellView {
                 _ => None,
             })
             .collect();
+        // Both halves of a `.md` document pane persist here:
+        //  - a Markdown pane (the rendered preview), and
+        //  - an EDITOR pane whose file is a `.md` — that is a markdown document
+        //    the user toggled into edit mode, and it needs an `SMarkdown`
+        //    record just as much. Recording only the preview half would mean
+        //    "toggle to edit, then quit" loses the pane entirely: nothing would
+        //    name that leaf, so restore would bring it back as a fresh terminal
+        //    — the exact regression `markdowns` exists to prevent, reintroduced
+        //    through the back door.
+        //
+        // `editing` is written from the live `md_edit_mode` set, so the mode the
+        // user chose is what comes back. An Editor pane on a `.md` file is
+        // edit mode BY CONSTRUCTION, so it pins `true` regardless: the record
+        // must describe the pane that actually exists, never a mode that would
+        // restore it as something else.
         let markdowns: Vec<(PaneId, crate::warpui::persist::SMarkdown)> = self
             .panes
             .iter()
-            .filter_map(|(id, pc)| match pc {
-                PaneContent::Markdown(h) => h.as_ref(app).path().map(|p| {
-                    (
-                        *id,
-                        crate::warpui::persist::SMarkdown {
-                            path: p.to_path_buf(),
-                            editing: false,
-                        },
-                    )
-                }),
-                _ => None,
+            .filter_map(|(id, pc)| {
+                let (path, editing) = match pc {
+                    PaneContent::Markdown(h) => {
+                        let p = h.as_ref(app).path()?.to_path_buf();
+                        let editing = self.md_edit_mode.contains(&p);
+                        (p, editing)
+                    }
+                    PaneContent::Editor(h) => {
+                        let p = h.as_ref(app).file_path().to_path_buf();
+                        if !is_markdown_path(&p) {
+                            return None;
+                        }
+                        (p, true)
+                    }
+                    _ => return None,
+                };
+                Some((*id, crate::warpui::persist::SMarkdown { path, editing }))
             })
             .collect();
         let images: Vec<(PaneId, crate::warpui::persist::SImage)> = self
@@ -8812,6 +8984,11 @@ impl CraneShellView {
     fn worktree_nav_row(
         &self,
         expanded: bool,
+        // Stable per-row identity (`wt:{pi}:{wi}`) backing the dirty-dot
+        // tooltip's persistent hover handle. Must be unique among rows on
+        // screen at once — two Projects can both have a `main` Workspace, so
+        // the display name alone is not enough.
+        row_key: &str,
         name: &str,
         icon_color: ColorU,
         label_color: ColorU,
@@ -8833,7 +9010,12 @@ impl CraneShellView {
         } else {
             icons::CARET_RIGHT
         };
+        // Center on the cross axis: `Flex` defaults to `CrossAxisAlignment::Start`,
+        // which top-aligns every child against the tallest one (the 12pt label).
+        // The 6x6 dirty dot and the 9pt caret are far shorter, so they visibly
+        // rode high in the row instead of sitting on the label's centreline.
         let mut row_inner = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(
                 Container::new(self.icon(caret_glyph, 9.0, theme::text_muted()))
                     .with_padding_right(3.0)
@@ -8887,21 +9069,29 @@ impl CraneShellView {
         // 3px filled add-colour dot so the branch still signals uncommitted
         // content. Rendered as a 6x6 fully-rounded (→ circular) success Rect.
         if added == 0 && deleted == 0 && dirty {
-            row_inner = row_inner.with_child(
-                Container::new(
-                    ConstrainedBox::new(
-                        Rect::new()
-                            .with_background_color(theme::success())
-                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
-                            .finish(),
-                    )
-                    .with_width(6.0)
-                    .with_height(6.0)
-                    .finish(),
+            // The bare dot reads as a status light with no legend — users have
+            // mistaken it for the Left Panel's notification pulse (same 6x6
+            // circle, same right-hand side of the row). A hover tooltip names
+            // it. The 6x6 dot alone is too small a hover target, so the
+            // tooltip wraps the padded Container (12x6) rather than the Rect.
+            let dot = Container::new(
+                ConstrainedBox::new(
+                    Rect::new()
+                        .with_background_color(theme::success())
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.0)))
+                        .finish(),
                 )
-                .with_padding_right(6.0)
+                .with_width(6.0)
+                .with_height(6.0)
                 .finish(),
-            );
+            )
+            .with_padding_right(6.0)
+            .finish();
+            row_inner = row_inner.with_child(self.with_tooltip(
+                &format!("wtdirty:{row_key}"),
+                "Uncommitted changes",
+                dot,
+            ));
         }
         if added > 0 {
             row_inner = row_inner.with_child(
@@ -9576,8 +9766,10 @@ impl CraneShellView {
                 };
                 // Feature 1: pass the worktree's cached diff-stat to the row builder so
                 // it renders the +N -M badge at the right side of the branch row.
+                let wt_key = format!("wt:{pi}:{wi}");
                 let wt_base = self.worktree_nav_row(
                     w_expanded,
+                    &wt_key,
                     &display,
                     wicon,
                     wcol,
@@ -9588,7 +9780,7 @@ impl CraneShellView {
                     wt_action,
                     Some(CraneShellAction::NewTabIn(pi, wi)),
                 );
-                let wt_base = self.row_shell(&format!("wt:{pi}:{wi}"), w_tier, wt_base);
+                let wt_base = self.row_shell(&wt_key, w_tier, wt_base);
                 // Right-click opens the worktree/branch context menu (mirrors the
                 // project row) without disturbing the left-click toggle.
                 let wt_row = EventHandler::new(wt_base)
@@ -11557,10 +11749,41 @@ impl CraneShellView {
             .finish()
         };
 
+        // A `.md` document gets an edit⇄preview toggle: PENCIL_SIMPLE while the
+        // rendered preview is showing (→ edit the source), FILE_TEXT while its
+        // editor is showing (→ back to the rendered preview). `icons.rs` ships
+        // no EYE glyph, so the rendered-doc icon stands in for old Crane's
+        // "Preview" affordance. `ToggleMarkdownMode` flips `md_edit_mode` and
+        // swaps this pane's content in place.
+        let md_toggle: Option<Box<dyn Element>> = match self.panes.get(&id) {
+            Some(PaneContent::Markdown(h)) => h.as_ref(app).path().map(|p| {
+                let p = p.to_path_buf();
+                self.icon_button(
+                    &format!("md-mode:{id}"),
+                    icons::PENCIL_SIMPLE,
+                    CraneShellAction::ToggleMarkdownMode { path: p, pane: id },
+                )
+            }),
+            Some(PaneContent::Editor(h)) => {
+                let p = h.as_ref(app).file_path().to_path_buf();
+                is_markdown_path(&p).then(|| {
+                    self.icon_button(
+                        &format!("md-mode:{id}"),
+                        icons::FILE_TEXT,
+                        CraneShellAction::ToggleMarkdownMode { path: p, pane: id },
+                    )
+                })
+            }
+            _ => None,
+        };
+
         // The Expanded title fills the row, pushing these to the right edge.
+        let mut btn_row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        if let Some(tb) = md_toggle {
+            btn_row = btn_row.with_child(tb).with_child(Self::spacer(2.0));
+        }
         let buttons = Container::new(
-            Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            btn_row
                 .with_child(self.icon_button(&format!("pane-max:{id}"), icons::ARROWS_OUT, CraneShellAction::ToggleMaximize(id)))
                 .with_child(Self::spacer(2.0))
                 .with_child(self.icon_button(&format!("pane-close:{id}"), icons::X, CraneShellAction::ClosePane(id)))
@@ -11872,9 +12095,17 @@ impl CraneShellView {
         // is pure and unit-tested) rather than an `is_x_path` call per branch,
         // so the Markdown / Image / Editor partition can't drift apart here.
         let route = open_file_route(&path);
-        // Markdown files render read-only in a Markdown pane instead of the
-        // editor (peer of the editor path below, same placement / reuse logic).
-        if route == OpenFileRoute::Markdown {
+        // Markdown files render in a Markdown pane instead of the editor (peer
+        // of the editor path below, same placement / reuse logic) — UNLESS the
+        // user put this document into edit mode via the pane header's toggle,
+        // in which case it opens in the editor like any other text file.
+        //
+        // The edit-mode check lives HERE rather than inside `open_file_route`
+        // on purpose: that function is pure and path-only (and unit-tested that
+        // way), so it stays the single answer to "what kind of file is this?"
+        // while this line answers the separate question "how does the user want
+        // to see it right now?".
+        if route == OpenFileRoute::Markdown && !self.md_edit_mode.contains(&path) {
             let handle = if let Some(h) = self.markdown_views.get(&path) {
                 h.clone()
             } else {
@@ -12058,16 +12289,26 @@ impl CraneShellView {
     /// shared Files Pane to whichever kind this path actually is; returning
     /// `None` here leaves the pane showing the PREVIOUSLY selected tab's
     /// content while the tab strip highlights the new one.
+    /// A `.md` path in `md_edit_mode` deliberately skips the Markdown branch:
+    /// the header toggle put an editor on that document, and clicking its File
+    /// Tab must not silently flip it back to the rendered preview. The trailing
+    /// `markdown_views` fallback keeps the pre-edit-mode behaviour for the case
+    /// where the mode is set but no editor buffer exists yet.
     fn file_tab_pane(&self, path: &PathBuf) -> Option<PaneContent> {
         if let Some(h) = self.image_views.get(path) {
-            Some(PaneContent::Image(h.clone()))
-        } else if let Some(h) = self.markdown_views.get(path) {
-            Some(PaneContent::Markdown(h.clone()))
-        } else {
-            self.editor_views
-                .get(path)
-                .map(|h| PaneContent::Editor(h.clone()))
+            return Some(PaneContent::Image(h.clone()));
         }
+        if !self.md_edit_mode.contains(path) {
+            if let Some(h) = self.markdown_views.get(path) {
+                return Some(PaneContent::Markdown(h.clone()));
+            }
+        }
+        if let Some(h) = self.editor_views.get(path) {
+            return Some(PaneContent::Editor(h.clone()));
+        }
+        self.markdown_views
+            .get(path)
+            .map(|h| PaneContent::Markdown(h.clone()))
     }
 
     // ── LSP ──────────────────────────────────────────────────────────────────
@@ -13947,6 +14188,16 @@ impl View for CraneShellView {
                     ctx.dispatch_typed_action(CraneShellAction::CloseContextMenu);
                     return DispatchEventResult::StopPropagation;
                 }
+                // Ctrl+` cycles Projects in the Left Panel (Ctrl+Shift+` =
+                // previous). A dedicated Ctrl chord kept off Cmd+`, which stays
+                // the Tab switcher. Backtick is not a terminal control code, so
+                // intercepting just this key leaves normal Ctrl input untouched.
+                if ks.ctrl && !ks.cmd && !ks.alt && (ks.key == "`" || ks.key == "~") {
+                    ctx.dispatch_typed_action(CraneShellAction::CycleProject(
+                        ks.shift || ks.key == "~",
+                    ));
+                    return DispatchEventResult::StopPropagation;
+                }
                 if ks.cmd && !ks.ctrl && !ks.alt {
                     // Shift uppercases the key ("D"), so normalize the case.
                     let key = ks.key.to_ascii_lowercase();
@@ -14139,6 +14390,12 @@ pub enum CraneShellAction {
     ClearFocused,
     /// Cmd+S save the focused File pane.
     SaveFocusedFile,
+    /// Flip a `.md` document between its rendered preview and the source
+    /// editor (the pane-header toggle). Toggles the path in `md_edit_mode`
+    /// and swaps every pane showing that document in place — Markdown⇄Editor.
+    /// `pane` is the header the click came from, so focus lands back on it
+    /// even when the document is shown in more than one pane.
+    ToggleMarkdownMode { path: PathBuf, pane: PaneId },
     /// Open the editor's Find bar / Replace bar / Goto-line input.
     FindFocused,
     ReplaceFocused,
@@ -14227,6 +14484,11 @@ pub enum CraneShellAction {
     FocusPrevPane,
     /// Cmd+] focus the next leaf pane (in-order traversal, wrapping).
     FocusNextPane,
+    /// Ctrl+` cycle to the next Project in the Left Panel (Ctrl+Shift+` =
+    /// previous). Lands on that project's first workspace/tab, skipping any
+    /// project that owns no openable tab yet. Distinct from
+    /// `AdvanceTabSwitcher`, which cycles Tabs within the active workspace.
+    CycleProject(bool),
     /// Cmd+Shift+W close the active tab (all panes in it).
     CloseActiveTab,
     /// Open a Git log pane.
@@ -14550,6 +14812,49 @@ impl CraneShellView {
                 self.active_tab = Some(*sel);
                 self.refresh_panel(ctx);
             }
+            CraneShellAction::CycleProject(backward) => {
+                // Current project from the active tab (fall back to the plain
+                // selection when no tab is active yet).
+                let cur = self
+                    .active_tab
+                    .map(|(pi, _, _)| pi)
+                    .unwrap_or(self.selected.0);
+                // Snapshot each workspace's first tab id (None = tabless) so the
+                // pure landing picker owns the wrap-around / skip / direction
+                // logic. Every returned key is a real tab, so `Select` never has
+                // to spawn a fresh terminal for a phantom key.
+                let projects: Vec<Vec<Option<usize>>> = self
+                    .projects
+                    .iter()
+                    .enumerate()
+                    .map(|(pi, p)| {
+                        (0..p.worktrees.len())
+                            .map(|wi| {
+                                self.worktree_tabs
+                                    .get(&(pi, wi))
+                                    .and_then(|t| t.first())
+                                    .map(|t| t.id)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let Some(sel) = cycle_project_landing(&projects, cur, *backward) else {
+                    return;
+                };
+                let Some(path) = self
+                    .projects
+                    .get(sel.0)
+                    .and_then(|p| p.worktrees.get(sel.1))
+                    .map(|w| PathBuf::from(&w.path))
+                else {
+                    return;
+                };
+                // Reveal the destination so the highlighted row is visible — the
+                // target project / workspace may have been collapsed.
+                self.expanded_projects.insert(sel.0);
+                self.expanded_worktrees.insert((sel.0, sel.1));
+                self.handle_action(&CraneShellAction::Select { sel, path }, ctx);
+            }
             CraneShellAction::SplitFocused(dir) => self.split_focused(*dir, ctx),
             // TODO(parity): Cmd+W should close the active File Tab first when a
             // Files/Editor pane has >1 tabs, and stage a running-process confirm
@@ -14678,6 +14983,130 @@ impl CraneShellView {
                         self.lsp.did_save(&path, &text, &self.lsp_configs);
                     }
                 }
+            }
+            CraneShellAction::ToggleMarkdownMode { path, pane } => {
+                let path = path.clone();
+                let pane = *pane;
+                let to_edit = !self.md_edit_mode.contains(&path);
+                if to_edit {
+                    // → Editor. Reuse the cached editor handle when one exists so
+                    // a prior edit session's unsaved buffer survives a round-trip;
+                    // otherwise build it from the file's on-disk content. Guard the
+                    // read exactly as `open_file` does: a `.md` EXTENSION is not a
+                    // UTF-8 guarantee, and `read_to_string().unwrap_or_default()`
+                    // would hand the editor an EMPTY buffer for a Latin-1 /
+                    // mis-named / since-deleted file — a reflexive Cmd+S would then
+                    // truncate the real file to zero bytes. On a bad read, stay in
+                    // the preview (it already shows a "cannot read" message) and do
+                    // NOT enter edit mode.
+                    let handle = if let Some(h) = self.editor_views.get(&path) {
+                        h.clone()
+                    } else {
+                        let content = match std::fs::read(&path).map(String::from_utf8) {
+                            Ok(Ok(s)) => s,
+                            _ => {
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                let tid = self.next_toast_id;
+                                self.next_toast_id = self.next_toast_id.wrapping_add(1);
+                                if self.toasts.len() >= TOAST_MAX {
+                                    self.toasts.pop_front();
+                                }
+                                self.toasts.push_back(Toast {
+                                    id: tid,
+                                    body: format!(
+                                        "“{name}” is not a text file — can't edit it as Markdown source."
+                                    ),
+                                    urgent: false,
+                                    source: "Files".to_string(),
+                                    tab_key: None,
+                                    at: std::time::Instant::now(),
+                                });
+                                ctx.notify();
+                                return;
+                            }
+                        };
+                        let mono = warpui::fonts::Cache::handle(ctx)
+                            .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
+                        let p = path.clone();
+                        let goto = Self::lsp_goto_cb(path.clone());
+                        let h = ctx.add_typed_action_view(move |ctx| {
+                            crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, p)
+                                .with_goto(goto)
+                        });
+                        let wrap = self.word_wrap_default;
+                        let trim = self.trim_on_save;
+                        h.update(ctx, |v, vctx| {
+                            if wrap {
+                                v.set_word_wrap(true, vctx);
+                            }
+                            v.set_trim_on_save(trim);
+                        });
+                        self.editor_views.insert(path.clone(), h.clone());
+                        h
+                    };
+                    // Swap every pane showing this document's preview to the
+                    // editor (handles are shared across panes, so there may be
+                    // more than one). Clone the handles out first to drop the
+                    // `self.panes` borrow before the `insert`.
+                    let candidates: Vec<(
+                        PaneId,
+                        ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>,
+                    )> = self
+                        .panes
+                        .iter()
+                        .filter_map(|(id, pc)| match pc {
+                            PaneContent::Markdown(h) => Some((*id, h.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    for (id, h) in candidates {
+                        if h.read(ctx, |v, _| v.path() == Some(path.as_path())) {
+                            self.panes.insert(id, PaneContent::Editor(handle.clone()));
+                        }
+                    }
+                    self.md_edit_mode.insert(path);
+                    // Focus lands on the header the click came from, even when the
+                    // document is shown in more than one pane.
+                    self.focused = Some(pane);
+                } else {
+                    // → Preview, rebuilt from the editor's LIVE buffer so unsaved
+                    // edits render immediately. This replaces the cached preview
+                    // handle, whose parsed content is now stale.
+                    let text = self
+                        .editor_views
+                        .get(&path)
+                        .map(|h| h.read(ctx, |v, app| v.buffer_text(app)))
+                        .unwrap_or_else(|| std::fs::read_to_string(&path).unwrap_or_default());
+                    let p = path.clone();
+                    let handle = ctx.add_typed_action_view(move |ctx| {
+                        crate::warpui::markdown_view::WarpMarkdownView::from_file_source(
+                            ctx, p, text,
+                        )
+                    });
+                    self.markdown_views.insert(path.clone(), handle.clone());
+                    let candidates: Vec<(
+                        PaneId,
+                        ViewHandle<crate::warpui::editor_view::WarpEditorView>,
+                    )> = self
+                        .panes
+                        .iter()
+                        .filter_map(|(id, pc)| match pc {
+                            PaneContent::Editor(h) => Some((*id, h.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    for (id, h) in candidates {
+                        if h.read(ctx, |v, _| v.file_path() == path.as_path()) {
+                            self.panes.insert(id, PaneContent::Markdown(handle.clone()));
+                        }
+                    }
+                    self.md_edit_mode.remove(&path);
+                    self.focused = Some(pane);
+                }
+                ctx.notify();
             }
             CraneShellAction::FindFocused => {
                 if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
@@ -16620,6 +17049,115 @@ mod diff_chip_tests {
 }
 
 #[cfg(test)]
+mod cycle_project_tests {
+    use super::cycle_project_landing;
+
+    // A workspace with one tab whose id is `tid`.
+    fn one(tid: usize) -> Vec<Option<usize>> {
+        vec![Some(tid)]
+    }
+
+    #[test]
+    fn forward_advances_to_the_next_project_and_wraps() {
+        let projects = vec![one(10), one(20), one(30)];
+        assert_eq!(cycle_project_landing(&projects, 0, false), Some((1, 0, 20)));
+        assert_eq!(cycle_project_landing(&projects, 1, false), Some((2, 0, 30)));
+        // From the last project, forward wraps back to the first.
+        assert_eq!(cycle_project_landing(&projects, 2, false), Some((0, 0, 10)));
+    }
+
+    #[test]
+    fn backward_steps_the_other_way_and_wraps() {
+        let projects = vec![one(10), one(20), one(30)];
+        assert_eq!(cycle_project_landing(&projects, 2, true), Some((1, 0, 20)));
+        assert_eq!(cycle_project_landing(&projects, 1, true), Some((0, 0, 10)));
+        // From the first project, backward wraps to the last.
+        assert_eq!(cycle_project_landing(&projects, 0, true), Some((2, 0, 30)));
+    }
+
+    #[test]
+    fn a_tabless_project_is_stepped_over_not_landed_on() {
+        // Project 1 owns a workspace but no tab yet: forward from 0 must skip it
+        // and land on project 2, never emit a (1, _, _) key that Select would
+        // have to spawn a fresh terminal for.
+        let projects = vec![one(10), vec![None], one(30)];
+        assert_eq!(cycle_project_landing(&projects, 0, false), Some((2, 0, 30)));
+        // Backward from 2 likewise skips project 1 back to project 0.
+        assert_eq!(cycle_project_landing(&projects, 2, true), Some((0, 0, 10)));
+    }
+
+    #[test]
+    fn lands_on_the_first_workspace_that_owns_a_tab() {
+        // Project 1's first workspace is tabless; the second owns tab 21.
+        let projects = vec![one(10), vec![None, Some(21)]];
+        assert_eq!(cycle_project_landing(&projects, 0, false), Some((1, 1, 21)));
+    }
+
+    #[test]
+    fn fewer_than_two_projects_has_nowhere_to_go() {
+        assert_eq!(cycle_project_landing(&[], 0, false), None);
+        assert_eq!(cycle_project_landing(&[one(10)], 0, false), None);
+        assert_eq!(cycle_project_landing(&[one(10)], 0, true), None);
+    }
+
+    #[test]
+    fn no_other_project_owns_a_tab_yields_none() {
+        // Current project has a tab; every other is tabless → nothing to cycle to.
+        let projects = vec![one(10), vec![None], vec![None]];
+        assert_eq!(cycle_project_landing(&projects, 0, false), None);
+        assert_eq!(cycle_project_landing(&projects, 0, true), None);
+    }
+}
+
+#[cfg(test)]
+mod markdown_mode_tests {
+    use super::{markdown_edit_path_set, markdown_preview_path_set};
+    use crate::warpui::persist::SMarkdown;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn sm(path: &str, editing: bool) -> SMarkdown {
+        SMarkdown { path: PathBuf::from(path), editing }
+    }
+
+    #[test]
+    fn edit_path_set_keeps_only_editing_nonempty_paths() {
+        let recs = vec![
+            sm("/a/README.md", true),  // edit mode → kept
+            sm("/a/NOTES.md", false),  // rendered preview → excluded
+            sm("", true),              // empty path (corrupt default) → dropped
+        ];
+        assert_eq!(
+            markdown_edit_path_set(&recs),
+            HashSet::from([PathBuf::from("/a/README.md")])
+        );
+    }
+
+    #[test]
+    fn preview_path_set_is_markdown_minus_edit() {
+        let md: HashSet<PathBuf> = ["/a/one.md", "/a/two.md", "/a/three.md"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let edit: HashSet<PathBuf> = ["/a/two.md"].iter().map(PathBuf::from).collect();
+        assert_eq!(
+            markdown_preview_path_set(md, &edit),
+            HashSet::from([PathBuf::from("/a/one.md"), PathBuf::from("/a/three.md")])
+        );
+    }
+
+    #[test]
+    fn an_edit_mode_path_never_appears_in_the_preview_set() {
+        // The core restore invariant this split exists to hold: an edit-mode
+        // `.md` must be excluded from the preview set, or it would restore as
+        // BOTH an editor and a rendered pane (or degrade to a fresh terminal).
+        let md: HashSet<PathBuf> = ["/a/doc.md"].iter().map(PathBuf::from).collect();
+        let edit: HashSet<PathBuf> = ["/a/doc.md"].iter().map(PathBuf::from).collect();
+        assert!(markdown_preview_path_set(md, &edit).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod restore_pane_kind_tests {
     use super::{
         editor_paths_for_restore, files_pane_bookkeeping, image_path_set, is_image_path,
@@ -16633,6 +17171,12 @@ mod restore_pane_kind_tests {
     /// asserts against, so those cases keep pinning the Markdown/Editor ladder
     /// unchanged rather than accidentally routing through the new arm.
     fn no_images() -> HashSet<PathBuf> {
+        HashSet::new()
+    }
+
+    /// Empty `md_edit` set — no `.md` file is in edit mode. The common case:
+    /// only the standalone-markdown-in-edit-mode test needs a non-empty one.
+    fn no_edits() -> HashSet<PathBuf> {
         HashSet::new()
     }
 
@@ -16726,7 +17270,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), Some(&doc), None, false, false);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_edits(), Some(&doc), None, false, false);
 
         assert_eq!(
             kind,
@@ -16753,7 +17297,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind = restored_pane_kind(
-            p, Some(p), &saved_paths, 0, &md_paths, &img_paths, None, Some(&img), false, false,
+            p, Some(p), &saved_paths, 0, &md_paths, &img_paths, &no_edits(), None, Some(&img), false, false,
         );
 
         assert_eq!(
@@ -16800,7 +17344,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind = restored_pane_kind(
-            3, None, &saved_paths, 0, &md_paths, &img_paths, None, Some(&img), false, false,
+            3, None, &saved_paths, 0, &md_paths, &img_paths, &no_edits(), None, Some(&img), false, false,
         );
 
         assert_eq!(kind, RestoredPaneKind::Image { path: img, is_files_pane: false });
@@ -16841,7 +17385,7 @@ mod restore_pane_kind_tests {
 
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
         let kind = restored_pane_kind(
-            5, None, &saved_paths, 0, &md_paths, &img_paths, None, Some(&empty), false, true,
+            5, None, &saved_paths, 0, &md_paths, &img_paths, &no_edits(), None, Some(&empty), false, true,
         );
         assert_eq!(kind, RestoredPaneKind::Terminal);
     }
@@ -16856,7 +17400,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
         let kind =
-            restored_pane_kind(3, None, &saved_paths, 0, &md_paths, &no_images(), Some(&doc), None, false, false);
+            restored_pane_kind(3, None, &saved_paths, 0, &md_paths, &no_images(), &no_edits(), Some(&doc), None, false, false);
 
         assert_eq!(kind, RestoredPaneKind::Markdown { path: doc, is_files_pane: false });
     }
@@ -16872,9 +17416,9 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), None, None, false, false);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_edits(), None, None, false, false);
 
-        assert_eq!(kind, RestoredPaneKind::Editor { path: code });
+        assert_eq!(kind, RestoredPaneKind::Editor { path: code, is_files_pane: true });
     }
 
     /// Minor fix: a `SMarkdown` with an empty (default) path — a
@@ -16891,12 +17435,12 @@ mod restore_pane_kind_tests {
         // No files-pane match, no browser, empty markdown path → falls
         // through to the terminal-cache arm (here: true → Terminal).
         let kind =
-            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), Some(&empty), None, false, true);
+            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), &no_edits(), Some(&empty), None, false, true);
         assert_eq!(kind, RestoredPaneKind::Terminal);
 
         // And with no terminal cache entry either, all the way to fresh.
         let kind =
-            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), Some(&empty), None, false, false);
+            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), &no_edits(), Some(&empty), None, false, false);
         assert_eq!(kind, RestoredPaneKind::FreshTerminal);
     }
 
@@ -16934,11 +17478,11 @@ mod restore_pane_kind_tests {
         // the very same doc.md. Unaffected by the files-pane branch since
         // p1 != p2 == saved_files_pane.
         let k1 =
-            restored_pane_kind(p1, Some(p2), &saved_paths, 1, &md_paths, &no_images(), Some(&doc), None, false, false);
+            restored_pane_kind(p1, Some(p2), &saved_paths, 1, &md_paths, &no_images(), &no_edits(), Some(&doc), None, false, false);
         assert_eq!(k1, RestoredPaneKind::Markdown { path: doc.clone(), is_files_pane: false });
 
         // P2: the shared Files pane, active tab (index 1) = doc.md itself.
-        let k2 = restored_pane_kind(p2, Some(p2), &saved_paths, 1, &md_paths, &no_images(), None, None, false, false);
+        let k2 = restored_pane_kind(p2, Some(p2), &saved_paths, 1, &md_paths, &no_images(), &no_edits(), None, None, false, false);
         assert_eq!(
             k2,
             RestoredPaneKind::Markdown { path: doc, is_files_pane: true },
@@ -17019,7 +17563,7 @@ mod restore_pane_kind_tests {
         let code = PathBuf::from("/tmp/main.rs");
         let pid: PaneId = 9;
         let saved_paths = vec![code.clone()];
-        let kind = RestoredPaneKind::Editor { path: code };
+        let kind = RestoredPaneKind::Editor { path: code, is_files_pane: true };
 
         let result = files_pane_bookkeeping(&kind, pid, &saved_paths, 0);
 
@@ -17035,7 +17579,7 @@ mod restore_pane_kind_tests {
         let b = PathBuf::from("/tmp/b.rs");
         let pid: PaneId = 4;
         let saved_paths = vec![a, b];
-        let kind = RestoredPaneKind::Editor { path: saved_paths[1].clone() };
+        let kind = RestoredPaneKind::Editor { path: saved_paths[1].clone(), is_files_pane: true };
 
         // saved_active (5) is well past saved_paths.len() (2).
         let result = files_pane_bookkeeping(&kind, pid, &saved_paths, 5);
@@ -17079,7 +17623,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), None, None, false, true);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_edits(), None, None, false, true);
 
         assert_eq!(
             kind,
@@ -17101,7 +17645,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), None, None, true, false);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_edits(), None, None, true, false);
 
         assert_eq!(
             kind,
