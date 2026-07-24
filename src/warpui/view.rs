@@ -298,6 +298,15 @@ pub struct TerminalView {
     scrollbar_drag: Rc<StdCell<bool>>,
     /// Persisted drag state for mouse text selection (element is rebuilt each frame).
     sel_dragging: Rc<StdCell<bool>>,
+    /// Persisted "SGR mouse-report press is down on this pane" flag: pairs each
+    /// forwarded press with its release so a mouse-reporting pane (e.g. Claude)
+    /// never swallows a sibling pane's selection Up. See GridElement's
+    /// `mouse_report_pressed`.
+    mouse_report_pressed: Rc<StdCell<bool>>,
+    /// Persisted deferred-press position for the click-vs-drag decision over a
+    /// mouse-reporting pane (plain drag → local selection, plain click →
+    /// forward). See GridElement's `mouse_report_pending`.
+    mouse_report_pending: Rc<StdCell<Option<warpui::geometry::vector::Vector2F>>>,
     /// Last mouse-down instant + viewport position for consecutive-click detection.
     last_click: Rc<RefCell<Option<(std::time::Instant, usize, usize)>>>,
     /// Consecutive click count (1 = simple, 2 = word, 3+ = line).
@@ -404,6 +413,8 @@ impl TerminalView {
             dimmed: StdCell::new(false),
             scrollbar_drag: Rc::new(StdCell::new(false)),
             sel_dragging: Rc::new(StdCell::new(false)),
+            mouse_report_pressed: Rc::new(StdCell::new(false)),
+            mouse_report_pending: Rc::new(StdCell::new(None)),
             last_click: Rc::new(RefCell::new(None)),
             click_count: Rc::new(StdCell::new(0)),
             _repaint: repaint,
@@ -879,7 +890,11 @@ impl View for TerminalView {
         .with_smooth_scroll(scroll_frac, overscan)
         .with_selection(sel_range, disp_off)
         .with_cursor_style(cursor_style.shape, cursor_style.blink)
-        .on_mouse_report(mouse_report_cb)
+        .on_mouse_report(
+            self.mouse_report_pressed.clone(),
+            self.mouse_report_pending.clone(),
+            mouse_report_cb,
+        )
         .on_mouse_select(self.sel_dragging.clone(), mouse_sel_cb)
         .with_link_spans(
             link_spans,
