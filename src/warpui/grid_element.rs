@@ -667,14 +667,23 @@ impl Element for GridElement {
         // selection when a mouse-reporting mode is active, so TUIs that own the
         // mouse (ranger / mc / vim-mouse) receive press/release events instead of
         // us starting a selection. Only left button (SGR button code 0).
+        //
+        // Shift is the local-selection override (iTerm2 / Warp convention): a
+        // Shift+drag bypasses forwarding entirely and runs our text selection so
+        // the user can still copy text out of a mouse-grabbing TUI. The gesture
+        // stays local for its whole life — once selection's Down set
+        // `mouse_dragging`, the matching Up must reach selection to finalize, so
+        // the Up arm below defers whenever a local drag is in flight.
         if let Some(cb) = self.mouse_report_cb.clone() {
             match event.raw_event() {
-                Event::LeftMouseDown { position, .. } if in_bounds(position) => {
+                Event::LeftMouseDown { position, modifiers, .. }
+                    if in_bounds(position) && !modifiers.shift =>
+                {
                     let (row, col, _) = pos_to_cell(position);
                     cb(true, col + 1, row + 1);
                     return true;
                 }
-                Event::LeftMouseUp { position, .. } => {
+                Event::LeftMouseUp { position, .. } if !self.mouse_dragging.get() => {
                     let (row, col, _) = pos_to_cell(position);
                     cb(false, col + 1, row + 1);
                     return true;
