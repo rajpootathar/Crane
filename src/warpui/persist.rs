@@ -127,6 +127,16 @@ pub struct SImage {
     pub path: PathBuf,
 }
 
+/// Persisted PDF Pane: the PDF file it renders. Exact peer of `SImage` —
+/// restored as a PDF (or, for a corrupt state file, Editor) pane rather than a
+/// terminal. Kept as its own record for the same additive-migration reasons as
+/// `SImage` (see its doc comment).
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SPdf {
+    #[serde(default)]
+    pub path: PathBuf,
+}
+
 /// One Workspace's File Tabs: the pane that IS its Files Pane, that pane's
 /// open File Tab paths, and which of them was active.
 ///
@@ -234,6 +244,11 @@ pub struct WarpuiState {
     /// of `markdowns` — see `SImage` for why it is a separate field.
     #[serde(default)]
     pub images: Vec<(PaneId, SImage)>,
+    /// Per PDF pane: the file it renders, keyed by pane id, so the restore loop
+    /// rebuilds a PDF pane (not a terminal) at that leaf. Exact peer of
+    /// `images` — see `SPdf`.
+    #[serde(default)]
+    pub pdfs: Vec<(PaneId, SPdf)>,
     /// Projects the user added via "Add Project" (not from session.json).
     #[serde(default)]
     pub added_projects: Vec<AddedProject>,
@@ -538,6 +553,30 @@ mod tests {
         assert_eq!(back.images.len(), 1, "image panes must survive a round trip");
         assert_eq!(back.images[0].0, 7, "the pane id keys the restore lookup");
         assert_eq!(back.images[0].1.path, PathBuf::from("/tmp/logo.png"));
+    }
+
+    /// A PDF pane's saved file must survive a round trip, keyed by pane id —
+    /// peer of `image_panes_survive_a_state_round_trip`. Without it the pane
+    /// restores as a fresh terminal.
+    #[test]
+    fn pdf_panes_survive_a_state_round_trip() {
+        let mut st = WarpuiState::default();
+        st.pdfs = vec![(9, SPdf { path: PathBuf::from("/tmp/report.pdf") })];
+        let json = serde_json::to_string(&st).expect("serialize");
+        let back: WarpuiState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.pdfs.len(), 1, "pdf panes must survive a round trip");
+        assert_eq!(back.pdfs[0].0, 9, "the pane id keys the restore lookup");
+        assert_eq!(back.pdfs[0].1.path, PathBuf::from("/tmp/report.pdf"));
+    }
+
+    /// Compatibility: a state file written before `pdfs` existed must still
+    /// load, with `pdfs` defaulting to empty (never a parse error on the user's
+    /// live `~/.crane/warpui-state.json`).
+    #[test]
+    fn a_state_file_predating_pdfs_still_loads() {
+        let legacy = r#"{"images":[]}"#;
+        let st: WarpuiState = serde_json::from_str(legacy).expect("pre-pdfs state must load");
+        assert!(st.pdfs.is_empty(), "the new field defaults to empty");
     }
 
     /// THE compatibility guarantee for the user's live session file: a state

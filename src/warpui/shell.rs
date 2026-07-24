@@ -306,6 +306,9 @@ pub struct CraneShellView {
     /// cached for the same reason: every pane showing the same image shares
     /// one decoded view rather than re-reading the file per pane.
     image_views: HashMap<PathBuf, ViewHandle<crate::warpui::image_view::WarpImageView>>,
+    /// Per-path PDF view cache — peer of `image_views`, so every pane showing
+    /// the same PDF shares one decoded view.
+    pdf_views: HashMap<PathBuf, ViewHandle<crate::warpui::pdf_view::WarpPdfView>>,
     /// `.md` paths the user switched into EDIT mode via the pane header's
     /// toggle. Absent = the rendered preview (the default for every `.md`
     /// file); present = the raw source in a `WarpEditorView`.
@@ -940,6 +943,7 @@ pub enum PaneContent {
     /// `Markdown`: a document pane that owns the shared Files Pane slot the
     /// same way, so it persists and restores through the same machinery.
     Image(ViewHandle<crate::warpui::image_view::WarpImageView>),
+    Pdf(ViewHandle<crate::warpui::pdf_view::WarpPdfView>),
     /// Read-only unified diff (HEAD vs working copy) for a changed file.
     Diff(ViewHandle<crate::warpui::diff_view::WarpDiffView>),
     /// Embedded browser: the view draws tab strip / URL toolbar / footer and
@@ -1139,23 +1143,34 @@ pub(crate) fn is_raster_image_path(path: &std::path::Path) -> bool {
 enum OpenFileRoute {
     Markdown,
     Image,
+    Pdf,
     /// Everything else — including files with no extension. Text is the
     /// fallback, and `open_file`'s binary guard catches non-UTF-8 content that
     /// slips through with an unrecognised extension.
     Editor,
 }
 
-/// The pane `open_file` opens `path` in. Markdown is tested first only
-/// because the two extension sets are disjoint and one of them has to go
-/// first; neither claims the other's suffixes.
+/// The pane `open_file` opens `path` in. The document extension sets are
+/// mutually disjoint, so the relative order is arbitrary; each is tested first
+/// only because one has to be.
 fn open_file_route(path: &std::path::Path) -> OpenFileRoute {
     if is_markdown_path(path) {
         OpenFileRoute::Markdown
     } else if is_image_path(path) {
         OpenFileRoute::Image
+    } else if is_pdf_path(path) {
+        OpenFileRoute::Pdf
     } else {
         OpenFileRoute::Editor
     }
+}
+
+/// Whether `path` routes to a PDF pane, by extension. Peer of `is_image_path`.
+fn is_pdf_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
 }
 
 /// Shared body of `markdown_path_set` / `image_path_set`: the union of the
@@ -1188,6 +1203,16 @@ fn image_path_set<'a>(
     saved_paths: &[PathBuf],
 ) -> HashSet<PathBuf> {
     document_path_set(image_paths, saved_paths, is_image_path)
+}
+
+/// Every path that must restore into a PDF pane rather than an Editor. Exact
+/// peer of `image_path_set` — a PDF is binary, so keeping it out of the Editor
+/// partition matters doubly (see `editor_paths_for_restore`).
+fn pdf_path_set<'a>(
+    pdf_paths: impl IntoIterator<Item = &'a PathBuf>,
+    saved_paths: &[PathBuf],
+) -> HashSet<PathBuf> {
+    document_path_set(pdf_paths, saved_paths, is_pdf_path)
 }
 
 /// Every path that must restore into a Markdown pane rather than an Editor.
@@ -1274,10 +1299,13 @@ fn editor_paths_for_restore<'a>(
     saved_paths: &'a [PathBuf],
     md_paths: &HashSet<PathBuf>,
     img_paths: &HashSet<PathBuf>,
+    pdf_paths: &HashSet<PathBuf>,
 ) -> Vec<&'a PathBuf> {
     saved_paths
         .iter()
-        .filter(|p| !md_paths.contains(*p) && !img_paths.contains(*p))
+        .filter(|p| {
+            !md_paths.contains(*p) && !img_paths.contains(*p) && !pdf_paths.contains(*p)
+        })
         .collect()
 }
 
@@ -1293,6 +1321,9 @@ enum RestoredPaneKind {
     /// `open_file` assigns an Image pane to the shared Files Pane slot exactly
     /// the way it assigns a Markdown one.
     Image { path: PathBuf, is_files_pane: bool },
+    /// Peer of `Image` — a PDF pane is assigned the shared Files Pane slot the
+    /// same way, so `is_files_pane` carries the same meaning.
+    Pdf { path: PathBuf, is_files_pane: bool },
     /// `is_files_pane` carries the same meaning as its `Markdown` / `Image`
     /// peers. It used to be implicit — `Editor` was reachable ONLY from the
     /// files-pane branch, so `files_pane_bookkeeping` could hardcode `true`.
@@ -1386,24 +1417,29 @@ fn restored_pane_kind(
     saved_active: usize,
     md_paths: &HashSet<PathBuf>,
     img_paths: &HashSet<PathBuf>,
+    pdf_paths: &HashSet<PathBuf>,
     md_edit: &HashSet<PathBuf>,
     markdown_path: Option<&PathBuf>,
     image_path: Option<&PathBuf>,
+    pdf_path: Option<&PathBuf>,
     is_browser: bool,
     is_terminal: bool,
 ) -> RestoredPaneKind {
     if Some(pid) == saved_files_pane && !saved_paths.is_empty() && !is_browser && !is_terminal {
         let active = clamped_active_index(saved_active, saved_paths.len());
         let path = saved_paths[active].clone();
-        // Image is consulted here, INSIDE the files-pane branch, for exactly
-        // the reason Markdown is: an image pane persists into BOTH `images`
-        // and the files-pane record (`open_file` assigns it the shared Files
-        // Pane slot), so an `Editor` fallthrough here would make the Image
-        // restore arm below unreachable and bring the file back as an empty
-        // text buffer. The two sets are disjoint by extension, so their
-        // relative order is a tiebreak only for a corrupt state file.
+        // Image / PDF are consulted here, INSIDE the files-pane branch, for
+        // exactly the reason Markdown is: such a pane persists into BOTH its own
+        // record (`images` / `pdfs`) and the files-pane record (`open_file`
+        // assigns it the shared Files Pane slot), so an `Editor` fallthrough
+        // here would make the Image/PDF restore arm below unreachable and — for
+        // a binary PDF — bring the file back as an empty text buffer. The sets
+        // are disjoint by extension, so their relative order is a tiebreak only
+        // for a corrupt state file.
         if img_paths.contains(&path) {
             RestoredPaneKind::Image { path, is_files_pane: true }
+        } else if pdf_paths.contains(&path) {
+            RestoredPaneKind::Pdf { path, is_files_pane: true }
         } else if md_paths.contains(&path) {
             // `md_paths` is the PREVIEW set (`markdown_preview_path_set`), so an
             // edit-mode `.md` file is already absent from it and falls through
@@ -1417,6 +1453,10 @@ fn restored_pane_kind(
         RestoredPaneKind::Browser
     } else if let Some(path) = image_path.filter(|p| !p.as_os_str().is_empty()) {
         RestoredPaneKind::Image { path: path.clone(), is_files_pane: false }
+    } else if let Some(path) = pdf_path.filter(|p| !p.as_os_str().is_empty()) {
+        // Standalone PDF pane (not its Workspace's Files Pane) — peer of the
+        // standalone Image arm above.
+        RestoredPaneKind::Pdf { path: path.clone(), is_files_pane: false }
     } else if let Some(path) = markdown_path.filter(|p| !p.as_os_str().is_empty()) {
         // A STANDALONE `.md` pane (reachable: open a doc in Tab 1, then open a
         // second file in Tab 2 — the Files Pane slot moves, this pane keeps only
@@ -1471,6 +1511,7 @@ fn files_pane_bookkeeping(
     let is_files_pane = match kind {
         RestoredPaneKind::Markdown { is_files_pane, .. }
         | RestoredPaneKind::Image { is_files_pane, .. }
+        | RestoredPaneKind::Pdf { is_files_pane, .. }
         | RestoredPaneKind::Editor { is_files_pane, .. } => *is_files_pane,
         RestoredPaneKind::Browser | RestoredPaneKind::Terminal | RestoredPaneKind::FreshTerminal => {
             false
@@ -1710,6 +1751,11 @@ impl CraneShellView {
             PathBuf,
             ViewHandle<crate::warpui::image_view::WarpImageView>,
         > = HashMap::new();
+        let mut restored_pdfs: HashMap<PaneId, crate::warpui::persist::SPdf> = HashMap::new();
+        let mut restored_pdf_views: HashMap<
+            PathBuf,
+            ViewHandle<crate::warpui::pdf_view::WarpPdfView>,
+        > = HashMap::new();
 
         // Ensure built-in theme TOML files are written to ~/.crane/themes/ on
         // first launch so users have a working template for each palette.
@@ -1773,6 +1819,7 @@ impl CraneShellView {
             restored_browsers = st.browsers.iter().cloned().collect();
             restored_markdowns = st.markdowns.iter().cloned().collect();
             restored_images = st.images.iter().cloned().collect();
+            restored_pdfs = st.pdfs.iter().cloned().collect();
             // Tab lists: prefer the path-keyed field (stable across project
             // reordering); fall back to the legacy index-keyed one for state
             // files written before `worktree_tabs_by_path` existed.
@@ -1989,6 +2036,25 @@ impl CraneShellView {
                 });
                 restored_image_views.insert(p.clone(), h);
             }
+            // Same pre-pass, same reasoning, for PDF panes. `WarpPdfView::new`
+            // needs the page-indicator + toolbar fonts, captured here from the
+            // shell's already-loaded families.
+            let pdf_paths = pdf_path_set(
+                restored_pdfs
+                    .iter()
+                    .filter(|(pid, _)| reachable_pids.contains(pid))
+                    .map(|(_, sp)| &sp.path),
+                effective_saved_paths,
+            );
+            for p in &pdf_paths {
+                let pc = p.clone();
+                let uf = ui_font;
+                let icf = icon_font;
+                let h = ctx.add_typed_action_view(move |ctx| {
+                    crate::warpui::pdf_view::WarpPdfView::new(ctx, pc, uf, icf)
+                });
+                restored_pdf_views.insert(p.clone(), h);
+            }
             // Every path the editor pre-pass must consider: the Files-Pane tab
             // lists, PLUS every reachable `.md` pane the user left in edit mode.
             // The second half matters for a STANDALONE markdown pane — one that
@@ -2012,7 +2078,9 @@ impl CraneShellView {
             if !editor_source_paths.is_empty() {
                 let mono = warpui::fonts::Cache::handle(ctx)
                     .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
-                for p in editor_paths_for_restore(&editor_source_paths, &md_paths, &img_paths) {
+                for p in
+                    editor_paths_for_restore(&editor_source_paths, &md_paths, &img_paths, &pdf_paths)
+                {
                     // Mirror `open_file`'s binary guard (see its own comment
                     // next to `std::fs::read(&path).map(String::from_utf8)`):
                     // `read_to_string(p).unwrap_or_default()` used to turn any
@@ -2074,6 +2142,7 @@ impl CraneShellView {
                         // handles this match reuses.
                         let markdown_path = restored_markdowns.get(&pid).map(|sm| &sm.path);
                         let image_path = restored_images.get(&pid).map(|si| &si.path);
+                        let pdf_path = restored_pdfs.get(&pid).map(|sp| &sp.path);
                         let is_browser = restored_browsers.contains_key(&pid);
                         let is_terminal = restored_term_cache.contains_key(&pid);
                         let kind = restored_pane_kind(
@@ -2083,9 +2152,11 @@ impl CraneShellView {
                             saved_active,
                             &md_paths,
                             &img_paths,
+                            &pdf_paths,
                             &restored_md_edit,
                             markdown_path,
                             image_path,
+                            pdf_path,
                             is_browser,
                             is_terminal,
                         );
@@ -2129,6 +2200,24 @@ impl CraneShellView {
                                     continue;
                                 };
                                 panes.insert(pid, PaneContent::Image(h));
+                            }
+                            RestoredPaneKind::Pdf { path, .. } => {
+                                // Same lockstep assumption as the Image arm above,
+                                // for the PDF pre-pass — degrade to a fresh
+                                // terminal rather than panic on user data.
+                                let Some(h) = restored_pdf_views.get(path).cloned() else {
+                                    panes.insert(
+                                        pid,
+                                        PaneContent::Terminal(Self::spawn_terminal(
+                                            ctx,
+                                            wpath.clone(),
+                                            ui_wake.clone(),
+                                        )),
+                                    );
+                                    drag_states.insert(pid, DraggableState::default());
+                                    continue;
+                                };
+                                panes.insert(pid, PaneContent::Pdf(h));
                             }
                             RestoredPaneKind::Editor { path, .. } => {
                                 // Same lockstep assumption as the Markdown arm
@@ -2456,6 +2545,7 @@ impl CraneShellView {
             editor_views: restored_editor_views,
             markdown_views: restored_markdown_views,
             image_views: restored_image_views,
+            pdf_views: restored_pdf_views,
             md_edit_mode: restored_md_edit,
             term_cache: RefCell::new(restored_term_cache),
             last_term_snapshot: std::cell::Cell::new(None),
@@ -2630,6 +2720,7 @@ impl CraneShellView {
             PaneContent::Welcome(_) => "Welcome",
             PaneContent::Markdown(_) => "Markdown",
             PaneContent::Image(_) => "Image",
+            PaneContent::Pdf(_) => "PDF",
             PaneContent::Diff(_) => "Diff",
             PaneContent::Browser(_) => "Browser",
         })
@@ -2870,6 +2961,17 @@ impl CraneShellView {
                 _ => None,
             })
             .collect();
+        let pdfs: Vec<(PaneId, crate::warpui::persist::SPdf)> = self
+            .panes
+            .iter()
+            .filter_map(|(id, pc)| match pc {
+                PaneContent::Pdf(h) => h
+                    .as_ref(app)
+                    .path()
+                    .map(|p| (*id, crate::warpui::persist::SPdf { path: p.to_path_buf() })),
+                _ => None,
+            })
+            .collect();
         let worktree_tabs: Vec<((usize, usize), Vec<STab>)> = self
             .worktree_tabs
             .iter()
@@ -2963,6 +3065,7 @@ impl CraneShellView {
             browsers,
             markdowns,
             images,
+            pdfs,
             expanded_worktrees: self.expanded_worktrees.iter().copied().collect(),
             worktree_tabs,
             worktree_tabs_by_path,
@@ -11288,6 +11391,7 @@ impl CraneShellView {
             Some(PaneContent::Browser(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Markdown(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Image(h)) => ChildView::new(h).finish(),
+            Some(PaneContent::Pdf(h)) => ChildView::new(h).finish(),
             Some(PaneContent::Diff(h)) => ChildView::new(h).finish(),
             None => Rect::new().with_background_color(theme::bg()).finish(),
         };
@@ -11716,6 +11820,9 @@ impl CraneShellView {
                     Some(PaneContent::Image(h)) => {
                         (icons::FILE, h.as_ref(app).title().to_string())
                     }
+                    Some(PaneContent::Pdf(h)) => {
+                        (icons::FILE, h.as_ref(app).title().to_string())
+                    }
                     Some(PaneContent::Diff(h)) => {
                         (icons::GIT_DIFF, format!("Diff: {}", h.as_ref(app).title()))
                     }
@@ -12019,6 +12126,7 @@ impl CraneShellView {
         self.editor_views.retain(|p, _| !p.starts_with(path));
         self.markdown_views.retain(|p, _| !p.starts_with(path));
         self.image_views.retain(|p, _| !p.starts_with(path));
+        self.pdf_views.retain(|p, _| !p.starts_with(path));
     }
 
     /// Insert `content` beside the focused pane (even split). Returns the id.
@@ -12064,6 +12172,7 @@ impl CraneShellView {
                 | Some(PaneContent::File(_))
                 | Some(PaneContent::Markdown(_))
                 | Some(PaneContent::Image(_))
+                | Some(PaneContent::Pdf(_))
         );
         let in_active = self
             .active_tab
@@ -12154,6 +12263,35 @@ impl CraneShellView {
             }
             self.files_pane.remove(&ws); // stale (closed or on another tab)
             if let Some(fp) = self.split_with_at(PaneContent::Image(handle), false, 0.35) {
+                self.files_pane.insert(ws, fp);
+            }
+            ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
+            return;
+        }
+        // PDFs render in a PDF pane — peer of the Image branch above, and for
+        // the same reason it must stay AHEAD of the editor path: a PDF is
+        // binary, so reaching the editor's UTF-8 guard would toast "not a text
+        // file" instead of opening the viewer.
+        if route == OpenFileRoute::Pdf {
+            let handle = if let Some(h) = self.pdf_views.get(&path) {
+                h.clone()
+            } else {
+                let p = path.clone();
+                let uf = self.ui_font;
+                let icf = self.icon_font;
+                let h = ctx.add_typed_action_view(move |ctx| {
+                    crate::warpui::pdf_view::WarpPdfView::new(ctx, p, uf, icf)
+                });
+                self.pdf_views.insert(path.clone(), h.clone());
+                h
+            };
+            if let Some(fp) = self.reusable_files_pane() {
+                self.panes.insert(fp, PaneContent::Pdf(handle));
+                self.focused = Some(fp);
+                return;
+            }
+            self.files_pane.remove(&ws); // stale (closed or on another tab)
+            if let Some(fp) = self.split_with_at(PaneContent::Pdf(handle), false, 0.35) {
                 self.files_pane.insert(ws, fp);
             }
             ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
@@ -12297,6 +12435,9 @@ impl CraneShellView {
     fn file_tab_pane(&self, path: &PathBuf) -> Option<PaneContent> {
         if let Some(h) = self.image_views.get(path) {
             return Some(PaneContent::Image(h.clone()));
+        }
+        if let Some(h) = self.pdf_views.get(path) {
+            return Some(PaneContent::Pdf(h.clone()));
         }
         if !self.md_edit_mode.contains(path) {
             if let Some(h) = self.markdown_views.get(path) {
@@ -15231,6 +15372,7 @@ impl CraneShellView {
                             self.editor_views.remove(&removed);
                             self.markdown_views.remove(&removed);
                             self.image_views.remove(&removed);
+                            self.pdf_views.remove(&removed);
                         }
                         if self.ws_file_paths(ws).is_empty() {
                             // Last tab closed — close the whole editor pane.
@@ -17161,8 +17303,8 @@ mod markdown_mode_tests {
 mod restore_pane_kind_tests {
     use super::{
         editor_paths_for_restore, files_pane_bookkeeping, image_path_set, is_image_path,
-        is_markdown_path, is_raster_image_path, markdown_path_set, restored_pane_kind, PaneId,
-        RestoredPaneKind,
+        is_markdown_path, is_raster_image_path, markdown_path_set, pdf_path_set, restored_pane_kind,
+        PaneId, RestoredPaneKind,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -17171,6 +17313,11 @@ mod restore_pane_kind_tests {
     /// asserts against, so those cases keep pinning the Markdown/Editor ladder
     /// unchanged rather than accidentally routing through the new arm.
     fn no_images() -> HashSet<PathBuf> {
+        HashSet::new()
+    }
+
+    /// Empty `pdf_paths` set — no PDF pane in the restored state.
+    fn no_pdfs() -> HashSet<PathBuf> {
         HashSet::new()
     }
 
@@ -17198,6 +17345,11 @@ mod restore_pane_kind_tests {
         // Extension matching is case-insensitive (`.PNG` off a camera / an
         // APFS case-insensitive volume must still route to the Image pane).
         assert_eq!(open_file_route(Path::new("/tmp/PHOTO.PNG")), OpenFileRoute::Image);
+
+        // PDFs route to their own pane (case-insensitive), never the Editor —
+        // a PDF is binary and would hit the editor's UTF-8 guard.
+        assert_eq!(open_file_route(Path::new("/tmp/report.pdf")), OpenFileRoute::Pdf);
+        assert_eq!(open_file_route(Path::new("/tmp/SCAN.PDF")), OpenFileRoute::Pdf);
 
         assert_eq!(
             open_file_route(Path::new("/tmp/main.rs")),
@@ -17270,7 +17422,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_edits(), Some(&doc), None, false, false);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_pdfs(), &no_edits(), Some(&doc), None, None, false, false);
 
         assert_eq!(
             kind,
@@ -17297,7 +17449,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind = restored_pane_kind(
-            p, Some(p), &saved_paths, 0, &md_paths, &img_paths, &no_edits(), None, Some(&img), false, false,
+            p, Some(p), &saved_paths, 0, &md_paths, &img_paths, &no_pdfs(), &no_edits(), None, Some(&img), None, false, false,
         );
 
         assert_eq!(
@@ -17305,6 +17457,55 @@ mod restore_pane_kind_tests {
             RestoredPaneKind::Image { path: img, is_files_pane: true },
             "an image saved as the Files pane's tab must restore as Image, not Editor"
         );
+    }
+
+    /// DEFECT SHAPE 1, for PDFs: the saved shape for "opened a .pdf as the
+    /// first Files-pane tab" is `files_pane = Some(P)` + `file_pane_paths =
+    /// [report.pdf]` + `pdfs = [(P, report.pdf)]` — the pid is BOTH. The
+    /// files-pane branch must consult `pdf_paths`, or it returns `Editor` and
+    /// brings a BINARY pdf back as an empty text buffer (peer of the image
+    /// case above).
+    #[test]
+    fn a_saved_pdf_pane_that_is_also_the_files_pane_restores_as_pdf() {
+        let pdf = PathBuf::from("/tmp/report.pdf");
+        let p: PaneId = 7;
+        let saved_paths = vec![pdf.clone()];
+        let pdf_paths = pdf_path_set([&pdf], &saved_paths);
+        let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
+
+        let kind = restored_pane_kind(
+            p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &pdf_paths, &no_edits(), None, None, Some(&pdf), false, false,
+        );
+
+        assert_eq!(
+            kind,
+            RestoredPaneKind::Pdf { path: pdf, is_files_pane: true },
+            "a pdf saved as the Files pane's tab must restore as PDF, not Editor"
+        );
+    }
+
+    /// DEFECT SHAPE 4, for PDFs — the data-destroying one. A PDF is binary, so
+    /// it must NEVER be handed to the editor pre-pass: `read_to_string` on a
+    /// PDF yields an empty buffer that a reflexive Cmd+S would then write back
+    /// over the real file. Excluding it from `editor_paths_for_restore` is the
+    /// braces to the pre-pass's UTF-8-guard belt.
+    #[test]
+    fn a_restored_pdf_path_never_also_gets_an_editor_buffer() {
+        let pdf = PathBuf::from("/tmp/report.pdf");
+        let code = PathBuf::from("/tmp/main.rs");
+        let saved_paths = vec![pdf.clone(), code.clone()];
+        let pdf_paths = pdf_path_set(std::iter::empty(), &saved_paths);
+        let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
+
+        let editor_paths =
+            editor_paths_for_restore(&saved_paths, &md_paths, &no_images(), &pdf_paths);
+
+        assert!(
+            !editor_paths.contains(&&pdf),
+            "a pdf must never be handed to the editor pre-pass — an empty buffer over it \
+             that Cmd+S writes back would truncate the real file"
+        );
+        assert!(editor_paths.contains(&&code), "a code file must still get its editor buffer");
     }
 
     /// DEFECT SHAPE 2, for images: the restored Image leaf that IS the saved
@@ -17344,7 +17545,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind = restored_pane_kind(
-            3, None, &saved_paths, 0, &md_paths, &img_paths, &no_edits(), None, Some(&img), false, false,
+            3, None, &saved_paths, 0, &md_paths, &img_paths, &no_pdfs(), &no_edits(), None, Some(&img), None, false, false,
         );
 
         assert_eq!(kind, RestoredPaneKind::Image { path: img, is_files_pane: false });
@@ -17363,7 +17564,7 @@ mod restore_pane_kind_tests {
         let img_paths = image_path_set(std::iter::empty(), &saved_paths);
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
-        let editor_paths = editor_paths_for_restore(&saved_paths, &md_paths, &img_paths);
+        let editor_paths = editor_paths_for_restore(&saved_paths, &md_paths, &img_paths, &no_pdfs());
 
         assert!(
             !editor_paths.contains(&&img),
@@ -17385,7 +17586,7 @@ mod restore_pane_kind_tests {
 
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
         let kind = restored_pane_kind(
-            5, None, &saved_paths, 0, &md_paths, &img_paths, &no_edits(), None, Some(&empty), false, true,
+            5, None, &saved_paths, 0, &md_paths, &img_paths, &no_pdfs(), &no_edits(), None, Some(&empty), None, false, true,
         );
         assert_eq!(kind, RestoredPaneKind::Terminal);
     }
@@ -17400,7 +17601,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
         let kind =
-            restored_pane_kind(3, None, &saved_paths, 0, &md_paths, &no_images(), &no_edits(), Some(&doc), None, false, false);
+            restored_pane_kind(3, None, &saved_paths, 0, &md_paths, &no_images(), &no_pdfs(), &no_edits(), Some(&doc), None, None, false, false);
 
         assert_eq!(kind, RestoredPaneKind::Markdown { path: doc, is_files_pane: false });
     }
@@ -17416,7 +17617,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_edits(), None, None, false, false);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_pdfs(), &no_edits(), None, None, None, false, false);
 
         assert_eq!(kind, RestoredPaneKind::Editor { path: code, is_files_pane: true });
     }
@@ -17435,12 +17636,12 @@ mod restore_pane_kind_tests {
         // No files-pane match, no browser, empty markdown path → falls
         // through to the terminal-cache arm (here: true → Terminal).
         let kind =
-            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), &no_edits(), Some(&empty), None, false, true);
+            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), &no_pdfs(), &no_edits(), Some(&empty), None, None, false, true);
         assert_eq!(kind, RestoredPaneKind::Terminal);
 
         // And with no terminal cache entry either, all the way to fresh.
         let kind =
-            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), &no_edits(), Some(&empty), None, false, false);
+            restored_pane_kind(5, None, &saved_paths, 0, &md_paths, &no_images(), &no_pdfs(), &no_edits(), Some(&empty), None, None, false, false);
         assert_eq!(kind, RestoredPaneKind::FreshTerminal);
     }
 
@@ -17478,11 +17679,11 @@ mod restore_pane_kind_tests {
         // the very same doc.md. Unaffected by the files-pane branch since
         // p1 != p2 == saved_files_pane.
         let k1 =
-            restored_pane_kind(p1, Some(p2), &saved_paths, 1, &md_paths, &no_images(), &no_edits(), Some(&doc), None, false, false);
+            restored_pane_kind(p1, Some(p2), &saved_paths, 1, &md_paths, &no_images(), &no_pdfs(), &no_edits(), Some(&doc), None, None, false, false);
         assert_eq!(k1, RestoredPaneKind::Markdown { path: doc.clone(), is_files_pane: false });
 
         // P2: the shared Files pane, active tab (index 1) = doc.md itself.
-        let k2 = restored_pane_kind(p2, Some(p2), &saved_paths, 1, &md_paths, &no_images(), &no_edits(), None, None, false, false);
+        let k2 = restored_pane_kind(p2, Some(p2), &saved_paths, 1, &md_paths, &no_images(), &no_pdfs(), &no_edits(), None, None, None, false, false);
         assert_eq!(
             k2,
             RestoredPaneKind::Markdown { path: doc, is_files_pane: true },
@@ -17503,7 +17704,7 @@ mod restore_pane_kind_tests {
         // doc.md is recorded as a live Markdown pane's path (e.g. pane P1)
         // even though it ALSO sits in the shared Files pane's saved tab list.
         let md_paths = markdown_path_set([&doc], &saved_paths);
-        let editor_paths = editor_paths_for_restore(&saved_paths, &md_paths, &no_images());
+        let editor_paths = editor_paths_for_restore(&saved_paths, &md_paths, &no_images(), &no_pdfs());
 
         assert!(
             !editor_paths.contains(&&doc),
@@ -17623,7 +17824,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set(std::iter::empty(), &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_edits(), None, None, false, true);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_pdfs(), &no_edits(), None, None, None, false, true);
 
         assert_eq!(
             kind,
@@ -17645,7 +17846,7 @@ mod restore_pane_kind_tests {
         let md_paths = markdown_path_set([&doc], &saved_paths);
 
         let kind =
-            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_edits(), None, None, true, false);
+            restored_pane_kind(p, Some(p), &saved_paths, 0, &md_paths, &no_images(), &no_pdfs(), &no_edits(), None, None, None, true, false);
 
         assert_eq!(
             kind,

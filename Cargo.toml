@@ -89,6 +89,14 @@ env_logger = "0.11"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
 pulldown-cmark = { version = "0.11", default-features = false }
+# PDF viewer (Files Pane). Binds libpdfium.dylib at runtime; the crate's
+# default features target pdfium 7763, matching our vendored chromium/7763
+# dylib exactly (vendor/pdfium/.pinned-tag) — pinned to the ABI-proven version
+# the pre-warpui build shipped, so the crate/dylib ABI can never drift.
+pdfium-render = "=0.9.2"
+# In-memory PNG encoding of rendered PDF pages; unifies with pdfium-render's
+# bundled image 0.25 so `PdfBitmap::as_image()` -> DynamicImage round-trips.
+image = { version = "0.25", default-features = false, features = ["png"] }
 similar = "2"
 webbrowser = "1"
 rfd = "0.15"

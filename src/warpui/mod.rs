@@ -35,6 +35,7 @@ pub mod history_store;
 pub mod icons;
 pub mod image_view;
 pub mod input;
+pub mod pdf_view;
 pub mod layout;
 pub mod line_edit;
 pub mod persist;
