@@ -481,6 +481,20 @@ impl Term {
         }
     }
 
+    /// The scrollback row immediately above the current viewport top (one
+    /// step older than `display_offset` reaches), or `None` at the top of
+    /// history or on the alt screen. The renderer paints this partially
+    /// visible extra row while fractional (sub-row) smooth scrolling shifts
+    /// the grid down by less than one cell.
+    pub fn row_above_viewport(&self) -> Option<&crate::row::Row> {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let from_back = self.grid.display_offset + 1;
+        let idx = self.scrollback.len().checked_sub(from_back)?;
+        self.scrollback.iter().nth(idx)
+    }
+
     /// Materialize the active selection as plain text. `None` when
     /// no selection is set or the selection is empty. Wide-char
     /// spacers are skipped — their glyph belongs to the preceding
@@ -1317,6 +1331,27 @@ impl Handler for Term {
                 vte::ansi::NamedPrivateMode::BracketedPaste => {
                     self.mode |= TermMode::BRACKETED_PASTE;
                 }
+                // Mouse reporting (DECSET 1000/1002/1003) + encodings
+                // (1005/1006). TUIs that own the mouse (Claude Code, ranger,
+                // vim +mouse) set these; the renderer routes wheel/clicks as
+                // SGR mouse events instead of scrollback/arrow fallbacks.
+                // Dropping them here misclassified such apps as "alt screen,
+                // no mouse" and broke scrolling over them.
+                vte::ansi::NamedPrivateMode::ReportMouseClicks => {
+                    self.mode |= TermMode::MOUSE_REPORT_CLICK;
+                }
+                vte::ansi::NamedPrivateMode::ReportCellMouseMotion => {
+                    self.mode |= TermMode::MOUSE_DRAG;
+                }
+                vte::ansi::NamedPrivateMode::ReportAllMouseMotion => {
+                    self.mode |= TermMode::MOUSE_MOTION;
+                }
+                vte::ansi::NamedPrivateMode::SgrMouse => {
+                    self.mode |= TermMode::MOUSE_SGR;
+                }
+                vte::ansi::NamedPrivateMode::Utf8Mouse => {
+                    self.mode |= TermMode::MOUSE_UTF8;
+                }
                 _ => {}
             }
         }
@@ -1347,6 +1382,21 @@ impl Handler for Term {
                 }
                 vte::ansi::NamedPrivateMode::BracketedPaste => {
                     self.mode -= TermMode::BRACKETED_PASTE;
+                }
+                vte::ansi::NamedPrivateMode::ReportMouseClicks => {
+                    self.mode -= TermMode::MOUSE_REPORT_CLICK;
+                }
+                vte::ansi::NamedPrivateMode::ReportCellMouseMotion => {
+                    self.mode -= TermMode::MOUSE_DRAG;
+                }
+                vte::ansi::NamedPrivateMode::ReportAllMouseMotion => {
+                    self.mode -= TermMode::MOUSE_MOTION;
+                }
+                vte::ansi::NamedPrivateMode::SgrMouse => {
+                    self.mode -= TermMode::MOUSE_SGR;
+                }
+                vte::ansi::NamedPrivateMode::Utf8Mouse => {
+                    self.mode -= TermMode::MOUSE_UTF8;
                 }
                 _ => {}
             }
@@ -2040,6 +2090,54 @@ mod tests {
             !stripped.ends_with("\r\n"),
             "trailing blank rows leaked into snapshot: {stripped:?}"
         );
+    }
+
+    #[test]
+    fn row_above_viewport_tracks_display_offset() {
+        let mut t = Term::new(2, 5);
+        // No scrollback yet — nothing above the viewport.
+        assert!(t.row_above_viewport().is_none());
+        // Push lines "0".."4"; with 2 visible rows, "0".."2" land in scrollback.
+        for i in 0..5 {
+            t.input(char::from_digit(i, 10).unwrap());
+            if i < 4 {
+                t.carriage_return();
+                let _ = t.linefeed();
+            }
+        }
+        assert_eq!(t.scrollback_len(), 3);
+        // At the live bottom (offset 0) the viewport shows "3","4"; the row
+        // above is the most recent scrollback row "2".
+        assert_eq!(t.row_above_viewport().unwrap().cells[0].ch, '2');
+        t.scroll_display(1);
+        assert_eq!(t.row_above_viewport().unwrap().cells[0].ch, '1');
+        t.scroll_display(1);
+        assert_eq!(t.row_above_viewport().unwrap().cells[0].ch, '0');
+        // Fully scrolled to the top of history — no row above.
+        t.scroll_display(1);
+        assert_eq!(t.display_offset(), 3);
+        assert!(t.row_above_viewport().is_none());
+    }
+
+    #[test]
+    fn mouse_report_private_modes_toggle() {
+        use vte::ansi::{NamedPrivateMode, PrivateMode};
+        let mut t = Term::new(2, 5);
+        assert!(!t.mode_contains(TermMode::MOUSE_REPORT_CLICK));
+        // Claude Code's typical handshake: click reporting + SGR encoding.
+        t.set_private_mode(PrivateMode::Named(NamedPrivateMode::ReportMouseClicks));
+        t.set_private_mode(PrivateMode::Named(NamedPrivateMode::SgrMouse));
+        assert!(t.mode_contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(t.mode_contains(TermMode::MOUSE_SGR));
+        t.unset_private_mode(PrivateMode::Named(NamedPrivateMode::ReportMouseClicks));
+        t.unset_private_mode(PrivateMode::Named(NamedPrivateMode::SgrMouse));
+        assert!(!t.mode_contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(!t.mode_contains(TermMode::MOUSE_SGR));
+        // Motion/drag variants map onto their own bits.
+        t.set_private_mode(PrivateMode::Named(NamedPrivateMode::ReportCellMouseMotion));
+        t.set_private_mode(PrivateMode::Named(NamedPrivateMode::ReportAllMouseMotion));
+        assert!(t.mode_contains(TermMode::MOUSE_DRAG));
+        assert!(t.mode_contains(TermMode::MOUSE_MOTION));
     }
 
     #[test]

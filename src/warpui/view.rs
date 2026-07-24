@@ -523,7 +523,7 @@ impl View for TerminalView {
         // Snapshot the viewport (scrollback-aware) into owned cells.
         let default_fg = color::default_fg();
         let default_bg = color::default_bg();
-        let (cells, rows, cols, cursor, sel_range, disp_off, cursor_style) = {
+        let (cells, rows, cols, cursor, sel_range, disp_off, cursor_style, scroll_frac, overscan) = {
             let ctrl = self.controller.borrow();
             let t = ctrl.term.lock();
             let cols = t.grid.columns;
@@ -543,6 +543,32 @@ impl View for TerminalView {
             };
             let mut cells = vec![blank; rows * cols];
 
+            // Shared cell → GridCell conversion (also used for the overscan row).
+            let to_grid = |cell: &crane_term::cell::Cell| -> GridCell {
+                let mut fg = color::term_color_to_coloru(cell.fg, true);
+                let mut bg = color::term_color_to_coloru(cell.bg, false);
+                if cell.flags.contains(Flags::INVERSE) {
+                    // Default-aware swap so inverted text stays readable
+                    // against the theme bg (mirrors view.rs::color_to_egui).
+                    let swapped_bg = if fg == default_bg { default_fg } else { fg };
+                    let swapped_fg = if bg == default_bg { default_bg } else { bg };
+                    fg = swapped_fg;
+                    bg = swapped_bg;
+                }
+                GridCell {
+                    ch: cell.ch,
+                    fg,
+                    bg,
+                    is_wide: cell.flags.contains(Flags::WIDE_CHAR),
+                    bold: cell.flags.contains(Flags::BOLD),
+                    italic: cell.flags.contains(Flags::ITALIC),
+                    underline: cell.flags.contains(Flags::UNDERLINE),
+                    dim: cell.flags.contains(Flags::DIM),
+                    hidden: cell.flags.contains(Flags::HIDDEN),
+                    strikethrough: cell.flags.contains(Flags::STRIKEOUT),
+                }
+            };
+
             // Drive from renderable_content() so scrollback (display_offset)
             // is honored; viewport_row = point.line + display_offset.
             let rc = t.renderable_content();
@@ -558,30 +584,39 @@ impl View for TerminalView {
                 if col >= cols {
                     continue;
                 }
-                let cell = rcell.cell;
-                let mut fg = color::term_color_to_coloru(cell.fg, true);
-                let mut bg = color::term_color_to_coloru(cell.bg, false);
-                if cell.flags.contains(Flags::INVERSE) {
-                    // Default-aware swap so inverted text stays readable
-                    // against the theme bg (mirrors view.rs::color_to_egui).
-                    let swapped_bg = if fg == default_bg { default_fg } else { fg };
-                    let swapped_fg = if bg == default_bg { default_bg } else { bg };
-                    fg = swapped_fg;
-                    bg = swapped_bg;
-                }
-                cells[vr as usize * cols + col] = GridCell {
-                    ch: cell.ch,
-                    fg,
-                    bg,
-                    is_wide: cell.flags.contains(Flags::WIDE_CHAR),
-                    bold: cell.flags.contains(Flags::BOLD),
-                    italic: cell.flags.contains(Flags::ITALIC),
-                    underline: cell.flags.contains(Flags::UNDERLINE),
-                    dim: cell.flags.contains(Flags::DIM),
-                    hidden: cell.flags.contains(Flags::HIDDEN),
-                    strikethrough: cell.flags.contains(Flags::STRIKEOUT),
-                };
+                cells[vr as usize * cols + col] = to_grid(rcell.cell);
             }
+
+            // Sub-row smooth scroll (Warp's fractional scroll_top): the
+            // fractional part of `scroll_pos` beyond the integer
+            // display_offset shifts the painted grid down by frac*cell_h px,
+            // with the scrollback row just above the viewport (`overscan`)
+            // filling the revealed strip. Resync `scroll_pos` whenever the
+            // terminal moved the offset itself (typing snaps to bottom,
+            // scrollbar drag) so a stale fraction can't linger.
+            let scroll_frac = if t.is_alt_screen() {
+                0.0
+            } else {
+                let sp = self.scroll_pos.get();
+                if sp.floor() as i32 != display_offset || sp < 0.0 {
+                    self.scroll_pos.set(display_offset as f32);
+                    0.0
+                } else {
+                    sp.fract()
+                }
+            };
+            let overscan = if scroll_frac > 0.001 {
+                t.row_above_viewport().map(|row| {
+                    let blank_cell = blank;
+                    (0..cols)
+                        .map(|c| row.cells.get(c).map(&to_grid).unwrap_or(blank_cell))
+                        .collect::<Vec<GridCell>>()
+                })
+            } else {
+                None
+            };
+            // Top of history with no row above: paint row-aligned.
+            let scroll_frac = if overscan.is_none() { 0.0 } else { scroll_frac };
 
             let cursor = if cursor_visible {
                 let cr = cursor_pt.line.0 + display_offset;
@@ -598,7 +633,7 @@ impl View for TerminalView {
             let sel_range = t.selection.as_ref().map(|s| s.to_range());
             let disp_off = t.grid.display_offset as i32;
 
-            (cells, rows, cols, cursor, sel_range, disp_off, cursor_style)
+            (cells, rows, cols, cursor, sel_range, disp_off, cursor_style, scroll_frac, overscan)
         };
 
         // Ring the system bell if a BEL arrived since the last frame. Drained
@@ -814,14 +849,20 @@ impl View for TerminalView {
 
         // Inactive-pane dim: fade every glyph toward the background and hide
         // the cursor while another pane owns focus (shell drives `set_dimmed`).
-        let (cells, cursor) = if self.dimmed.get() {
+        let (cells, cursor, overscan) = if self.dimmed.get() {
             let mut cells = cells;
             for c in cells.iter_mut() {
                 c.fg.a = (c.fg.a as f32 * 0.45) as u8;
             }
-            (cells, None)
+            let overscan = overscan.map(|mut ov| {
+                for c in ov.iter_mut() {
+                    c.fg.a = (c.fg.a as f32 * 0.45) as u8;
+                }
+                ov
+            });
+            (cells, None, overscan)
         } else {
-            (cells, cursor)
+            (cells, cursor, overscan)
         };
         let grid = GridElement::new(
             rows,
@@ -835,6 +876,7 @@ impl View for TerminalView {
             self.desired.clone(),
         )
         .with_resize_wake(self.wake.clone())
+        .with_smooth_scroll(scroll_frac, overscan)
         .with_selection(sel_range, disp_off)
         .with_cursor_style(cursor_style.shape, cursor_style.blink)
         .on_mouse_report(mouse_report_cb)
@@ -905,6 +947,18 @@ impl View for TerminalView {
         let cell_h = crate::warpui::fontsize::base() * 1.2;
         let scroll_cb: std::rc::Rc<dyn Fn(f32, bool)> = std::rc::Rc::new(move |dy: f32, precise: bool| {
             let delta_lines = if precise { dy / cell_h } else { dy };
+            // Soft-knee on fast flicks: deltas under ~3 lines/event pass 1:1
+            // (micro-scroll fidelity untouched); above that, the excess is
+            // compressed 55% so trackpad momentum doesn't overshoot at
+            // uncontrollable speed. Continuous and monotonic, so there is no
+            // feel-step at the knee.
+            const KNEE: f32 = 2.5;
+            const EXCESS_GAIN: f32 = 0.35;
+            let delta_lines = if delta_lines.abs() > KNEE {
+                delta_lines.signum() * (KNEE + (delta_lines.abs() - KNEE) * EXCESS_GAIN)
+            } else {
+                delta_lines
+            };
             let ctrl = scroll_ctrl.borrow();
             let (alt, mouse, max, cur) = {
                 let t = ctrl.term.lock();
@@ -929,17 +983,31 @@ impl View for TerminalView {
                 return;
             }
             if alt {
-                // Alt-screen app without mouse (less/man/vim): one PageUp/Down
-                // per ~8 accumulated lines (it only understands page keys).
-                const LINES_PER_PAGE: f32 = 8.0;
+                // Alt-screen app without mouse (Claude Code/less/vim): ONE
+                // ARROW KEY PER LINE — Warp's alt_scroll (view.rs:9274 sends
+                // SS3 CUU/CUD once per line, fraction banked across events).
+                // The old PageUp/PageDown-per-8-lines conversion read as
+                // half-page jumps with heavy trackpad travel and overshoot.
                 let acc = page_accum.get() + delta_lines;
-                let pages = (acc / LINES_PER_PAGE).trunc() as i32;
-                page_accum.set(acc - pages as f32 * LINES_PER_PAGE);
-                if pages != 0 {
-                    let key: &[u8] = if pages > 0 { b"\x1b[5~" } else { b"\x1b[6~" };
-                    for _ in 0..pages.unsigned_abs().min(2) {
-                        ctrl.write_input(key);
+                let lines = acc.trunc() as i32;
+                page_accum.set(acc - lines as f32);
+                if lines != 0 {
+                    // SS3 arrows (ESC O A/B) — what Warp always sends here;
+                    // alt-screen TUIs run application cursor-key mode. Cap a
+                    // single burst so a wild momentum flick can't flood the PTY.
+                    let key: &[u8] = if lines > 0 { b"\x1bOA" } else { b"\x1bOB" };
+                    let n = lines.unsigned_abs().min(40) as usize;
+                    let mut seq = Vec::with_capacity(n * 3);
+                    for _ in 0..n {
+                        seq.extend_from_slice(key);
                     }
+                    ctrl.write_input(&seq);
+                }
+                if crate::warpui::grid_element::scroll_trace() {
+                    eprintln!(
+                        "[scroll] t={:.1}ms ALT dy={dy:+.2} precise={precise} lines={lines}",
+                        crate::warpui::grid_element::trace_epoch().elapsed().as_secs_f64() * 1e3,
+                    );
                 }
                 return;
             }
@@ -948,15 +1016,32 @@ impl View for TerminalView {
             // delta_lines scrolls up -> increases display_offset.
             let cur_f = cur as f32;
             // Resync if the terminal moved the offset itself (typing snaps to bottom).
-            if (scroll_pos.get() - cur_f).abs() >= 1.0 {
+            if scroll_pos.get().floor() as i32 != cur as i32 || scroll_pos.get() < 0.0 {
                 scroll_pos.set(cur_f);
             }
-            let pos = (scroll_pos.get() + delta_lines).clamp(0.0, max as f32);
+            let prev = scroll_pos.get();
+            let pos = (prev + delta_lines).clamp(0.0, max as f32);
             scroll_pos.set(pos);
-            let delta_rows = pos.round() as i32 - cur as i32;
+            // Floor (not round): display_offset holds the integer part and the
+            // remaining fraction becomes the sub-row pixel shift painted by
+            // GridElement (Warp-style smooth scroll) — see render()'s
+            // `scroll_frac` / `overscan`.
+            let delta_rows = pos.floor() as i32 - cur as i32;
             if delta_rows != 0 {
                 ctrl.term.lock().scroll_display(delta_rows);
+            }
+            // Wake on ANY position change: sub-row fractions repaint too —
+            // that per-pixel glide (not easing) is what makes it smooth.
+            if delta_rows != 0 || (pos - prev).abs() > f32::EPSILON {
                 (scroll_wake)();
+            }
+            // CRANE_SCROLL_TRACE=1: event-side timing probe for scroll-feel
+            // debugging (pairs with the paint-side probe in grid_element.rs).
+            if crate::warpui::grid_element::scroll_trace() {
+                eprintln!(
+                    "[scroll] t={:.1}ms dy={dy:+.2} precise={precise} pos={pos:.3} rows={delta_rows} max={max}",
+                    crate::warpui::grid_element::trace_epoch().elapsed().as_secs_f64() * 1e3,
+                );
             }
         });
         let term_body = EventHandler::new(grid.on_scroll(scroll_cb).finish())
@@ -1038,10 +1123,19 @@ impl TerminalView {
             ks.key == "up" && !ks.ctrl && !ks.alt && !ks.shift && !ks.cmd && !ks.meta;
         let is_down =
             ks.key == "down" && !ks.ctrl && !ks.alt && !ks.shift && !ks.cmd && !ks.meta;
+        let (app_cursor_now, alt_now) = {
+            let t = ctrl.term.lock();
+            (t.is_app_cursor(), t.is_alt_screen())
+        };
         if (is_up || is_down)
             && ctrl.shell_integration_active()
             && !ctrl.keymap_is_vi()
-            && !ctrl.term.lock().is_app_cursor()
+            && !app_cursor_now
+            // Full-screen apps must receive raw arrows. DECCKM alone is not a
+            // reliable full-screen tell — Claude Code (ink) runs the alt
+            // screen WITHOUT app-cursor mode, and intercepting there typed
+            // ^E^U + a shell command into its input (broke /resume arrows).
+            && !alt_now
         {
             let pwd = ctrl
                 .live_cwd()

@@ -637,6 +637,9 @@ pub struct CraneShellView {
     /// Per-project cache of the last `git worktree list` signature, used by the
     /// background worktree-poll tick to skip re-computing when nothing changed.
     worktree_poll_sig: HashMap<String, String>,
+    /// True while a background worktree poll (git shell-outs) is in flight —
+    /// the next tick skips instead of stacking a second one.
+    worktree_poll_inflight: bool,
     /// Per-scope generation counter for keyed async git scans (the reusable
     /// dedup / cancel-on-supersede primitive backing `spawn_git_scan`). A scope
     /// is an arbitrary string key — `"tree"` for a whole-tree sidebar backfill,
@@ -1001,6 +1004,30 @@ enum UpdatePrompt {
 
 /// Old check.rs `REMIND_AFTER_SECS`.
 const UPDATE_REMIND_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// One worktree row from a background `poll_worktrees` pass: `git worktree
+/// list` branch plus the diff/dirty badges, all shelled out OFF the UI thread.
+struct WorktreePollEntry {
+    path: PathBuf,
+    branch: String,
+    diff_stat: (u32, u32),
+    dirty: bool,
+}
+
+/// Native file dialog pre-parented to Crane's real render window. rfd's
+/// parentless fallback is `NSApp.mainWindow ?? windows.firstObject`; when
+/// `mainWindow` is transiently nil (app unfocused, mid-startup) that
+/// firstObject can be macOS's hidden 500x500 phantom helper window, so the
+/// NSOpenPanel sheet attaches to an invisible window and the picker appears
+/// to do nothing (same failure the WKWebView hit — see HostWindow::current).
+/// Parenting explicitly pins the sheet to the visible window.
+fn native_file_dialog(title: &str) -> rfd::AsyncFileDialog {
+    let mut d = rfd::AsyncFileDialog::new().set_title(title);
+    if let Some(win) = crate::warpui::browser::HostWindow::current() {
+        d = d.set_parent(&win);
+    }
+    d
+}
 
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
@@ -2675,6 +2702,7 @@ impl CraneShellView {
             switch_branch_scroll: ClippedScrollStateHandle::new(),
             new_workspace: None,
             worktree_poll_sig: HashMap::new(),
+            worktree_poll_inflight: false,
             git_scan_gen: HashMap::new(),
             _worktree_tick: worktree_tick,
             lsp: crate::lsp::LspManager::new(),
@@ -8375,41 +8403,93 @@ impl CraneShellView {
             }
             changed = true;
         }
-        // 2) Per git-project worktree reconciliation.
-        // Collect (pi, main_path) for git projects to avoid borrow conflicts.
-        let git_projects: Vec<(usize, String)> = self
+        if changed {
+            ctx.notify();
+        }
+        // 2) Per git-project worktree reconciliation. The git shell-outs
+        // (`worktree list`, diff, dirty) fork subprocesses at ~100-250ms each;
+        // running them here froze paints mid-scroll (steady ~250ms hitches —
+        // found via `sample` during a scroll session). They now run on the
+        // background executor; `apply_worktree_poll` reconciles on the
+        // main-thread callback with everything precomputed.
+        if self.worktree_poll_inflight {
+            return;
+        }
+        let git_projects: Vec<String> = self
             .projects
             .iter()
-            .enumerate()
-            .filter(|(_, p)| !p.is_loose)
-            .map(|(i, p)| (i, p.path.clone()))
+            .filter(|p| !p.is_loose)
+            .map(|p| p.path.clone())
             .collect();
+        if git_projects.is_empty() {
+            return;
+        }
+        self.worktree_poll_inflight = true;
+        let old_sigs = self.worktree_poll_sig.clone();
+        let fut = async move {
+            git_projects
+                .into_iter()
+                .filter_map(|main_path| {
+                    let main = std::path::Path::new(&main_path);
+                    let listed = crate::warpui::git::list_worktrees(main);
+                    // Signature = the git output; unchanged projects are
+                    // dropped here so the callback touches nothing for them.
+                    let sig: String = listed
+                        .iter()
+                        .map(|(p, b)| format!("{}|{}", p.display(), b))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if old_sigs.get(&main_path) == Some(&sig) {
+                        return None;
+                    }
+                    let entries: Vec<WorktreePollEntry> = listed
+                        .into_iter()
+                        .map(|(wpath, wbranch)| {
+                            let diff_stat = crate::warpui::git::diff_numstat(&wpath);
+                            let dirty = crate::warpui::git::is_dirty(&wpath);
+                            WorktreePollEntry { path: wpath, branch: wbranch, diff_stat, dirty }
+                        })
+                        .collect();
+                    Some((main_path, sig, entries))
+                })
+                .collect::<Vec<_>>()
+        };
+        ctx.spawn(fut, |this, results, vctx| {
+            this.worktree_poll_inflight = false;
+            this.apply_worktree_poll(results, vctx);
+        });
+    }
+
+    /// Main-thread half of `poll_worktrees`: reconcile the sidebar against the
+    /// background-computed `git worktree list` (+ diff/dirty) results.
+    fn apply_worktree_poll(
+        &mut self,
+        results: Vec<(String, String, Vec<WorktreePollEntry>)>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let mut changed = false;
         // A dead worktree to remove this tick (at most one — removal remaps many
         // index-keyed structures, so we do one per tick and let the next tick
         // catch the rest).
         let mut dead_remove: Option<(usize, usize)> = None;
-        for (pi, main_path) in git_projects {
-            let main = std::path::Path::new(&main_path);
-            let listed = crate::warpui::git::list_worktrees(main);
-            // Signature = the git output; skip the heavy path when unchanged.
-            let sig: String = listed
-                .iter()
-                .map(|(p, b)| format!("{}|{}", p.display(), b))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if self.worktree_poll_sig.get(&main_path) == Some(&sig) {
+        for (main_path, sig, listed) in results {
+            // Projects may have shifted since the poll was spawned — re-resolve
+            // the index by path; a since-removed project is simply skipped.
+            let Some(pi) = self.projects.iter().position(|p| p.path == main_path) else {
                 continue;
-            }
+            };
             self.worktree_poll_sig.insert(main_path.clone(), sig);
             let listed_paths: HashSet<String> =
-                listed.iter().map(|(p, _)| p.to_string_lossy().to_string()).collect();
+                listed.iter().map(|e| e.path.to_string_lossy().to_string()).collect();
             // 2a) Reconcile each worktree git knows about. NEW paths get a row;
             //     EXISTING paths whose branch moved (a `git checkout` in the
             //     worktree's terminal) have their label + diff/dirty refreshed
             //     in place. The previous code only appended new rows and dropped
             //     dead ones, so a branch switch left the sidebar showing the
             //     stale branch forever.
-            for (wpath, wbranch) in &listed {
+            for entry in &listed {
+                let wpath = &entry.path;
+                let wbranch = &entry.branch;
                 let wps = wpath.to_string_lossy().to_string();
                 let name = if wbranch == "(detached)" || wbranch.is_empty() {
                     crate::warpui::projects::basename_of(wpath)
@@ -8425,19 +8505,17 @@ impl CraneShellView {
                 if let Some(w) = p.worktrees.iter_mut().find(|w| w.path == wps) {
                     if !renamed && w.name != name {
                         w.name = name;
-                        w.diff_stat = crate::warpui::git::diff_numstat(wpath);
-                        w.dirty = crate::warpui::git::is_dirty(wpath);
+                        w.diff_stat = entry.diff_stat;
+                        w.dirty = entry.dirty;
                         changed = true;
                     }
                 } else {
-                    let diff_stat = crate::warpui::git::diff_numstat(wpath);
-                    let dirty = crate::warpui::git::is_dirty(wpath);
                     p.worktrees.push(crate::warpui::projects::WorktreeNode {
                         name,
                         path: wps,
                         tabs: Vec::new(),
-                        diff_stat,
-                        dirty,
+                        diff_stat: entry.diff_stat,
+                        dirty: entry.dirty,
                     });
                     changed = true;
                 }
@@ -14221,6 +14299,16 @@ impl View for CraneShellView {
             || self.git_log_branch_prompt.is_some()
             || self.switch_branch.is_some()
             || self.new_pane_menu_open;
+        // An inline text editor is capturing typing: the rename field, the
+        // new-entry field, the commit box, or a git-log prompt/filter. Plain
+        // keys already reach these via SendKeys, but Cmd editing chords must be
+        // carved out of the global chord table below or Cmd+A/C/V/X act on the
+        // focused pane (e.g. select-all the terminal grid) mid-edit.
+        let inline_edit_active = self.renaming.is_some()
+            || self.pending_new_entry.is_some()
+            || self.git_log_branch_prompt.is_some()
+            || self.git_log_filter_active
+            || self.commit_focused;
         // App-level keyboard shortcuts. The terminal pane propagates Cmd combos
         // up to here (its own on_keydown returns PropagateToParent for cmd).
         let scroll_wake = self.ui_wake.clone();
@@ -14315,6 +14403,22 @@ impl View for CraneShellView {
                 if switch_branch_open && ((!ks.cmd && !ks.ctrl && !ks.alt) || edit_chord) {
                     ctx.dispatch_typed_action(CraneShellAction::SwitchBranchKey(ks.clone()));
                     return DispatchEventResult::StopPropagation;
+                }
+                // Inline editors (rename / new entry / commit box / git-log
+                // prompts): editing chords route into SendKeys, whose handler
+                // already forwards to the active inline editor. Without this the
+                // global chord table below wins and Cmd+A selects the terminal
+                // grid while a rename field has focus. Cmd+Z is swallowed rather
+                // than forwarded — LineEdit has no undo, and letting it through
+                // would trigger the global file-operation undo mid-edit.
+                if inline_edit_active && ks.cmd && !ks.ctrl {
+                    if edit_chord {
+                        ctx.dispatch_typed_action(CraneShellAction::SendKeys(ks.clone()));
+                        return DispatchEventResult::StopPropagation;
+                    }
+                    if ks.key.to_ascii_lowercase() == "z" {
+                        return DispatchEventResult::StopPropagation;
+                    }
                 }
                 // No modal, but a dropdown / popover menu is open: Escape closes it
                 // (same clearing as clicking away) and is consumed so it does not
@@ -14709,6 +14813,15 @@ pub enum CraneShellAction {
     ShowTooltip { text: String, x: f32, y: f32 },
     /// Hide the hover tooltip (mouse left the anchoring element).
     HideTooltip,
+    /// Intentionally empty: dispatched by the terminal grid on every wheel
+    /// event purely for its side effect — action dispatch runs
+    /// `flush_effects` → `update_windows`, painting the scroll frame in the
+    /// SAME dispatch turn. A bare `ctx.notify()` only records the
+    /// invalidation (nothing on the notify-only path flushes), so scroll
+    /// frames would otherwise land a runloop tick late via the async wake
+    /// pump — reading as jittery/floaty scrolling. Mirrors Warp, whose wheel
+    /// handling always flushed through an action.
+    ScrollRepaint,
     /// Open a native file picker and open the chosen file into the Files pane.
     OpenExternalFile,
     /// Remove the project at index `i` from the project list and persist.
@@ -16016,6 +16129,10 @@ impl CraneShellView {
             CraneShellAction::ShowTooltip { text, x, y } => {
                 self.hover_tip = Some((text.clone(), *x, *y));
             }
+            CraneShellAction::ScrollRepaint => {
+                // No state change — the dispatch itself flushes the frame
+                // (see the variant doc).
+            }
             CraneShellAction::HideTooltip => {
                 self.hover_tip = None;
             }
@@ -16024,9 +16141,7 @@ impl CraneShellView {
                 // re-enter warpui's borrowed event dispatch (a blocking sync modal
                 // here panics with "RefCell already borrowed"). The callback runs
                 // on the main thread once the user confirms/cancels.
-                let fut = rfd::AsyncFileDialog::new()
-                    .set_title("Choose project folder")
-                    .pick_folder();
+                let fut = native_file_dialog("Choose project folder").pick_folder();
                 ctx.spawn(fut, |this, res: Option<rfd::FileHandle>, vctx| {
                     if let Some(folder) = res {
                         let p = folder.path().to_path_buf();
@@ -16082,9 +16197,7 @@ impl CraneShellView {
                 // Async native file picker (see AddProject) — a sync modal here
                 // re-enters warpui's borrowed dispatch and panics. Open the chosen
                 // file into the Files pane on the main-thread callback.
-                let fut = rfd::AsyncFileDialog::new()
-                    .set_title("Open file")
-                    .pick_file();
+                let fut = native_file_dialog("Open file").pick_file();
                 ctx.spawn(fut, |this, res: Option<rfd::FileHandle>, vctx| {
                     if let Some(f) = res {
                         let path = f.path().to_path_buf();
@@ -16901,8 +17014,7 @@ impl CraneShellView {
                     .map(|st| st.custom_path.text().to_string())
                     .filter(|p| !p.is_empty())
                     .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
-                let fut = rfd::AsyncFileDialog::new()
-                    .set_title("Choose worktree parent folder")
+                let fut = native_file_dialog("Choose worktree parent folder")
                     .set_directory(start)
                     .pick_folder();
                 ctx.spawn(fut, |this, res: Option<rfd::FileHandle>, vctx| {

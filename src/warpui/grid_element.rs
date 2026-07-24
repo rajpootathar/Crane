@@ -15,6 +15,18 @@ fn blink_epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
+/// True when `CRANE_SCROLL_TRACE=1`: scroll-feel debugging probes print
+/// event- and paint-side timings to stderr. Cached once per process.
+pub fn scroll_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRANE_SCROLL_TRACE").is_some())
+}
+
+/// Shared epoch for scroll-trace timestamps (event and paint probes align).
+pub fn trace_epoch() -> Instant {
+    blink_epoch()
+}
+
 use crane_term::index::{Column as TermColumn, Line as TermLine, Point as TermPoint, Side};
 use crane_term::selection::SelectionRange;
 use crane_term::CursorShape;
@@ -142,6 +154,12 @@ pub struct GridElement {
     /// vim-mouse work) INSTEAD of starting a text selection. The callback
     /// receives `(press, col_1based, row_1based)`.
     mouse_report_cb: Option<Rc<dyn Fn(bool, usize, usize)>>,
+    /// Sub-row smooth-scroll fraction (0..1): the whole grid paints shifted
+    /// down by `scroll_frac * cell_h` px (Warp's fractional scroll_top).
+    scroll_frac: f32,
+    /// The scrollback row just above the viewport, painted in the strip the
+    /// fractional shift reveals at the top. `None` paints row-aligned.
+    overscan_row: Option<Vec<GridCell>>,
 }
 
 impl GridElement {
@@ -186,7 +204,32 @@ impl GridElement {
             link_pressed: Rc::new(RefCell::new(None)),
             url_did_drag: Rc::new(StdCell::new(false)),
             mouse_report_cb: None,
+            scroll_frac: 0.0,
+            overscan_row: None,
         }
+    }
+
+    /// Sub-row smooth-scroll state: `frac` (0..1) shifts the painted grid down
+    /// by `frac * cell_h` px; `overscan` is the scrollback row just above the
+    /// viewport, filling the revealed top strip. Warp-style pixel scrolling —
+    /// smoothness comes from painting the fraction, not from animation.
+    pub fn with_smooth_scroll(mut self, frac: f32, overscan: Option<Vec<GridCell>>) -> Self {
+        self.scroll_frac = frac.clamp(0.0, 0.999);
+        self.overscan_row = overscan;
+        self
+    }
+
+    /// Rows to paint: the overscan row (at -1) when present, then the
+    /// viewport rows. The `f32` is the row's y position in cell heights.
+    fn paint_rows(&self) -> impl Iterator<Item = (f32, &[GridCell])> {
+        self.overscan_row
+            .as_deref()
+            .map(|ov| (-1.0f32, ov))
+            .into_iter()
+            .chain(
+                (0..self.rows)
+                    .map(move |r| (r as f32, &self.cells[r * self.cols..(r + 1) * self.cols])),
+            )
     }
 
     /// Attach a scroll-wheel handler that receives `(delta_y_points, precise)`.
@@ -311,19 +354,39 @@ impl Element for GridElement {
         // metric); clamp so tiny/large fonts still get a sensible offset.
         let underline_off = ((-descent) * 0.5).clamp(1.0, 3.0);
         let (cw, ch) = (self.cell_w, self.cell_h);
+        // Sub-row smooth scroll: shift every painted row down by the
+        // fractional part of the scroll position (in px) and paint the
+        // overscan row (index -1) in the revealed top strip. Clipped to the
+        // element bounds so partial rows can't bleed into sibling panes.
+        let fy = self.scroll_frac * ch;
+        let smooth = self.overscan_row.is_some() || fy > 0.01;
+        if scroll_trace() {
+            eprintln!(
+                "[paint]  t={:.1}ms frac={:.3} fy={fy:.2}px overscan={}",
+                trace_epoch().elapsed().as_secs_f64() * 1e3,
+                self.scroll_frac,
+                self.overscan_row.is_some(),
+            );
+        }
 
         // 1) Whole-grid background + the single hit rect.
         ctx.scene
             .draw_rect_with_hit_recording(RectF::new(origin, size))
             .with_background(Fill::Solid(self.default_bg));
 
+        if smooth {
+            ctx.scene
+                .start_layer(warpui::ClipBounds::BoundedByActiveLayerAnd(RectF::new(
+                    origin, size,
+                )));
+        }
+
         // 2) Per-cell backgrounds (only where != default).
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                let cell = self.cells[r * self.cols + c];
+        for (rowf, row_cells) in self.paint_rows() {
+            for (c, cell) in row_cells.iter().enumerate().take(self.cols) {
                 if cell.bg != self.default_bg {
                     let x = origin.x() + c as f32 * cw;
-                    let y = origin.y() + r as f32 * ch;
+                    let y = origin.y() + rowf * ch + fy;
                     ctx.scene
                         .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(cw, ch)))
                         .with_background(Fill::Solid(cell.bg));
@@ -341,7 +404,7 @@ impl Element for GridElement {
                     let pt = TermPoint::new(TermLine(term_line), TermColumn(c));
                     if sel.contains(pt) {
                         let x = origin.x() + c as f32 * cw;
-                        let y = origin.y() + r as f32 * ch;
+                        let y = origin.y() + r as f32 * ch + fy;
                         ctx.scene
                             .draw_rect_without_hit_recording(
                                 RectF::new(vec2f(x, y), vec2f(cw, ch)),
@@ -353,9 +416,8 @@ impl Element for GridElement {
         }
 
         // 4) Glyphs + decorations (underline, strikethrough).
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                let cell = self.cells[r * self.cols + c];
+        for (rowf, row_cells) in self.paint_rows() {
+            for (c, &cell) in row_cells.iter().enumerate().take(self.cols) {
 
                 // SGR hidden: suppress the glyph entirely.
                 if cell.hidden {
@@ -400,7 +462,7 @@ impl Element for GridElement {
                     if let Some((gid, render_font)) = fc.glyph_for_char(cell_font, cell.ch, true) {
                         let pos = vec2f(
                             origin.x() + c as f32 * cw,
-                            origin.y() + r as f32 * ch + baseline,
+                            origin.y() + rowf * ch + fy + baseline,
                         );
                         ctx.scene.draw_glyph(pos, gid, render_font, self.font_size, fg);
                     }
@@ -411,7 +473,7 @@ impl Element for GridElement {
                 // position in the old renderer rather than a fixed +2px offset.
                 if cell.underline {
                     let x = origin.x() + c as f32 * cw;
-                    let y = origin.y() + r as f32 * ch + baseline + underline_off;
+                    let y = origin.y() + rowf * ch + fy + baseline + underline_off;
                     ctx.scene
                         .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(cw, 1.0)))
                         .with_background(Fill::Solid(fg));
@@ -420,7 +482,7 @@ impl Element for GridElement {
                 // Strikethrough: 1px line at cell vertical midpoint.
                 if cell.strikethrough {
                     let x = origin.x() + c as f32 * cw;
-                    let y = origin.y() + r as f32 * ch + ch * 0.5;
+                    let y = origin.y() + rowf * ch + fy + ch * 0.5;
                     ctx.scene
                         .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(cw, 1.0)))
                         .with_background(Fill::Solid(fg));
@@ -453,7 +515,7 @@ impl Element for GridElement {
                     let wide = self.cells[cr * self.cols + cc].is_wide;
                     let full_w = if wide { cw * 2.0 } else { cw };
                     let x = origin.x() + cc as f32 * cw;
-                    let y = origin.y() + cr as f32 * ch;
+                    let y = origin.y() + cr as f32 * ch + fy;
                     let rect = match self.cursor_shape {
                         CursorShape::Block => RectF::new(vec2f(x, y), vec2f(full_w, ch)),
                         CursorShape::Beam => {
@@ -481,12 +543,16 @@ impl Element for GridElement {
                 let eff_end = hce.min(self.cols);
                 let x = origin.x() + hcs as f32 * cw;
                 let w = (eff_end.saturating_sub(hcs)) as f32 * cw;
-                let y = origin.y() + hr as f32 * ch + baseline + 2.0;
+                let y = origin.y() + hr as f32 * ch + fy + baseline + 2.0;
                 let ul_color = crate::warpui::theme::accent();
                 ctx.scene
                     .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(w, 1.0)))
                     .with_background(Fill::Solid(ul_color));
             }
+        }
+
+        if smooth {
+            ctx.scene.stop_layer();
         }
     }
 
@@ -516,8 +582,24 @@ impl Element for GridElement {
                     && position.x() <= o.x() + s.x()
                     && position.y() >= o.y()
                     && position.y() <= o.y() + s.y();
+                if scroll_trace() {
+                    eprintln!(
+                        "[grid-ev] t={:.1}ms pos=({:.0},{:.0}) origin=({:.0},{:.0}) size=({:.0},{:.0}) inside={inside}",
+                        trace_epoch().elapsed().as_secs_f64() * 1e3,
+                        position.x(), position.y(), o.x(), o.y(), s.x(), s.y(),
+                    );
+                }
                 if inside {
                     cb(delta.y(), *precise);
+                    // Paint THIS dispatch turn. `notify()` records the
+                    // invalidation; the ScrollRepaint action forces the
+                    // synchronous `flush_effects` → `update_windows` that the
+                    // notify-only path lacks (async wake alone lands the frame
+                    // a runloop tick late — reads as jittery scrolling).
+                    ctx.notify();
+                    ctx.dispatch_typed_action(
+                        crate::warpui::shell::CraneShellAction::ScrollRepaint,
+                    );
                     return true;
                 }
             }
@@ -531,7 +613,9 @@ impl Element for GridElement {
         };
         let pos_to_cell = |p: &Vector2F| -> (usize, usize, Side) {
             let rel_x = (p.x() - o.x()).max(0.0);
-            let rel_y = (p.y() - o.y()).max(0.0);
+            // Subtract the sub-row smooth-scroll shift so hit-testing matches
+            // where rows are actually painted (see paint()'s `fy`).
+            let rel_y = (p.y() - o.y() - self.scroll_frac * ch).max(0.0);
             let col = ((rel_x / cw).floor() as usize).min(self.cols.saturating_sub(1));
             let row = ((rel_y / ch).floor() as usize).min(self.rows.saturating_sub(1));
             let cell_frac = (rel_x % cw) / cw.max(1.0);

@@ -305,6 +305,22 @@ impl raw_window_handle::HasWindowHandle for HostWindow {
     }
 }
 
+impl raw_window_handle::HasDisplayHandle for HostWindow {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        // AppKit has no per-display state in raw-window-handle; the handle is a
+        // unit marker. Needed so HostWindow satisfies rfd::set_parent's bounds.
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(
+                raw_window_handle::RawDisplayHandle::AppKit(
+                    raw_window_handle::AppKitDisplayHandle::new(),
+                ),
+            )
+        })
+    }
+}
+
 // ── Host ─────────────────────────────────────────────────────────────────────
 
 impl BrowserHost {
