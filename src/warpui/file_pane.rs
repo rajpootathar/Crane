@@ -6,11 +6,11 @@
 use std::path::PathBuf;
 
 use warpui::elements::{
-    ConstrainedBox, Container, DispatchEventResult, Element, EventHandler, Expanded, Flex,
-    ParentElement, Rect, Stack, Text,
+    ConstrainedBox, DispatchEventResult, Element, EventHandler, Expanded, Flex, ParentElement,
+    Rect, Stack, Text,
 };
 use warpui::fonts::FamilyId;
-use warpui::{AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext};
+use warpui::{AppContext, Entity, TypedActionView, View, ViewContext};
 
 use crate::warpui::theme;
 
@@ -23,26 +23,9 @@ const RENDER_LINES: usize = 2000;
 struct OpenFile {
     /// Full path — tabs are keyed by this so same-named files don't collide.
     path: PathBuf,
-    name: String,
     lines: Vec<String>,
     /// Unsaved edits in THIS file (per-file, not per-view).
     dirty: bool,
-}
-
-fn read_file(path: &PathBuf) -> OpenFile {
-    let content = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| format!("<cannot read {}: {e}>", path.display()));
-    let lines = content.lines().map(str::to_string).collect(); // full content
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    OpenFile {
-        path: path.clone(),
-        name,
-        lines,
-        dirty: false,
-    }
 }
 
 pub struct FileView {
@@ -61,116 +44,12 @@ pub struct FileView {
     /// Monospace cell metrics for click→(line,col) mapping.
     char_w: f32,
     line_h: f32,
-    /// Window rect of the text body (recorded each paint by a RectProbe).
-    body_rect: std::rc::Rc<std::cell::Cell<warpui::geometry::rect::RectF>>,
     /// Set when this pane was created from pre-built text (git log etc.) — then
     /// it shows that single doc with no tab strip.
     is_doc: bool,
 }
 
 impl FileView {
-    pub fn new(ctx: &mut ViewContext<Self>, path: PathBuf) -> Self {
-        let (font, char_w, line_h) = Self::font(ctx);
-        Self {
-            font,
-            files: vec![read_file(&path)],
-            active: 0,
-            cursor: (0, 0),
-            undo: Vec::new(),
-            redo: Vec::new(),
-            scroll: 0,
-            char_w,
-            line_h,
-            body_rect: std::rc::Rc::new(std::cell::Cell::new(warpui::geometry::rect::RectF::new(
-                warpui::geometry::vector::vec2f(0.0, 0.0),
-                warpui::geometry::vector::vec2f(0.0, 0.0),
-            ))),
-            is_doc: false,
-        }
-    }
-
-    /// A single read-only doc pane from pre-built lines (git log, placeholders).
-    pub fn from_text(ctx: &mut ViewContext<Self>, title: String, lines: Vec<String>) -> Self {
-        let (font, char_w, line_h) = Self::font(ctx);
-        Self {
-            font,
-            files: vec![OpenFile {
-                path: PathBuf::new(),
-                name: title,
-                lines,
-                dirty: false,
-            }],
-            active: 0,
-            cursor: (0, 0),
-            undo: Vec::new(),
-            redo: Vec::new(),
-            scroll: 0,
-            char_w,
-            line_h,
-            body_rect: std::rc::Rc::new(std::cell::Cell::new(warpui::geometry::rect::RectF::new(
-                warpui::geometry::vector::vec2f(0.0, 0.0),
-                warpui::geometry::vector::vec2f(0.0, 0.0),
-            ))),
-            is_doc: true,
-        }
-    }
-
-    /// Load the mono font and measure its cell width + line height at 12pt.
-    fn font(ctx: &mut ViewContext<Self>) -> (FamilyId, f32, f32) {
-        use warpui::fonts::Properties;
-        warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            let family = crate::warpui::bundled_fonts::mono(cache);
-            let size = 12.0;
-            let font = cache.select_font(family, Properties::default());
-            let char_w = cache
-                .glyph_for_char(font, 'M', false)
-                .and_then(|(gid, mf)| cache.glyph_advance(mf, size, gid).ok())
-                .map(|v| v.x())
-                .filter(|w| *w > 0.0)
-                .unwrap_or(size * 0.6);
-            let line_h = (cache.ascent(font, size) - cache.descent(font, size)).max(size);
-            (family, char_w, line_h)
-        })
-    }
-
-    /// Open `path` as a new tab (or switch to it if already open).
-    pub fn open(&mut self, path: PathBuf) {
-        let f = read_file(&path);
-        if let Some(i) = self.files.iter().position(|of| of.path == f.path) {
-            self.active = i;
-        } else {
-            self.files.push(f);
-            self.active = self.files.len() - 1;
-        }
-        self.cursor = (0, 0);
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.files.get(self.active).map(|f| f.dirty).unwrap_or(false)
-    }
-
-    /// Switch the active file tab (shell-driven).
-    pub fn switch(&mut self, i: usize) {
-        if i < self.files.len() {
-            self.active = i;
-            self.cursor = (0, 0);
-            self.scroll = 0;
-        }
-    }
-
-    /// Close file tab `i` (shell-driven; keeps >=1 file).
-    pub fn close_tab(&mut self, i: usize) {
-        if i < self.files.len() && self.files.len() > 1 {
-            self.files.remove(i);
-            if self.active >= self.files.len() {
-                self.active = self.files.len() - 1;
-            } else if self.active > i {
-                self.active -= 1;
-            }
-            self.cursor = (0, 0);
-        }
-    }
-
     /// Apply an editing keystroke to the active file. Char-indexed so unicode
     /// stays correct. Returns false for doc panes (read-only).
     pub fn edit(&mut self, ks: &warpui::keymap::Keystroke) {
@@ -396,58 +275,6 @@ impl FileView {
         }
     }
 
-    fn tab_strip(&self) -> Box<dyn Element> {
-        let mut row = Flex::row();
-        for (i, f) in self.files.iter().enumerate() {
-            let active = i == self.active;
-            let bg = if active { theme::surface() } else { theme::topbar_bg() };
-            let fg = if active { theme::text() } else { theme::text_muted() };
-            // Per-file dirty marker.
-            let label = if f.dirty {
-                format!("* {}", f.name)
-            } else {
-                f.name.clone()
-            };
-            let chip = EventHandler::new(
-                Container::new(Text::new(label, self.font, 11.0).with_color(fg).finish())
-                    .with_background_color(bg)
-                    .with_padding_left(10.0)
-                    .with_padding_right(10.0)
-                    .with_padding_top(6.0)
-                    .with_padding_bottom(6.0)
-                    .finish(),
-            )
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(FileViewAction::Switch(i));
-                DispatchEventResult::StopPropagation
-            })
-            .finish();
-            // Close button (ASCII "x" — FileView only loads the mono font).
-            let close = EventHandler::new(
-                Container::new(
-                    Text::new("x".to_string(), self.font, 11.0)
-                        .with_color(theme::text_muted())
-                        .finish(),
-                )
-                .with_background_color(bg)
-                .with_padding_left(2.0)
-                .with_padding_right(8.0)
-                .with_padding_top(6.0)
-                .with_padding_bottom(6.0)
-                .finish(),
-            )
-            .on_left_mouse_down(move |ctx, _app, _pos| {
-                ctx.dispatch_typed_action(FileViewAction::Close(i));
-                DispatchEventResult::StopPropagation
-            })
-            .finish();
-            row = row.with_child(Flex::row().with_child(chip).with_child(close).finish());
-        }
-        ConstrainedBox::new(self.panel(theme::topbar_bg(), row.finish()))
-            .with_height(28.0)
-            .finish()
-    }
-
     fn panel(&self, bg: warpui::color::ColorU, content: Box<dyn Element>) -> Box<dyn Element> {
         Stack::new()
             .with_child(Rect::new().with_background_color(bg).finish())
@@ -462,8 +289,6 @@ impl Entity for FileView {
 
 #[derive(Debug, Clone)]
 pub enum FileViewAction {
-    Switch(usize),
-    Close(usize),
     /// Scroll by N lines (positive = down).
     Scroll(i32),
 }
@@ -472,25 +297,6 @@ impl TypedActionView for FileView {
     type Action = FileViewAction;
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
-            FileViewAction::Switch(i) => {
-                if *i < self.files.len() {
-                    self.active = *i;
-                    self.cursor = (0, 0);
-                }
-            }
-            FileViewAction::Close(i) => {
-                // Keep at least one file open (closing the pane itself is the
-                // shell's job — out of scope here).
-                if *i < self.files.len() && self.files.len() > 1 {
-                    self.files.remove(*i);
-                    if self.active >= self.files.len() {
-                        self.active = self.files.len() - 1;
-                    } else if self.active > *i {
-                        self.active -= 1;
-                    }
-                    self.cursor = (0, 0);
-                }
-            }
             FileViewAction::Scroll(delta) => {
                 let max = self
                     .files

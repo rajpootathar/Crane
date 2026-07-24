@@ -161,4 +161,18 @@ impl Node {
             }
         }
     }
+
+    /// True if `id` is a leaf anywhere in this subtree. Non-allocating
+    /// alternative to `leaves(&mut Vec::new()).contains(&id)` — callers that
+    /// only need membership (e.g. "which Tab owns this pane?") used to pay a
+    /// heap allocation per Layout per call for a Vec they immediately
+    /// discarded.
+    pub fn contains_leaf(&self, id: PaneId) -> bool {
+        match self {
+            Node::Leaf(pid) => *pid == id,
+            Node::Split { first, second, .. } => {
+                first.contains_leaf(id) || second.contains_leaf(id)
+            }
+        }
+    }
 }

@@ -20,6 +20,11 @@ pub fn text_header() -> ColorU   { rgb(crate::theme::current().text_header) }
 pub fn accent() -> ColorU        { rgb(crate::theme::current().accent) }
 pub fn row_active() -> ColorU    { rgb(crate::theme::current().row_active) }
 pub fn row_hover() -> ColorU     { rgb(crate::theme::current().row_hover) }
+// Sibling of the other theme-token getters above (all live); no caller
+// wires a focus-border colour yet but the token exists in every bundled
+// theme file and is meant to be picked up once the focus-border render
+// path reads from the theme instead of a hardcoded accent. Kept, not deleted.
+#[allow(dead_code)]
 pub fn focus_border() -> ColorU  { rgb(crate::theme::current().focus_border) }
 pub fn error() -> ColorU         { rgb(crate::theme::current().error) }
 pub fn success() -> ColorU       { rgb(crate::theme::current().success) }
@@ -94,5 +99,11 @@ pub fn menu_shadow() -> ColorU    { ColorU { r: 0, g: 0, b: 0, a: 128 } }
 pub const TOPBAR_H: f32 = 36.0;
 pub const HEADER_H: f32 = 24.0;
 pub const TAB_H: f32    = 26.0;
+// LEFT_W / RIGHT_W: default panel widths, same spirit as TOPBAR_H/HEADER_H/
+// TAB_H above (all live). No caller reads these yet — actual panel widths
+// are currently tracked as per-instance state — but they're the documented
+// defaults for panel layout and are meant to be wired up together. Kept.
+#[allow(dead_code)]
 pub const LEFT_W: f32   = 240.0;
+#[allow(dead_code)]
 pub const RIGHT_W: f32  = 300.0;

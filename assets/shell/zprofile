@@ -1,0 +1,26 @@
+# Crane ZDOTDIR shim — .zprofile.
+#
+# Read only for login shells. Crane spawns interactive non-login shells, so
+# this is normally inert; it exists so a login zsh started inside a Crane pane
+# (`zsh -l`, an ssh hop back in) still gets the user's own .zprofile instead of
+# silently losing it to Crane's ZDOTDIR redirect.
+#
+# See .zshenv for what CRANE_ZDOTDIR / CRANE_USER_ZDOTDIR mean. The fallbacks
+# below re-derive them so this shim is still correct if it is ever reached
+# without .zshenv having run (zsh -f, a hand-run `source`).
+
+CRANE_ZDOTDIR="${CRANE_ZDOTDIR:-${ZDOTDIR:-$HOME}}"
+CRANE_USER_ZDOTDIR="${CRANE_USER_ZDOTDIR:-${CRANE_OLD_ZDOTDIR:-$HOME}}"
+# See .zshenv: a "user" directory equal to Crane's makes this shim source
+# itself, recursing until zsh gives up.
+[[ "$CRANE_USER_ZDOTDIR" == "$CRANE_ZDOTDIR" ]] && CRANE_USER_ZDOTDIR="$HOME"
+
+if [[ -f "$CRANE_USER_ZDOTDIR/.zprofile" ]]; then
+  ZDOTDIR="$CRANE_USER_ZDOTDIR"
+  source "$CRANE_USER_ZDOTDIR/.zprofile"
+  CRANE_USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
+fi
+
+# `export` — .zshenv unsets ZDOTDIR to let the user's own file relocate it, so
+# the export attribute has to be re-applied wherever it is set back.
+export ZDOTDIR="$CRANE_ZDOTDIR"

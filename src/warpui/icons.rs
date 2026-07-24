@@ -25,14 +25,21 @@ pub const ARROW_CLOCKWISE: &str = "\u{E036}";
 pub const ARROW_SQUARE_OUT: &str = "\u{E5DE}";
 pub const ARROW_COUNTER_CLOCKWISE: &str = "\u{E038}";
 pub const ARROWS_OUT: &str = "\u{E0A2}";
+// Not wired into any pane yet, but CLAUDE.md names these four as part of
+// the sanctioned icon palette for future UI work (Crane bans raw Unicode
+// glyph icons — see "Icons" in the project ruleset). Kept, not deleted.
+#[allow(dead_code)]
 pub const DOWNLOAD_SIMPLE: &str = "\u{E20C}";
 pub const GEAR: &str = "\u{E270}";
 pub const GLOBE: &str = "\u{E288}";
 pub const INFO: &str = "\u{E2CE}";
 pub const WARNING: &str = "\u{E4E0}";
+#[allow(dead_code)]
 pub const PAINT_BRUSH: &str = "\u{E6F0}";
+#[allow(dead_code)]
 pub const CODE: &str = "\u{E1BC}";
 pub const KEYBOARD: &str = "\u{E2D8}";
+#[allow(dead_code)]
 pub const LIGHTNING: &str = "\u{E2DE}";
 pub const CIRCLE: &str = "\u{E18A}";
 pub const SIDEBAR: &str = "\u{EAB6}";

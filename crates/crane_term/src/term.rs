@@ -4,12 +4,26 @@
 
 use crate::cell::{Cell, Color, Flags, NamedColor};
 use crate::grid::{Cursor, Grid};
-use crate::handler::{CursorStyle, Handler, ProcessorInput, ScrollDelta};
+use crate::handler::{CursorStyle, Handler, ProcessorInput, ScrollDelta, ShellIntegrationEvent};
 use crate::index::{Column, Line, Point};
 use crate::mode::TermMode;
 use crate::row::Row;
 use crate::scrollback::Scrollback;
 use crate::selection::Selection;
+
+/// Hard cap on buffered [`ShellIntegrationEvent`]s between drains.
+///
+/// Deliberately far more generous than `notifications`'s cap (32): dropping
+/// an old desktop-notification toast is harmless, but dropping a shell
+/// event can break command/exit-code pairing downstream and silently lose
+/// a recorded command. In normal operation the PTY reader drains
+/// `shell_events` every parse pass, so this ceiling is never approached —
+/// it exists only so a `Term` nobody drains (e.g. before the reader-thread
+/// wiring lands) cannot grow its heap without bound. On overflow the
+/// oldest event is evicted first; the resulting possibly-lost command
+/// record is an accepted cost because shell-integration history recording
+/// is best-effort and must never be allowed to leak memory.
+const SHELL_EVENT_QUEUE_MAX: usize = 1024;
 
 #[derive(Debug)]
 pub struct Term {
@@ -57,6 +71,13 @@ pub struct Term {
     /// App-level toast queue. Bounded loosely by drop-after-32 so a
     /// runaway emitter can't pin unbounded heap if the UI is paused.
     notifications: Vec<TermNotification>,
+    /// OSC 633 shell-integration events buffered for the reader thread to
+    /// drain into the history store. Bounded at [`SHELL_EVENT_QUEUE_MAX`],
+    /// evicting the oldest event first when full — unlike `notifications`,
+    /// where evicting an old toast is harmless, evicting here means a
+    /// lost command record; see the constant's doc comment for why that
+    /// tradeoff is acceptable and why the cap is set so much higher.
+    shell_events: Vec<ShellIntegrationEvent>,
     /// Whether full-screen redraws on this Term should be treated as
     /// ephemeral frames (the live grid is mutable surface, never
     /// history) or as scrollback-producing output (the default Bash /
@@ -91,6 +112,14 @@ pub struct Term {
     /// [`Term::take_bell`] once per frame so the UI can flash / chime
     /// exactly once per bell burst.
     bell_pending: bool,
+    /// The active theme's default foreground / background / cursor colours,
+    /// as 8-bit RGB. Injected by Crane via [`Term::set_default_colors`]; used
+    /// only to answer OSC 10 / 11 / 12 colour queries so apps can adapt to a
+    /// light vs dark theme. Defaults to a light-grey-on-near-black scheme so a
+    /// pre-injection query still reads as "dark terminal".
+    default_fg_rgb: (u8, u8, u8),
+    default_bg_rgb: (u8, u8, u8),
+    default_cursor_rgb: (u8, u8, u8),
 }
 
 /// Resize / full-clear policy for the primary screen. See the
@@ -132,11 +161,31 @@ impl Term {
             selection: None,
             pty_replies: Vec::new(),
             notifications: Vec::new(),
+            shell_events: Vec::new(),
             full_grid_clear_behavior: FullGridClearBehavior::default(),
             cursor_style: CursorStyle::default(),
             window_title: None,
             bell_pending: false,
+            default_fg_rgb: (0xb0, 0xb4, 0xc0),
+            default_bg_rgb: (0x0e, 0x10, 0x18),
+            default_cursor_rgb: (0xb0, 0xb4, 0xc0),
         }
+    }
+
+    /// Tell this Term the active theme's default foreground / background /
+    /// cursor colours, so OSC 10 / 11 / 12 queries answer with the truth. Crane
+    /// calls this at PTY spawn and whenever the theme changes; an app that
+    /// queries `OSC 11 ; ?` then learns the real background and picks readable
+    /// text instead of assuming dark and rendering light-on-light.
+    pub fn set_default_colors(
+        &mut self,
+        fg: (u8, u8, u8),
+        bg: (u8, u8, u8),
+        cursor: (u8, u8, u8),
+    ) {
+        self.default_fg_rgb = fg;
+        self.default_bg_rgb = bg;
+        self.default_cursor_rgb = cursor;
     }
 
     /// Cursor presentation last requested by the PTY via DECSCUSR
@@ -163,6 +212,12 @@ impl Term {
     /// loop each frame; returns an empty Vec when nothing is pending.
     pub fn take_notifications(&mut self) -> Vec<TermNotification> {
         std::mem::take(&mut self.notifications)
+    }
+
+    /// Drain buffered OSC 633 shell-integration events. Called by the PTY
+    /// reader each pass; empty when the shell has no integration sourced.
+    pub fn take_shell_events(&mut self) -> Vec<ShellIntegrationEvent> {
+        std::mem::take(&mut self.shell_events)
     }
 
     /// One-way switch: tell this Term to treat primary-screen frame
@@ -424,6 +479,20 @@ impl Term {
             row: 0,
             col: 0,
         }
+    }
+
+    /// The scrollback row immediately above the current viewport top (one
+    /// step older than `display_offset` reaches), or `None` at the top of
+    /// history or on the alt screen. The renderer paints this partially
+    /// visible extra row while fractional (sub-row) smooth scrolling shifts
+    /// the grid down by less than one cell.
+    pub fn row_above_viewport(&self) -> Option<&crate::row::Row> {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let from_back = self.grid.display_offset + 1;
+        let idx = self.scrollback.len().checked_sub(from_back)?;
+        self.scrollback.iter().nth(idx)
     }
 
     /// Materialize the active selection as plain text. `None` when
@@ -1262,6 +1331,27 @@ impl Handler for Term {
                 vte::ansi::NamedPrivateMode::BracketedPaste => {
                     self.mode |= TermMode::BRACKETED_PASTE;
                 }
+                // Mouse reporting (DECSET 1000/1002/1003) + encodings
+                // (1005/1006). TUIs that own the mouse (Claude Code, ranger,
+                // vim +mouse) set these; the renderer routes wheel/clicks as
+                // SGR mouse events instead of scrollback/arrow fallbacks.
+                // Dropping them here misclassified such apps as "alt screen,
+                // no mouse" and broke scrolling over them.
+                vte::ansi::NamedPrivateMode::ReportMouseClicks => {
+                    self.mode |= TermMode::MOUSE_REPORT_CLICK;
+                }
+                vte::ansi::NamedPrivateMode::ReportCellMouseMotion => {
+                    self.mode |= TermMode::MOUSE_DRAG;
+                }
+                vte::ansi::NamedPrivateMode::ReportAllMouseMotion => {
+                    self.mode |= TermMode::MOUSE_MOTION;
+                }
+                vte::ansi::NamedPrivateMode::SgrMouse => {
+                    self.mode |= TermMode::MOUSE_SGR;
+                }
+                vte::ansi::NamedPrivateMode::Utf8Mouse => {
+                    self.mode |= TermMode::MOUSE_UTF8;
+                }
                 _ => {}
             }
         }
@@ -1292,6 +1382,21 @@ impl Handler for Term {
                 }
                 vte::ansi::NamedPrivateMode::BracketedPaste => {
                     self.mode -= TermMode::BRACKETED_PASTE;
+                }
+                vte::ansi::NamedPrivateMode::ReportMouseClicks => {
+                    self.mode -= TermMode::MOUSE_REPORT_CLICK;
+                }
+                vte::ansi::NamedPrivateMode::ReportCellMouseMotion => {
+                    self.mode -= TermMode::MOUSE_DRAG;
+                }
+                vte::ansi::NamedPrivateMode::ReportAllMouseMotion => {
+                    self.mode -= TermMode::MOUSE_MOTION;
+                }
+                vte::ansi::NamedPrivateMode::SgrMouse => {
+                    self.mode -= TermMode::MOUSE_SGR;
+                }
+                vte::ansi::NamedPrivateMode::Utf8Mouse => {
+                    self.mode -= TermMode::MOUSE_UTF8;
                 }
                 _ => {}
             }
@@ -1359,6 +1464,24 @@ impl Handler for Term {
         self.window_title = title;
     }
 
+    fn osc_color_query(&mut self, index: u16) {
+        // Answer OSC 10/11/12 `?` queries with the active theme's colour so
+        // apps adapt to a light vs dark terminal. xterm's reply format is
+        //   \e]<index>;rgb:RRRR/GGGG/BBBB\a
+        // with 16-bit channels; we replicate each 8-bit byte into 4 hex digits
+        // (0xAB -> "abab"), which every consumer accepts. Terminated with BEL.
+        let (r, g, b) = match index {
+            10 => self.default_fg_rgb,
+            11 => self.default_bg_rgb,
+            12 => self.default_cursor_rgb,
+            _ => return,
+        };
+        let reply = format!(
+            "\x1b]{index};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x07"
+        );
+        self.reply(reply.as_bytes());
+    }
+
     fn bell(&mut self) {
         // BEL (0x07). Latch until the UI drains it via `take_bell`.
         self.bell_pending = true;
@@ -1382,6 +1505,16 @@ impl Handler for Term {
             body: body.to_string(),
             urgent,
         });
+    }
+
+    fn shell_integration(&mut self, event: ShellIntegrationEvent) {
+        // See `SHELL_EVENT_QUEUE_MAX`'s doc comment: bounded so an
+        // undrained Term can't leak memory, oldest-first eviction so the
+        // most recent (most actionable) events survive.
+        if self.shell_events.len() >= SHELL_EVENT_QUEUE_MAX {
+            self.shell_events.remove(0);
+        }
+        self.shell_events.push(event);
     }
 }
 
@@ -1960,6 +2093,54 @@ mod tests {
     }
 
     #[test]
+    fn row_above_viewport_tracks_display_offset() {
+        let mut t = Term::new(2, 5);
+        // No scrollback yet — nothing above the viewport.
+        assert!(t.row_above_viewport().is_none());
+        // Push lines "0".."4"; with 2 visible rows, "0".."2" land in scrollback.
+        for i in 0..5 {
+            t.input(char::from_digit(i, 10).unwrap());
+            if i < 4 {
+                t.carriage_return();
+                let _ = t.linefeed();
+            }
+        }
+        assert_eq!(t.scrollback_len(), 3);
+        // At the live bottom (offset 0) the viewport shows "3","4"; the row
+        // above is the most recent scrollback row "2".
+        assert_eq!(t.row_above_viewport().unwrap().cells[0].ch, '2');
+        t.scroll_display(1);
+        assert_eq!(t.row_above_viewport().unwrap().cells[0].ch, '1');
+        t.scroll_display(1);
+        assert_eq!(t.row_above_viewport().unwrap().cells[0].ch, '0');
+        // Fully scrolled to the top of history — no row above.
+        t.scroll_display(1);
+        assert_eq!(t.display_offset(), 3);
+        assert!(t.row_above_viewport().is_none());
+    }
+
+    #[test]
+    fn mouse_report_private_modes_toggle() {
+        use vte::ansi::{NamedPrivateMode, PrivateMode};
+        let mut t = Term::new(2, 5);
+        assert!(!t.mode_contains(TermMode::MOUSE_REPORT_CLICK));
+        // Claude Code's typical handshake: click reporting + SGR encoding.
+        t.set_private_mode(PrivateMode::Named(NamedPrivateMode::ReportMouseClicks));
+        t.set_private_mode(PrivateMode::Named(NamedPrivateMode::SgrMouse));
+        assert!(t.mode_contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(t.mode_contains(TermMode::MOUSE_SGR));
+        t.unset_private_mode(PrivateMode::Named(NamedPrivateMode::ReportMouseClicks));
+        t.unset_private_mode(PrivateMode::Named(NamedPrivateMode::SgrMouse));
+        assert!(!t.mode_contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(!t.mode_contains(TermMode::MOUSE_SGR));
+        // Motion/drag variants map onto their own bits.
+        t.set_private_mode(PrivateMode::Named(NamedPrivateMode::ReportCellMouseMotion));
+        t.set_private_mode(PrivateMode::Named(NamedPrivateMode::ReportAllMouseMotion));
+        assert!(t.mode_contains(TermMode::MOUSE_DRAG));
+        assert!(t.mode_contains(TermMode::MOUSE_MOTION));
+    }
+
+    #[test]
     fn scroll_display_clamps_to_scrollback_size() {
         let mut t = Term::new(2, 5);
         t.scroll_display(10);
@@ -1998,6 +2179,41 @@ mod tests {
         let mut t = Term::new(5, 10);
         t.identify_terminal(None);
         assert_eq!(t.take_pty_replies(), b"\x1b[?6c");
+    }
+
+    #[test]
+    fn osc11_query_replies_with_injected_background() {
+        let mut t = Term::new(5, 10);
+        // Light theme background (crane-light: 248,249,252).
+        t.set_default_colors((36, 40, 52), (248, 249, 252), (36, 40, 52));
+        t.osc_color_query(11);
+        assert_eq!(
+            t.take_pty_replies(),
+            b"\x1b]11;rgb:f8f8/f9f9/fcfc\x07".as_slice()
+        );
+    }
+
+    #[test]
+    fn osc10_and_osc12_query_use_fg_and_cursor() {
+        let mut t = Term::new(5, 10);
+        t.set_default_colors((0x24, 0x28, 0x34), (0xf8, 0xf9, 0xfc), (0xaa, 0xbb, 0xcc));
+        t.osc_color_query(10);
+        assert_eq!(
+            t.take_pty_replies(),
+            b"\x1b]10;rgb:2424/2828/3434\x07".as_slice()
+        );
+        t.osc_color_query(12);
+        assert_eq!(
+            t.take_pty_replies(),
+            b"\x1b]12;rgb:aaaa/bbbb/cccc\x07".as_slice()
+        );
+    }
+
+    #[test]
+    fn osc_color_query_ignores_unknown_index() {
+        let mut t = Term::new(5, 10);
+        t.osc_color_query(99);
+        assert!(t.take_pty_replies().is_empty());
     }
 
     #[test]
@@ -2214,6 +2430,44 @@ mod tests {
         t.goto(0, 0);
         t.insert_blank_lines(2);
         assert_eq!(t.scrollback.len(), before);
+    }
+
+    #[test]
+    fn shell_events_buffer_and_drain() {
+        use crate::handler::ShellIntegrationEvent::*;
+        let mut t = Term::new(5, 10);
+        t.shell_integration(PromptStart);
+        t.shell_integration(CommandLine("ls -la".into()));
+        let drained = t.take_shell_events();
+        assert_eq!(drained, vec![PromptStart, CommandLine("ls -la".into())]);
+        assert!(t.take_shell_events().is_empty(), "drain must empty the queue");
+    }
+
+    /// An undrained `Term` must never grow `shell_events` past
+    /// `SHELL_EVENT_QUEUE_MAX`, and overflow must evict the *oldest*
+    /// events first so the most recent (most actionable) ones survive.
+    #[test]
+    fn shell_events_queue_bounded_evicts_oldest() {
+        use crate::handler::ShellIntegrationEvent::CommandFinished;
+        let mut t = Term::new(5, 10);
+        let overflow = 10;
+        for i in 0..(SHELL_EVENT_QUEUE_MAX + overflow) {
+            t.shell_integration(CommandFinished { exit: Some(i as i32) });
+        }
+        let events = t.take_shell_events();
+        assert_eq!(events.len(), SHELL_EVENT_QUEUE_MAX, "queue must be capped");
+        assert_eq!(
+            events.first(),
+            Some(&CommandFinished { exit: Some(overflow as i32) }),
+            "the oldest `overflow` events must have been evicted"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&CommandFinished {
+                exit: Some((SHELL_EVENT_QUEUE_MAX + overflow - 1) as i32)
+            }),
+            "the newest event must survive"
+        );
     }
 }
 

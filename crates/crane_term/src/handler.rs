@@ -79,6 +79,28 @@ pub struct ProcessorInput<'a> {
     pub is_sync_frame: bool,
 }
 
+/// A shell-integration event decoded from an OSC 633 sequence (VS Code's
+/// convention). Surfaced to the Handler so Crane can record command history
+/// keyed by cwd + exit code + prompt boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellIntegrationEvent {
+    /// 633;A — the shell is about to draw a prompt.
+    PromptStart,
+    /// 633;B — end of prompt / start of editable command region.
+    CommandStart,
+    /// 633;C — the command is about to execute (leaving the prompt).
+    PreExec,
+    /// 633;D;<exit> — the command finished with this exit code (None if absent).
+    CommandFinished { exit: Option<i32> },
+    /// 633;E;<cmdline> — the command line text (already unescaped).
+    CommandLine(String),
+    /// 633;P;Cwd=<path> — the shell's current working directory.
+    Cwd(String),
+    /// 633;P;Keymap=<vi|emacs> — the shell's line-editor keymap, reported once
+    /// per prompt so a mid-session `set -o vi` / `bindkey -v` is picked up.
+    Keymap(String),
+}
+
 /// Trait the [`crate::processor::Processor`] drives. v1 is
 /// intentionally minimal — methods get added as we wire up real CSI
 /// dispatch in [`crate::perform`]. Default impls are no-ops so
@@ -178,6 +200,20 @@ pub trait Handler {
     /// is `true` for OSC 777 ("urgency=critical"-style senders) and
     /// `false` for plain OSC 9.
     fn osc_notification(&mut self, _body: &str, _urgent: bool) {}
+
+    /// OSC 633 shell-integration event (prompt boundary, command text, cwd,
+    /// or exit code). Default no-op; Crane's `Term` buffers these for the
+    /// reader thread to record into the history store.
+    fn shell_integration(&mut self, _event: ShellIntegrationEvent) {}
+
+    /// OSC 10 / 11 / 12 with a `?` payload — an app is *querying* the
+    /// default foreground (10), background (11), or cursor (12) colour so
+    /// it can adapt its own palette to a light vs dark terminal. `index`
+    /// is 10, 11, or 12. The implementation should push an
+    /// `\e]<index>;rgb:RRRR/GGGG/BBBB\a` reply onto its outbound queue.
+    /// Default impl is a no-op (a non-answering terminal makes apps guess,
+    /// which on a light theme yields unreadable light-on-light text).
+    fn osc_color_query(&mut self, _index: u16) {}
 
     // ---- queries the parser asks us to answer back to the PTY ----
 

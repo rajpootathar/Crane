@@ -12,11 +12,92 @@ use std::thread;
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
-use crane_term::{Processor, Term, TermNotification};
+use crane_term::{Processor, ShellIntegrationEvent, Term, TermNotification};
+
+use crate::warpui::history_store::{now_ms, HistoryEntry};
 
 /// Called from the reader thread when the grid changes and the UI should
 /// repaint. Must be cheap and thread-safe (e.g. send on a channel).
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Folds a terminal's OSC 633 event stream into completed [`HistoryEntry`]s.
+///
+/// The shell hooks report a command in two halves: `preexec` emits the command
+/// line (`E`) and `PreExec` (`C`), then the *next* `precmd` emits the exit code
+/// (`D`) followed by the new cwd (`P;Cwd=`). So the cwd standing when `D`
+/// arrives is still the directory the command actually ran in — recording it
+/// then, before the next `Cwd` event lands, is what makes `cd /tmp` attribute
+/// to where it was typed rather than to where it landed.
+///
+/// A finish with no command in flight (the user pressed Enter on an empty
+/// line, or integration loaded mid-command) yields nothing.
+struct ShellRecorder {
+    session_id: u64,
+    cwd: String,
+    pending_command: Option<String>,
+    start_ms: u64,
+}
+
+impl ShellRecorder {
+    fn new(session_id: u64) -> Self {
+        Self {
+            session_id,
+            cwd: String::new(),
+            pending_command: None,
+            start_ms: 0,
+        }
+    }
+
+    /// Feed one event; returns a completed entry on `CommandFinished` (if a
+    /// command was in flight), else `None`.
+    fn feed(&mut self, event: ShellIntegrationEvent) -> Option<HistoryEntry> {
+        match event {
+            ShellIntegrationEvent::Cwd(p) => {
+                self.cwd = p;
+                None
+            }
+            ShellIntegrationEvent::CommandLine(c) => {
+                self.pending_command = Some(c);
+                self.start_ms = now_ms();
+                None
+            }
+            ShellIntegrationEvent::CommandFinished { exit } => {
+                let command = self.pending_command.take()?;
+                let trimmed = command.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                Some(HistoryEntry {
+                    command: trimmed.to_string(),
+                    pwd: self.cwd.clone(),
+                    exit_code: exit,
+                    session_id: self.session_id,
+                    start_ms: self.start_ms,
+                    end_ms: now_ms(),
+                })
+            }
+            // Prompt boundaries carry no data we persist directly; the keymap is
+            // tracked out-of-band by the reader loop's atomic, not recorded here.
+            ShellIntegrationEvent::PromptStart
+            | ShellIntegrationEvent::CommandStart
+            | ShellIntegrationEvent::PreExec
+            | ShellIntegrationEvent::Keymap(_) => None,
+        }
+    }
+}
+
+/// Translates the `live_cwd` cell's raw contents (empty string is the
+/// "no `Cwd` event yet" sentinel) into the `Option` shape `live_cwd()`
+/// hands callers. Split out from the accessor so the empty-vs-populated
+/// behavior is unit-testable without spinning up a full PTY-backed
+/// `TerminalController`.
+fn empty_to_none(raw: String) -> Option<String> {
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
+}
 
 pub struct TerminalController {
     pub term: Arc<Mutex<Term>>,
@@ -46,10 +127,52 @@ pub struct TerminalController {
     /// The directory the shell was spawned in — persisted so a restored
     /// session reopens the terminal in the same place (old Crane parity).
     pub cwd: std::path::PathBuf,
+    /// Identifies this shell session in the history log. Stamped onto every
+    /// entry the reader thread records so ranking can tell "this terminal"
+    /// apart from every other one.
+    session_id: u64,
+    /// Session ids earlier incarnations of this pane used, recovered from
+    /// persistence. Empty for now — populated when session restore learns to
+    /// carry the id across a relaunch.
+    restored_session_ids: Vec<u64>,
+    /// Latched true the first time the reader thread drains any OSC 633 shell
+    /// event, i.e. the shell is actually instrumented. Gates the ranked-history
+    /// up/down interception: without proof of integration we leave the arrow
+    /// keys alone so an uninstrumented shell (bare `ssh`, fish, …) behaves
+    /// exactly as before.
+    shell_integration_active: Arc<AtomicBool>,
+    /// The shell's live cwd, updated by the reader thread whenever an OSC 633
+    /// `P;Cwd=` event arrives. Empty until the first such event. Distinct from
+    /// `cwd` (the spawn directory, which never changes): this is what the
+    /// ranked-history "current directory" tie-break should actually use, since
+    /// the user `cd`s around after spawn.
+    live_cwd: Arc<Mutex<String>>,
+    /// True when the shell's line editor is in the vi keymap, updated by the
+    /// reader thread from each OSC 633 `P;Keymap=` event (emitted once per
+    /// prompt). Gates OUT the ranked-history up/down interception: the `^E^U`
+    /// line-clear it sends is an emacs-keymap sequence, so in vi we leave the
+    /// arrows alone and the shell's own native vi history takes over.
+    keymap_is_vi: Arc<AtomicBool>,
 }
 
 impl TerminalController {
     pub fn new(cols: usize, rows: usize, cwd: Option<&Path>, wake: Wake) -> std::io::Result<Self> {
+        crate::warpui::shell_init::ensure_installed();
+
+        // Warm the history store HERE, on the spawning (UI) thread, before the
+        // reader thread below exists. `store()` is a OnceLock whose initializer
+        // reads and JSON-parses every line of history.jsonl; its only other
+        // caller is the reader thread, so without this the whole load happens
+        // there at the first completed command — during which nothing is
+        // draining the PTY, the buffer backs up and the shell blocks on write.
+        // The log is capped at HISTORY_MAX entries (compacted on load), so
+        // this warm-up cost is bounded rather than growing with months of
+        // use — but it still belongs on the spawning thread, not the reader
+        // thread. Paying the cost at spawn makes it invisible. Do not remove
+        // as "unused": the return value is deliberately discarded, the
+        // initialization is the point.
+        let _ = crate::warpui::history_store::store();
+
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
@@ -60,11 +183,15 @@ impl TerminalController {
             })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+        // Bound outside the `CommandBuilder` match because the shell-integration
+        // env below has to know which shell it is configuring.
+        #[cfg(unix)]
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+
         let mut cmd = {
             #[cfg(unix)]
             {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-                CommandBuilder::new(shell)
+                CommandBuilder::new(&shell)
             }
             #[cfg(not(unix))]
             {
@@ -75,6 +202,78 @@ impl TerminalController {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Crane");
         cmd.env_remove("VTE_VERSION");
+        // COLORFGBG is the static (env-var) counterpart to the OSC 11 query
+        // above: the rxvt convention many CLIs read at startup to detect a
+        // light vs dark terminal. Format "<fg>;<bg>" as ANSI indices; the bg
+        // field is what matters — index 15 (white) → light, 0 (black) → dark.
+        // Fixed at spawn (a live theme switch won't update it, but apps read it
+        // once at launch anyway; the OSC 11 path covers the live case).
+        {
+            let th = crate::theme::current();
+            let lum = 0.299 * th.terminal_bg.r as f32
+                + 0.587 * th.terminal_bg.g as f32
+                + 0.114 * th.terminal_bg.b as f32;
+            cmd.env("COLORFGBG", if lum > 128.0 { "0;15" } else { "15;0" });
+        }
+
+        // A unique id for THIS shell session, stamped onto every command it
+        // records so ranking can float the current session's history to the
+        // top of up-arrow. Monotonic per process; uniqueness across restarts
+        // comes from the wall-clock component.
+        let session_id = {
+            use std::sync::atomic::AtomicU64;
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            crate::warpui::history_store::now_ms().wrapping_shl(16)
+                | (SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff)
+        };
+
+        // Load Crane's shell integration without touching the user's rc files.
+        //
+        // zsh: point ZDOTDIR at our shim dir, whose .zshrc sources the user's
+        // real rc and then our hooks. `CRANE_OLD_ZDOTDIR` is forwarded only
+        // when the inherited ZDOTDIR is genuinely the user's — see
+        // `shell_init::inherited_user_zdotdir` for why handing over Crane's own
+        // (the nested-Crane case) strands the user with an unconfigured shell.
+        //
+        // bash: `--rcfile`, which is an argument rather than env. It applies to
+        // interactive non-login shells, which is what a bare `bash` on a PTY
+        // is; crane-init.bash sources the user's ~/.bashrc itself, since
+        // --rcfile replaces it. Deliberately no `--norc` — that would suppress
+        // --rcfile too.
+        //
+        // BOTH mechanisms replace the user's startup files rather than adding
+        // to them, so both are gated on the install actually being on disk:
+        // `ensure_installed` above is best-effort and never retries, and
+        // pointing a shell at shims that were never written costs the user
+        // their entire environment. No install → spawn exactly as before.
+        //
+        // Any other shell (fish, nu, …) simply spawns unchanged and records no
+        // history, rather than getting env it cannot interpret.
+        #[cfg(unix)]
+        {
+            match std::path::Path::new(&shell)
+                .file_name()
+                .and_then(|n| n.to_str())
+            {
+                Some("zsh") => {
+                    if let Some(zdotdir) = crate::warpui::shell_init::installed_zsh_zdotdir() {
+                        if let Some(old) = crate::warpui::shell_init::inherited_user_zdotdir() {
+                            cmd.env("CRANE_OLD_ZDOTDIR", old);
+                        }
+                        cmd.env("ZDOTDIR", zdotdir);
+                    }
+                }
+                Some("bash") => {
+                    if let Some(rcfile) = crate::warpui::shell_init::installed_bash_rcfile() {
+                        cmd.arg("--rcfile");
+                        cmd.arg(rcfile);
+                    }
+                }
+                _ => {}
+            }
+        }
+        cmd.env("CRANE_SESSION_ID", session_id.to_string());
+
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         } else if let Some(home) = std::env::var_os("HOME") {
@@ -98,11 +297,24 @@ impl TerminalController {
         ));
 
         let term = Arc::new(Mutex::new(Term::new(rows, cols)));
+        // Seed the Term with the active theme's colours so OSC 10/11/12 queries
+        // answer with the truth — an app that asks "is the background light or
+        // dark?" gets the real answer and picks readable text, instead of
+        // assuming dark and rendering light-on-light on a light theme.
+        {
+            let th = crate::theme::current();
+            let fg = (th.terminal_fg.r, th.terminal_fg.g, th.terminal_fg.b);
+            let bg = (th.terminal_bg.r, th.terminal_bg.g, th.terminal_bg.b);
+            term.lock().set_default_colors(fg, bg, fg);
+        }
         let parser = Arc::new(Mutex::new(Processor::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let bell = Arc::new(AtomicBool::new(false));
         let bell_notify = Arc::new(AtomicBool::new(false));
+        let shell_integration_active = Arc::new(AtomicBool::new(false));
         let notif_queue: Arc<Mutex<Vec<TermNotification>>> = Arc::new(Mutex::new(Vec::new()));
+        let live_cwd = Arc::new(Mutex::new(String::new()));
+        let keymap_is_vi = Arc::new(AtomicBool::new(false));
 
         // Reader thread: PTY -> crane_term, write back replies, wake the UI.
         // Lock order is ALWAYS parser-then-term (deadlock-critical).
@@ -113,17 +325,21 @@ impl TerminalController {
             let alive = alive.clone();
             let bell = bell.clone();
             let bell_notify = bell_notify.clone();
+            let shell_integration_active = shell_integration_active.clone();
             let notif_queue = notif_queue.clone();
+            let live_cwd = live_cwd.clone();
+            let keymap_is_vi = keymap_is_vi.clone();
             Some(thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
                 let mut last_epoch = 0u64;
                 let mut last_cursor = (usize::MAX, usize::MAX);
+                let mut recorder = ShellRecorder::new(session_id);
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            let (replies, epoch, cursor, rang, notes);
+                            let (replies, epoch, cursor, rang, notes, shell_events);
                             {
                                 let mut p = parser.lock();
                                 let mut t = term.lock();
@@ -139,6 +355,11 @@ impl TerminalController {
                                 // the same reason: a bare notification may not
                                 // dirty the grid, so buffer + force a wake below.
                                 notes = t.take_notifications();
+                                // OSC 633 command-history events. Drained under
+                                // the same lock, folded into entries below —
+                                // outside it, so no file write ever happens
+                                // while the grid is held.
+                                shell_events = t.take_shell_events();
                             }
                             // Write replies BEFORE the next read (P10k workaround).
                             if !replies.is_empty() {
@@ -158,6 +379,38 @@ impl TerminalController {
                                 last_epoch = epoch;
                                 last_cursor = cursor;
                                 wake();
+                            }
+                            // Seeing any OSC 633 event proves the shell is
+                            // instrumented — latch it so the UI thread can gate
+                            // the up/down history interception on real
+                            // integration.
+                            if !shell_events.is_empty() {
+                                shell_integration_active.store(true, Ordering::Relaxed);
+                            }
+                            // Record AFTER the wake: a completed command costs
+                            // one small append, and the repaint should never
+                            // wait on the disk. `append` is best-effort and
+                            // infallible by contract, so this can neither block
+                            // meaningfully nor panic the reader.
+                            for ev in shell_events {
+                                // Publish the live cwd for the UI thread's
+                                // ranked-history tie-break. Inspect by reference
+                                // (feed() moves ev) and lock only this cell —
+                                // never the term or store locks at the same
+                                // time.
+                                if let ShellIntegrationEvent::Cwd(p) = &ev {
+                                    *live_cwd.lock() = p.clone();
+                                }
+                                // Track the shell's line-editor keymap for the UI
+                                // thread's up/down interception gate. Same
+                                // by-reference, single-atomic pattern as the live
+                                // cwd above — no term or store lock held here.
+                                if let ShellIntegrationEvent::Keymap(k) = &ev {
+                                    keymap_is_vi.store(k == "vi", Ordering::Relaxed);
+                                }
+                                if let Some(entry) = recorder.feed(ev) {
+                                    crate::warpui::history_store::store().lock().append(entry);
+                                }
                             }
                         }
                     }
@@ -185,7 +438,48 @@ impl TerminalController {
             bell_notify,
             notif_queue,
             cwd,
+            session_id,
+            restored_session_ids: Vec::new(),
+            shell_integration_active,
+            live_cwd,
+            keymap_is_vi,
         })
+    }
+
+    /// This terminal's history session id.
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Session ids this terminal inherited from earlier runs of the same pane.
+    /// Empty until session restore carries the id across a relaunch; ranked
+    /// history treats these as current-session so a restored terminal still
+    /// shows its own prior commands at the top of up-arrow.
+    pub fn restored_session_ids(&self) -> &[u64] {
+        &self.restored_session_ids
+    }
+
+    /// True once this shell has emitted at least one OSC 633 event, i.e. Crane's
+    /// shell integration is live in it. Used to gate ranked-history up/down
+    /// interception — an uninstrumented shell keeps its native arrow behaviour.
+    pub fn shell_integration_active(&self) -> bool {
+        self.shell_integration_active.load(Ordering::Relaxed)
+    }
+
+    /// True when the shell reported (via OSC 633 `P;Keymap=vi`) that its line
+    /// editor is in the vi keymap. A plain atomic load — cheap, lock-free, safe
+    /// on the UI hot path. Gates OUT the ranked-history up/down interception so
+    /// a vi user keeps the shell's own native arrow-key history.
+    pub fn keymap_is_vi(&self) -> bool {
+        self.keymap_is_vi.load(Ordering::Relaxed)
+    }
+
+    /// The shell's live cwd as of the most recent OSC 633 `P;Cwd=` event, or
+    /// `None` if none has arrived yet (caller should fall back to the spawn
+    /// `cwd`). Locks, clones, and drops immediately — never held across
+    /// another lock.
+    pub fn live_cwd(&self) -> Option<String> {
+        empty_to_none(self.live_cwd.lock().clone())
     }
 
     /// Drain the desktop notifications (OSC 9 / OSC 777) buffered by the reader
@@ -316,6 +610,57 @@ impl TerminalController {
             // Ask the shell to repaint its prompt at row 0.
             self.write_input(b"\x0c");
         }
+    }
+}
+
+#[cfg(test)]
+mod recorder_tests {
+    use super::*;
+    use crane_term::ShellIntegrationEvent::*;
+
+    #[test]
+    fn recorder_emits_one_entry_per_completed_command() {
+        let mut rec = ShellRecorder::new(42);
+        // Prompt, cwd, command typed, executes, finishes.
+        rec.feed(Cwd("/proj".into()));
+        rec.feed(CommandLine("cargo build".into()));
+        rec.feed(PreExec);
+        let out = rec.feed(CommandFinished { exit: Some(0) });
+        let e = out.expect("a completed command yields an entry");
+        assert_eq!(e.command, "cargo build");
+        assert_eq!(e.pwd, "/proj");
+        assert_eq!(e.exit_code, Some(0));
+        assert_eq!(e.session_id, 42);
+    }
+
+    #[test]
+    fn recorder_ignores_a_finish_with_no_command() {
+        let mut rec = ShellRecorder::new(1);
+        // A bare prompt with no command typed (user hit Enter on empty line).
+        assert!(rec.feed(CommandFinished { exit: Some(0) }).is_none());
+    }
+}
+
+#[cfg(test)]
+mod live_cwd_tests {
+    use super::*;
+
+    #[test]
+    fn empty_cell_reports_no_live_cwd() {
+        // Mirrors the cell's initial state from `TerminalController::new`
+        // before any OSC 633 `P;Cwd=` event has arrived — callers must fall
+        // back to the spawn cwd rather than treat "" as a real directory.
+        assert_eq!(empty_to_none(String::new()), None);
+    }
+
+    #[test]
+    fn populated_cell_reports_the_live_cwd() {
+        // Mirrors the reader thread's `*live_cwd.lock() = p.clone()` update
+        // once a `Cwd` event has been observed.
+        assert_eq!(
+            empty_to_none("/tmp/project".to_string()),
+            Some("/tmp/project".to_string())
+        );
     }
 }
 

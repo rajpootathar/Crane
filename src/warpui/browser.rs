@@ -215,14 +215,6 @@ pub fn queue_action(key: SlotKey, action: Action) {
     BRIDGE.with(|b| b.borrow_mut().actions.push((key, action)));
 }
 
-pub fn report_pane(key: SlotKey, rect: RectF, url: &str) {
-    BRIDGE.with(|b| b.borrow_mut().alive.push((key, rect, url.to_string())));
-}
-
-pub fn report_inactive(key: SlotKey, url: &str) {
-    BRIDGE.with(|b| b.borrow_mut().inactive.push((key, url.to_string())));
-}
-
 pub fn take_bridge() -> Bridge {
     BRIDGE.with(|b| std::mem::take(&mut *b.borrow_mut()))
 }
@@ -309,6 +301,22 @@ impl raw_window_handle::HasWindowHandle for HostWindow {
             raw_window_handle::WindowHandle::borrow_raw(raw_window_handle::RawWindowHandle::AppKit(
                 handle,
             ))
+        })
+    }
+}
+
+impl raw_window_handle::HasDisplayHandle for HostWindow {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        // AppKit has no per-display state in raw-window-handle; the handle is a
+        // unit marker. Needed so HostWindow satisfies rfd::set_parent's bounds.
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(
+                raw_window_handle::RawDisplayHandle::AppKit(
+                    raw_window_handle::AppKitDisplayHandle::new(),
+                ),
+            )
         })
     }
 }

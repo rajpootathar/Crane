@@ -5,7 +5,6 @@
 //! (terminals are respawned in the worktree cwd).
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -101,6 +100,65 @@ pub struct SBrowser {
     pub active: usize,
 }
 
+/// Persisted Markdown Pane: the file it renders and whether it was left in
+/// edit mode. Restored as a Markdown (or Editor) pane rather than a terminal.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SMarkdown {
+    #[serde(default)]
+    pub path: PathBuf,
+    /// True = the pane was showing the editor, false = the rendered preview.
+    #[serde(default)]
+    pub editing: bool,
+}
+
+/// Persisted Image Pane: the image file it renders. Restored as an Image (or
+/// Editor) pane rather than a terminal.
+///
+/// A separate record from `SMarkdown` rather than one generalised
+/// document-pane struct with a kind tag: `SMarkdown` carries an `editing`
+/// flag that has no image analogue, and unifying them would require migrating
+/// the user's live `~/.crane/warpui-state.json` — real risk of dropping
+/// already-persisted `markdowns` entries — to deduplicate a two-field struct.
+/// Adding a field is purely additive: older state files parse (serde default),
+/// and an older binary reading a newer file simply ignores this one.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SImage {
+    #[serde(default)]
+    pub path: PathBuf,
+}
+
+/// Persisted PDF Pane: the PDF file it renders. Exact peer of `SImage` —
+/// restored as a PDF (or, for a corrupt state file, Editor) pane rather than a
+/// terminal. Kept as its own record for the same additive-migration reasons as
+/// `SImage` (see its doc comment).
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SPdf {
+    #[serde(default)]
+    pub path: PathBuf,
+}
+
+/// One Workspace's File Tabs: the pane that IS its Files Pane, that pane's
+/// open File Tab paths, and which of them was active.
+///
+/// `pane` is part of the record rather than a separate map because a saved
+/// leaf only restores as a document pane (Editor / Markdown) when restore can
+/// recognise it as that Workspace's Files Pane — see `restored_pane_kind` in
+/// `shell.rs`. The old flat schema carried exactly one such id
+/// (`WarpuiState::files_pane`), which is precisely why only one Workspace's
+/// File Tabs could ever come back.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SFileTabs {
+    /// The Files Pane's leaf id in this Workspace (None if it had none).
+    #[serde(default)]
+    pub pane: Option<PaneId>,
+    /// Files open as File Tabs in that pane, in tab order.
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    /// The active File Tab index within `paths`.
+    #[serde(default)]
+    pub active: usize,
+}
+
 /// A project added via the warpui "Add Project" flow (not sourced from session.json).
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct AddedProject {
@@ -150,14 +208,26 @@ pub struct WarpuiState {
     #[serde(default)]
     pub next_pane_id: PaneId,
     /// The File pane's leaf id (so it's restored as a File pane, not a terminal).
+    /// LEGACY — one flat record for the whole session, so only ONE Workspace's
+    /// File Tabs survived a restart. See `file_tabs_by_path`, which restore
+    /// prefers. Still written (from the selected Workspace) so an older binary
+    /// reading this file finds something sane, and still READ as the migration
+    /// source for state files that predate `file_tabs_by_path`.
     #[serde(default)]
     pub files_pane: Option<PaneId>,
-    /// Files open in the File pane, restored as tabs.
+    /// Files open in the File pane, restored as tabs. LEGACY — see `files_pane`.
     #[serde(default)]
     pub file_pane_paths: Vec<PathBuf>,
-    /// The active file tab index within `file_pane_paths`.
+    /// The active file tab index within `file_pane_paths`. LEGACY — see
+    /// `files_pane`.
     #[serde(default)]
     pub file_pane_active: usize,
+    /// Per worktree checkout PATH: that Workspace's File Tabs. Path-keyed for
+    /// the same reason as `worktree_tabs_by_path` — indices shift when projects
+    /// are added, removed or reordered between runs; checkout paths do not, so
+    /// each Workspace's File Tabs land back in the RIGHT Workspace.
+    #[serde(default)]
+    pub file_tabs_by_path: Vec<(String, SFileTabs)>,
     /// Per terminal pane: cwd + ANSI scrollback snapshot, keyed by pane id.
     #[serde(default)]
     pub terminals: Vec<(PaneId, STerminal)>,
@@ -165,6 +235,20 @@ pub struct WarpuiState {
     /// restore loop rebuilds a Browser (not a terminal) at that leaf.
     #[serde(default)]
     pub browsers: Vec<(PaneId, SBrowser)>,
+    /// Per Markdown pane: the file + mode, keyed by pane id, so the restore
+    /// loop rebuilds a Markdown pane (not a terminal) at that leaf.
+    #[serde(default)]
+    pub markdowns: Vec<(PaneId, SMarkdown)>,
+    /// Per Image pane: the file it renders, keyed by pane id, so the restore
+    /// loop rebuilds an Image pane (not a terminal) at that leaf. Exact peer
+    /// of `markdowns` — see `SImage` for why it is a separate field.
+    #[serde(default)]
+    pub images: Vec<(PaneId, SImage)>,
+    /// Per PDF pane: the file it renders, keyed by pane id, so the restore loop
+    /// rebuilds a PDF pane (not a terminal) at that leaf. Exact peer of
+    /// `images` — see `SPdf`.
+    #[serde(default)]
+    pub pdfs: Vec<(PaneId, SPdf)>,
     /// Projects the user added via "Add Project" (not from session.json).
     #[serde(default)]
     pub added_projects: Vec<AddedProject>,
@@ -324,20 +408,6 @@ fn write_bytes(path: &std::path::Path, bytes: &[u8]) {
     }
 }
 
-/// Helper to rebuild HashMap fields from the flat Vecs.
-pub fn worktree_tabs_map(state: &WarpuiState) -> HashMap<(usize, usize), Vec<STab>> {
-    state.worktree_tabs.iter().cloned().collect()
-}
-
-pub fn expanded_sets(
-    state: &WarpuiState,
-) -> (HashSet<usize>, HashSet<(usize, usize)>) {
-    (
-        state.expanded_projects.iter().copied().collect(),
-        state.expanded_worktrees.iter().copied().collect(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +457,145 @@ mod tests {
         assert!(st.worktree_tabs_by_path.is_empty());
         assert!(st.active_tab_path.is_none());
         assert!(st.expanded_project_paths.is_empty());
+    }
+
+    /// Every Workspace's File Tabs must survive a serialize → deserialize
+    /// round trip, each keyed by its own worktree checkout PATH. This is the
+    /// field that makes "Workspace B's open files come back in B" possible at
+    /// all — the legacy flat trio could only ever carry ONE Workspace's.
+    #[test]
+    fn file_tabs_by_path_round_trips_every_workspace() {
+        let mut st = WarpuiState::default();
+        st.file_tabs_by_path = vec![
+            (
+                "/tmp/wt-a".into(),
+                SFileTabs {
+                    pane: Some(4),
+                    paths: vec![PathBuf::from("/tmp/wt-a/lib.rs"), PathBuf::from("/tmp/wt-a/x.md")],
+                    active: 1,
+                },
+            ),
+            (
+                "/tmp/wt-b".into(),
+                SFileTabs {
+                    pane: Some(9),
+                    paths: vec![PathBuf::from("/tmp/wt-b/main.rs")],
+                    active: 0,
+                },
+            ),
+        ];
+        let bytes = serde_json::to_vec(&st).unwrap();
+        let back: WarpuiState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.file_tabs_by_path.len(), 2, "both Workspaces' File Tabs must survive");
+        assert_eq!(back.file_tabs_by_path[0].0, "/tmp/wt-a");
+        assert_eq!(back.file_tabs_by_path[0].1.pane, Some(4));
+        assert_eq!(
+            back.file_tabs_by_path[0].1.paths,
+            vec![PathBuf::from("/tmp/wt-a/lib.rs"), PathBuf::from("/tmp/wt-a/x.md")],
+            "tab order and contents must round trip exactly"
+        );
+        assert_eq!(back.file_tabs_by_path[0].1.active, 1, "the active File Tab index must survive");
+        assert_eq!(back.file_tabs_by_path[1].0, "/tmp/wt-b");
+        assert_eq!(back.file_tabs_by_path[1].1.pane, Some(9));
+        assert_eq!(back.file_tabs_by_path[1].1.paths, vec![PathBuf::from("/tmp/wt-b/main.rs")]);
+    }
+
+    /// The user's real `~/.crane/warpui-state.json` predates `file_tabs_by_path`
+    /// and carries the legacy FLAT Files-Pane trio. It must still parse, with
+    /// the flat fields intact (restore migrates them) and the new field empty.
+    #[test]
+    fn legacy_flat_file_pane_fields_still_parse() {
+        let legacy = r#"{
+            "files_pane": 12,
+            "file_pane_paths": ["/tmp/wt-a/lib.rs", "/tmp/wt-a/x.md"],
+            "file_pane_active": 1
+        }"#;
+        let st: WarpuiState = serde_json::from_str(legacy).expect("legacy state must load");
+        assert_eq!(st.files_pane, Some(12), "the legacy Files Pane id is the migration source");
+        assert_eq!(st.file_pane_paths.len(), 2, "the legacy open files must not be dropped");
+        assert_eq!(st.file_pane_active, 1);
+        assert!(st.file_tabs_by_path.is_empty(), "the path-keyed field defaults to empty");
+    }
+
+    /// A Markdown pane's saved file + mode must survive a serialize →
+    /// deserialize round trip, keyed by pane id, the same as `browsers`.
+    #[test]
+    fn markdown_panes_survive_a_state_round_trip() {
+        let mut st = WarpuiState::default();
+        st.markdowns = vec![(
+            7,
+            SMarkdown { path: std::path::PathBuf::from("/tmp/doc.md"), editing: false },
+        )];
+        let json = serde_json::to_string(&st).expect("serialize");
+        let back: WarpuiState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.markdowns.len(), 1, "markdown panes must survive a round trip");
+        assert_eq!(back.markdowns[0].1.path, std::path::PathBuf::from("/tmp/doc.md"));
+    }
+
+    /// Backward compatibility: an existing ~/.crane/warpui-state.json predates
+    /// this field and must still deserialize rather than wiping the session.
+    #[test]
+    fn state_without_markdowns_still_loads() {
+        let legacy = r#"{}"#;
+        let st: WarpuiState = serde_json::from_str(legacy).expect("legacy state must load");
+        assert!(st.markdowns.is_empty());
+    }
+
+    /// An Image pane's saved file must survive a serialize → deserialize round
+    /// trip, keyed by pane id, exactly like `markdowns` / `browsers`. Without
+    /// this field the pane restores as a fresh terminal.
+    #[test]
+    fn image_panes_survive_a_state_round_trip() {
+        let mut st = WarpuiState::default();
+        st.images = vec![(7, SImage { path: PathBuf::from("/tmp/logo.png") })];
+        let json = serde_json::to_string(&st).expect("serialize");
+        let back: WarpuiState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.images.len(), 1, "image panes must survive a round trip");
+        assert_eq!(back.images[0].0, 7, "the pane id keys the restore lookup");
+        assert_eq!(back.images[0].1.path, PathBuf::from("/tmp/logo.png"));
+    }
+
+    /// A PDF pane's saved file must survive a round trip, keyed by pane id —
+    /// peer of `image_panes_survive_a_state_round_trip`. Without it the pane
+    /// restores as a fresh terminal.
+    #[test]
+    fn pdf_panes_survive_a_state_round_trip() {
+        let mut st = WarpuiState::default();
+        st.pdfs = vec![(9, SPdf { path: PathBuf::from("/tmp/report.pdf") })];
+        let json = serde_json::to_string(&st).expect("serialize");
+        let back: WarpuiState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.pdfs.len(), 1, "pdf panes must survive a round trip");
+        assert_eq!(back.pdfs[0].0, 9, "the pane id keys the restore lookup");
+        assert_eq!(back.pdfs[0].1.path, PathBuf::from("/tmp/report.pdf"));
+    }
+
+    /// Compatibility: a state file written before `pdfs` existed must still
+    /// load, with `pdfs` defaulting to empty (never a parse error on the user's
+    /// live `~/.crane/warpui-state.json`).
+    #[test]
+    fn a_state_file_predating_pdfs_still_loads() {
+        let legacy = r#"{"images":[]}"#;
+        let st: WarpuiState = serde_json::from_str(legacy).expect("pre-pdfs state must load");
+        assert!(st.pdfs.is_empty(), "the new field defaults to empty");
+    }
+
+    /// THE compatibility guarantee for the user's live session file: a state
+    /// file written before `images` existed must still load, with `images`
+    /// defaulting to empty AND every previously-persisted `markdowns` entry
+    /// intact. Adding a document-pane field must never cost the user the
+    /// document panes they already had.
+    #[test]
+    fn a_state_file_predating_images_still_loads_and_keeps_its_markdowns() {
+        let legacy = r#"{
+            "show_left": true,
+            "markdowns": [[3, {"path": "/tmp/doc.md", "editing": false}]],
+            "files_pane": 3,
+            "file_pane_paths": ["/tmp/doc.md"]
+        }"#;
+        let st: WarpuiState = serde_json::from_str(legacy).expect("legacy state must load");
+        assert!(st.images.is_empty(), "the new field defaults to empty");
+        assert_eq!(st.markdowns.len(), 1, "existing markdown panes must NOT be dropped");
+        assert_eq!(st.markdowns[0].1.path, PathBuf::from("/tmp/doc.md"));
+        assert_eq!(st.files_pane, Some(3), "the rest of the legacy state must survive too");
     }
 }

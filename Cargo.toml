@@ -11,7 +11,7 @@ exclude = ["vendor"]
 
 [package]
 name = "crane"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "Native GPU-rendered terminal + IDE environment"
 authors = ["rajpootathar"]
@@ -77,12 +77,26 @@ anyhow = "1"
 # replaces the hand-rolled FileView so the file pane is warp-quality.
 warp_editor = { path = "vendor/warp/crates/editor" }
 string-offset = { path = "vendor/warp/crates/string-offset" }
+# Warp's markdown content model (FormattedText / FormattedTextFragment).
+# Not re-exported through warpui/warpui_core — those crates depend on it
+# internally but keep it private, so the markdown view depends on it
+# directly to build FormattedTextElement content for wrapping mixed-style
+# paragraphs (src/warpui/markdown_view.rs).
+markdown_parser = { path = "vendor/warp/crates/markdown_parser" }
 rangemap = "1.7"
 log = "0.4"
 env_logger = "0.11"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
 pulldown-cmark = { version = "0.11", default-features = false }
+# PDF viewer (Files Pane). Binds libpdfium.dylib at runtime; the crate's
+# default features target pdfium 7763, matching our vendored chromium/7763
+# dylib exactly (vendor/pdfium/.pinned-tag) — pinned to the ABI-proven version
+# the pre-warpui build shipped, so the crate/dylib ABI can never drift.
+pdfium-render = "=0.9.2"
+# In-memory PNG encoding of rendered PDF pages; unifies with pdfium-render's
+# bundled image 0.25 so `PdfBitmap::as_image()` -> DynamicImage round-trips.
+image = { version = "0.25", default-features = false, features = ["png"] }
 similar = "2"
 webbrowser = "1"
 rfd = "0.15"
@@ -102,6 +116,11 @@ trash = "5"
 # Project; a single debouncer thread coalesces bursts. See
 # src/warpui/file_watcher.rs. 8.x is the latest stable line.
 notify = "8"
+# warpui_core's own `Image` element takes its animation start time as an
+# `instant::Instant` (src/warpui/image_view.rs), not `std::time::Instant` —
+# same crate vendor/warp's workspace already pins (0.1.12), unified by cargo
+# into the same dependency graph since warpui is a path dependency.
+instant = "0.1.12"
 
 [dev-dependencies]
 tempfile = "3"

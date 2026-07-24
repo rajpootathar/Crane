@@ -21,7 +21,7 @@
 //! drives both adapters from the same byte stream so the existing
 //! grid/scrollback parse path is unchanged.
 
-use crate::handler::Handler;
+use crate::handler::{Handler, ShellIntegrationEvent};
 
 pub struct Bridge<'a, H: Handler> {
     pub inner: &'a mut H,
@@ -310,6 +310,63 @@ impl<H: Handler> vte::Perform for OscWatcher<'_, H> {
                 };
                 self.inner.osc_notification(&combined, true);
             }
+            // OSC 10 / 11 / 12 — dynamic colour query. When an app sends
+            //   OSC 11 ; ? ST
+            // it is asking for the terminal's default background so it can
+            // pick readable text for a light vs dark theme. We only answer the
+            // *query* form (a `?` payload); the set form (an app changing our
+            // colours) is ignored. Without this reply, apps assume a dark
+            // background and render light text — unreadable on a light theme.
+            b"10" | b"11" | b"12" => {
+                if params.get(1).map(|p| *p == b"?").unwrap_or(false) {
+                    // SAFETY: matched literals above are valid ASCII digits.
+                    let index = std::str::from_utf8(params[0])
+                        .ok()
+                        .and_then(|s| s.parse::<u16>().ok());
+                    if let Some(index) = index {
+                        self.inner.osc_color_query(index);
+                    }
+                }
+            }
+            // OSC 633 — VS Code shell-integration. Reports prompt boundaries,
+            // the command line, cwd, and exit code so Crane can record history.
+            b"633" => {
+                let Some(sub) = params.get(1).and_then(|p| p.first().copied()) else {
+                    return;
+                };
+                let event = match sub {
+                    b'A' => Some(ShellIntegrationEvent::PromptStart),
+                    b'B' => Some(ShellIntegrationEvent::CommandStart),
+                    b'C' => Some(ShellIntegrationEvent::PreExec),
+                    b'D' => {
+                        let exit = params
+                            .get(2)
+                            .and_then(|p| std::str::from_utf8(p).ok())
+                            .and_then(|s| s.trim().parse::<i32>().ok());
+                        Some(ShellIntegrationEvent::CommandFinished { exit })
+                    }
+                    b'E' => params
+                        .get(2)
+                        .map(|p| ShellIntegrationEvent::CommandLine(unescape_osc633(p))),
+                    b'P' => params.get(2).and_then(|p| {
+                        // 633;P carries `<key>=<value>` properties. `Cwd=` and
+                        // `Keymap=` are the two we consume; any other property
+                        // (VS Code emits several) falls through to `None` and is
+                        // silently ignored.
+                        let s = String::from_utf8_lossy(p);
+                        if let Some(cwd) = s.strip_prefix("Cwd=") {
+                            Some(ShellIntegrationEvent::Cwd(cwd.to_string()))
+                        } else {
+                            s.strip_prefix("Keymap=")
+                                .map(|k| ShellIntegrationEvent::Keymap(k.to_string()))
+                        }
+                    }),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    self.inner.shell_integration(event);
+                }
+            }
             _ => {}
         }
     }
@@ -326,19 +383,79 @@ fn join_params_utf8(parts: &[&[u8]]) -> String {
     out
 }
 
+/// Reverse VS Code's OSC 633 payload escaping: `\xHH` hex escapes back to
+/// their byte, so a command line containing `;` (encoded `\x3b`) or a newline
+/// (`\x0a`) round-trips intact. Unknown/malformed escapes are passed through
+/// literally.
+///
+/// Decoded output is accumulated as **bytes**, not `char`s: VS Code escapes
+/// non-ASCII text byte-by-byte, so a single multi-byte UTF-8 character (e.g.
+/// `é` = `\xc3\xa9`) arrives as a sequence of single-byte escapes. Pushing
+/// each decoded byte through `byte as char` would reinterpret it as a
+/// Latin-1 codepoint and produce mojibake (`Ã©`) instead of reconstructing
+/// the original character. Buffering raw bytes and converting once at the
+/// end with `String::from_utf8_lossy` lets adjacent escapes recombine into
+/// their intended multi-byte sequence; genuinely invalid UTF-8 degrades to
+/// replacement characters instead of silently wrong text.
+fn unescape_osc633(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    let mut buf: Vec<u8> = Vec::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if chars.peek() == Some(&'x') {
+                chars.next();
+                let h1 = chars.next();
+                let h2 = chars.next();
+                if let (Some(a), Some(b)) = (h1, h2) {
+                    if let Ok(byte) = u8::from_str_radix(&format!("{a}{b}"), 16) {
+                        buf.push(byte);
+                        continue;
+                    }
+                }
+                // Malformed escape — emit what we consumed literally.
+                buf.push(b'\\');
+                buf.push(b'x');
+                if let Some(a) = h1 {
+                    buf.extend_from_slice(a.encode_utf8(&mut [0u8; 4]).as_bytes());
+                }
+                if let Some(b) = h2 {
+                    buf.extend_from_slice(b.encode_utf8(&mut [0u8; 4]).as_bytes());
+                }
+                continue;
+            }
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+                buf.push(b'\\');
+                continue;
+            }
+        }
+        buf.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 #[cfg(test)]
 mod osc_tests {
     use super::*;
-    use crate::handler::Handler;
+    use crate::handler::{Handler, ShellIntegrationEvent};
 
     #[derive(Default)]
     struct Collector {
         events: Vec<(String, bool)>,
+        color_queries: Vec<u16>,
+        shell_events: Vec<ShellIntegrationEvent>,
     }
 
     impl Handler for Collector {
         fn osc_notification(&mut self, body: &str, urgent: bool) {
             self.events.push((body.to_string(), urgent));
+        }
+        fn osc_color_query(&mut self, index: u16) {
+            self.color_queries.push(index);
+        }
+        fn shell_integration(&mut self, event: ShellIntegrationEvent) {
+            self.shell_events.push(event);
         }
     }
 
@@ -348,6 +465,22 @@ mod osc_tests {
         let mut watcher = OscWatcher { inner: &mut sink };
         parser.advance(&mut watcher, bytes);
         sink.events
+    }
+
+    fn run_color_queries(bytes: &[u8]) -> Vec<u16> {
+        let mut parser = vte::Parser::new();
+        let mut sink = Collector::default();
+        let mut watcher = OscWatcher { inner: &mut sink };
+        parser.advance(&mut watcher, bytes);
+        sink.color_queries
+    }
+
+    fn run_shell_events(bytes: &[u8]) -> Vec<ShellIntegrationEvent> {
+        let mut parser = vte::Parser::new();
+        let mut sink = Collector::default();
+        let mut watcher = OscWatcher { inner: &mut sink };
+        parser.advance(&mut watcher, bytes);
+        sink.shell_events
     }
 
     #[test]
@@ -381,6 +514,23 @@ mod osc_tests {
     }
 
     #[test]
+    fn osc11_background_query_surfaced() {
+        assert_eq!(run_color_queries(b"\x1b]11;?\x07"), vec![11]);
+    }
+
+    #[test]
+    fn osc10_and_osc12_queries_surfaced() {
+        assert_eq!(run_color_queries(b"\x1b]10;?\x1b\\"), vec![10]);
+        assert_eq!(run_color_queries(b"\x1b]12;?\x07"), vec![12]);
+    }
+
+    #[test]
+    fn osc11_set_form_is_not_a_query() {
+        // An app *setting* the background (no `?`) must not trigger a reply.
+        assert!(run_color_queries(b"\x1b]11;rgb:00/00/00\x07").is_empty());
+    }
+
+    #[test]
     fn empty_osc9_body_dropped() {
         let evts = run(b"\x1b]9;\x07");
         assert!(evts.is_empty());
@@ -396,5 +546,81 @@ mod osc_tests {
     fn osc9_inline_with_text_emits_once() {
         let evts = run(b"hello \x1b]9;ping\x07 world");
         assert_eq!(evts, vec![("ping".into(), false)]);
+    }
+
+    #[test]
+    fn osc633_boundaries_and_payloads_decode() {
+        use ShellIntegrationEvent::*;
+        assert!(matches!(run_shell_events(b"\x1b]633;A\x07").as_slice(), [PromptStart]));
+        assert!(matches!(run_shell_events(b"\x1b]633;B\x07").as_slice(), [CommandStart]));
+        assert!(matches!(run_shell_events(b"\x1b]633;C\x07").as_slice(), [PreExec]));
+        assert!(matches!(
+            run_shell_events(b"\x1b]633;D;0\x07").as_slice(),
+            [CommandFinished { exit: Some(0) }]
+        ));
+        assert!(matches!(
+            run_shell_events(b"\x1b]633;D;130\x07").as_slice(),
+            [CommandFinished { exit: Some(130) }]
+        ));
+        assert_eq!(
+            run_shell_events(b"\x1b]633;E;git commit\x07"),
+            vec![CommandLine("git commit".into())]
+        );
+        assert_eq!(
+            run_shell_events(b"\x1b]633;P;Cwd=/Users/x/proj\x07"),
+            vec![Cwd("/Users/x/proj".into())]
+        );
+        assert_eq!(
+            run_shell_events(b"\x1b]633;P;Keymap=vi\x07"),
+            vec![Keymap("vi".into())]
+        );
+        assert_eq!(
+            run_shell_events(b"\x1b]633;P;Keymap=emacs\x07"),
+            vec![Keymap("emacs".into())]
+        );
+    }
+
+    #[test]
+    fn osc633_unknown_p_property_ignored() {
+        // A `P;<other>=` property Crane does not consume (VS Code emits several)
+        // must decode to nothing rather than erroring or mis-classifying.
+        assert!(run_shell_events(b"\x1b]633;P;IsWindows=True\x07").is_empty());
+    }
+
+    #[test]
+    fn osc633_command_line_unescapes_semicolons_and_newlines() {
+        // VS Code encodes ; as \x3b, newline as \x0a, backslash as \x5c.
+        assert_eq!(
+            run_shell_events(b"\x1b]633;E;echo a\\x3bb\\x0ac\x07"),
+            vec![ShellIntegrationEvent::CommandLine("echo a;b\nc".into())]
+        );
+    }
+
+    #[test]
+    fn osc633_unknown_subcommand_ignored() {
+        assert!(run_shell_events(b"\x1b]633;Z;whatever\x07").is_empty());
+    }
+
+    #[test]
+    fn osc633_command_line_unescapes_backslash() {
+        // VS Code encodes a literal backslash as \x5c. Nothing previously
+        // pinned this third escape — a refactor of `unescape_osc633` could
+        // silently regress it.
+        assert_eq!(
+            run_shell_events(b"\x1b]633;E;echo a\\x5cb\x07"),
+            vec![ShellIntegrationEvent::CommandLine("echo a\\b".into())]
+        );
+    }
+
+    #[test]
+    fn osc633_command_line_reconstructs_multibyte_utf8() {
+        // \xc3\xa9 is 'é' UTF-8-encoded and then escaped byte-by-byte, the
+        // way VS Code escapes non-ASCII text. The two escapes must
+        // recombine into the original UTF-8 sequence, not decode as two
+        // separate Latin-1 codepoints (`Ã©`).
+        assert_eq!(
+            run_shell_events(b"\x1b]633;E;echo \\xc3\\xa9\x07"),
+            vec![ShellIntegrationEvent::CommandLine("echo é".into())]
+        );
     }
 }

@@ -1,0 +1,28 @@
+# Crane ZDOTDIR shim — .zshrc.
+#
+# Sources the user's real interactive rc, then loads Crane's OSC 633 hooks
+# last so they sit on top of whatever prompt framework that rc installed.
+#
+# See .zshenv for what CRANE_ZDOTDIR / CRANE_USER_ZDOTDIR mean and why the
+# user's file is sourced at top level rather than from a helper function.
+
+CRANE_ZDOTDIR="${CRANE_ZDOTDIR:-${ZDOTDIR:-$HOME}}"
+CRANE_USER_ZDOTDIR="${CRANE_USER_ZDOTDIR:-${CRANE_OLD_ZDOTDIR:-$HOME}}"
+# See .zshenv: a "user" directory equal to Crane's makes this shim source
+# itself, recursing until zsh gives up.
+[[ "$CRANE_USER_ZDOTDIR" == "$CRANE_ZDOTDIR" ]] && CRANE_USER_ZDOTDIR="$HOME"
+
+if [[ -f "$CRANE_USER_ZDOTDIR/.zshrc" ]]; then
+  ZDOTDIR="$CRANE_USER_ZDOTDIR"
+  source "$CRANE_USER_ZDOTDIR/.zshrc"
+  CRANE_USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
+fi
+
+# `export` — .zshenv unsets ZDOTDIR to let the user's own file relocate it, so
+# the export attribute has to be re-applied wherever it is set back.
+export ZDOTDIR="$CRANE_ZDOTDIR"
+
+# Crane's integration loads last so its hooks see the final shell state.
+if [[ -f "$CRANE_ZDOTDIR/crane-init.zsh" ]]; then
+  source "$CRANE_ZDOTDIR/crane-init.zsh"
+fi

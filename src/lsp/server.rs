@@ -121,6 +121,10 @@ impl ServerKey {
         }
     }
 
+    /// Manual-install fallback copy for the not-yet-rebuilt per-server
+    /// install UI (see `Downloader`'s auto-install chain, staged the
+    /// same way).
+    #[allow(dead_code)]
     pub fn install_hint(self) -> &'static str {
         match self {
             ServerKey::RustAnalyzer => "rustup component add rust-analyzer",
@@ -169,6 +173,10 @@ pub enum Status {
 pub struct Location {
     pub path: PathBuf,
     pub line: u32,
+    /// Column of the target position. `goto_location` only jumps by line
+    /// today (`goto_line`); not read yet, kept for a future column-precise
+    /// jump-to-definition.
+    #[allow(dead_code)]
     pub character: u32,
 }
 
@@ -381,7 +389,10 @@ impl LspServer {
     /// Most recent stderr lines from the server process. Empty when
     /// the server started cleanly; populated when spawn failed or the
     /// server wrote to stderr before exiting. UI surfaces this under
-    /// a dead server so the user can see the actual cause.
+    /// a dead server so the user can see the actual cause. Only caller
+    /// today is `LspManager::last_stderr`, itself staged for the
+    /// not-yet-rebuilt per-server status UI.
+    #[allow(dead_code)]
     pub fn last_stderr(&self) -> Vec<String> {
         self.shared.0.lock().last_stderr.clone()
     }

@@ -92,6 +92,11 @@ impl LanguageConfigs {
             .unwrap_or_else(|| LanguageConfig::defaults_for(key))
     }
 
+    /// Writer half of `get_or_default`. No caller yet — the per-language
+    /// LSP settings UI (`configs` is documented in `shell.rs` as "not yet
+    /// surfaced in warpui Settings") hasn't been rebuilt since the legacy
+    /// egui frontend was dropped. Kept for when it is.
+    #[allow(dead_code)]
     pub fn set(&mut self, key: ServerKey, cfg: LanguageConfig) {
         self.configs.insert(format!("{key:?}"), cfg);
     }
@@ -143,6 +148,12 @@ impl LspManager {
     /// of `files` / `pending_files` so a subsequent did_open after re-
     /// enabling the server starts from a clean slate instead of
     /// silently routing notifications into the void.
+    ///
+    /// No caller yet — `shutdown_all` (the global on/off toggle) is wired
+    /// up, but the per-language enable/disable toggle this per-server
+    /// teardown is meant to back hasn't been rebuilt in warpui yet. Kept
+    /// for when it is.
+    #[allow(dead_code)]
     pub fn shutdown_disabled(&mut self, configs: &LanguageConfigs) {
         let to_kill: Vec<ServerKey> = self
             .servers
@@ -348,12 +359,19 @@ impl LspManager {
         }
     }
 
+    /// Accept/decline handlers for `prompt_install`, which `tick()` above
+    /// already populates for real. No caller yet because the per-server
+    /// install popover (present in the old egui Settings > Language
+    /// Servers UI, per `shell.rs`'s `settings_lsp` doc comment) hasn't
+    /// been rebuilt in warpui. Kept for when it is.
+    #[allow(dead_code)]
     pub fn accept_install(&mut self, wake: &Wake) {
         if let Some(key) = self.prompt_install.take() {
             self.downloader.start_download(key, wake.clone());
         }
     }
 
+    #[allow(dead_code)]
     pub fn decline_install(&mut self) {
         if let Some(key) = self.prompt_install.take() {
             self.declined.insert(key);
@@ -469,6 +487,10 @@ impl LspManager {
     /// Last captured stderr lines for a server, if it's currently
     /// spawned. Used by the Settings UI to show *why* a server is
     /// dead (rustup shim missing component, spawn errno, etc.).
+    /// `settings_lsp()` already renders `statuses()` per server — this is
+    /// the un-rebuilt per-server detail line that would follow it. Kept
+    /// for when that UI lands.
+    #[allow(dead_code)]
     pub fn last_stderr(&self, key: ServerKey) -> Vec<String> {
         self.servers
             .get(&key)

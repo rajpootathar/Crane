@@ -63,9 +63,6 @@ const MINIMAP_W: f32 = 10.0;
 /// yet (value matches egui_phosphor 0.12 regular, same as the other consts).
 const CHECK_CIRCLE: &str = "\u{E184}";
 
-/// Image extensions the old egui diff view special-cased (`file_util::IMAGE_EXTS`).
-const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
-
 /// Blend `c` down to alpha `a` for a translucent row tint (mirrors the way
 /// `theme::drop_zone` derives a wash from `accent`).
 fn tint(c: ColorU, a: u8) -> ColorU {
@@ -138,13 +135,15 @@ impl DiffComputed {
     }
 }
 
-/// True when `path`'s extension marks an image (old `file_util::is_image_path`).
+/// True when `path`'s extension marks a RASTER image this diff guard treats
+/// as undiffable (old `file_util::IMAGE_EXTS`, minus `svg`). Delegates to
+/// `shell::is_raster_image_path` — deliberately NOT `shell::is_image_path`,
+/// which also matches `svg`. SVG is XML text: it opens in the read-only
+/// Image pane just like a PNG, but a changed `.svg` still gets a real
+/// syntax-highlighted text diff here instead of this binary-guard row. This
+/// wrapper exists only to take a `&str` (git gives paths as strings here).
 fn is_image_path_str(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    crate::warpui::shell::is_raster_image_path(Path::new(path))
 }
 
 /// Content-sniff for binary data: a NUL in the first 8 KB (the classic git
@@ -370,12 +369,12 @@ fn build_rows(old_text: &str, new_text: &str, ext: &str) -> (Vec<Row>, usize, us
 /// highlighting, `TextDiff`, `git diff` hunk parsing, and the per-hunk
 /// staged-state probes (`git apply --reverse --cached --check` each).
 fn compute(repo_root: Option<PathBuf>, rel: String, abs: PathBuf) -> DiffComputed {
-    // Image guard first (extension-based, cheap). The old egui view rendered
-    // the image; warpui has no image element yet, so a guard row stands in.
+    // Raster-image guard first (extension-based, cheap). `svg` is XML text
+    // and deliberately falls through to a real diff below — only the raster
+    // formats in `DIFF_RASTER_IMAGE_EXTS` short-circuit here, since their
+    // bytes have no meaningful text form.
     if is_image_path_str(&rel) {
-        return DiffComputed::with_binary(
-            "Image file — no text diff (image preview pending)".to_string(),
-        );
+        return DiffComputed::with_binary("Image file — no text diff".to_string());
     }
 
     // Working-copy side. A missing file is a legit all-deletions diff; a file
@@ -1520,6 +1519,25 @@ mod tests {
         assert!(is_image_path_str("a/b/photo.jpeg"));
         assert!(!is_image_path_str("src/main.rs"));
         assert!(!is_image_path_str("Makefile"));
+    }
+
+    /// FINDING 1 regression guard: `.svg` opens in the Image pane (it's in
+    /// `shell::IMAGE_EXTS`), but SVG is XML text — the diff view's binary
+    /// guard must NOT swallow its text diff the way it correctly does for an
+    /// actual raster format. Before the Image pane existed, `diff_view` kept
+    /// a private extension list with no `svg` entry, so a changed `.svg` got
+    /// a real syntax-highlighted diff; hoisting that list into the shared,
+    /// routing-focused `IMAGE_EXTS` silently added `svg` to it too, which
+    /// would have regressed this if `is_image_path_str` still read
+    /// `IMAGE_EXTS` directly instead of the raster-only subset.
+    #[test]
+    fn svg_is_not_treated_as_an_undiffable_raster_image() {
+        assert!(
+            !is_image_path_str("icon.svg"),
+            "svg must fall through to a real text diff, not the binary-image guard row"
+        );
+        // A genuine raster format right next to it must still guard.
+        assert!(is_image_path_str("icon.png"));
     }
 
     // ── row building (line numbers + gutter padding + spans) ────────────

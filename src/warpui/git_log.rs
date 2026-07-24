@@ -6,9 +6,9 @@
 //! `src/git_log/{data,graph,refs}.rs`, collapsed into one module.
 //!
 //! Everything here is a pure `git` subprocess + in-memory transform, so the
-//! shell runs [`load`] / [`load_graph_for`] and [`load_detail`] off the UI
-//! thread via `ctx.spawn` (background executor) — nothing here blocks the
-//! frame. The in-memory transforms ([`filter_commits`] / [`filtered_frame`],
+//! shell runs [`load_graph_for`] and [`load_detail`] off the UI thread via
+//! `ctx.spawn` (background executor) — nothing here blocks the frame. The
+//! in-memory transforms ([`filter_commits`] / [`filtered_frame`],
 //! [`ref_groups`], [`step_selection`]) are pure and cheap enough to run on
 //! the UI thread at interaction time.
 
@@ -83,18 +83,13 @@ pub fn parse_log_output(stdout: &str) -> Vec<CommitRecord> {
     out
 }
 
-/// Run `git log --all --date-order` against `repo` and parse the records.
-/// `max_count` caps the walk (pass a large value for the initial load).
-/// Empty Vec on any error.
-pub fn load_commits(repo: &Path, max_count: usize) -> Vec<CommitRecord> {
-    load_commits_for(repo, max_count, None)
-}
-
-/// [`load_commits`] with an optional ref scope. `Some("main")` walks only the
-/// commits reachable from that ref (`git log <ref>`) — the refs-column branch
-/// / tag filter, matching old Crane's `FilterState::branch` semantics — while
-/// `None` keeps the full `--all` walk. Empty Vec on any error, including a
-/// ref name git can't resolve.
+/// Run `git log --date-order` against `repo` and parse the records, with an
+/// optional ref scope. `Some("main")` walks only the commits reachable from
+/// that ref (`git log <ref>`) — the refs-column branch / tag filter, matching
+/// old Crane's `FilterState::branch` semantics — while `None` keeps the full
+/// `--all` walk. `max_count` caps the walk (pass a large value for the
+/// initial load). Empty Vec on any error, including a ref name git can't
+/// resolve.
 pub fn load_commits_for(
     repo: &Path,
     max_count: usize,
@@ -542,17 +537,12 @@ pub struct GraphFrame {
 /// 10 000, matching old Crane's `GitLogState::reload` walk depth.
 pub const MAX_COMMITS: usize = 10_000;
 
-/// Load the full graph for `repo`. Blocking (subprocess) — call off the UI
-/// thread. Returns an empty frame on any error / non-repo.
-pub fn load(repo: &Path) -> GraphFrame {
-    load_graph_for(repo, None)
-}
-
-/// [`load`] with an optional ref scope: `Some("main")` reloads the graph from
-/// only the commits reachable from that ref (`git log <ref>` — the refs-column
-/// branch/tag filter), `None` is the full `--all` walk. Refs always load in
-/// full so the pills and the refs column stay complete while the commit list
-/// is narrowed. Blocking — call off the UI thread.
+/// Load the full graph for `repo`, with an optional ref scope: `Some("main")`
+/// loads the graph from only the commits reachable from that ref (`git log
+/// <ref>` — the refs-column branch/tag filter), `None` is the full `--all`
+/// walk. Refs always load in full so the pills and the refs column stay
+/// complete while the commit list is narrowed. Blocking (subprocess) — call
+/// off the UI thread. Returns an empty frame on any error / non-repo.
 pub fn load_graph_for(repo: &Path, ref_filter: Option<&str>) -> GraphFrame {
     let commits = load_commits_for(repo, MAX_COMMITS, ref_filter);
     let refs = load_refs(repo);

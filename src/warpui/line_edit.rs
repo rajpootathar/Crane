@@ -100,13 +100,6 @@ impl LineEdit {
         self.anchor = None;
     }
 
-    /// Take the buffer out, resetting the field.
-    pub fn take(&mut self) -> String {
-        self.caret = 0;
-        self.anchor = None;
-        std::mem::take(&mut self.text)
-    }
-
     /// Move the caret to a byte offset (snapped to the nearest char
     /// boundary at or below `to`, clamped to the text). Used for
     /// click-to-place.
