@@ -10311,9 +10311,19 @@ impl CraneShellView {
         };
         let menu_path = r.path.clone();
         let is_dir = r.is_dir;
+        // Open / toggle fires on mouse-UP, not down: this row is wrapped in a
+        // `Draggable`, which passes the down straight to the child (arming the
+        // drag only AFTER the 5px threshold). Binding the action to the down
+        // therefore opened the file at the very start of EVERY drag gesture, and
+        // the mid-gesture `open_file` (which splits a pane + relayouts) stranded
+        // the drag ghost. On mouse-up, a real drag is in `Dragging` state so the
+        // `Draggable` suppresses the child event (no open); only a click — which
+        // never crossed the threshold (`WaitingToDrag`) — reaches the child and
+        // opens. Exactly the "click passes through under the threshold" behavior
+        // the drag-drop feature always intended.
         let clickable = EventHandler::new(
             EventHandler::new(row)
-                .on_left_mouse_down(move |ctx, _app, _pos| {
+                .on_left_mouse_up(move |ctx, _app, _pos| {
                     ctx.dispatch_typed_action(action.clone());
                     DispatchEventResult::StopPropagation
                 })
