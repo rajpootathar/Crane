@@ -11,7 +11,7 @@ exclude = ["vendor"]
 
 [package]
 name = "crane"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 description = "Native GPU-rendered terminal + IDE environment"
 authors = ["rajpootathar"]
