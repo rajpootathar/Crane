@@ -455,6 +455,17 @@ pub struct CraneShellView {
     fs_drag_states: std::cell::RefCell<HashMap<String, DraggableState>>,
     /// Undo stack for Files-tree ops (Cmd+Z when no editor owns focus).
     file_ops: Vec<FileOp>,
+    /// How a confirmed delete reaches the system Trash.
+    ///
+    /// Injectable ONLY so tests can drive the delete → `purge_path_everywhere`
+    /// wiring without a real Trash write. A `tempfile` sandbox does NOT
+    /// contain `trash::delete`: the crate resolves the Trash through
+    /// Foundation, which ignores the `HOME` override the tests install. A real
+    /// call therefore escapes the tempdir and drops the test's stub file into
+    /// the developer's own `~/.Trash` — with the Trash sound and a system
+    /// notification — on every `make test`. Production always uses
+    /// [`system_trash`].
+    trash_delete: fn(&std::path::Path) -> Result<(), String>,
     /// Loaded `git show` detail for the selected commit.
     git_log_detail: Option<crate::warpui::git_log::CommitDetail>,
     /// True while the selected commit's `git show` is computing.
@@ -1046,6 +1057,12 @@ enum FileOp {
     /// A path created by a copy (internal alt-copy or an external OS drop);
     /// undo moves it to the Trash (recoverable, never a permanent unlink).
     Copy { created: PathBuf },
+}
+
+/// Production deleter behind [`CraneShellView::trash_delete`]: move `path` to
+/// the system Trash (recoverable — never a permanent unlink).
+fn system_trash(path: &std::path::Path) -> Result<(), String> {
+    trash::delete(path).map_err(|e| e.to_string())
 }
 
 /// Settings dialog sections (old `modals/settings.rs::SettingsSection`).
@@ -2633,6 +2650,7 @@ impl CraneShellView {
             fs_zones_last: Rc::new(std::cell::RefCell::new(Vec::new())),
             fs_drag_states: std::cell::RefCell::new(HashMap::new()),
             file_ops: Vec::new(),
+            trash_delete: system_trash,
             git_log_hover: Rc::new(Cell::new(None)),
             git_log_detail: None,
             git_log_detail_loading: false,
@@ -3902,7 +3920,7 @@ impl CraneShellView {
                 }
             }
             FileOp::Copy { created } => {
-                if let Err(e) = trash::delete(&created) {
+                if let Err(e) = (self.trash_delete)(&created) {
                     self.commit_error = Some(format!("Undo copy: {e}"));
                 }
             }
@@ -15754,7 +15772,7 @@ impl CraneShellView {
                     // `confirm_delete_file` modal). Works for both files and
                     // directories. Surface any failure instead of silently
                     // dropping the request.
-                    if let Err(e) = trash::delete(&path) {
+                    if let Err(e) = (self.trash_delete)(&path) {
                         self.commit_error = Some(format!("Trash: {e}"));
                     } else {
                         if self.selected_file.as_deref() == Some(path.as_path()) {
@@ -18755,6 +18773,216 @@ mod restore_wiring_integration_tests {
         });
     }
 
+    /// The delete-resurrection hazard, in the shape it actually occurs:
+    /// deleting a DIRECTORY while files under it are open as File Tabs.
+    ///
+    /// `ConfirmDelete` accepts folders as well as files, so a single delete
+    /// can invalidate many open tabs at once. A tab left pointing at a file
+    /// inside a deleted folder looks normal, and the `markdown_views` /
+    /// `editor_views` buffer it keeps alive means Cmd+S on that tab writes
+    /// the deleted file straight back to disk — the deletion silently undone.
+    /// `purge_path_everywhere` closes those tabs and drops those buffers.
+    ///
+    /// The sweep is prefix-keyed (`starts_with`), which is also what keeps it
+    /// correctly SCOPED: a sibling outside the deleted subtree must keep its
+    /// tab and its buffer. That is why `keep.md` and `docs-old.md` are here —
+    /// the sweep must never degrade into "close everything", and `docs-old.md`
+    /// additionally pins that the match is COMPONENT-wise (`Path::starts_with`)
+    /// and not a raw string prefix, which would wrongly sweep it.
+    ///
+    /// Scope: this is the SINGLE-Workspace case only. The cross-Workspace
+    /// sweep is a separate and genuinely reachable hazard — a Workspace's tab
+    /// list is NOT confined to its own checkout (Cmd+O feeds `open_file` any
+    /// picked path with no root check, a terminal path-click opens any
+    /// absolute path, and `AddProject` dedupes on exact string equality so
+    /// Projects may nest) — and is pinned by its own test,
+    /// `deleting_a_file_closes_its_tab_in_every_workspace`.
+    #[test]
+    fn deleting_a_directory_closes_the_file_tabs_beneath_it() {
+        use crate::warpui::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let proj_path = proj.path().to_string_lossy().into_owned();
+
+        // The Markdown pane's own seed doc, a `docs/` subtree holding two
+        // files, and two survivors outside that subtree.
+        //
+        // `one.md` and `two.rs` deliberately route DIFFERENTLY: `open_file`
+        // sends markdown to `markdown_views` and everything else to
+        // `editor_views`, so an all-markdown fixture would leave the
+        // `editor_views` assertions below checking an always-empty map.
+        // `two.rs` is also the branch that holds unsaved Cmd+S buffers —
+        // the exact resurrection hazard this test exists for.
+        //
+        // `docs-old.md` is a survivor whose NAME shares the deleted
+        // directory's string prefix ("docs") while not being under it.
+        // Component-wise `Path::starts_with` spares it; a naive
+        // `to_string_lossy().starts_with` would wrongly sweep it.
+        let seed = proj.path().join("seed.md");
+        let docs_dir = proj.path().join("docs");
+        std::fs::create_dir(&docs_dir).expect("create docs dir");
+        let doc_one = docs_dir.join("one.md");
+        let doc_two = docs_dir.join("two.rs");
+        let keep = proj.path().join("keep.md");
+        let keep_adjacent = proj.path().join("docs-old.md");
+        for p in [&seed, &doc_one, &doc_two, &keep, &keep_adjacent] {
+            std::fs::write(p, "# doc\n").expect("write temp fixture file");
+        }
+
+        const PID: PaneId = 30;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 31;
+        st.added_projects =
+            vec![AddedProject { name: "proj".to_string(), path: proj_path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            proj_path.clone(),
+            vec![STab {
+                id: 0,
+                name: "A".to_string(),
+                layout: SNode::Leaf(PID),
+                focus: Some(PID),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((proj_path.clone(), 0));
+        st.markdowns = vec![(PID, SMarkdown { path: seed, editing: false })];
+
+        let proj_path2 = proj_path.clone();
+        let (doc_one2, doc_two2, keep2, keep_adj2, docs_dir2) = (
+            doc_one.clone(),
+            doc_two.clone(),
+            keep.clone(),
+            keep_adjacent.clone(),
+            docs_dir.clone(),
+        );
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws = v
+                        .ws_key_for_path_for_test(&proj_path2)
+                        .expect("the Project must resolve to a Workspace");
+
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws.0, ws.1, 0),
+                            path: std::path::PathBuf::from(&proj_path2),
+                        },
+                        vctx,
+                    );
+                    // Two File Tabs inside `docs/`, two survivors outside it.
+                    v.open_file(doc_one2.clone(), vctx);
+                    v.open_file(doc_two2.clone(), vctx);
+                    v.open_file(keep2.clone(), vctx);
+                    v.open_file(keep_adj2.clone(), vctx);
+
+                    let (fp, paths, _) = v.files_pane_state_for_test(ws);
+                    assert!(fp.is_some(), "the Workspace must own a Files Pane");
+                    assert_eq!(
+                        paths,
+                        [
+                            doc_one2.clone(),
+                            doc_two2.clone(),
+                            keep2.clone(),
+                            keep_adj2.clone()
+                        ],
+                        "all four files are open as File Tabs before the delete"
+                    );
+                    // Both cache maps must really be populated, or the
+                    // post-delete `!contains_key` assertions below would be
+                    // checking empty maps and pass no matter what the sweep
+                    // does. `.md` lands in `markdown_views`, `.rs` in
+                    // `editor_views`.
+                    assert!(
+                        v.markdown_views.contains_key(&doc_one2),
+                        "the markdown fixture must be cached before the delete"
+                    );
+                    assert!(
+                        v.editor_views.contains_key(&doc_two2),
+                        "the non-markdown fixture must be cached before the delete"
+                    );
+
+                    // Delete for real on disk, but NEVER through the system
+                    // Trash. `trash::delete` resolves the Trash through
+                    // Foundation, which ignores this test's `HOME` override,
+                    // so a real call escapes the tempdir sandbox and drops
+                    // the fixture into the developer's own `~/.Trash` — Trash
+                    // sound and system notification included — on every
+                    // `make test`. What is under test here is
+                    // `purge_path_everywhere`'s sweep, not the `trash`
+                    // crate's ability to trash something.
+                    v.trash_delete = |p| {
+                        let removed = if p.is_dir() {
+                            std::fs::remove_dir_all(p)
+                        } else {
+                            std::fs::remove_file(p)
+                        };
+                        removed.map_err(|e| e.to_string())
+                    };
+
+                    v.handle_action_impl(
+                        &CraneShellAction::RequestDelete(docs_dir2.clone()),
+                        vctx,
+                    );
+                    v.handle_action_impl(&CraneShellAction::ConfirmDelete, vctx);
+
+                    // The delete really happened — without this, every
+                    // assertion below could pass vacuously against a tree
+                    // that was never touched.
+                    assert!(
+                        !docs_dir2.exists(),
+                        "the deleted directory must actually be gone from disk"
+                    );
+
+                    // Both tabs under `docs/` closed; BOTH siblings outside it
+                    // survived — including `docs-old.md`, which a raw string
+                    // prefix would have swept.
+                    let (fp_after, paths_after, active_after) =
+                        v.files_pane_state_for_test(ws);
+                    assert_eq!(
+                        paths_after,
+                        [keep2.clone(), keep_adj2.clone()],
+                        "only the File Tabs beneath the deleted directory may close"
+                    );
+                    assert!(
+                        fp_after.is_some(),
+                        "the Files Pane stays alive while a tab outside the subtree remains"
+                    );
+                    // The active index is re-based onto the shortened list.
+                    // An overshoot panics on the next paint; an undershoot
+                    // silently selects the wrong tab.
+                    assert!(
+                        active_after < paths_after.len(),
+                        "the active File Tab index must stay inside the surviving list"
+                    );
+
+                    // ...AND no cached buffer may survive for the deleted
+                    // paths — the part that actually stops Cmd+S from
+                    // resurrecting a file inside a deleted folder.
+                    for gone in [&doc_one2, &doc_two2] {
+                        assert!(
+                            !v.editor_views.contains_key(gone),
+                            "editor_views must not cache a buffer under a deleted directory"
+                        );
+                        assert!(
+                            !v.markdown_views.contains_key(gone),
+                            "markdown_views must not cache a buffer under a deleted directory"
+                        );
+                    }
+                });
+            });
+        });
+    }
+
     /// The delete-resurrection hazard: the same file open as a File Tab in
     /// TWO Workspaces, deleted from one of them. Before the fix, deleting
     /// only swept `ws_file_paths(self.ws_key())` — the CURRENTLY SELECTED
@@ -18766,6 +18994,13 @@ mod restore_wiring_integration_tests {
     /// tab list unconditionally, because deletion is a stronger intent than
     /// the refcount that exists only to let unrelated Workspaces share one
     /// cached buffer.
+    ///
+    /// That refcount is `FileTabCloseConfirmed`'s `still_open` check, which
+    /// scans EVERY Workspace's `file_pane_paths` — dead code unless two
+    /// Workspaces can list the same `PathBuf`, so the codebase already
+    /// treats this state as reachable. Peer of
+    /// `deleting_a_directory_closes_the_file_tabs_beneath_it`, which covers
+    /// the single-Workspace subtree case.
     #[test]
     fn deleting_a_file_closes_its_tab_in_every_workspace() {
         use crate::warpui::shell::CraneShellAction;
@@ -18782,13 +19017,16 @@ mod restore_wiring_integration_tests {
 
         let seed_a = proj_a.path().join("seed-a.md");
         let seed_b = proj_b.path().join("seed-b.md");
-        // The SAME logical document, opened as a File Tab in both Projects —
-        // mirrors a monorepo-style shared file, or simply the same absolute
-        // path bind-mounted / symlinked into both checkouts. What matters
-        // for this test is only that both Workspaces' `file_pane_paths`
-        // list the identical `PathBuf`.
-        let shared_doc = proj_a.path().join("shared.md");
-        for p in [&seed_a, &seed_b, &shared_doc] {
+        // The SAME absolute path, opened as a File Tab in both Projects.
+        // This is not contrived: `open_file` applies NO Workspace-root
+        // check, so Cmd+O (`OpenExternalFile`) hands it any path the native
+        // picker returns, a terminal path-click (`OpenFileAtPath`) opens any
+        // absolute path, and `AddProject` dedupes on exact string equality
+        // so `~/repo` and `~/repo/sub` can both be Projects. All that
+        // matters here is that both Workspaces' `file_pane_paths` end up
+        // listing the identical `PathBuf` — which two clicks achieve.
+        let external_doc = proj_a.path().join("external.md");
+        for p in [&seed_a, &seed_b, &external_doc] {
             std::fs::write(p, "# doc\n").expect("write temp md file");
         }
 
@@ -18830,7 +19068,7 @@ mod restore_wiring_integration_tests {
         ];
 
         let (path_a2, path_b2) = (path_a.clone(), path_b.clone());
-        let shared_doc2 = shared_doc.clone();
+        let external_doc2 = external_doc.clone();
         App::test((), move |mut app| async move {
             let app = &mut app;
             let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
@@ -18854,7 +19092,7 @@ mod restore_wiring_integration_tests {
                         },
                         vctx,
                     );
-                    v.open_file(shared_doc2.clone(), vctx);
+                    v.open_file(external_doc2.clone(), vctx);
                     v.handle_action_impl(
                         &CraneShellAction::Select {
                             sel: (ws_b.0, ws_b.1, 1),
@@ -18862,23 +19100,29 @@ mod restore_wiring_integration_tests {
                         },
                         vctx,
                     );
-                    v.open_file(shared_doc2.clone(), vctx);
+                    v.open_file(external_doc2.clone(), vctx);
 
                     // Sanity: both Workspaces show it open, and the shared
                     // path is cached exactly once in `editor_views` (or
                     // `markdown_views`, since this is a `.md` doc).
                     let (fp_a, paths_a, _) = v.files_pane_state_for_test(ws_a);
                     assert!(fp_a.is_some(), "Workspace A must own a Files Pane");
-                    assert_eq!(paths_a, [shared_doc2.clone()]);
+                    assert_eq!(paths_a, [external_doc2.clone()]);
                     let (fp_b, paths_b, _) = v.files_pane_state_for_test(ws_b);
                     assert!(fp_b.is_some(), "Workspace B must own a Files Pane");
-                    assert_eq!(paths_b, [shared_doc2.clone()]);
+                    assert_eq!(paths_b, [external_doc2.clone()]);
+
+                    // Never through the real system Trash — see the
+                    // `trash_delete` field doc. A real call escapes the
+                    // tempdir sandbox into the developer's own `~/.Trash`.
+                    v.trash_delete =
+                        |p| std::fs::remove_file(p).map_err(|e| e.to_string());
 
                     // Delete it while Workspace B is the SELECTED one — the
                     // hazard the finding describes deletes from whichever
                     // Workspace is active; B was the last one selected above.
                     v.handle_action_impl(
-                        &CraneShellAction::RequestDelete(shared_doc2.clone()),
+                        &CraneShellAction::RequestDelete(external_doc2.clone()),
                         vctx,
                     );
                     v.handle_action_impl(&CraneShellAction::ConfirmDelete, vctx);
@@ -18903,12 +19147,116 @@ mod restore_wiring_integration_tests {
                     // resurrecting the trashed file: no `editor_views` /
                     // `markdown_views` entry may still point at this path.
                     assert!(
-                        !v.editor_views.contains_key(&shared_doc2),
+                        !v.editor_views.contains_key(&external_doc2),
                         "editor_views must not hold a cached buffer for a deleted path"
                     );
                     assert!(
-                        !v.markdown_views.contains_key(&shared_doc2),
+                        !v.markdown_views.contains_key(&external_doc2),
                         "markdown_views must not hold a cached buffer for a deleted path"
+                    );
+                });
+            });
+        });
+    }
+
+    /// A FAILED delete must change NOTHING. `ConfirmDelete` deliberately puts
+    /// the sweep in the `else` arm: when the Trash write fails (permissions, a
+    /// locked file, a read-only volume) the file is STILL on disk, so closing
+    /// its File Tab would strand the user's unsaved edits behind a tab they
+    /// can no longer reach. Hoisting the sweep out of that `else` passes every
+    /// other test in this file — this is the only thing pinning it, and the
+    /// injectable `trash_delete` seam is what makes a failing delete testable
+    /// at all.
+    #[test]
+    fn a_failed_delete_leaves_the_file_tab_and_its_buffer_intact() {
+        use crate::warpui::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let proj_path = proj.path().to_string_lossy().into_owned();
+        let seed = proj.path().join("seed.md");
+        let doc = proj.path().join("doomed.md");
+        for p in [&seed, &doc] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID: PaneId = 30;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 31;
+        st.added_projects =
+            vec![AddedProject { name: "proj".to_string(), path: proj_path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            proj_path.clone(),
+            vec![STab {
+                id: 0,
+                name: "A".to_string(),
+                layout: SNode::Leaf(PID),
+                focus: Some(PID),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((proj_path.clone(), 0));
+        st.markdowns = vec![(PID, SMarkdown { path: seed, editing: false })];
+
+        let proj_path2 = proj_path.clone();
+        let doc2 = doc.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws = v
+                        .ws_key_for_path_for_test(&proj_path2)
+                        .expect("the Project must resolve to a Workspace");
+                    v.handle_action_impl(
+                        &CraneShellAction::Select {
+                            sel: (ws.0, ws.1, 0),
+                            path: std::path::PathBuf::from(&proj_path2),
+                        },
+                        vctx,
+                    );
+                    v.open_file(doc2.clone(), vctx);
+                    assert!(
+                        v.markdown_views.contains_key(&doc2),
+                        "the fixture must be cached before the delete is attempted"
+                    );
+
+                    // Fail the delete the way a real Trash write can.
+                    v.trash_delete = |_| Err("permission denied".to_string());
+
+                    v.handle_action_impl(
+                        &CraneShellAction::RequestDelete(doc2.clone()),
+                        vctx,
+                    );
+                    v.handle_action_impl(&CraneShellAction::ConfirmDelete, vctx);
+
+                    // The file never left disk...
+                    assert!(doc2.exists(), "a failed delete must not remove the file");
+                    // ...so its tab and its buffer must both survive, or the
+                    // user's unsaved edits are stranded behind a closed tab.
+                    let (_, paths_after, _) = v.files_pane_state_for_test(ws);
+                    assert_eq!(
+                        paths_after,
+                        [doc2.clone()],
+                        "a failed delete must not close the File Tab"
+                    );
+                    assert!(
+                        v.markdown_views.contains_key(&doc2),
+                        "a failed delete must not drop the cached buffer"
+                    );
+                    // ...and the failure is surfaced, never swallowed.
+                    assert!(
+                        v.commit_error
+                            .as_deref()
+                            .is_some_and(|e| e.contains("permission denied")),
+                        "the Trash failure must be surfaced to the user"
                     );
                 });
             });
