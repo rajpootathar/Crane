@@ -54,6 +54,13 @@ impl Scrollback {
         self.rows.iter()
     }
 
+    /// Row by index from the oldest end (`0` = oldest retained row).
+    /// O(1) — prefer this over `iter().nth(i)` on hot paths like
+    /// selection materialization, which walks rows per frame.
+    pub fn get(&self, idx: usize) -> Option<&Row> {
+        self.rows.get(idx)
+    }
+
     /// Resize each retained row to `cols` columns. Called when the
     /// terminal viewport resizes — keeps stored rows wide enough
     /// for the new viewport without losing content.

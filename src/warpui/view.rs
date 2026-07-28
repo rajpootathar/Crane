@@ -210,7 +210,7 @@ fn scan_paths(row: &str, cwd: &std::path::Path) -> Vec<PathHit> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crane_term::index::{Column as TermColumn, Line as TermLine, Point as TermPoint, Side};
-use crane_term::selection::{expand_to_line, expand_to_word, Selection, SelectionAnchor, SelectionType};
+use crane_term::selection::{Selection, SelectionType};
 use crane_term::{Flags, TermMode};
 
 use warpui::elements::{
@@ -268,6 +268,35 @@ fn is_inside_vertical_separators(term: &crane_term::Term, start_col: usize, rows
     has_left && has_right
 }
 
+/// How long after a click a following click still counts as consecutive.
+const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Advance the consecutive-click counter (1 = simple, 2 = word, 3 = line).
+///
+/// A repeat click must land within [`MULTI_CLICK_WINDOW`] on the same row and
+/// within one column of the previous one. The column tolerance matters: a
+/// trackpad triple-click almost always drifts a pixel or two, and demanding the
+/// exact same cell made triple-click fail into a plain single click — which is
+/// why triple-click and drag appeared to behave differently.
+fn consecutive_click_count(
+    prev: u32,
+    last: Option<(std::time::Instant, usize, usize)>,
+    now: std::time::Instant,
+    vrow: usize,
+    vcol: usize,
+) -> u32 {
+    match last {
+        Some((t, pr, pc))
+            if now.duration_since(t) < MULTI_CLICK_WINDOW
+                && pr == vrow
+                && pc.abs_diff(vcol) <= 1 =>
+        {
+            prev + 1
+        }
+        _ => 1,
+    }
+}
+
 pub struct TerminalView {
     font_family: FamilyId,
     controller: Rc<RefCell<TerminalController>>,
@@ -298,6 +327,12 @@ pub struct TerminalView {
     scrollbar_drag: Rc<StdCell<bool>>,
     /// Persisted drag state for mouse text selection (element is rebuilt each frame).
     sel_dragging: Rc<StdCell<bool>>,
+    /// Selection-drag autoscroll request published by GridElement while the
+    /// pointer is held past the top / bottom edge: `(rows_per_tick, col, side)`,
+    /// positive rows = up into history. Drained by [`Self::autoscroll_tick`],
+    /// which the shell's 33ms animation tick drives — the pointer stops emitting
+    /// drag events once it stops moving, so the scroll has to come from a tick.
+    sel_autoscroll: Rc<StdCell<Option<(i32, usize, Side)>>>,
     /// Persisted "SGR mouse-report press is down on this pane" flag: pairs each
     /// forwarded press with its release so a mouse-reporting pane (e.g. Claude)
     /// never swallows a sibling pane's selection Up. See GridElement's
@@ -409,6 +444,7 @@ impl TerminalView {
             dimmed: StdCell::new(false),
             scrollbar_drag: Rc::new(StdCell::new(false)),
             sel_dragging: Rc::new(StdCell::new(false)),
+            sel_autoscroll: Rc::new(StdCell::new(None)),
             mouse_report_pressed: Rc::new(StdCell::new(false)),
             last_click: Rc::new(RefCell::new(None)),
             click_count: Rc::new(StdCell::new(0)),
@@ -425,6 +461,59 @@ impl TerminalView {
     /// its `layouts` map so dispatched notifications carry the right source tab.
     pub fn owner_cell(&self) -> Rc<StdCell<Option<(usize, usize, usize)>>> {
         self.owner_key.clone()
+    }
+
+    /// Advance a selection drag that has run past the top / bottom edge: scroll
+    /// the viewport one step and drag the active end to the edge row under the
+    /// pointer. Driven by the shell's 33ms tick because the OS stops sending
+    /// drag events the moment the pointer stops moving — without a tick, holding
+    /// the mouse below the terminal would stall the selection on the last
+    /// visible row.
+    ///
+    /// A no-op (single `Cell` read) whenever no drag is overscrolling.
+    pub fn autoscroll_tick(&self) {
+        let Some((rows_per_tick, col, side)) = self.sel_autoscroll.get() else {
+            return;
+        };
+        // The drag ended without a LeftMouseUp reaching this element (pane
+        // closed, focus stolen): stop rather than scroll forever.
+        if !self.sel_dragging.get() {
+            self.sel_autoscroll.set(None);
+            return;
+        }
+        let ctrl = self.controller.borrow();
+        let mut t = ctrl.term.lock();
+        // Alt-screen (vim / less / htop) has no scrollback and the app owns its
+        // viewport — there is nothing to scroll into.
+        if t.is_alt_screen() {
+            return;
+        }
+        let before = t.display_offset();
+        t.scroll_display(rows_per_tick);
+        let after = t.display_offset();
+        if after == before {
+            // Already at the top of history / at the live bottom.
+            return;
+        }
+        // Extend to the edge row the pointer is past, in the NEW display
+        // coordinates. `rows_per_tick > 0` means we scrolled up, so the pointer
+        // is above the grid and the active end belongs on the first row.
+        let rows = t.grid.rows.len();
+        let vrow = if rows_per_tick > 0 {
+            0
+        } else {
+            rows.saturating_sub(1)
+        };
+        let cols = t.grid.columns;
+        let pt = TermPoint::new(
+            TermLine(vrow as i32 - after as i32),
+            TermColumn(col.min(cols.saturating_sub(1))),
+        );
+        if let Some(sel) = t.selection.as_mut() {
+            sel.update(pt, side);
+        }
+        drop(t);
+        (self.wake)();
     }
 
     /// Restore a terminal from a persisted session: spawn in `cwd`, then replay
@@ -636,7 +725,7 @@ impl View for TerminalView {
                 None
             };
 
-            let sel_range = t.selection.as_ref().map(|s| s.to_range());
+            let sel_range = t.selection_range();
             let disp_off = t.grid.display_offset as i32;
 
             (cells, rows, cols, cursor, sel_range, disp_off, cursor_style, scroll_frac, overscan)
@@ -710,18 +799,8 @@ impl View for TerminalView {
                         let now = std::time::Instant::now();
                         let count = {
                             let mut last = last_click.borrow_mut();
-                            let prev = click_count.get();
-                            let new_count = match *last {
-                                Some((t, pr, pc))
-                                    if now.duration_since(t)
-                                        < std::time::Duration::from_millis(500)
-                                        && pr == vrow
-                                        && pc == vcol =>
-                                {
-                                    prev + 1
-                                }
-                                _ => 1,
-                            };
+                            let new_count =
+                                consecutive_click_count(click_count.get(), *last, now, vrow, vcol);
                             *last = Some((now, vrow, vcol));
                             click_count.set(new_count);
                             new_count
@@ -745,61 +824,28 @@ impl View for TerminalView {
                             return;
                         }
 
-                        let sel = if count >= 3 {
-                            // Triple click: select the whole line.
-                            let range = expand_to_line(pt, grid_cols);
-                            Selection {
-                                kind: SelectionType::Lines,
-                                anchor: SelectionAnchor {
-                                    point: range.start,
-                                    side: Side::Left,
-                                },
-                                active: SelectionAnchor {
-                                    point: range.end,
-                                    side: Side::Right,
-                                },
-                            }
-                        } else if count == 2
-                            && term_line >= 0
-                            && (term_line as usize) < grid_rows
-                        {
-                            // Double click: expand to the word under the cursor.
-                            let row_idx = term_line as usize;
-                            let range = expand_to_word(pt, grid_cols, |c| {
-                                t.grid
-                                    .cell_at(row_idx, c)
-                                    .map(|cell| cell.ch)
-                                    .unwrap_or(' ')
-                            });
-                            Selection {
-                                kind: SelectionType::Semantic,
-                                anchor: SelectionAnchor {
-                                    point: range.start,
-                                    side: Side::Left,
-                                },
-                                active: SelectionAnchor {
-                                    point: range.end,
-                                    side: Side::Right,
-                                },
-                            }
-                        } else {
-                            // Single click: start a drag selection. If the start
-                            // cell sits between two TUI vertical separators
-                            // (lazygit/k9s column divider), promote to Block so
-                            // dragging one column stays rectangular
+                        // Only the KIND is decided here. The word / logical-line
+                        // expansion itself happens in `Term::selection_range()`,
+                        // against the live grid, every time the range is
+                        // materialized — so a drag after the expanding click keeps
+                        // extending by whole words / whole lines instead of
+                        // collapsing to the raw cell under the cursor, and a
+                        // triple-click covers the whole WRAPLINE chain exactly like
+                        // a drag across the same wrapped command.
+                        let kind = if count >= 3 {
+                            SelectionType::Lines
+                        } else if count == 2 {
+                            SelectionType::Semantic
+                        } else if is_inside_vertical_separators(&t, pt.column.0, grid_rows) {
+                            // Single click starting between two TUI vertical
+                            // separators (lazygit/k9s column divider): promote to
+                            // Block so dragging one column stays rectangular
                             // (old `view.rs:886-895`).
-                            let kind = if is_inside_vertical_separators(
-                                &t,
-                                pt.column.0,
-                                grid_rows,
-                            ) {
-                                SelectionType::Block
-                            } else {
-                                SelectionType::Simple
-                            };
-                            Selection::new(kind, pt, side)
+                            SelectionType::Block
+                        } else {
+                            SelectionType::Simple
                         };
-                        t.selection = Some(sel);
+                        t.selection = Some(Selection::new(kind, pt, side));
                         drop(t);
                         (sel_wake)();
                     }
@@ -887,6 +933,7 @@ impl View for TerminalView {
         .with_cursor_style(cursor_style.shape, cursor_style.blink)
         .on_mouse_report(self.mouse_report_pressed.clone(), mouse_report_cb)
         .on_mouse_select(self.sel_dragging.clone(), mouse_sel_cb)
+        .with_sel_autoscroll(self.sel_autoscroll.clone())
         .with_link_spans(
             link_spans,
             self.url_hover.clone(),
@@ -1252,6 +1299,47 @@ fn write_pasted_image(image: &warpui::clipboard::ImageData) -> Option<String> {
     let path = dir.join(format!("{id}.{ext}"));
     std::fs::write(&path, &image.data).ok()?;
     Some(path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod click_count_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn repeat_clicks_on_the_same_cell_accumulate() {
+        let t0 = Instant::now();
+        assert_eq!(consecutive_click_count(0, None, t0, 4, 9), 1);
+        let t1 = t0 + Duration::from_millis(120);
+        assert_eq!(consecutive_click_count(1, Some((t0, 4, 9)), t1, 4, 9), 2);
+        let t2 = t1 + Duration::from_millis(120);
+        assert_eq!(consecutive_click_count(2, Some((t1, 4, 9)), t2, 4, 9), 3);
+    }
+
+    /// A trackpad triple-click drifts. One column of slack keeps the third
+    /// click a triple-click instead of demoting it to a fresh single click.
+    #[test]
+    fn one_column_of_drift_still_counts_as_a_repeat() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(100);
+        assert_eq!(consecutive_click_count(2, Some((t0, 4, 9)), t1, 4, 10), 3);
+        assert_eq!(consecutive_click_count(2, Some((t0, 4, 9)), t1, 4, 8), 3);
+    }
+
+    #[test]
+    fn drifting_further_or_off_the_row_restarts_the_count() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(100);
+        assert_eq!(consecutive_click_count(2, Some((t0, 4, 9)), t1, 4, 12), 1);
+        assert_eq!(consecutive_click_count(2, Some((t0, 4, 9)), t1, 5, 9), 1);
+    }
+
+    #[test]
+    fn a_slow_second_click_restarts_the_count() {
+        let t0 = Instant::now();
+        let late = t0 + MULTI_CLICK_WINDOW + Duration::from_millis(1);
+        assert_eq!(consecutive_click_count(1, Some((t0, 4, 9)), late, 4, 9), 1);
+    }
 }
 
 #[cfg(test)]

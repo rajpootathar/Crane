@@ -162,6 +162,13 @@ pub struct GridElement {
     /// `true` and hijack the next drag). Set by the Shift-forward path (Shift is
     /// the "send this gesture to the app" override). Persisted by the View.
     mouse_report_pressed: Rc<StdCell<bool>>,
+    /// Selection-drag autoscroll request, published for the owning View's
+    /// tick to act on: `Some((rows_per_tick, col, side))` while the pointer is
+    /// held past the top (positive rows = scroll up into history) or bottom
+    /// (negative) edge, `None` otherwise. `col`/`side` carry the horizontal
+    /// position so the tick can keep extending the selection while the
+    /// pointer sits still and no further drag events arrive.
+    sel_autoscroll: Option<Rc<StdCell<Option<(i32, usize, Side)>>>>,
     /// Sub-row smooth-scroll fraction (0..1): the whole grid paints shifted
     /// down by `scroll_frac * cell_h` px (Warp's fractional scroll_top).
     scroll_frac: f32,
@@ -213,6 +220,7 @@ impl GridElement {
             url_did_drag: Rc::new(StdCell::new(false)),
             mouse_report_cb: None,
             mouse_report_pressed: Rc::new(StdCell::new(false)),
+            sel_autoscroll: None,
             scroll_frac: 0.0,
             overscan_row: None,
         }
@@ -295,6 +303,18 @@ impl GridElement {
     ) -> Self {
         self.mouse_dragging = dragging;
         self.mouse_sel_cb = Some(cb);
+        self
+    }
+
+    /// Attach the shared cell this element publishes selection-drag autoscroll
+    /// requests into. The owning View's tick reads it and scrolls, which is what
+    /// keeps the selection growing while the pointer is held outside the grid
+    /// (no further drag events arrive once the mouse stops moving).
+    pub fn with_sel_autoscroll(
+        mut self,
+        cell: Rc<StdCell<Option<(i32, usize, Side)>>>,
+    ) -> Self {
+        self.sel_autoscroll = Some(cell);
         self
     }
 
@@ -587,37 +607,6 @@ impl Element for GridElement {
         let (Some(o), Some(s)) = (self.origin_vec, self.size) else {
             return false;
         };
-        // Scroll wheel — bounds-gated: with several terminal panes (or the
-        // git-log dock / other scrollables) on screen, an ungated arm here
-        // would consume wheel events destined for siblings.
-        if let Some(cb) = self.scroll_cb.as_ref() {
-            if let Event::ScrollWheel { delta, precise, position, .. } = event.raw_event() {
-                let inside = position.x() >= o.x()
-                    && position.x() <= o.x() + s.x()
-                    && position.y() >= o.y()
-                    && position.y() <= o.y() + s.y();
-                if scroll_trace() {
-                    eprintln!(
-                        "[grid-ev] t={:.1}ms pos=({:.0},{:.0}) origin=({:.0},{:.0}) size=({:.0},{:.0}) inside={inside}",
-                        trace_epoch().elapsed().as_secs_f64() * 1e3,
-                        position.x(), position.y(), o.x(), o.y(), s.x(), s.y(),
-                    );
-                }
-                if inside {
-                    cb(delta.y(), *precise);
-                    // Paint THIS dispatch turn. `notify()` records the
-                    // invalidation; the ScrollRepaint action forces the
-                    // synchronous `flush_effects` → `update_windows` that the
-                    // notify-only path lacks (async wake alone lands the frame
-                    // a runloop tick late — reads as jittery scrolling).
-                    ctx.notify();
-                    ctx.dispatch_typed_action(
-                        crate::warpui::shell::CraneShellAction::ScrollRepaint,
-                    );
-                    return true;
-                }
-            }
-        }
         let (cw, ch) = (self.cell_w, self.cell_h);
         let in_bounds = |p: &Vector2F| -> bool {
             p.x() >= o.x()
@@ -636,6 +625,55 @@ impl Element for GridElement {
             let side = if cell_frac < 0.5 { Side::Left } else { Side::Right };
             (row, col, side)
         };
+        // Any button release ends autoscroll, even one this element didn't own
+        // the drag for. The owning arm below is gated on `mouse_dragging`, and a
+        // sibling element consuming the Up first would strand that flag — which
+        // used to mean only a stale bool, but now would leave the pane scrolling
+        // itself until it ran out of scrollback. Observation only: no consume.
+        if matches!(event.raw_event(), Event::LeftMouseUp { .. }) {
+            if let Some(auto) = self.sel_autoscroll.as_ref() {
+                auto.set(None);
+            }
+        }
+        // Scroll wheel — bounds-gated: with several terminal panes (or the
+        // git-log dock / other scrollables) on screen, an ungated arm here
+        // would consume wheel events destined for siblings.
+        if let Some(cb) = self.scroll_cb.as_ref() {
+            if let Event::ScrollWheel { delta, precise, position, .. } = event.raw_event() {
+                let inside = in_bounds(position);
+                if scroll_trace() {
+                    eprintln!(
+                        "[grid-ev] t={:.1}ms pos=({:.0},{:.0}) origin=({:.0},{:.0}) size=({:.0},{:.0}) inside={inside}",
+                        trace_epoch().elapsed().as_secs_f64() * 1e3,
+                        position.x(), position.y(), o.x(), o.y(), s.x(), s.y(),
+                    );
+                }
+                if inside {
+                    cb(delta.y(), *precise);
+                    // Wheel/trackpad DURING a selection drag: the viewport just
+                    // moved under a pointer that never moved, so re-issue the
+                    // drag at the same pixel. Without this the selection stays
+                    // pinned to the cell it had before the scroll and the user
+                    // can't select past one screenful by scrolling.
+                    if self.mouse_dragging.get() {
+                        if let Some(sel_cb) = self.mouse_sel_cb.as_ref() {
+                            let (row, col, side) = pos_to_cell(position);
+                            sel_cb(MouseSelPhase::Drag, row, col, side, false);
+                        }
+                    }
+                    // Paint THIS dispatch turn. `notify()` records the
+                    // invalidation; the ScrollRepaint action forces the
+                    // synchronous `flush_effects` → `update_windows` that the
+                    // notify-only path lacks (async wake alone lands the frame
+                    // a runloop tick late — reads as jittery scrolling).
+                    ctx.notify();
+                    ctx.dispatch_typed_action(
+                        crate::warpui::shell::CraneShellAction::ScrollRepaint,
+                    );
+                    return true;
+                }
+            }
+        }
         // Return the link span (URL or file path) hit at (row, col), if any.
         let link_hit_at = |row: usize, col: usize| -> Option<&LinkSpan> {
             self.link_spans
@@ -729,10 +767,28 @@ impl Element for GridElement {
                 Event::LeftMouseDragged { position, .. } if self.mouse_dragging.get() => {
                     self.url_did_drag.set(true);
                     let (row, col, side) = pos_to_cell(position);
+                    // Past an edge → ask the View's tick to keep scrolling.
+                    // `pos_to_cell` clamps to the grid, so without this the
+                    // selection would just stall on the first/last visible row.
+                    // Rate scales with the overshoot (1 row/tick at the edge,
+                    // capped so a flick to the screen edge stays controllable).
+                    if let Some(auto) = self.sel_autoscroll.as_ref() {
+                        let above = o.y() - position.y();
+                        let below = position.y() - (o.y() + s.y());
+                        let rate = |px: f32| ((px / ch).ceil() as i32).clamp(1, 8);
+                        auto.set(if above > 0.0 {
+                            Some((rate(above), col, side))
+                        } else if below > 0.0 {
+                            Some((-rate(below), col, side))
+                        } else {
+                            None
+                        });
+                    }
                     cb(MouseSelPhase::Drag, row, col, side, false);
                     return true;
                 }
                 Event::LeftMouseUp { position, .. } if self.mouse_dragging.get() => {
+                    // Autoscroll was already cleared by the unconditional arm above.
                     self.mouse_dragging.set(false);
                     cb(MouseSelPhase::Up, 0, 0, Side::Left, false);
                     // Link click: only when no drag happened and the release is on

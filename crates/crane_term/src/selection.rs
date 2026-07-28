@@ -55,8 +55,30 @@ impl Selection {
 
     /// True when the selection has zero coverage (anchor == active
     /// on the same side).
+    ///
+    /// `Semantic` and `Lines` are never empty: they are anchored by a
+    /// double / triple click and expand against the grid at
+    /// materialization time, so a click with no drag still covers a
+    /// whole word / logical line. Reporting them empty would make the
+    /// view drop the selection on mouse-up and a triple-click would
+    /// visibly flash and vanish.
     pub fn is_empty(&self) -> bool {
+        if matches!(self.kind, SelectionType::Semantic | SelectionType::Lines) {
+            return false;
+        }
         self.anchor.point == self.active.point && self.anchor.side == self.active.side
+    }
+
+    /// The raw endpoints in document order, ignoring the side hints.
+    /// Expanding kinds (`Semantic` / `Lines`) grow outward from these,
+    /// so the half-cell hint that trims a `Simple` range must not
+    /// shrink them.
+    pub fn ordered_points(&self) -> (Point, Point) {
+        if self.anchor.point <= self.active.point {
+            (self.anchor.point, self.active.point)
+        } else {
+            (self.active.point, self.anchor.point)
+        }
     }
 
     /// Materialize the inclusive start/end pair, normalized so that
@@ -123,16 +145,6 @@ impl SelectionRange {
         } else {
             true
         }
-    }
-}
-
-/// Helper used by the `Lines` selection kind. Expands an anchor to
-/// cover the full row.
-pub fn expand_to_line(point: Point, columns: usize) -> SelectionRange {
-    SelectionRange {
-        start: Point::new(point.line, crate::index::Column(0)),
-        end: Point::new(point.line, crate::index::Column(columns.saturating_sub(1))),
-        is_block: false,
     }
 }
 

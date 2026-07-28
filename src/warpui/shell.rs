@@ -2568,6 +2568,7 @@ impl CraneShellView {
             anim_ticker,
             |this: &mut Self, _instant, vctx| {
                 guarded_tick(this, vctx, "anim", |this, vctx| {
+                    this.selection_autoscroll_tick(vctx);
                     if !this.toasts.is_empty() || this.any_attention_active() {
                         vctx.notify();
                     }
@@ -2841,6 +2842,18 @@ impl CraneShellView {
             // synchronous write (a spawned writer thread would be killed).
             self.save_state_now(&*vctx);
             true
+        }
+    }
+
+    /// Drive selection-drag autoscroll for every terminal pane. Rides the
+    /// existing 33ms animation tick rather than giving each TerminalView its own
+    /// timer: only one drag can be live at a time, and a pane that isn't
+    /// overscrolling costs a single `Cell` read here.
+    fn selection_autoscroll_tick(&self, vctx: &ViewContext<Self>) {
+        for pc in self.panes.values() {
+            if let PaneContent::Terminal(h) = pc {
+                h.as_ref(vctx).autoscroll_tick();
+            }
         }
     }
 

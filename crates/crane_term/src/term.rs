@@ -9,7 +9,7 @@ use crate::index::{Column, Line, Point};
 use crate::mode::TermMode;
 use crate::row::Row;
 use crate::scrollback::Scrollback;
-use crate::selection::Selection;
+use crate::selection::{Selection, SelectionRange, SelectionType};
 
 /// Hard cap on buffered [`ShellIntegrationEvent`]s between drains.
 ///
@@ -475,10 +475,104 @@ impl Term {
                 visible: self.mode.contains(TermMode::SHOW_CURSOR),
             },
             display_offset: self.grid.display_offset,
-            selection_range: self.selection.as_ref().map(|s| s.to_range()),
+            selection_range: self.selection_range(),
             row: 0,
             col: 0,
         }
+    }
+
+    /// Row at a grid-absolute line: `>= 0` indexes the live viewport,
+    /// negative indexes scrollback with `-1` = the row most recently
+    /// evicted off the top. This is the coordinate space
+    /// [`Selection`] anchors live in, so it stays valid while the user
+    /// scrolls.
+    pub fn row_at(&self, line: i32) -> Option<&Row> {
+        if line >= 0 {
+            self.grid.rows.get(line as usize)
+        } else {
+            let from_back = (-line) as usize;
+            self.scrollback
+                .len()
+                .checked_sub(from_back)
+                .and_then(|i| self.scrollback.get(i))
+        }
+    }
+
+    /// True when `line` auto-wrapped into `line + 1` — its last cell
+    /// carries WRAPLINE, so the two visual rows are one logical line.
+    fn wraps_into_next(&self, line: i32) -> bool {
+        self.row_at(line)
+            .and_then(|r| r.cells.last())
+            .map(|c| c.flags.contains(Flags::WRAPLINE))
+            .unwrap_or(false)
+    }
+
+    /// First and last visual row of the logical line containing
+    /// `line` — walks the WRAPLINE chain in both directions across the
+    /// scrollback / live-grid boundary.
+    fn logical_line_bounds(&self, line: i32) -> (i32, i32) {
+        let top = -(self.scrollback.len() as i32);
+        let bottom = self.grid.rows.len() as i32 - 1;
+        let mut first = line;
+        while first > top && self.wraps_into_next(first - 1) {
+            first -= 1;
+        }
+        let mut last = line;
+        while last < bottom && self.wraps_into_next(last) {
+            last += 1;
+        }
+        (first, last)
+    }
+
+    /// The selection materialized against the grid. `Simple` and
+    /// `Block` pass through unchanged; `Semantic` (double-click) and
+    /// `Lines` (triple-click) expand each endpoint outward to the
+    /// enclosing word / logical line.
+    ///
+    /// Expansion happens HERE, not at mouse-down, so a drag after the
+    /// expanding click keeps extending by whole words / whole lines
+    /// instead of collapsing back to the raw cell under the cursor —
+    /// and so triple-click and a plain drag over the same wrapped
+    /// command yield identical text.
+    pub fn selection_range(&self) -> Option<SelectionRange> {
+        let sel = self.selection.as_ref()?;
+        let cols = self.grid.columns;
+        match sel.kind {
+            SelectionType::Simple | SelectionType::Block => Some(sel.to_range()),
+            SelectionType::Semantic => {
+                let (a, b) = sel.ordered_points();
+                let start = self.word_bounds(a, cols).start;
+                let end = self.word_bounds(b, cols).end;
+                Some(SelectionRange {
+                    start,
+                    end,
+                    is_block: false,
+                })
+            }
+            SelectionType::Lines => {
+                let (a, b) = sel.ordered_points();
+                let (first, _) = self.logical_line_bounds(a.line.0);
+                let (_, last) = self.logical_line_bounds(b.line.0);
+                Some(SelectionRange {
+                    start: Point::new(Line(first), Column(0)),
+                    end: Point::new(Line(last), Column(cols.saturating_sub(1))),
+                    is_block: false,
+                })
+            }
+        }
+    }
+
+    /// Word under `point`, clipped to its own row. Empty rows and
+    /// non-word cells yield the single cell, matching the "double-click
+    /// on whitespace selects that cell" behavior of other terminals.
+    fn word_bounds(&self, point: Point, cols: usize) -> SelectionRange {
+        let line = point.line.0;
+        crate::selection::expand_to_word(point, cols, |c| {
+            self.row_at(line)
+                .and_then(|r| r.cells.get(c))
+                .map(|cell| if cell.ch == '\0' { ' ' } else { cell.ch })
+                .unwrap_or(' ')
+        })
     }
 
     /// The scrollback row immediately above the current viewport top (one
@@ -513,19 +607,9 @@ impl Term {
         if sel.is_empty() {
             return None;
         }
-        let range = sel.to_range();
+        let range = self.selection_range()?;
         let cols = self.grid.columns;
-        let row_at = |line: i32| -> Option<&Row> {
-            if line >= 0 {
-                self.grid.rows.get(line as usize)
-            } else {
-                let from_back = (-line) as usize;
-                self.scrollback
-                    .len()
-                    .checked_sub(from_back)
-                    .and_then(|i| self.scrollback.iter().nth(i))
-            }
-        };
+        let row_at = |line: i32| -> Option<&Row> { self.row_at(line) };
         let mut out = String::new();
         let mut nonempty = false;
         let line_start = range.start.line.0;
@@ -555,12 +639,8 @@ impl Term {
             // chose a rectangle and wants N independent lines, not
             // a merged logical line that drops the column-grid
             // structure.
-            let wraps_into_next = !range.is_block
-                && line < line_end
-                && row_at(line)
-                    .and_then(|r| r.cells.last())
-                    .map(|c| c.flags.contains(Flags::WRAPLINE))
-                    .unwrap_or(false);
+            let wraps_into_next =
+                !range.is_block && line < line_end && self.wraps_into_next(line);
             if !wraps_into_next {
                 // Margin-padding only — strip it. Wrapped rows keep
                 // their tail intact so a literal space at the wrap
@@ -1643,6 +1723,166 @@ mod tests {
             "block selection across rows must keep `\\n` even when source row wrapped: {:?}",
             copied
         );
+    }
+
+    // ---- Semantic / Lines expansion -------------------------------------
+    //
+    // `Semantic` (double-click) and `Lines` (triple-click) are expanded at
+    // materialization time against the grid, so a drag after the expanding
+    // click extends by whole words / whole logical lines instead of
+    // collapsing back to the raw cell under the cursor.
+
+    /// Triple-click must select the whole *logical* line — every visual
+    /// row in the WRAPLINE chain — not just the visual row that was
+    /// clicked. Otherwise a triple-click and a drag over the same wrapped
+    /// command copy different text.
+    #[test]
+    fn line_selection_covers_whole_wrapped_logical_line() {
+        let mut t = Term::new(5, 50);
+        let mut p = crate::Processor::new();
+        let line = b"ssh -i ./.crane/secrets/login.pem -o IdentitiesOnly=yes -J ec2-user@host";
+        p.parse_bytes(&mut t, line);
+        assert!(
+            t.grid.rows[0]
+                .cells
+                .last()
+                .map(|c| c.flags.contains(Flags::WRAPLINE))
+                .unwrap_or(false),
+            "fixture broken: row 0 didn't wrap"
+        );
+        // Triple-click lands on the SECOND visual row of the wrapped line.
+        t.selection = Some(Selection::new(
+            SelectionType::Lines,
+            Point::new(Line(1), Column(3)),
+            Side::Left,
+        ));
+        let copied = t.selection_to_string().expect("line selection has text");
+        assert!(
+            !copied.contains('\n'),
+            "logical line must come back as one line: {copied:?}"
+        );
+        assert_eq!(
+            copied,
+            String::from_utf8_lossy(line),
+            "triple-click must copy the whole logical line"
+        );
+    }
+
+    /// A `Lines` / `Semantic` selection with anchor == active still covers
+    /// real cells. `is_empty()` reporting true would make the view drop the
+    /// selection on mouse-up, so a triple-click without drag would vanish.
+    #[test]
+    fn expanding_selection_kinds_are_never_empty() {
+        let lines = Selection::new(
+            SelectionType::Lines,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        let semantic = Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        let simple = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        assert!(!lines.is_empty(), "Lines selection must not report empty");
+        assert!(
+            !semantic.is_empty(),
+            "Semantic selection must not report empty"
+        );
+        assert!(
+            simple.is_empty(),
+            "a Simple click with no drag is still empty"
+        );
+    }
+
+    /// Dragging after a triple-click extends by whole lines, not to the
+    /// raw cell under the cursor.
+    #[test]
+    fn dragging_a_line_selection_extends_whole_rows() {
+        let mut t = Term::new(5, 20);
+        let mut p = crate::Processor::new();
+        p.parse_bytes(&mut t, b"alpha\r\nbravo\r\ncharlie\r\n");
+        let mut sel = Selection::new(
+            SelectionType::Lines,
+            Point::new(Line(0), Column(2)),
+            Side::Left,
+        );
+        // Drag down to the middle of row 2.
+        sel.update(Point::new(Line(2), Column(3)), Side::Left);
+        t.selection = Some(sel);
+        let copied = t.selection_to_string().expect("line selection has text");
+        assert_eq!(copied, "alpha\nbravo\ncharlie");
+    }
+
+    /// Double-click must work on rows that have scrolled into scrollback
+    /// (negative grid lines), same as triple-click.
+    #[test]
+    fn semantic_selection_expands_word_in_scrollback() {
+        let mut t = Term::new(3, 20);
+        let mut p = crate::Processor::new();
+        p.parse_bytes(&mut t, b"hello_world here\r\n");
+        // Push that row into scrollback.
+        for _ in 0..4 {
+            p.parse_bytes(&mut t, b"filler\r\n");
+        }
+        assert!(t.scrollback.len() >= 2, "fixture broken: no scrollback");
+        // Locate the row holding `hello_world` in scrollback coordinates.
+        let line = (-(t.scrollback.len() as i32)..0)
+            .find(|&l| {
+                t.row_at(l)
+                    .map(|r| r.cells.iter().map(|c| c.ch).collect::<String>())
+                    .is_some_and(|s| s.starts_with("hello_world"))
+            })
+            .expect("hello_world row must be in scrollback");
+        // Double-click in the middle of the word.
+        t.selection = Some(Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(line), Column(4)),
+            Side::Left,
+        ));
+        let copied = t.selection_to_string().expect("word selection has text");
+        assert_eq!(copied, "hello_world");
+    }
+
+    /// A `Semantic` drag expands BOTH ends: start snaps to the beginning of
+    /// the first word, end snaps to the end of the last word.
+    #[test]
+    fn semantic_selection_expands_both_ends() {
+        let mut t = Term::new(3, 30);
+        let mut p = crate::Processor::new();
+        p.parse_bytes(&mut t, b"alpha bravo charlie");
+        // Press mid-"alpha", drag to mid-"charlie".
+        let mut sel = Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(0), Column(2)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(0), Column(14)), Side::Left);
+        t.selection = Some(sel);
+        let copied = t.selection_to_string().expect("word selection has text");
+        assert_eq!(copied, "alpha bravo charlie");
+    }
+
+    /// Backward drag (right-to-left) after a double-click still expands to
+    /// whole words — endpoint ordering must be normalized before expansion.
+    #[test]
+    fn semantic_selection_normalizes_backward_drag() {
+        let mut t = Term::new(3, 30);
+        let mut p = crate::Processor::new();
+        p.parse_bytes(&mut t, b"alpha bravo charlie");
+        let mut sel = Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(0), Column(14)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(0), Column(2)), Side::Left);
+        t.selection = Some(sel);
+        let copied = t.selection_to_string().expect("word selection has text");
+        assert_eq!(copied, "alpha bravo charlie");
     }
 
 /// Wrap merge must work on rows already evicted to scrollback.
