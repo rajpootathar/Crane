@@ -27,12 +27,6 @@ pub fn trace_epoch() -> Instant {
     blink_epoch()
 }
 
-/// Squared pixel distance a deferred press must travel before a plain drag over
-/// a mouse-reporting pane promotes from "pending click" to a local text
-/// selection. 3px — small enough to feel like an immediate drag, large enough
-/// that hand jitter during a click still forwards as a click.
-const CLICK_DRAG_THRESHOLD_SQ: f32 = 9.0;
-
 use crane_term::index::{Column as TermColumn, Line as TermLine, Point as TermPoint, Side};
 use crane_term::selection::SelectionRange;
 use crane_term::CursorShape;
@@ -168,13 +162,6 @@ pub struct GridElement {
     /// `true` and hijack the next drag). Set by the Shift-forward path (Shift is
     /// the "send this gesture to the app" override). Persisted by the View.
     mouse_report_pressed: Rc<StdCell<bool>>,
-    /// The window position of a DEFERRED plain (no-Shift) left-press on a
-    /// mouse-reporting pane. We can't tell a click from a drag at press time, so
-    /// we hold the press here and decide later: cross the drag threshold → a
-    /// local text selection; release without crossing it → forward the press +
-    /// release to the app as a click. `Some` only while that decision is
-    /// pending. Persisted by the View across per-frame rebuilds.
-    mouse_report_pending: Rc<StdCell<Option<Vector2F>>>,
     /// Sub-row smooth-scroll fraction (0..1): the whole grid paints shifted
     /// down by `scroll_frac * cell_h` px (Warp's fractional scroll_top).
     scroll_frac: f32,
@@ -226,7 +213,6 @@ impl GridElement {
             url_did_drag: Rc::new(StdCell::new(false)),
             mouse_report_cb: None,
             mouse_report_pressed: Rc::new(StdCell::new(false)),
-            mouse_report_pending: Rc::new(StdCell::new(None)),
             scroll_frac: 0.0,
             overscan_row: None,
         }
@@ -281,11 +267,9 @@ impl GridElement {
     pub fn on_mouse_report(
         mut self,
         pressed: Rc<StdCell<bool>>,
-        pending: Rc<StdCell<Option<Vector2F>>>,
         cb: Option<Rc<dyn Fn(bool, usize, usize)>>,
     ) -> Self {
         self.mouse_report_pressed = pressed;
-        self.mouse_report_pending = pending;
         self.mouse_report_cb = cb;
         self
     }
@@ -694,20 +678,20 @@ impl Element for GridElement {
         }
 
         // Mouse-reporting panes (Claude / vim-mouse / lazygit / ranger / tmux).
-        // By the chosen policy the convention is INVERTED from a stock terminal:
-        // a plain left-DRAG runs a LOCAL text selection, a plain CLICK is
-        // forwarded to the app (so its clickable UI still works), and SHIFT is
-        // the "send this whole gesture to the app" override — the escape hatch
-        // for vim-visual-by-mouse / lazygit / tmux drags.
+        // Policy: no modifier = LOCAL (a plain click focuses / positions, a plain
+        // drag selects text), SHIFT = "send this gesture to the app". A stray
+        // plain click therefore can never select a Claude option (or approve a
+        // permission prompt) by accident, and click now mirrors how drag already
+        // behaved: plain → local, Shift → app. The app's own clickable UI
+        // (lazygit / k9s buttons, tmux, vim-visual-by-mouse) is reached with
+        // Shift+click / Shift+drag.
         //
-        // Click vs. drag can't be told apart at press time, so a plain press is
-        // DEFERRED into `mouse_report_pending`: the first drag past the
-        // threshold promotes it into a selection; a release that never crossed
-        // the threshold forwards it as a click. Shift+press forwards immediately
-        // and is paired with its release via `mouse_report_pressed` — a pane
-        // forwards a release only for a press IT made, so it can never swallow a
-        // sibling pane's selection Up (which used to strand the sibling's
-        // `mouse_dragging` flag and hijack the next drag).
+        // A Shift+press forwards an SGR press immediately and is paired with its
+        // release via `mouse_report_pressed` — a pane forwards a release only for
+        // a press IT made, so it can never swallow the LeftMouseUp of a
+        // text-selection gesture in a sibling pane (which used to strand the
+        // sibling's `mouse_dragging` flag and hijack the next drag). Every
+        // non-Shift event falls through to the local selection path below.
         if let Some(cb) = self.mouse_report_cb.clone() {
             match event.raw_event() {
                 // Shift+press → forward to the app now; pair its release below.
@@ -715,53 +699,12 @@ impl Element for GridElement {
                     if in_bounds(position) && modifiers.shift =>
                 {
                     let (row, col, _) = pos_to_cell(position);
-                    self.mouse_report_pending.set(None);
                     self.mouse_report_pressed.set(true);
                     cb(true, col + 1, row + 1);
                     return true;
                 }
                 Event::LeftMouseUp { position, .. } if self.mouse_report_pressed.get() => {
                     self.mouse_report_pressed.set(false);
-                    let (row, col, _) = pos_to_cell(position);
-                    cb(false, col + 1, row + 1);
-                    return true;
-                }
-                // Plain press → defer (a click to forward, or a drag to select).
-                Event::LeftMouseDown { position, .. } if in_bounds(position) => {
-                    self.mouse_report_pending.set(Some(*position));
-                    return true;
-                }
-                // Plain drag past the threshold → promote the deferred press
-                // into a local text selection anchored at the press cell. Below
-                // the threshold we hold the gesture (still could be a click).
-                Event::LeftMouseDragged { position, .. }
-                    if self.mouse_report_pending.get().is_some() =>
-                {
-                    let down = self.mouse_report_pending.get().unwrap();
-                    let dx = down.x() - position.x();
-                    let dy = down.y() - position.y();
-                    if dx * dx + dy * dy > CLICK_DRAG_THRESHOLD_SQ {
-                        self.mouse_report_pending.set(None);
-                        if let Some(sel) = self.mouse_sel_cb.clone() {
-                            let (drow, dcol, dside) = pos_to_cell(&down);
-                            self.url_did_drag.set(true);
-                            self.mouse_dragging.set(true);
-                            sel(MouseSelPhase::Down, drow, dcol, dside, false);
-                            let (row, col, side) = pos_to_cell(position);
-                            sel(MouseSelPhase::Drag, row, col, side, false);
-                        }
-                    }
-                    return true;
-                }
-                // Plain release without crossing the threshold → a click →
-                // forward press+release to the app.
-                Event::LeftMouseUp { position, .. }
-                    if self.mouse_report_pending.get().is_some() =>
-                {
-                    let down = self.mouse_report_pending.get().unwrap();
-                    self.mouse_report_pending.set(None);
-                    let (drow, dcol, _) = pos_to_cell(&down);
-                    cb(true, dcol + 1, drow + 1);
                     let (row, col, _) = pos_to_cell(position);
                     cb(false, col + 1, row + 1);
                     return true;
