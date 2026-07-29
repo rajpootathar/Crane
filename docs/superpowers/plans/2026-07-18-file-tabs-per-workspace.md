@@ -43,8 +43,8 @@ The whole restore path is currently unreachable from tests. A reviewer proved it
 The harness already exists. `markdown_view.rs`'s layout tests use `App::test(…)` → `app.add_window(WindowStyle::NotStealFocus, |ctx| …)` to obtain a real `ViewContext` and run a full layout+paint pass. `mod.rs:164` shows production hands `CraneShellView::new` to `add_window` the same way. The only blocker is that `new` reads global state internally.
 
 **Files:**
-- Modify: `src/warpui/shell.rs` (`new` at `:1206`, which calls `persist::load()` at `:1224`)
-- Test: `src/warpui/shell.rs` test module
+- Modify: `src/app/shell.rs` (`new` at `:1206`, which calls `persist::load()` at `:1224`)
+- Test: `src/app/shell.rs` test module
 
 - [ ] **Step 1: Add the seam**
 
@@ -92,7 +92,7 @@ Comment out the `files_pane_bookkeeping` call site in `new_with_state` and confi
 Run: `make test` — all 134 plus yours.
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "test(warpui): make session restore reachable from tests
 
 The restore path ran only inside CraneShellView::new, which loads global
@@ -107,8 +107,8 @@ harness the layout tests already use."
 ### Task 1: Scope the runtime state per Workspace
 
 **Files:**
-- Modify: `src/warpui/shell.rs` (the three fields + their ~78 usage sites)
-- Test: `src/warpui/shell.rs` test module (extract pure helpers if needed)
+- Modify: `src/app/shell.rs` (the three fields + their ~78 usage sites)
+- Test: `src/app/shell.rs` test module (extract pure helpers if needed)
 
 **Interfaces:**
 - Produces: `fn ws_key(&self) -> (usize, usize)` returning `(self.selected.0, self.selected.1)`; the three fields rekeyed as maps. Task 2 persists them.
@@ -167,7 +167,7 @@ Leave `editor_views` global.
 
 - [ ] **Step 3: Migrate every usage site**
 
-Work through all ~78 sites (`grep -n 'file_pane_paths\|file_pane_active\|files_pane' src/warpui/shell.rs`). Most become `self.file_pane_paths.entry(self.ws_key()).or_default()` or `.get(&self.ws_key())`. Let the compiler drive it — the type change makes every site an error until handled.
+Work through all ~78 sites (`grep -n 'file_pane_paths\|file_pane_active\|files_pane' src/app/shell.rs`). Most become `self.file_pane_paths.entry(self.ws_key()).or_default()` or `.get(&self.ws_key())`. Let the compiler drive it — the type change makes every site an error until handled.
 
 **Take special care at these**, which do cross-workspace or lifecycle work:
 - `:2689`, `:2774` — path rewrites across tabs (a rename/move); must update the right Workspace's list, and possibly several
@@ -185,7 +185,7 @@ Expected: PASS. Fix any breakage from the rekeying before continuing.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "refactor(warpui): scope Files Pane state to its Workspace
 
 files_pane, file_pane_paths and file_pane_active were flat globals, so
@@ -200,9 +200,9 @@ global so an editor handle is still reused across Workspaces."
 ### Task 2: Persist per Workspace, keyed by path
 
 **Files:**
-- Modify: `src/warpui/persist.rs` (new path-keyed field + keep legacy for migration)
-- Modify: `src/warpui/shell.rs` (save + restore)
-- Test: `src/warpui/persist.rs` test module
+- Modify: `src/app/persist.rs` (new path-keyed field + keep legacy for migration)
+- Modify: `src/app/shell.rs` (save + restore)
+- Test: `src/app/persist.rs` test module
 
 **Interfaces:**
 - Consumes: Task 1's keyed fields and `ws_key`.
@@ -287,7 +287,7 @@ Write a test using a legacy state shape containing `file_pane_paths`, `files_pan
 Run: `make test`
 
 ```bash
-git add src/warpui/persist.rs src/warpui/shell.rs
+git add src/app/persist.rs src/app/shell.rs
 git commit -m "feat(warpui): persist File Tabs per Workspace, keyed by checkout path
 
 File Tabs were persisted as one flat list, so they reappeared in whichever

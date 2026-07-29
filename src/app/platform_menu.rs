@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use warpui::{ViewHandle, WindowId};
 
-use crate::warpui::shell::CraneShellView;
+use crate::app::shell::CraneShellView;
 
 /// Shared slot filled once the root view exists (see `mod.rs::run`). Reused here
 /// so menu-item callbacks can reach the shell on the main thread.
@@ -41,7 +41,7 @@ pub fn install(_builder: &mut warpui::platform::AppBuilder, _shell: ShellSlot) {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::ShellSlot;
-    use crate::warpui::shell::CraneShellAction;
+    use crate::app::shell::CraneShellAction;
 
     use warpui::keymap::Keystroke;
     use warpui::platform::menu::{

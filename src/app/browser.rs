@@ -121,7 +121,7 @@ pub mod memory {
     }
 }
 
-use crate::warpui::layout::PaneId;
+use crate::app::layout::PaneId;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};

@@ -4,14 +4,14 @@
 
 **Goal:** Execute the approved chrome-polish design (`docs/superpowers/specs/2026-07-15-chrome-polish-design.md`): compact 24px pane headers with hover-lit 20×20 buttons, a two-row File-pane header, two-tier Left-Panel selection, underline tabs, premium context menus, a decluttered top bar (＋ New Pane dropdown, theme → gear menu), a live-pulse status bar, watcher-driven change counters for all repos, and full-FPS notification animation.
 
-**Architecture:** All changes live in the warpui front-end (`src/warpui/`), almost entirely `shell.rs` + `theme.rs`. New visual language = white-alpha "washes" layered via existing `Hoverable`/`Container` elements; menus use `Container::with_corner_radius` + `with_drop_shadow` (already available). No new crates, no async runtime, no behavior changes except those in the spec.
+**Architecture:** All changes live in the warpui front-end (`src/app/`), almost entirely `shell.rs` + `theme.rs`. New visual language = white-alpha "washes" layered via existing `Hoverable`/`Container` elements; menus use `Container::with_corner_radius` + `with_drop_shadow` (already available). No new crates, no async runtime, no behavior changes except those in the spec.
 
 **Tech Stack:** Rust edition 2024, in-house warpui (vendor/warp), `Hoverable` / `Container` / `Flex` / `ConstrainedBox` / `Stack` / `EventHandler` elements. Build with `cargo build`, tests with `make test`.
 
 ## Global Constraints
 
-- Icons: only glyphs from `src/warpui/icons.rs` — never raw Unicode (tofu risk).
-- All colors via `src/warpui/theme.rs` tokens or the new wash helpers — no hardcoded hex/rgb in shell.rs.
+- Icons: only glyphs from `src/app/icons.rs` — never raw Unicode (tofu risk).
+- All colors via `src/app/theme.rs` tokens or the new wash helpers — no hardcoded hex/rgb in shell.rs.
 - Commit messages: conventional commits, zero AI references, no Co-Authored-By.
 - `cargo build` must be warning-free for touched code; `make test` must pass before each commit.
 - Run the app for visual checks with `CRANE_WARP=1 cargo run` (warpui front-end).
@@ -22,8 +22,8 @@
 ### Task 1: Wash tokens + shared hover icon button
 
 **Files:**
-- Modify: `src/warpui/theme.rs` (append)
-- Modify: `src/warpui/shell.rs:6999-7010` (`fn icon_button`)
+- Modify: `src/app/theme.rs` (append)
+- Modify: `src/app/shell.rs:6999-7010` (`fn icon_button`)
 
 **Interfaces:**
 - Produces: `theme::hover_wash() -> ColorU` (white @ 3.5% ≈ a9), `theme::selection_wash() -> ColorU` (white @ 7% ≈ a18), `theme::context_wash() -> ColorU` (white @ 2.5% ≈ a6), `theme::menu_shadow() -> ColorU` (black @ 50%).
@@ -31,7 +31,7 @@
 
 - [ ] **Step 1: Add wash helpers to theme.rs**
 
-Append to `src/warpui/theme.rs`:
+Append to `src/app/theme.rs`:
 
 ```rust
 /// White-alpha overlay washes — the app-wide hover/selection language.
@@ -60,7 +60,7 @@ pub const TAB_H: f32    = 26.0;
 
 - [ ] **Step 2: Rework `icon_button` with hover + fixed hit box**
 
-Replace `src/warpui/shell.rs` `fn icon_button` (anchor: `rg -n "fn icon_button" src/warpui/shell.rs`):
+Replace `src/app/shell.rs` `fn icon_button` (anchor: `rg -n "fn icon_button" src/app/shell.rs`):
 
 ```rust
     /// A 20×20 hover-lit icon button (12px glyph). `key` must be unique per
@@ -103,7 +103,7 @@ If warpui has no `Align` element (check `rg -n "pub struct Align" vendor/warp/cr
 
 - [ ] **Step 3: Fix all `icon_button` callers**
 
-`rg -n "self.icon_button\(" src/warpui/shell.rs` — each call gains a key string naming the spot, e.g. in `pane_header`: `self.icon_button(&format!("pane-max:{id}"), icons::ARROWS_OUT, …)`, `…("pane-close:{id}")…`; in `top_bar`: `"tb-left"`, `"tb-gitlog"`, `"tb-right"`. Buttons keyed per pane id MUST include the id (multiple panes on screen).
+`rg -n "self.icon_button\(" src/app/shell.rs` — each call gains a key string naming the spot, e.g. in `pane_header`: `self.icon_button(&format!("pane-max:{id}"), icons::ARROWS_OUT, …)`, `…("pane-close:{id}")…`; in `top_bar`: `"tb-left"`, `"tb-gitlog"`, `"tb-right"`. Buttons keyed per pane id MUST include the id (multiple panes on screen).
 
 - [ ] **Step 4: Build + test**
 
@@ -114,14 +114,14 @@ Run: `cargo build 2>&1 | tail -5` — expect `Finished`. Run: `make test` — ex
 `CRANE_WARP=1 cargo run` — pane-header ✕/⛶ are visibly smaller, hover shows a rounded wash + pointing hand.
 
 ```bash
-git add src/warpui/theme.rs src/warpui/shell.rs
+git add src/app/theme.rs src/app/shell.rs
 git commit -m "feat(warpui): hover-lit compact icon buttons + wash tokens"
 ```
 
 ### Task 2: Slim pane header (all panes) + hairline divider
 
 **Files:**
-- Modify: `src/warpui/shell.rs:9179-9311` (`fn pane_header`)
+- Modify: `src/app/shell.rs:9179-9311` (`fn pane_header`)
 
 **Interfaces:**
 - Consumes: Task 1 `icon_button(key, glyph, action)`, `theme::HEADER_H`.
@@ -129,7 +129,7 @@ git commit -m "feat(warpui): hover-lit compact icon buttons + wash tokens"
 
 - [ ] **Step 1: Shrink header + add divider**
 
-In `fn pane_header` (anchor: `rg -n "fn pane_header" src/warpui/shell.rs`):
+In `fn pane_header` (anchor: `rg -n "fn pane_header" src/app/shell.rs`):
 - Delete `const H: f32 = 26.0;`, use `theme::HEADER_H`.
 - Non-file title: `Text::new(label, self.ui_font, 11.0)` keeps size 11; adjust `with_padding_top(6.0)` → `4.0` (24px row centering).
 - Buttons row gets right padding + vertical centering:
@@ -178,17 +178,17 @@ In `fn pane_header` (anchor: `rg -n "fn pane_header" src/warpui/shell.rs`):
 
 - [ ] **Step 2: Build, visual check, commit**
 
-`cargo build` then `CRANE_WARP=1 cargo run`: headers slimmer, hairline separates header from grid, terminal content not clipped (grid height derives from pane rect minus header — verify no constant `26.0` remains: `rg -n "26\.0" src/warpui/shell.rs` and fix any header-math hit).
+`cargo build` then `CRANE_WARP=1 cargo run`: headers slimmer, hairline separates header from grid, terminal content not clipped (grid height derives from pane rect minus header — verify no constant `26.0` remains: `rg -n "26\.0" src/app/shell.rs` and fix any header-math hit).
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "feat(warpui): 24px pane headers with bottom hairline"
 ```
 
 ### Task 3: File pane two-row header (pane chrome + tab strip)
 
 **Files:**
-- Modify: `src/warpui/shell.rs` (`fn pane_header` file-pane branch; the caller that stacks header above content — anchor `rg -n "pane_header\(" src/warpui/shell.rs`)
+- Modify: `src/app/shell.rs` (`fn pane_header` file-pane branch; the caller that stacks header above content — anchor `rg -n "pane_header\(" src/app/shell.rs`)
 
 **Interfaces:**
 - Consumes: Task 1 washes/buttons, Task 2 structure.
@@ -293,7 +293,7 @@ In `pane_header`, replace the `is_file_pane` title branch with the standard titl
 
 - [ ] **Step 3: Stack the strip under the header at the pane assembly site**
 
-Find where `pane_header(id, app)` is composed above the pane body (`rg -n "pane_header" src/warpui/shell.rs`). For the file pane insert the strip between header and body:
+Find where `pane_header(id, app)` is composed above the pane body (`rg -n "pane_header" src/app/shell.rs`). For the file pane insert the strip between header and body:
 
 ```rust
         let mut col = Flex::column().with_child(self.pane_header(id, app));
@@ -310,14 +310,14 @@ Find where `pane_header(id, app)` is composed above the pane body (`rg -n "pane_
 `cargo build`; run: File pane shows "Files" header w/ ⛶ ✕ on row 1, tabs with underline + own ✕ on row 2; pane-✕ closes the whole pane, tab-✕ closes one tab; dirty dot renders; other panes unchanged.
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "feat(warpui): file pane gets own header row with tab strip beneath"
 ```
 
 ### Task 4: Left Panel — two-tier selection, hover, 24px rows, footer Add Project
 
 **Files:**
-- Modify: `src/warpui/shell.rs` — left-tree row builders (anchor: `rg -n "fn tree_row|fn left_" src/warpui/shell.rs` and the project/worktree/tab/terminal row builders around `shell.rs:7100-7900`), the Add Project button, and the `PROJECTS` header.
+- Modify: `src/app/shell.rs` — left-tree row builders (anchor: `rg -n "fn tree_row|fn left_" src/app/shell.rs` and the project/worktree/tab/terminal row builders around `shell.rs:7100-7900`), the Add Project button, and the `PROJECTS` header.
 
 **Interfaces:**
 - Consumes: Task 1 washes.
@@ -377,7 +377,7 @@ In the same walk, for depth ≥ 1 prepend per-level guide columns to the row con
 
 - [ ] **Step 4: PROJECTS header ＋ and footer Add Project row**
 
-- Header: after the "PROJECTS" label, `Expanded` spacer, then `self.icon_button("projects-add", icons::FOLDER_PLUS, <existing AddProject action>)` (find the action: `rg -n "Add Project" src/warpui/shell.rs`).
+- Header: after the "PROJECTS" label, `Expanded` spacer, then `self.icon_button("projects-add", icons::FOLDER_PLUS, <existing AddProject action>)` (find the action: `rg -n "Add Project" src/app/shell.rs`).
 - Replace the boxed bottom button with a quiet row: 1px `divider()` top border, `icons::PLUS` + "Add Project" at 11px `text_muted()`, hover → `hover_wash()` + `text_hover()`; same dispatch action.
 
 - [ ] **Step 5: Build, visual check, commit**
@@ -385,14 +385,14 @@ In the same walk, for depth ≥ 1 prepend per-level guide columns to the row con
 `cargo build`; run: hover any row = soft wash; selected terminal = brightest row w/ white text; its chain = whisper tint; other projects quiet; ＋ in header and footer row both open Add Project.
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "feat(warpui): two-tier left panel selection with hover washes"
 ```
 
 ### Task 5: Right Panel underline tabs
 
 **Files:**
-- Modify: `src/warpui/shell.rs:7931-7948` (`fn tab_label`), `shell.rs:8129-8148` (tabs row in `right_sidebar`), `shell.rs:8234-8249` (`changes_tab_label`).
+- Modify: `src/app/shell.rs:7931-7948` (`fn tab_label`), `shell.rs:8129-8148` (tabs row in `right_sidebar`), `shell.rs:8234-8249` (`changes_tab_label`).
 
 **Interfaces:**
 - Consumes: Task 1 washes; same underline pattern as Task 3.
@@ -405,14 +405,14 @@ git commit -m "feat(warpui): two-tier left panel selection with hover washes"
 - [ ] **Step 3: Build, visual check, commit**
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "feat(warpui): right panel switcher as underline tabs"
 ```
 
 ### Task 6: Premium context menus
 
 **Files:**
-- Modify: `src/warpui/shell.rs:2774-2830` (`menu_item`, `menu_separator`), the menu container builders (anchor: `rg -n "context_menu|fn .*menu" src/warpui/shell.rs`, includes the folder-group menu at ~3416 and row menus at ~3054), swatch builders at shell.rs:2857/2935/3384.
+- Modify: `src/app/shell.rs:2774-2830` (`menu_item`, `menu_separator`), the menu container builders (anchor: `rg -n "context_menu|fn .*menu" src/app/shell.rs`, includes the folder-group menu at ~3416 and row menus at ~3054), swatch builders at shell.rs:2857/2935/3384.
 
 **Interfaces:**
 - Consumes: Task 1 washes.
@@ -430,7 +430,7 @@ git commit -m "feat(warpui): right panel switcher as underline tabs"
             .finish()
 ```
 
-(Match the existing `Border` constructor: `rg -n "Border::" src/warpui/shell.rs` and copy that idiom.)
+(Match the existing `Border` constructor: `rg -n "Border::" src/app/shell.rs` and copy that idiom.)
 
 - [ ] **Step 2: `menu_item_hint`** — extend the existing `menu_item` body: item Container gains `with_corner_radius(…Pixels(5.0))`; hover bg = `selection_wash()` (or `danger_wash()` + `theme::error()` text when `danger`); after the label add `Expanded` spacer + optional hint `Text::new(hint, ui_font, 10.0).with_color(theme::text_muted())`. Add `fn menu_label`: 10px, `text_muted()`, `with_padding_left(9.0).with_padding_top(6.0).with_padding_bottom(3.0)`.
 
@@ -441,14 +441,14 @@ git commit -m "feat(warpui): right panel switcher as underline tabs"
 - [ ] **Step 5: Build, visual check (right-click a project / folder group / right-panel row), commit**
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "feat(warpui): rounded shadowed context menus with sectioned swatches"
 ```
 
 ### Task 7: Top bar — capsule breadcrumb + ＋ New Pane dropdown; theme pill removed
 
 **Files:**
-- Modify: `src/warpui/shell.rs:8816-8863` (`fn top_bar`), action enum (`CraneShellAction` at ~11495) + `handle_action` (~11937), modal/overlay dispatch if menus render as overlays (reuse the context-menu overlay plumbing — anchor `rg -n "context_menu.*Some|OpenContextMenu" src/warpui/shell.rs`).
+- Modify: `src/app/shell.rs:8816-8863` (`fn top_bar`), action enum (`CraneShellAction` at ~11495) + `handle_action` (~11937), modal/overlay dispatch if menus render as overlays (reuse the context-menu overlay plumbing — anchor `rg -n "context_menu.*Some|OpenContextMenu" src/app/shell.rs`).
 
 **Interfaces:**
 - Consumes: Task 6 menu chrome (`menu_item_hint`, `menu_label`).
@@ -470,42 +470,42 @@ git commit -m "feat(warpui): rounded shadowed context menus with sectioned swatc
             .finish()
 ```
 
-(Icon names: verify in `src/warpui/icons.rs`; substitute the closest existing glyphs — do NOT add raw Unicode.) Menu items already dispatch `CloseContextMenu`; make `ToggleNewPaneMenu` close on any item dispatch and on outside click, same as context menus.
+(Icon names: verify in `src/app/icons.rs`; substitute the closest existing glyphs — do NOT add raw Unicode.) Menu items already dispatch `CloseContextMenu`; make `ToggleNewPaneMenu` close on any item dispatch and on outside click, same as context menus.
 
 - [ ] **Step 3: Top-lit gradient** — check for a gradient fill: `rg -n "Gradient|LinearGradient" vendor/warp/crates/warpui_core/src/scene.rs`. If present, apply vertical topbar gradient (topbar_bg lightened 4% → topbar_bg); if absent, fake it: 1px `ColorU{255,255,255,a:10}` rect pinned at the bar's top edge. Do not build a gradient primitive for this.
 
 - [ ] **Step 4: Build, visual check, commit** — bar shows: toggle, capsule, spacer, ＋ New Pane, git log, toggle; each menu item works; theme pill gone (theme switching returns in Task 8).
 
 ```bash
-git add src/warpui/shell.rs src/warpui/theme.rs
+git add src/app/shell.rs src/app/theme.rs
 git commit -m "feat(warpui): top bar capsule breadcrumb and new-pane menu"
 ```
 
 ### Task 8: Status bar — live pulse + gear menu (theme picker moves here)
 
 **Files:**
-- Modify: `src/warpui/shell.rs:8865-8960` (`fn status_bar`), action enum + handler (`SetTheme` already exists), state field `gear_menu_open: bool`.
+- Modify: `src/app/shell.rs:8865-8960` (`fn status_bar`), action enum + handler (`SetTheme` already exists), state field `gear_menu_open: bool`.
 
 **Interfaces:**
-- Consumes: Task 6 menu chrome; `self.changes` (dirty = non-empty), `crate::warpui::git::diff_numstat` cached totals already surfaced for the active workspace (reuse the same source the Left Panel badge uses — `rg -n "diff_stat" src/warpui/shell.rs`); `crate::theme::load_all()`.
+- Consumes: Task 6 menu chrome; `self.changes` (dirty = non-empty), `crate::warpui::git::diff_numstat` cached totals already surfaced for the active workspace (reuse the same source the Left Panel badge uses — `rg -n "diff_stat" src/app/shell.rs`); `crate::theme::load_all()`.
 - Produces: gear menu listing themes (replaces the removed top-bar cycle pill).
 
 - [ ] **Step 1: Branch cluster + state dot + chip** — prepend an 7×7 dot (rounded rect, radius 3.5) to the branch cluster: `theme::success()` when `self.changes.is_empty()`, `theme::warning()` otherwise. After the cluster, when dirty, a chip (18px tall, `surface()` bg, radius 9): `+{added}` in `success()`, `−{deleted}` in `error()`, 10px font, from the active workspace's cached numstat. Chip + cluster share the existing `OpenSwitchBranch` click.
 - [ ] **Step 2: Hover language** — wrap Ln/Col cluster and the new ⚙ button (far right, `self.icon_button("sb-gear", icons::GEAR /* verify glyph name in icons.rs */, CraneShellAction::ToggleGearMenu)`) with hover washes. Bar height uses `theme::STATUS_H` (26).
-- [ ] **Step 3: Gear menu** — overlay menu (Task 6 chrome) anchored bottom-right: `menu_label("THEME")` + one `menu_item_hint(icons::PAINT_BRUSH, <name>, active-marker-as-hint, false, CraneShellAction::SetTheme(name))` per `crate::theme::load_all()` entry (active theme's hint = "active"), separator, "Keyboard Shortcuts" (dispatching the existing shortcuts-modal action — `rg -n "Keyboard Shortcuts" src/warpui/shell.rs`).
+- [ ] **Step 3: Gear menu** — overlay menu (Task 6 chrome) anchored bottom-right: `menu_label("THEME")` + one `menu_item_hint(icons::PAINT_BRUSH, <name>, active-marker-as-hint, false, CraneShellAction::SetTheme(name))` per `crate::theme::load_all()` entry (active theme's hint = "active"), separator, "Keyboard Shortcuts" (dispatching the existing shortcuts-modal action — `rg -n "Keyboard Shortcuts" src/app/shell.rs`).
 - [ ] **Step 4: Defer agent-activity indicator** — spec Open Item; do not implement now.
 - [ ] **Step 5: Build, visual check, commit**
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "feat(warpui): status bar repo pulse with gear theme menu"
 ```
 
 ### Task 9: Live +x/−y counters for every watched repo
 
 **Files:**
-- Modify: `src/warpui/shell.rs:6743-6812` (`fn drain_fs_events`)
-- Test: `src/warpui/file_watcher.rs` (existing tests keep passing; no new unit test — the change is shell wiring, verified behaviorally)
+- Modify: `src/app/shell.rs:6743-6812` (`fn drain_fs_events`)
+- Test: `src/app/file_watcher.rs` (existing tests keep passing; no new unit test — the change is shell wiring, verified behaviorally)
 
 **Interfaces:**
 - Consumes: existing `self.fs_events`, `self.spawn_git_scan(ctx, generation, paths)` (see its use at shell.rs:6792), `self.projects[..].worktrees[..].path`.
@@ -534,21 +534,21 @@ git commit -m "feat(warpui): status bar repo pulse with gear theme menu"
         }
 ```
 
-Add field `bg_badge_last_scan: std::time::Instant` (init `Instant::now()` in the constructor near `git_log_last_reload` — find with `rg -n "git_log_last_reload" src/warpui/shell.rs`). Confirm `spawn_git_scan` generations: the active block uses `"active-diff"`; verify a second generation string doesn't cancel it (read `fn spawn_git_scan`) — if generations are exclusive, reuse `"active-diff"` semantics by passing all paths in one call instead.
+Add field `bg_badge_last_scan: std::time::Instant` (init `Instant::now()` in the constructor near `git_log_last_reload` — find with `rg -n "git_log_last_reload" src/app/shell.rs`). Confirm `spawn_git_scan` generations: the active block uses `"active-diff"`; verify a second generation string doesn't cancel it (read `fn spawn_git_scan`) — if generations are exclusive, reuse `"active-diff"` semantics by passing all paths in one call instead.
 
-- [ ] **Step 2: Bust the numstat cache** — `src/warpui/projects.rs:70` caches numstat keyed by path. Read `cached_diff_numstat` and its invalidation; ensure `spawn_git_scan` results bypass/update that cache (if the scan writes `w.diff_stat` directly — see shell.rs:6549 — nothing to do).
+- [ ] **Step 2: Bust the numstat cache** — `src/app/projects.rs:70` caches numstat keyed by path. Read `cached_diff_numstat` and its invalidation; ensure `spawn_git_scan` results bypass/update that cache (if the scan writes `w.diff_stat` directly — see shell.rs:6549 — nothing to do).
 
 - [ ] **Step 3: Verify behaviorally + commit** — run Crane with two projects; `touch`/edit a file in the NON-active project's checkout from another terminal; its +N/−M badge updates within ~1s without switching projects. `make test` passes (file_watcher tests unaffected).
 
 ```bash
-git add src/warpui/shell.rs src/warpui/projects.rs
+git add src/app/shell.rs src/app/projects.rs
 git commit -m "fix(warpui): background workspaces refresh change badges live"
 ```
 
 ### Task 10: Notification pulse at full frame rate
 
 **Files:**
-- Modify: `src/warpui/shell.rs:1352-1387` (fast tick), `~1392` (browser ticker block, as the pattern to copy)
+- Modify: `src/app/shell.rs:1352-1387` (fast tick), `~1392` (browser ticker block, as the pattern to copy)
 
 **Interfaces:**
 - Consumes: `self.any_attention_active()`, `self.toasts`, `warpui::r#async::Timer::interval`, `guarded_tick`.
@@ -580,14 +580,14 @@ Store/leak the returned task handle exactly the way `browser_tick`'s is handled 
 - [ ] **Step 2: Verify + commit** — trigger a notification (background terminal bell — e.g. `sleep 1 && printf '\a'` in a non-focused pane's shell); sidebar glow breathes smoothly. Idle CPU unchanged when no animation is active (the tick is a no-op check).
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "fix(warpui): notification pulse animates at full frame rate"
 ```
 
 ### Task 11: ⌘⇧B Browser shortcut + shortcuts-modal entries
 
 **Files:**
-- Modify: `src/warpui/shell.rs` — key handling (find the ⌘T/⌘D handling: `rg -n "SplitFocused|key_char.*'t'|Cmd\\+T" src/warpui/shell.rs`), shortcuts table at shell.rs:4086.
+- Modify: `src/app/shell.rs` — key handling (find the ⌘T/⌘D handling: `rg -n "SplitFocused|key_char.*'t'|Cmd\\+T" src/app/shell.rs`), shortcuts table at shell.rs:4086.
 
 **Interfaces:**
 - Consumes: `CraneShellAction::OpenBrowser` (exists — used by the old Browser pill).
@@ -598,7 +598,7 @@ git commit -m "fix(warpui): notification pulse animates at full frame rate"
 - [ ] **Step 3: Build, verify both ⌘B and ⌘⇧B, `make test`, commit**
 
 ```bash
-git add src/warpui/shell.rs
+git add src/app/shell.rs
 git commit -m "feat(warpui): Cmd+Shift+B opens a browser pane"
 ```
 
@@ -606,6 +606,6 @@ git commit -m "feat(warpui): Cmd+Shift+B opens a browser pane"
 
 **Files:** none new.
 
-- [ ] **Step 1: Consistency pass** — `rg -n "with_uniform_padding\(5.0\)|15\.0, theme::text_muted" src/warpui/shell.rs`: any surviving old-style icon button (e.g. `status_icon_button`) migrates to Task 1's `icon_button`. `rg -n "row_active\(\)" src/warpui/shell.rs`: confirm remaining uses are intentional (non-left-panel).
+- [ ] **Step 1: Consistency pass** — `rg -n "with_uniform_padding\(5.0\)|15\.0, theme::text_muted" src/app/shell.rs`: any surviving old-style icon button (e.g. `status_icon_button`) migrates to Task 1's `icon_button`. `rg -n "row_active\(\)" src/app/shell.rs`: confirm remaining uses are intentional (non-left-panel).
 - [ ] **Step 2: Full verify** — `cargo build --release && make test`; manual pass over every touched region with the spec §1–§9 as checklist.
 - [ ] **Step 3: Ship** — working tree must be clean (all tasks committed). Then per project rules: `make ship-minor` (user-noticeable feature set → 0.6.0).

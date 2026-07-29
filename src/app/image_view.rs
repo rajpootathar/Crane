@@ -24,7 +24,7 @@ use warpui::elements::{
 use warpui::fonts::FamilyId;
 use warpui::{AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext};
 
-use crate::warpui::theme;
+use crate::app::theme;
 
 /// Prose font size for the decode-failure fallback message.
 const BASE: f32 = 14.0;
@@ -81,7 +81,7 @@ impl WarpImageView {
     /// Mirrors `WarpMarkdownView::fonts`.
     fn font(ctx: &mut ViewContext<Self>) -> FamilyId {
         warpui::fonts::Cache::handle(ctx)
-            .update(ctx, |cache, _| crate::warpui::bundled_fonts::ui(cache))
+            .update(ctx, |cache, _| crate::app::bundled_fonts::ui(cache))
     }
 
     /// The `Image` element itself, sized by whatever bounded constraint its

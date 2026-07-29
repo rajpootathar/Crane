@@ -23,8 +23,8 @@ use warpui::fonts::FamilyId;
 use warpui::platform::Cursor;
 use warpui::{AppContext, Entity, TypedActionView, View, ViewContext};
 
-use crate::warpui::icons;
-use crate::warpui::theme;
+use crate::app::icons;
+use crate::app::theme;
 
 /// Which primary action the user clicked on the landing page. The view itself
 /// can't perform any of these (they need the shell), so it hands this enum to

@@ -34,6 +34,25 @@ Code still uses the old names `Workspace` (for the Layout struct) and `Worktree`
 
 **Single binary, single process.** No FFI, no Go, no subprocesses other than `git`.
 
+### `crate::app` vs `warpui` — two names, two things
+
+The GPU front-end lives in **`src/app/`** (`crate::app::shell`, `crate::app::view`, …)
+and is built on **`warpui`**, Warp's MIT-licensed UI framework vendored at
+`vendor/warp/crates/warpui` and consumed as a path dependency.
+
+The module used to be called `warpui` too, which made every `warpui::` reference
+ambiguous — ours or theirs? It is now `app`. The rule going forward:
+
+- `crate::app::…` — Crane's own UI code. Ours to change.
+- `warpui::…` (`Element`, `Flex`, `Text`, `AppContext`, …) — the framework. Not ours.
+- `mod app;` in `main.rs` shadows the extern crate name **inside that file only**,
+  which is why the entry point calls `app::run()`.
+- `~/.crane/warpui-state.json` keeps its old on-disk name on purpose — every
+  existing user has that file, and renaming it without a migration drops their
+  session. See the header comment in `src/app/persist.rs`.
+- The old `src/warpui/` paths survive in `docs/archive/warpui-migration/` by
+  design: that is a record of the egui→warpui migration, not live documentation.
+
 ```
 src/
 ├── main.rs          — eframe entry + shortcuts + top-level layout composition + modal

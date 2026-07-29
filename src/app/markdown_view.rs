@@ -22,7 +22,7 @@ use warpui::elements::{
 use warpui::fonts::FamilyId;
 use warpui::{AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext};
 
-use crate::warpui::theme;
+use crate::app::theme;
 
 /// Base prose font size. Headings scale off this; code is one point smaller.
 const BASE: f32 = 14.0;
@@ -691,8 +691,8 @@ impl WarpMarkdownView {
     /// Mirrors the shell's `ui_font` load and `FileView`'s mono load.
     fn fonts(ctx: &mut ViewContext<Self>) -> (FamilyId, FamilyId) {
         warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            let prose = crate::warpui::bundled_fonts::ui(cache);
-            let mono = crate::warpui::bundled_fonts::mono(cache);
+            let prose = crate::app::bundled_fonts::ui(cache);
+            let mono = crate::app::bundled_fonts::mono(cache);
             (prose, mono)
         })
     }

@@ -21,10 +21,10 @@ use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::vec2f;
 use warpui::{AppContext, Entity, TypedActionView, View, ViewContext};
 
-use crate::warpui::browser::{self, SlotKey};
-use crate::warpui::layout::PaneId;
-use crate::warpui::rect_probe::RectProbe;
-use crate::warpui::{icons, theme};
+use crate::app::browser::{self, SlotKey};
+use crate::app::layout::PaneId;
+use crate::app::rect_probe::RectProbe;
+use crate::app::{icons, theme};
 
 /// Footer status-bar height (matches the old egui FOOTER_H).
 const FOOTER_H: f32 = 22.0;

@@ -81,7 +81,7 @@ Grab the latest build for your platform from the [Releases](https://github.com/r
 ### Performance & architecture
 - **No async runtime** — plain `std::thread` + `parking_lot` + `mpsc`. No Tokio. The PTY reader lives on its own thread and wakes the GPU frame loop via warpui's repaint channel.
 - **Idle is free** — at rest Crane runs zero git subprocesses and does zero per-frame `read_dir`; git status, diffs, and git-log reloads run off the render thread and are cached, so only real changes wake the system.
-- **One file watcher** (`src/warpui/file_watcher.rs`) for the whole app — `notify` with event coalescing and prefix routing to the owning project (macOS FSEvents, Linux inotify, Windows ReadDirectoryChangesW), filtering `.git/objects/`, `.git/logs/`, and editor temp files.
+- **One file watcher** (`src/app/file_watcher.rs`) for the whole app — `notify` with event coalescing and prefix routing to the owning project (macOS FSEvents, Linux inotify, Windows ReadDirectoryChangesW), filtering `.git/objects/`, `.git/logs/`, and editor temp files.
 - **Cached diff renders** — `TextDiff::from_lines` + `git diff` computed off-thread and cached; re-rendering an unchanged diff is a cheap `Arc::clone`.
 - **Lazy init** — a session that never opens a project pays no background thread cost.
 
@@ -205,13 +205,13 @@ git push origin v0.1.0
 
 ## Architecture
 
-Single binary. Pure Rust. No Electron, no web runtime, no async runtime. `main.rs` hands off directly to `warpui::run()` — warpui (`src/warpui/`) is the sole front-end.
+Single binary. Pure Rust. No Electron, no web runtime, no async runtime. `main.rs` hands off directly to `app::run()` — the `app` module (`src/app/`) is the sole front-end, built on Warp's `warpui` framework crate. The two are deliberately named apart: `crate::app` is Crane's UI, `warpui` is the framework it renders with.
 
 ```
 src/
-├── main.rs          entry point → warpui::run()
+├── main.rs          entry point → app::run()
 ├── startup.rs       process init before the UI spawns a PTY
-├── warpui/          the entire GPU-rendered front-end (warpui + warp_editor)
+├── app/             the entire GPU-rendered front-end (on warpui + warp_editor)
 │   ├── shell.rs         top-level shell: panes, tabs, layout, shortcuts, persistence
 │   ├── controller.rs    app state + action dispatch
 │   ├── layout.rs · split.rs         Layout tree (Leaf / Split) + draggable splitters

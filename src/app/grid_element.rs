@@ -118,7 +118,7 @@ pub struct GridElement {
     /// a one-shot size change — a split/close that adds or removes a sibling
     /// pane — would leave the grid stale until the next incidental event. Waking
     /// on the change guarantees the follow-up frame that applies it.
-    resize_wake: Option<crate::warpui::controller::Wake>,
+    resize_wake: Option<crate::app::controller::Wake>,
     size: Option<Vector2F>,
     origin: Option<Point>,
     /// Paint-time origin in window coords, used in dispatch_event for hit-testing.
@@ -257,7 +257,7 @@ impl GridElement {
 
     /// Repaint waker fired when the fitted grid size changes in layout() — so a
     /// one-shot resize (split/close) self-completes its two-frame apply.
-    pub fn with_resize_wake(mut self, wake: crate::warpui::controller::Wake) -> Self {
+    pub fn with_resize_wake(mut self, wake: crate::app::controller::Wake) -> Self {
         self.resize_wake = Some(wake);
         self
     }
@@ -430,7 +430,7 @@ impl Element for GridElement {
 
         // 3) Selection highlight (over cell backgrounds, under cursor and glyphs).
         if let Some(sel) = self.selection {
-            let sel_color = crate::warpui::theme::selection();
+            let sel_color = crate::app::theme::selection();
             let disp = self.display_offset;
             for r in 0..self.rows {
                 for c in 0..self.cols {
@@ -578,7 +578,7 @@ impl Element for GridElement {
                 let x = origin.x() + hcs as f32 * cw;
                 let w = (eff_end.saturating_sub(hcs)) as f32 * cw;
                 let y = origin.y() + hr as f32 * ch + fy + baseline + 2.0;
-                let ul_color = crate::warpui::theme::accent();
+                let ul_color = crate::app::theme::accent();
                 ctx.scene
                     .draw_rect_without_hit_recording(RectF::new(vec2f(x, y), vec2f(w, 1.0)))
                     .with_background(Fill::Solid(ul_color));
@@ -668,7 +668,7 @@ impl Element for GridElement {
                     // a runloop tick late — reads as jittery scrolling).
                     ctx.notify();
                     ctx.dispatch_typed_action(
-                        crate::warpui::shell::CraneShellAction::ScrollRepaint,
+                        crate::app::shell::CraneShellAction::ScrollRepaint,
                     );
                     return true;
                 }
@@ -807,7 +807,7 @@ impl Element for GridElement {
                                     }
                                     LinkTarget::File { path, line, col } => {
                                         ctx.dispatch_typed_action(
-                                            crate::warpui::shell::CraneShellAction::OpenFileAtPath {
+                                            crate::app::shell::CraneShellAction::OpenFileAtPath {
                                                 path,
                                                 line,
                                                 col,

@@ -89,7 +89,7 @@ path) because two ranges of one file are two distinct live views.
 and `Commits` → short SHAs. The leading icon is what distinguishes a diff tab
 from an editable file tab.
 
-`icons::GIT_DIFF` (`src/warpui/icons.rs:7`) is the required marker — **not** a
+`icons::GIT_DIFF` (`src/app/icons.rs:7`) is the required marker — **not** a
 Unicode glyph such as `⟷` or `↔`, which the bundled JetBrains Mono and the
 default proportional face do not cover and which therefore render as tofu
 boxes (project rule: icons always come from the bundled icon font). The Changes

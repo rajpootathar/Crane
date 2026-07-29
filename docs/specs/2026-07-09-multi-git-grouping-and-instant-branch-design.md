@@ -1,7 +1,7 @@
 # Multi-git grouping (parent-is-repo) + instant branch refresh
 
 **Date:** 2026-07-09
-**Area:** Left Panel projects tree (`src/warpui/projects.rs`, `src/warpui/shell.rs`, `src/warpui/git.rs`)
+**Area:** Left Panel projects tree (`src/app/projects.rs`, `src/app/shell.rs`, `src/app/git.rs`)
 **Goal:** Restore two old-egui behaviors lost in the warpui port.
 
 ## Background

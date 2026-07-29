@@ -166,9 +166,9 @@ impl Element for GutterElement {
                 match kind {
                     DiffKind::Added | DiffKind::Modified => {
                         let color = if kind == DiffKind::Added {
-                            crate::warpui::theme::success()
+                            crate::app::theme::success()
                         } else {
-                            crate::warpui::theme::accent()
+                            crate::app::theme::accent()
                         };
                         ctx.scene
                             .draw_rect_without_hit_recording(RectF::new(
@@ -180,7 +180,7 @@ impl Element for GutterElement {
                     DiffKind::Deleted => {
                         // Deleted lines have no row of their own — paint a small
                         // right-pointing wedge centred on this line's top boundary.
-                        Self::draw_deleted_wedge(ctx, origin.x(), y, crate::warpui::theme::error());
+                        Self::draw_deleted_wedge(ctx, origin.x(), y, crate::app::theme::error());
                     }
                 }
             }

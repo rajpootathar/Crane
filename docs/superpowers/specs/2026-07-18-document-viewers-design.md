@@ -60,8 +60,8 @@ and neither new viewer needs to deviate from it.
 
 Two new self-contained warpui `View`s implementing `Entity` + `TypedActionView`:
 
-- `src/warpui/image_view.rs` → `WarpImageView`
-- `src/warpui/pdf_view.rs` → `WarpPdfView`
+- `src/app/image_view.rs` → `WarpImageView`
+- `src/app/pdf_view.rs` → `WarpPdfView`
 
 Wired into `shell.rs` at the four sites markdown already uses:
 

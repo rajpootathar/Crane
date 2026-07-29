@@ -61,7 +61,7 @@ fn cached_current_branch(path: &Path) -> String {
     {
         return v;
     }
-    let v = crate::warpui::git::current_branch(path);
+    let v = crate::app::git::current_branch(path);
     git_cache().lock().unwrap().entry(key).or_default().branch =
         Some((Instant::now(), v.clone()));
     v
@@ -78,7 +78,7 @@ fn cached_diff_numstat(path: &Path) -> (u32, u32) {
     {
         return v;
     }
-    let v = crate::warpui::git::diff_numstat(path);
+    let v = crate::app::git::diff_numstat(path);
     git_cache().lock().unwrap().entry(key).or_default().diff = Some((Instant::now(), v));
     v
 }
@@ -94,7 +94,7 @@ fn cached_is_dirty(path: &Path) -> bool {
     {
         return v;
     }
-    let v = crate::warpui::git::is_dirty(path);
+    let v = crate::app::git::is_dirty(path);
     git_cache().lock().unwrap().entry(key).or_default().dirty = Some((Instant::now(), v));
     v
 }
@@ -129,9 +129,9 @@ pub struct RepoGitInfo {
 /// background scan future) — it forks `git` three times.
 pub fn scan_repo_git(path: &Path) -> RepoGitInfo {
     RepoGitInfo {
-        branch: crate::warpui::git::current_branch(path),
-        diff_stat: crate::warpui::git::diff_numstat(path),
-        dirty: crate::warpui::git::is_dirty(path),
+        branch: crate::app::git::current_branch(path),
+        diff_stat: crate::app::git::diff_numstat(path),
+        dirty: crate::app::git::is_dirty(path),
     }
 }
 
@@ -302,7 +302,7 @@ fn expand_folder(
     let nested: Vec<PathBuf> = if opened.path.is_empty() {
         Vec::new()
     } else {
-        crate::warpui::git::discover_repos(path, 5)
+        crate::app::git::discover_repos(path, 5)
             .into_iter()
             .filter(|p| p.as_path() != path)
             .collect()
@@ -313,8 +313,8 @@ fn expand_folder(
         // Parent is a repo: only gitignored, non-submodule nested clones.
         // Resolve the submodule set and the ignored subset ONCE (one `git`
         // fork each) rather than shelling out per candidate.
-        let submods = crate::warpui::git::submodule_paths(path);
-        let ignored = crate::warpui::git::ignored_paths(path, &nested);
+        let submods = crate::app::git::submodule_paths(path);
+        let ignored = crate::app::git::ignored_paths(path, &nested);
         nested
             .into_iter()
             .filter(|p| {
@@ -491,7 +491,7 @@ fn session_folders(with_git: bool) -> Vec<OpenedFolder> {
 /// cache path compiled); not on any hot path.
 #[allow(dead_code)]
 pub fn load_projects_extended(
-    added: &[crate::warpui::persist::AddedProject],
+    added: &[crate::app::persist::AddedProject],
     removed: &[String],
     tints: &HashMap<String, [u8; 3]>,
 ) -> Vec<ProjectNode> {
@@ -509,7 +509,7 @@ pub fn load_projects_extended(
 /// later by `CraneShellView::spawn_git_scan` (which runs the git shell-outs off
 /// the UI thread and applies the results back into these nodes by path).
 pub fn load_projects_shallow(
-    added: &[crate::warpui::persist::AddedProject],
+    added: &[crate::app::persist::AddedProject],
     removed: &[String],
     tints: &HashMap<String, [u8; 3]>,
 ) -> Vec<ProjectNode> {
@@ -526,7 +526,7 @@ pub fn load_projects_shallow(
 /// whole-tree reload, so existing projects' already-filled badges and
 /// (project-index-keyed) state are untouched.
 pub fn load_one_shallow(
-    added: &crate::warpui::persist::AddedProject,
+    added: &crate::app::persist::AddedProject,
     removed: &[String],
     tints: &HashMap<String, [u8; 3]>,
 ) -> Vec<ProjectNode> {
@@ -548,7 +548,7 @@ pub fn load_one_shallow(
 }
 
 fn load_projects_core(
-    added: &[crate::warpui::persist::AddedProject],
+    added: &[crate::app::persist::AddedProject],
     removed: &[String],
     tints: &HashMap<String, [u8; 3]>,
     with_git: bool,

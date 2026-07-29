@@ -37,8 +37,8 @@ use warpui::geometry::vector::vec2f;
 use warpui::image_cache::ImageType;
 use warpui::{AppContext, Entity, SingletonEntity as _, TypedActionView, View, ViewContext};
 
-use crate::warpui::rect_probe::RectProbe;
-use crate::warpui::{icons, theme};
+use crate::app::rect_probe::RectProbe;
+use crate::app::{icons, theme};
 
 /// Zoom presets the user steps through with the toolbar +/- buttons. Identical
 /// to the pre-warpui build.
@@ -709,7 +709,7 @@ mod tests {
     /// Load the two fonts the view needs, inside the test window's context.
     fn test_fonts(ctx: &mut ViewContext<WarpPdfView>) -> (FamilyId, FamilyId) {
         let ui = warpui::fonts::Cache::handle(ctx)
-            .update(ctx, |c, _| crate::warpui::bundled_fonts::ui(c));
+            .update(ctx, |c, _| crate::app::bundled_fonts::ui(c));
         let icon = warpui::fonts::Cache::handle(ctx).update(ctx, |c, _| {
             c.load_family_from_bytes("phosphor", vec![include_bytes!("assets/Phosphor.ttf").to_vec()])
                 .expect("load phosphor")

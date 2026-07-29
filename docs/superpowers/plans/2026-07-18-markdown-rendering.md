@@ -4,7 +4,7 @@
 
 **Goal:** Fix two correctness bugs that silently destroy and clip markdown content, restore a dropped port regression, then add links, strikethrough and task lists.
 
-**Architecture:** `src/warpui/markdown_view.rs` parses markdown once into an owned `Block` model, then rebuilds warpui elements from that model each frame. Two bugs live in that pipeline: the parse loop leaks table cell text into an accumulator that is never flushed, and the render path builds a `Flex::row` for mixed-style text, which cannot wrap. Fixes target the parse loop and swap the hand-rolled row for warp's shipped `FormattedTextElement`.
+**Architecture:** `src/app/markdown_view.rs` parses markdown once into an owned `Block` model, then rebuilds warpui elements from that model each frame. Two bugs live in that pipeline: the parse loop leaks table cell text into an accumulator that is never flushed, and the render path builds a `Flex::row` for mixed-style text, which cannot wrap. Fixes target the parse loop and swap the hand-rolled row for warp's shipped `FormattedTextElement`.
 
 **Tech Stack:** Rust edition 2024, `pulldown-cmark` 0.11, warpui (`vendor/warp` submodule), `cargo test --bin crane`.
 
@@ -24,8 +24,8 @@
 Fixes silent data loss. Table structure events are swallowed by the `_ => {}` catch-all at `:189` while `Event::Text` at `:164` still pushes every cell's text into `runs`. Nothing flushes it, so cell text merges into the next paragraph or dumps at EOF via the defensive flush at `:193`.
 
 **Files:**
-- Modify: `src/warpui/markdown_view.rs` (`Block` enum ~`:51`, `parse` loop `:100-191`, `block_element` `:268`)
-- Test: `src/warpui/markdown_view.rs` (new `#[cfg(test)] mod tests` at end of file)
+- Modify: `src/app/markdown_view.rs` (`Block` enum ~`:51`, `parse` loop `:100-191`, `block_element` `:268`)
+- Test: `src/app/markdown_view.rs` (new `#[cfg(test)] mod tests` at end of file)
 
 **Interfaces:**
 - Consumes: nothing (first task)
@@ -33,7 +33,7 @@ Fixes silent data loss. Table structure events are swallowed by the `_ => {}` ca
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `src/warpui/markdown_view.rs`:
+Append to `src/app/markdown_view.rs`:
 
 ```rust
 #[cfg(test)]
@@ -95,7 +95,7 @@ Expected: FAIL — compile error `no variant named 'Table' found for enum 'Block
 
 - [ ] **Step 3: Add the Table variant and Cell alias**
 
-In `src/warpui/markdown_view.rs`, add above the `Block` enum (~`:50`):
+In `src/app/markdown_view.rs`, add above the `Block` enum (~`:50`):
 
 ```rust
 /// One table cell's inline content.
@@ -258,7 +258,7 @@ Expected: PASS, no warnings about an unreachable `Block::Table` arm.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/warpui/markdown_view.rs
+git add src/app/markdown_view.rs
 git commit -m "fix(warpui): render markdown tables and stop cell text leaking into adjacent blocks
 
 Table structure events were swallowed by the catch-all arm while cell
@@ -278,8 +278,8 @@ start so an unflushed construct can never leak across blocks again."
 `inline_element` (`:301`) takes a soft-wrapping `Text` only when a block is uniform prose. Any paragraph containing inline code, bold, or italic falls to a `Flex::row` of `.soft_wrap(false)` pieces (`:329, 334, 342, 348`), which cannot wrap by construction and is clipped at the pane's right edge. Almost every technical paragraph has a code span, so most of a document does not wrap.
 
 **Files:**
-- Modify: `src/warpui/markdown_view.rs` (`inline_element` `:301-323`, imports `:13-16`)
-- Test: `src/warpui/markdown_view.rs` (`mod tests`)
+- Modify: `src/app/markdown_view.rs` (`inline_element` `:301-323`, imports `:13-16`)
+- Test: `src/app/markdown_view.rs` (`mod tests`)
 
 **Interfaces:**
 - Consumes: `Run`, `Emph`, `Cell` from Task 1.
@@ -425,7 +425,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/warpui/markdown_view.rs
+git add src/app/markdown_view.rs
 git commit -m "fix(warpui): wrap markdown paragraphs that mix prose and inline styling
 
 Mixed-style blocks were built as a Flex row of non-wrapping Text pieces,
@@ -445,8 +445,8 @@ The uniform-prose fast path is unchanged."
 warpui handles `Tag::Item` but never `Tag::List`; old Crane handled both (`views/markdown_view.rs:98/102`). With no list-level tracking there is no nesting depth, so closing a nested list emits a phantom empty bullet, ordered lists lose numbering, and nested items lose indentation.
 
 **Files:**
-- Modify: `src/warpui/markdown_view.rs` (`Block` enum, `parse` loop, `bullet_element` `:358`)
-- Test: `src/warpui/markdown_view.rs` (`mod tests`)
+- Modify: `src/app/markdown_view.rs` (`Block` enum, `parse` loop, `bullet_element` `:358`)
+- Test: `src/app/markdown_view.rs` (`mod tests`)
 
 **Interfaces:**
 - Consumes: `Block`, `Run` from Task 1.
@@ -647,7 +647,7 @@ Run: `make test`
 Expected: PASS.
 
 ```bash
-git add src/warpui/markdown_view.rs
+git add src/app/markdown_view.rs
 git commit -m "fix(warpui): track markdown list nesting for depth, numbering and phantom bullets
 
 The port handled Tag::Item but dropped Tag::List, so there was no list
@@ -665,8 +665,8 @@ ordinal on each bullet, and suppresses bullets whose content is empty."
 `Options::all()` already emits these events; they are discarded by the catch-all. Link URLs are lost entirely — link text survives only incidentally through `Event::Text`.
 
 **Files:**
-- Modify: `src/warpui/markdown_view.rs` (`Emph` enum, `Run` struct, `parse` loop, `formatted_spans`)
-- Test: `src/warpui/markdown_view.rs` (`mod tests`)
+- Modify: `src/app/markdown_view.rs` (`Emph` enum, `Run` struct, `parse` loop, `formatted_spans`)
+- Test: `src/app/markdown_view.rs` (`mod tests`)
 
 **Interfaces:**
 - Consumes: `formatted_spans` from Task 2, `Block::Bullet { .. }` from Task 3.
@@ -883,7 +883,7 @@ Run: `make test`
 Expected: PASS.
 
 ```bash
-git add src/warpui/markdown_view.rs
+git add src/app/markdown_view.rs
 git commit -m "feat(warpui): render markdown links, strikethrough and task lists
 
 These events were already emitted by the parser and silently discarded;

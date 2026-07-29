@@ -30,7 +30,7 @@
 
 ## Global Constraints
 
-- Never use Unicode glyph icons — bundled fonts render them as tofu. Only constants that exist in `src/warpui/icons.rs` (there is **no** `EYE`).
+- Never use Unicode glyph icons — bundled fonts render them as tofu. Only constants that exist in `src/app/icons.rs` (there is **no** `EYE`).
 - Do NOT modify anything under `vendor/warp/`.
 - **Do NOT run `cargo fmt` in any form** — it reformats the entire workspace including vendored code regardless of the path argument. Hand-format.
 - Every persisted field carries `#[serde(default)]`. Never break deserialization of an existing `~/.crane/warpui-state.json`; never read or write it from tests (use the `HomeOverride` guard).
@@ -43,7 +43,7 @@
 
 ### Task 1: pdfium binding + page rendering
 
-**Files:** create `src/warpui/pdf_view.rs`; modify `src/warpui/mod.rs`, `Cargo.toml`.
+**Files:** create `src/app/pdf_view.rs`; modify `src/app/mod.rs`, `Cargo.toml`.
 
 - [ ] **Step 1: Add the dependency, matching the pinned ABI**
 

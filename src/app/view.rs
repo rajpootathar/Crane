@@ -221,10 +221,10 @@ use warpui::keymap::Keystroke;
 use warpui::r#async::SpawnedLocalStream;
 use warpui::{AppContext, Entity, SingletonEntity as _, View, ViewContext};
 
-use crate::warpui::color;
-use crate::warpui::controller::{TerminalController, Wake};
-use crate::warpui::grid_element::{GridCell, GridElement, MouseSelPhase};
-use crate::warpui::input::keystroke_to_pty_bytes;
+use crate::app::color;
+use crate::app::controller::{TerminalController, Wake};
+use crate::app::grid_element::{GridCell, GridElement, MouseSelPhase};
+use crate::app::input::keystroke_to_pty_bytes;
 
 
 /// Ring the macOS system alert sound (the classic "beep"). `NSBeep` is a free
@@ -348,7 +348,7 @@ pub struct TerminalView {
     url_hover: Rc<StdCell<Option<(usize, usize, usize)>>>,
     /// Link target that was pressed at the last LeftMouseDown (click-without-drag
     /// detection). URL or resolved file path.
-    link_pressed: Rc<RefCell<Option<crate::warpui::grid_element::LinkTarget>>>,
+    link_pressed: Rc<RefCell<Option<crate::app::grid_element::LinkTarget>>>,
     /// Whether LeftMouseDragged fired since the last LeftMouseDown.
     url_did_drag: Rc<StdCell<bool>>,
     /// The (project_idx, worktree_idx, tab_id) this terminal currently lives in,
@@ -390,7 +390,7 @@ impl TerminalView {
         rx: async_channel::Receiver<()>,
     ) -> Self {
         let font_family = warpui::fonts::Cache::handle(ctx)
-            .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
+            .update(ctx, |cache, _| crate::app::bundled_fonts::mono(cache));
         ctx.focus_self();
 
         // Spawn directly in the initial requested cwd (avoids the
@@ -410,7 +410,7 @@ impl TerminalView {
                 let notes = this.controller.borrow().take_notifications();
                 for n in notes {
                     ctx.dispatch_typed_action(
-                        &crate::warpui::shell::CraneShellAction::TermNotification {
+                        &crate::app::shell::CraneShellAction::TermNotification {
                             body: n.body,
                             urgent: n.urgent,
                             source,
@@ -424,7 +424,7 @@ impl TerminalView {
                 // when `source` isn't the active tab.
                 if this.controller.borrow().take_bell_notify() {
                     ctx.dispatch_typed_action(
-                        &crate::warpui::shell::CraneShellAction::TermBell { source },
+                        &crate::app::shell::CraneShellAction::TermBell { source },
                     );
                 }
                 ctx.notify();
@@ -744,7 +744,7 @@ impl View for TerminalView {
         // resolve against the terminal's cwd and are kept only when they exist.
         // URLs win on overlap (a URL is a strictly more specific match than a
         // token-with-a-dot), so a path hit overlapping a URL span is dropped.
-        use crate::warpui::grid_element::{LinkSpan, LinkTarget};
+        use crate::app::grid_element::{LinkSpan, LinkTarget};
         let link_spans: Vec<LinkSpan> = {
             let cwd = self.controller.borrow().cwd.clone();
             let mut spans = Vec::new();
@@ -922,7 +922,7 @@ impl View for TerminalView {
             cells,
             cursor,
             self.font_family,
-            crate::warpui::fontsize::base(),
+            crate::app::fontsize::base(),
             color::default_bg(),
             color::cursor_color(),
             self.desired.clone(),
@@ -959,11 +959,11 @@ impl View for TerminalView {
             (sb_len + rows, sb_len.saturating_sub(sb_disp_off))
         };
         let mut scrollbar_el =
-            crate::warpui::scrollbar_element::LineScrollbar::new(
+            crate::app::scrollbar_element::LineScrollbar::new(
                 total,
                 rows,
                 top,
-                crate::warpui::theme::border(),
+                crate::app::theme::border(),
             );
         // Draggable thumb on the main screen (scrollback). In alt-screen there's
         // nothing to drag (the app owns its viewport), so leave it display-only.
@@ -997,7 +997,7 @@ impl View for TerminalView {
         // bypasses). Positive delta.y() = scroll up. Warp keeps scroll_top as
         // fractional lines across events; we mirror that by keeping `scroll_pos`
         // (fractional display_offset) and truncating to integer rows on apply.
-        let cell_h = crate::warpui::fontsize::base() * 1.2;
+        let cell_h = crate::app::fontsize::base() * 1.2;
         let scroll_cb: std::rc::Rc<dyn Fn(f32, bool)> = std::rc::Rc::new(move |dy: f32, precise: bool| {
             let delta_lines = if precise { dy / cell_h } else { dy };
             // Soft-knee on fast flicks: deltas under ~3 lines/event pass 1:1
@@ -1056,10 +1056,10 @@ impl View for TerminalView {
                     }
                     ctrl.write_input(&seq);
                 }
-                if crate::warpui::grid_element::scroll_trace() {
+                if crate::app::grid_element::scroll_trace() {
                     eprintln!(
                         "[scroll] t={:.1}ms ALT dy={dy:+.2} precise={precise} lines={lines}",
-                        crate::warpui::grid_element::trace_epoch().elapsed().as_secs_f64() * 1e3,
+                        crate::app::grid_element::trace_epoch().elapsed().as_secs_f64() * 1e3,
                     );
                 }
                 return;
@@ -1090,10 +1090,10 @@ impl View for TerminalView {
             }
             // CRANE_SCROLL_TRACE=1: event-side timing probe for scroll-feel
             // debugging (pairs with the paint-side probe in grid_element.rs).
-            if crate::warpui::grid_element::scroll_trace() {
+            if crate::app::grid_element::scroll_trace() {
                 eprintln!(
                     "[scroll] t={:.1}ms dy={dy:+.2} precise={precise} pos={pos:.3} rows={delta_rows} max={max}",
-                    crate::warpui::grid_element::trace_epoch().elapsed().as_secs_f64() * 1e3,
+                    crate::app::grid_element::trace_epoch().elapsed().as_secs_f64() * 1e3,
                 );
             }
         });
@@ -1200,7 +1200,7 @@ impl TerminalView {
             // reentrant while the reader thread's `append` holds this same lock
             // across disk I/O, so the guard must never outlive this scope.
             let ranked: Vec<String> = {
-                let s = crate::warpui::history_store::store().lock();
+                let s = crate::app::history_store::store().lock();
                 let restored: std::collections::HashSet<u64> =
                     ctrl.restored_session_ids().iter().copied().collect();
                 s.rank(ctrl.session_id(), &restored, &pwd)

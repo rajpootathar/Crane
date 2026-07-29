@@ -36,9 +36,9 @@ use warpui::{
 
 use rangemap::RangeMap;
 
-use crate::warpui::find_bar_element::{BarMode, FindBarElement};
-use crate::warpui::gutter_element::DiffKind;
-use crate::warpui::theme;
+use crate::app::find_bar_element::{BarMode, FindBarElement};
+use crate::app::gutter_element::DiffKind;
+use crate::app::theme;
 
 const BASELINE: f32 = 0.78;
 
@@ -118,7 +118,7 @@ fn diag_color(severity: u8) -> ColorU {
 fn styles(font: FamilyId) -> RichTextStyles {
     let para = |tab: Option<u8>| ParagraphStyles {
         font_family: font,
-        font_size: crate::warpui::fontsize::editor(),
+        font_size: crate::app::fontsize::editor(),
         font_weight: Weight::Normal,
         line_height_ratio: 1.3,
         text_color: theme::text(),
@@ -170,7 +170,7 @@ fn styles(font: FamilyId) -> RichTextStyles {
             scrollbar_nonactive_thumb_color: theme::border(),
             scrollbar_active_thumb_color: theme::accent(),
             font_family: font,
-            font_size: crate::warpui::fontsize::editor(),
+            font_size: crate::app::fontsize::editor(),
             cell_padding: 8.0,
             outer_border: true,
             column_dividers: true,
@@ -385,9 +385,9 @@ enum FindMode {
 struct FindState {
     mode: FindMode,
     /// The search query (Find/Replace) or the line-number text (Goto).
-    query: crate::warpui::line_edit::LineEdit,
+    query: crate::app::line_edit::LineEdit,
     /// The replacement text (Replace mode).
-    replace: crate::warpui::line_edit::LineEdit,
+    replace: crate::app::line_edit::LineEdit,
     /// Which field captures typed characters: `true` = query, `false` = replace.
     find_field_active: bool,
     /// Match ranges as 0-based char offsets into the buffer text `(start, end)`,
@@ -401,8 +401,8 @@ impl FindState {
     fn new(mode: FindMode) -> Self {
         Self {
             mode,
-            query: crate::warpui::line_edit::LineEdit::default(),
-            replace: crate::warpui::line_edit::LineEdit::default(),
+            query: crate::app::line_edit::LineEdit::default(),
+            replace: crate::app::line_edit::LineEdit::default(),
             find_field_active: true,
             matches: Vec::new(),
             current: None,
@@ -452,7 +452,7 @@ fn compute_diff(path: &std::path::Path) -> RangeMap<u32, DiffKind> {
     let Some(repo) = path.parent() else {
         return map;
     };
-    for (line, kind) in crate::warpui::git::file_line_diff(repo, path) {
+    for (line, kind) in crate::app::git::file_line_diff(repo, path) {
         let dk = match kind {
             'A' => DiffKind::Added,
             'M' => DiffKind::Modified,
@@ -794,7 +794,7 @@ impl WarpEditorView {
             return false;
         }
         let formatter = if format_on_save && !self.read_only {
-            crate::warpui::formatter::for_path(&self.path)
+            crate::app::formatter::for_path(&self.path)
         } else {
             None
         };
@@ -809,7 +809,7 @@ impl WarpEditorView {
         let text = self.buffer_text(ctx);
         let submitted_version = self.buffer_version(ctx);
 
-        let fut = async move { crate::warpui::formatter::run(&fmt, &text) };
+        let fut = async move { crate::app::formatter::run(&fmt, &text) };
         ctx.spawn(fut, move |this, formatted, vctx| {
             this.apply_format_result(formatted, submitted_version, vctx);
         });
@@ -1574,7 +1574,7 @@ impl WarpEditorView {
             state.query = q;
         } else if let Some(sel) = self.selected_text(ctx) {
             if !sel.is_empty() && !sel.contains('\n') {
-                state.query = crate::warpui::line_edit::LineEdit::new(sel);
+                state.query = crate::app::line_edit::LineEdit::new(sel);
             }
         }
         self.find = Some(state);
@@ -1916,7 +1916,7 @@ impl WarpEditorView {
     /// Route an editing keystroke into the active find-bar field's LineEdit
     /// (caret, selection, word-nav, clipboard). Goto mode only accepts digits.
     fn find_edit_key(&mut self, ks: &warpui::keymap::Keystroke, ctx: &mut ViewContext<Self>) {
-        use crate::warpui::line_edit::Outcome;
+        use crate::app::line_edit::Outcome;
         let Some(f) = self.find.as_mut() else { return };
         let goto = f.mode == FindMode::Goto;
         // Goto: reject non-digit printable chars up front (LineEdit would
@@ -2418,10 +2418,10 @@ impl View for WarpEditorView {
             }
             d.map.clone()
         };
-        let gutter = crate::warpui::gutter_element::GutterElement::new(
+        let gutter = crate::app::gutter_element::GutterElement::new(
             render_state.clone(),
             self.gutter_font,
-            crate::warpui::fontsize::editor(),
+            crate::app::fontsize::editor(),
             PARAGRAPH_MIN_HEIGHT.as_f32(),
             cursor_line,
             theme::text_muted(),
@@ -2492,7 +2492,7 @@ impl View for WarpEditorView {
             std::rc::Rc::new(|ctx, frac| {
                 ctx.dispatch_typed_action(EditAction::ScrollToFrac(frac));
             });
-        let scrollbar = crate::warpui::scrollbar_element::ScrollbarElement::new(
+        let scrollbar = crate::app::scrollbar_element::ScrollbarElement::new(
             render_state.clone(),
             theme::border(),
         )
@@ -2570,7 +2570,7 @@ impl WarpEditorView {
             Text::new(
                 "This file changed on disk".to_string(),
                 self.gutter_font,
-                crate::warpui::fontsize::editor(),
+                crate::app::fontsize::editor(),
             )
             .with_color(theme::warning())
             .finish(),
@@ -2600,7 +2600,7 @@ impl WarpEditorView {
             Text::new(
                 err.to_string(),
                 self.gutter_font,
-                crate::warpui::fontsize::editor(),
+                crate::app::fontsize::editor(),
             )
             .with_color(theme::error())
             .finish(),
@@ -2629,7 +2629,7 @@ impl WarpEditorView {
                 Text::new(
                     label.to_string(),
                     self.gutter_font,
-                    crate::warpui::fontsize::editor(),
+                    crate::app::fontsize::editor(),
                 )
                 .with_color(theme::text())
                 .finish(),

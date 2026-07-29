@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::warpui::file_pane::FileView;
-use crate::warpui::file_tree;
-use crate::warpui::icons;
-use crate::warpui::layout::{Dir, Node, PaneId};
-use crate::warpui::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
-use crate::warpui::split::SplitBox;
+use crate::app::file_pane::FileView;
+use crate::app::file_tree;
+use crate::app::icons;
+use crate::app::layout::{Dir, Node, PaneId};
+use crate::app::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
+use crate::app::split::SplitBox;
 use warpui::color::ColorU;
 use warpui::elements::{
     Align, Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
@@ -36,9 +36,9 @@ use warpui::{
     ViewHandle,
 };
 
-use crate::warpui::theme;
-use crate::warpui::view::TerminalView;
-use crate::warpui::welcome_view::{WarpWelcomeView, WelcomeAction, WelcomeCallback};
+use crate::app::theme;
+use crate::app::view::TerminalView;
+use crate::app::welcome_view::{WarpWelcomeView, WelcomeAction, WelcomeCallback};
 
 /// A full-screen blocking modal. Rendered as the topmost child of the root
 /// stack: a dim backdrop that absorbs clicks + a centered content card. Escape
@@ -143,7 +143,7 @@ enum RowTier {
 struct PendingNewEntry {
     parent: PathBuf,
     is_folder: bool,
-    name: crate::warpui::line_edit::LineEdit,
+    name: crate::app::line_edit::LineEdit,
     error: Option<String>,
 }
 
@@ -297,18 +297,18 @@ pub struct CraneShellView {
     /// Deliberately NOT per Workspace: this is a handle CACHE keyed by path, and
     /// two Workspaces that open the same file should share one live buffer.
     /// Only File Tab *visibility* is Workspace-scoped.
-    editor_views: HashMap<PathBuf, ViewHandle<crate::warpui::editor_view::WarpEditorView>>,
+    editor_views: HashMap<PathBuf, ViewHandle<crate::app::editor_view::WarpEditorView>>,
     /// Live markdown views per open `.md` path — kept alive across tab switches
     /// so each rendered doc preserves its own scroll offset (peer of
     /// `editor_views`; a Markdown pane shows the one for the active file tab).
-    markdown_views: HashMap<PathBuf, ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>>,
+    markdown_views: HashMap<PathBuf, ViewHandle<crate::app::markdown_view::WarpMarkdownView>>,
     /// Live Image panes keyed by source path — peer of `markdown_views`, and
     /// cached for the same reason: every pane showing the same image shares
     /// one decoded view rather than re-reading the file per pane.
-    image_views: HashMap<PathBuf, ViewHandle<crate::warpui::image_view::WarpImageView>>,
+    image_views: HashMap<PathBuf, ViewHandle<crate::app::image_view::WarpImageView>>,
     /// Per-path PDF view cache — peer of `image_views`, so every pane showing
     /// the same PDF shares one decoded view.
-    pdf_views: HashMap<PathBuf, ViewHandle<crate::warpui::pdf_view::WarpPdfView>>,
+    pdf_views: HashMap<PathBuf, ViewHandle<crate::app::pdf_view::WarpPdfView>>,
     /// `.md` paths the user switched into EDIT mode via the pane header's
     /// toggle. Absent = the rendered preview (the default for every `.md`
     /// file); present = the raw source in a `WarpEditorView`.
@@ -321,7 +321,7 @@ pub struct CraneShellView {
     /// Cached terminal snapshots (cwd + ANSI scrollback) for persistence.
     /// Refreshed on every action but time-debounced so per-keystroke cost stays
     /// low while still capturing recent command output.
-    term_cache: RefCell<HashMap<PaneId, crate::warpui::persist::STerminal>>,
+    term_cache: RefCell<HashMap<PaneId, crate::app::persist::STerminal>>,
     /// Last time `term_cache` was refreshed (debounce clock).
     last_term_snapshot: std::cell::Cell<Option<std::time::Instant>>,
     /// Panes cleared via Cmd+K since the last snapshot — allows their persisted
@@ -339,7 +339,7 @@ pub struct CraneShellView {
     next_pane_id: PaneId,
     /// Which tab's layout is shown in the center.
     active_tab: Option<(usize, usize, usize)>,
-    projects: Vec<crate::warpui::projects::ProjectNode>,
+    projects: Vec<crate::app::projects::ProjectNode>,
     /// Active worktree dir — drives the Files/Changes panel root.
     active_cwd: Option<PathBuf>,
     /// Cached current branch of the active worktree (status bar).
@@ -352,7 +352,7 @@ pub struct CraneShellView {
     /// Loaded lane-graph snapshot (commits + refs + lanes). `None` until the
     /// first off-thread [`git_log::load`] lands. Shared behind `Rc` so the
     /// custom list element can borrow it without a data clone.
-    git_log_frame: Option<Rc<crate::warpui::git_log::GraphFrame>>,
+    git_log_frame: Option<Rc<crate::app::git_log::GraphFrame>>,
     /// Repo the cached frame was loaded against — detects Workspace switches.
     git_log_repo: Option<PathBuf>,
     /// True while an off-thread graph load is in flight (loading placeholder).
@@ -387,18 +387,18 @@ pub struct CraneShellView {
     /// `None` = `--all` (the full graph).
     git_log_ref_filter: Option<String>,
     /// Case-insensitive text filter over subject / hash / author; "" = off.
-    git_log_filter: crate::warpui::line_edit::LineEdit,
+    git_log_filter: crate::app::line_edit::LineEdit,
     /// True while the git-log filter field owns typing (`SendKeys` routes here).
     git_log_filter_active: bool,
     /// Filtered-frame cache keyed by (needle, generation) — `filtered_frame`
     /// re-runs lane layout over up to 10k commits, which must not happen per
     /// paint. RefCell: filled lazily from `render` (which is `&self`).
     git_log_filtered:
-        std::cell::RefCell<Option<(String, u64, Rc<crate::warpui::git_log::GraphFrame>)>>,
+        std::cell::RefCell<Option<(String, u64, Rc<crate::app::git_log::GraphFrame>)>>,
     /// Open commit context menu: (sha, window x, window y).
     git_log_menu: Option<(String, f32, f32)>,
     /// Inline "create branch from commit" prompt: (sha, name buffer).
-    git_log_branch_prompt: Option<(String, crate::warpui::line_edit::LineEdit)>,
+    git_log_branch_prompt: Option<(String, crate::app::line_edit::LineEdit)>,
     /// True while `git fetch --all --prune --tags` runs off-thread.
     git_log_fetching: bool,
     /// Last release re-check (in-session updates are re-polled every 6h).
@@ -436,11 +436,11 @@ pub struct CraneShellView {
     /// Window-space cursor during a sidebar drag (drives the drop-line).
     tree_drag_pos: Rc<Cell<Option<warpui::geometry::vector::Vector2F>>>,
     /// Sidebar row rects + scopes, repopulated at paint (visual order).
-    tree_zones: crate::warpui::rect_probe::ZoneList<TreeScope>,
+    tree_zones: crate::app::rect_probe::ZoneList<TreeScope>,
     /// Previous frame's zones — render-time readers (the drop-line overlay)
     /// use this snapshot: the live list is cleared at render start and only
     /// refills at paint, AFTER the overlay is built.
-    tree_zones_last: crate::warpui::rect_probe::ZoneList<TreeScope>,
+    tree_zones_last: crate::app::rect_probe::ZoneList<TreeScope>,
     /// Per-row `DraggableState`s, keyed by a stable row string.
     tree_drag_states: std::cell::RefCell<HashMap<String, DraggableState>>,
     /// In-flight Files-tree row drag: the source path (None = no drag).
@@ -448,9 +448,9 @@ pub struct CraneShellView {
     /// Window-space cursor during a Files-tree drag (drop-target highlight).
     fs_drag_pos: Rc<Cell<Option<warpui::geometry::vector::Vector2F>>>,
     /// Directory-row rects (+ the tree root as a whole), repopulated at paint.
-    fs_zones: crate::warpui::rect_probe::ZoneList<PathBuf>,
+    fs_zones: crate::app::rect_probe::ZoneList<PathBuf>,
     /// Previous frame's dir-row zones (render-time drop-hover highlight).
-    fs_zones_last: crate::warpui::rect_probe::ZoneList<PathBuf>,
+    fs_zones_last: crate::app::rect_probe::ZoneList<PathBuf>,
     /// Per-file-row `DraggableState`s.
     fs_drag_states: std::cell::RefCell<HashMap<String, DraggableState>>,
     /// Undo stack for Files-tree ops (Cmd+Z when no editor owns focus).
@@ -467,7 +467,7 @@ pub struct CraneShellView {
     /// [`system_trash`].
     trash_delete: fn(&std::path::Path) -> Result<(), String>,
     /// Loaded `git show` detail for the selected commit.
-    git_log_detail: Option<crate::warpui::git_log::CommitDetail>,
+    git_log_detail: Option<crate::app::git_log::CommitDetail>,
     /// True while the selected commit's `git show` is computing.
     git_log_detail_loading: bool,
     /// Row scroll offset for the detail/diff panel.
@@ -476,7 +476,7 @@ pub struct CraneShellView {
     git_log_detail_file: usize,
     /// Commit message buffer + whether the commit box has keyboard focus
     /// (keys route to it instead of the terminal).
-    commit_msg: crate::warpui::line_edit::LineEdit,
+    commit_msg: crate::app::line_edit::LineEdit,
     commit_focused: bool,
     /// Draggable left-panel boundary (fraction of the window width).
     left_ratio: Rc<Cell<f32>>,
@@ -498,7 +498,7 @@ pub struct CraneShellView {
     /// in render() (which runs every repaint). Avoids shelling out `git` /
     /// walking the FS every frame.
     file_rows: Vec<file_tree::FileRow>,
-    changes: Vec<crate::warpui::git::Change>,
+    changes: Vec<crate::app::git::Change>,
     /// Left tree expand state.
     expanded_projects: HashSet<usize>,
     expanded_worktrees: HashSet<(usize, usize)>,
@@ -508,7 +508,7 @@ pub struct CraneShellView {
     /// Monotonic tab id source.
     next_tab_id: usize,
     /// Projects added by the user via "Add Project" (not sourced from session.json).
-    added_projects: Vec<crate::warpui::persist::AddedProject>,
+    added_projects: Vec<crate::app::persist::AddedProject>,
     /// Paths of session.json projects the user explicitly removed.
     removed_project_paths: Vec<String>,
     /// Per-project tint overrides keyed by project path.
@@ -540,7 +540,7 @@ pub struct CraneShellView {
     /// expanded (members visible). Toggled via `CraneShellAction::ToggleGroup`.
     collapsed_groups: HashSet<String>,
     /// Collapsed directory groups in the Changes tree, keyed by their relative
-    /// path (e.g. "src/warpui"). Port of old egui `collapsed_change_dirs`.
+    /// path (e.g. "src/app"). Port of old egui `collapsed_change_dirs`.
     collapsed_change_dirs: HashSet<String>,
     /// Commit / stage error surfaced under the commit box (legacy `git_error`).
     commit_error: Option<String>,
@@ -554,7 +554,7 @@ pub struct CraneShellView {
     dirty_dirs: HashSet<String>,
     /// Shared async git-op status (Push / Pull / Fetch / Commit). Written by the
     /// background thread in `git::spawn_git_op`, polled each render for the pill.
-    git_op: Arc<Mutex<crate::warpui::git::OpStatus>>,
+    git_op: Arc<Mutex<crate::app::git::OpStatus>>,
     /// Repaint waker handed to background git-op threads.
     git_wake: Arc<dyn Fn() + Send + Sync>,
     /// Keeps the git-op repaint stream alive for the view's lifetime.
@@ -706,11 +706,11 @@ pub struct CraneShellView {
     /// Workspace (worktree) root trigger a Changes/Files/diff refresh for the
     /// ACTIVE repo. Kept alive for the view's lifetime (Drop tears down the OS
     /// watch + joins the debounce thread).
-    file_watcher: crate::warpui::file_watcher::FileWatcher,
+    file_watcher: crate::app::file_watcher::FileWatcher,
     /// Coalesced change events drained on the fast tick. Each `ChangeEvent.root`
     /// is a canonicalized watched root (matched against `canonicalize(active_cwd)`
     /// to decide whether the ACTIVE repo needs a refresh).
-    fs_events: std::sync::mpsc::Receiver<crate::warpui::file_watcher::ChangeEvent>,
+    fs_events: std::sync::mpsc::Receiver<crate::app::file_watcher::ChangeEvent>,
     /// Original path strings currently registered with `file_watcher`, so
     /// `sync_watches` only canonicalizes / (un)registers on an actual change
     /// instead of every tick.
@@ -731,7 +731,7 @@ pub struct CraneShellView {
     /// tick's 4 FPS. No-op boolean check when idle.
     _anim_tick: warpui::r#async::SpawnedLocalStream,
     /// Native WKWebView slots for Browser Panes, reconciled by `browser_tick`.
-    browser_host: crate::warpui::browser::BrowserHost,
+    browser_host: crate::app::browser::BrowserHost,
 }
 
 /// An in-flight goto-definition request token (server + JSON-RPC id) plus the
@@ -802,7 +802,7 @@ pub struct TabMeta {
 pub struct FifMatch {
     /// Absolute path of the file the match lives in.
     pub path: PathBuf,
-    /// Root-relative display path (e.g. "src/warpui/shell.rs").
+    /// Root-relative display path (e.g. "src/app/shell.rs").
     pub display: String,
     /// 1-based line number of the match.
     pub line: u32,
@@ -815,7 +815,7 @@ pub struct FifMatch {
 /// same keystroke path as the commit box (`edit_find_in_files`); each edit
 /// re-runs a synchronous recursive substring search over the active project.
 pub struct FindInFilesState {
-    pub query: crate::warpui::line_edit::LineEdit,
+    pub query: crate::app::line_edit::LineEdit,
     pub results: Vec<FifMatch>,
     /// True when the result set was capped at `FIF_MAX_RESULTS`.
     pub truncated: bool,
@@ -836,7 +836,7 @@ pub struct TabSwitcherState {
 /// names) into the rendered list. Picking a branch checks it out in the active
 /// workspace; each row also offers "+ worktree" (open New Workspace pre-filled).
 pub struct SwitchBranchState {
-    pub query: crate::warpui::line_edit::LineEdit,
+    pub query: crate::app::line_edit::LineEdit,
     /// The active project index (for "+ worktree" / new-branch worktree flows).
     pub project_idx: usize,
     /// Every candidate branch name (locals first, then deduped remote shorts).
@@ -852,7 +852,7 @@ pub struct SwitchBranchState {
     pub track: std::collections::HashMap<String, (usize, usize)>,
     /// When `Some`, the footer "＋ New Branch…" row is an active text input
     /// holding the typed name; `None` = the footer shows its resting row.
-    pub new_branch_input: Option<crate::warpui::line_edit::LineEdit>,
+    pub new_branch_input: Option<crate::app::line_edit::LineEdit>,
     /// Highlighted row (Enter checks it out).
     pub selected: usize,
     /// True while the off-thread `git branch` / `git branch -r` listing is in
@@ -872,7 +872,7 @@ pub struct NewWorkspaceState {
     /// The project the worktree is created under.
     pub project_idx: usize,
     /// The branch name being typed / chosen.
-    pub branch: crate::warpui::line_edit::LineEdit,
+    pub branch: crate::app::line_edit::LineEdit,
     /// Opened from the branch picker with an EXISTING branch — the field is
     /// read-only (a `worktree add -b <existing>` would fail; old modal's
     /// `branch_locked`).
@@ -894,7 +894,7 @@ pub struct NewWorkspaceState {
     /// Where the checkout lands (old `LocationMode` selector).
     pub mode: LocationMode,
     /// Parent folder for `LocationMode::Custom` (via Browse… or typed).
-    pub custom_path: crate::warpui::line_edit::LineEdit,
+    pub custom_path: crate::app::line_edit::LineEdit,
     /// True while the custom-path field owns typing (else the branch field).
     pub path_focused: bool,
     /// Error surfaced under the field on a failed `git worktree add`.
@@ -924,7 +924,7 @@ const FIF_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// `Some`, exactly like the commit box captures keys via `commit_focused`.
 pub struct RenameState {
     pub target: RenameTarget,
-    pub buffer: crate::warpui::line_edit::LineEdit,
+    pub buffer: crate::app::line_edit::LineEdit,
 }
 
 /// What the active inline rename targets.
@@ -948,22 +948,22 @@ pub enum PaneContent {
     #[allow(dead_code)]
     File(ViewHandle<FileView>),
     /// Warp's real text editor (warp_editor) — warp-quality file editing.
-    Editor(ViewHandle<crate::warpui::editor_view::WarpEditorView>),
+    Editor(ViewHandle<crate::app::editor_view::WarpEditorView>),
     /// Landing / new-tab surface (wordmark + action cards + cheat-sheet).
     Welcome(ViewHandle<WarpWelcomeView>),
     /// Read-only rendered Markdown document (`.md` / `.markdown`).
-    Markdown(ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>),
+    Markdown(ViewHandle<crate::app::markdown_view::WarpMarkdownView>),
     /// Read-only rendered raster/vector image (see `IMAGE_EXTS`). Peer of
     /// `Markdown`: a document pane that owns the shared Files Pane slot the
     /// same way, so it persists and restores through the same machinery.
-    Image(ViewHandle<crate::warpui::image_view::WarpImageView>),
-    Pdf(ViewHandle<crate::warpui::pdf_view::WarpPdfView>),
+    Image(ViewHandle<crate::app::image_view::WarpImageView>),
+    Pdf(ViewHandle<crate::app::pdf_view::WarpPdfView>),
     /// Read-only unified diff (HEAD vs working copy) for a changed file.
-    Diff(ViewHandle<crate::warpui::diff_view::WarpDiffView>),
+    Diff(ViewHandle<crate::app::diff_view::WarpDiffView>),
     /// Embedded browser: the view draws tab strip / URL toolbar / footer and
     /// reserves the body rect; the native WKWebViews are reconciled against it
     /// by `browser::BrowserHost` on the shell's browser tick.
-    Browser(ViewHandle<crate::warpui::browser_view::WarpBrowserView>),
+    Browser(ViewHandle<crate::app::browser_view::WarpBrowserView>),
 }
 
 /// A mutating git-log commit operation (context-menu verbs).
@@ -1034,7 +1034,7 @@ struct WorktreePollEntry {
 /// Parenting explicitly pins the sheet to the visible window.
 fn native_file_dialog(title: &str) -> rfd::AsyncFileDialog {
     let mut d = rfd::AsyncFileDialog::new().set_title(title);
-    if let Some(win) = crate::warpui::browser::HostWindow::current() {
+    if let Some(win) = crate::app::browser::HostWindow::current() {
         d = d.set_parent(&win);
     }
     d
@@ -1291,7 +1291,7 @@ fn markdown_path_set<'a>(
 /// straight into it — which is what makes the preview/edit choice survive a
 /// restart in BOTH directions.
 fn markdown_edit_path_set<'a>(
-    markdowns: impl IntoIterator<Item = &'a crate::warpui::persist::SMarkdown>,
+    markdowns: impl IntoIterator<Item = &'a crate::app::persist::SMarkdown>,
 ) -> HashSet<PathBuf> {
     markdowns
         .into_iter()
@@ -1570,7 +1570,7 @@ fn files_pane_bookkeeping(
 
 impl CraneShellView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
-        Self::new_with_state(ctx, crate::warpui::persist::load())
+        Self::new_with_state(ctx, crate::app::persist::load())
     }
 
     /// Build the shell from an explicit persisted state. `new` above reads
@@ -1582,10 +1582,10 @@ impl CraneShellView {
     /// ever touching the real `~/.crane`.
     pub fn new_with_state(
         ctx: &mut ViewContext<Self>,
-        saved_state: Option<crate::warpui::persist::WarpuiState>,
+        saved_state: Option<crate::app::persist::WarpuiState>,
     ) -> Self {
         let ui_font = warpui::fonts::Cache::handle(ctx)
-            .update(ctx, |cache, _| crate::warpui::bundled_fonts::ui(cache));
+            .update(ctx, |cache, _| crate::app::bundled_fonts::ui(cache));
         let icon_font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
             cache
                 .load_family_from_bytes(
@@ -1598,11 +1598,11 @@ impl CraneShellView {
         // keeps the graph columns and hash/subject/meta columns aligned).
         // Bundled JetBrains Mono (graceful Menlo fallback inside).
         let mono_font = warpui::fonts::Cache::handle(ctx)
-            .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
+            .update(ctx, |cache, _| crate::app::bundled_fonts::mono(cache));
         // Project overlay (added/removed/tints) applied when building the
         // initial project list, sourced from the `saved_state` parameter above
         // (production hands in `persist::load()`'s result via `new`).
-        let init_added: Vec<crate::warpui::persist::AddedProject> = saved_state
+        let init_added: Vec<crate::app::persist::AddedProject> = saved_state
             .as_ref()
             .map(|s| s.added_projects.clone())
             .unwrap_or_default();
@@ -1648,10 +1648,10 @@ impl CraneShellView {
         // so seed them before the first frame.
         if let Some(st) = saved_state.as_ref() {
             if st.terminal_font > 0.0 {
-                crate::warpui::fontsize::set_base(st.terminal_font);
+                crate::app::fontsize::set_base(st.terminal_font);
             }
             if st.editor_font > 0.0 {
-                crate::warpui::fontsize::set_editor(st.editor_font);
+                crate::app::fontsize::set_editor(st.editor_font);
             }
         }
         crate::syntax::set_theme_override(init_syntax_override.clone());
@@ -1677,7 +1677,7 @@ impl CraneShellView {
         // so the first frame paints immediately even with many worktrees. Branch
         // labels + diff/dirty badges are filled in a moment later by the async
         // scan kicked off at the end of `new` (see `spawn_git_scan` below).
-        let mut projects = crate::warpui::projects::load_projects_shallow(
+        let mut projects = crate::app::projects::load_projects_shallow(
             &init_added, &init_removed, &init_tints,
         );
         // Apply the persisted sidebar drag-drop ordering BEFORE any keyed
@@ -1750,7 +1750,7 @@ impl CraneShellView {
         // repaint). Idempotent + non-blocking.
         {
             let wake = ui_wake.clone();
-            crate::warpui::update::spawn_check(move || wake());
+            crate::app::update::spawn_check(move || wake());
         }
         let mut active_tab = None;
         let mut focused = None;
@@ -1775,30 +1775,30 @@ impl CraneShellView {
         let mut restored_active: HashMap<(usize, usize), usize> = HashMap::new();
         let mut restored_editor_views: HashMap<
             PathBuf,
-            ViewHandle<crate::warpui::editor_view::WarpEditorView>,
+            ViewHandle<crate::app::editor_view::WarpEditorView>,
         > = HashMap::new();
-        let mut restored_term_cache: HashMap<PaneId, crate::warpui::persist::STerminal> =
+        let mut restored_term_cache: HashMap<PaneId, crate::app::persist::STerminal> =
             HashMap::new();
-        let mut restored_browsers: HashMap<PaneId, crate::warpui::persist::SBrowser> =
+        let mut restored_browsers: HashMap<PaneId, crate::app::persist::SBrowser> =
             HashMap::new();
-        let mut restored_markdowns: HashMap<PaneId, crate::warpui::persist::SMarkdown> =
+        let mut restored_markdowns: HashMap<PaneId, crate::app::persist::SMarkdown> =
             HashMap::new();
         let mut restored_markdown_views: HashMap<
             PathBuf,
-            ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>,
+            ViewHandle<crate::app::markdown_view::WarpMarkdownView>,
         > = HashMap::new();
         // `.md` paths the saved state says were left in EDIT mode — seeds the
         // live `md_edit_mode` set so the preview/edit choice survives a restart.
         let mut restored_md_edit: HashSet<PathBuf> = HashSet::new();
-        let mut restored_images: HashMap<PaneId, crate::warpui::persist::SImage> = HashMap::new();
+        let mut restored_images: HashMap<PaneId, crate::app::persist::SImage> = HashMap::new();
         let mut restored_image_views: HashMap<
             PathBuf,
-            ViewHandle<crate::warpui::image_view::WarpImageView>,
+            ViewHandle<crate::app::image_view::WarpImageView>,
         > = HashMap::new();
-        let mut restored_pdfs: HashMap<PaneId, crate::warpui::persist::SPdf> = HashMap::new();
+        let mut restored_pdfs: HashMap<PaneId, crate::app::persist::SPdf> = HashMap::new();
         let mut restored_pdf_views: HashMap<
             PathBuf,
-            ViewHandle<crate::warpui::pdf_view::WarpPdfView>,
+            ViewHandle<crate::app::pdf_view::WarpPdfView>,
         > = HashMap::new();
 
         // Ensure built-in theme TOML files are written to ~/.crane/themes/ on
@@ -1817,7 +1817,7 @@ impl CraneShellView {
                 }
             }
             if st.zoom_level > 0.0 {
-                crate::warpui::fontsize::set_level(st.zoom_level);
+                crate::app::fontsize::set_level(st.zoom_level);
                 ctx.set_zoom_factor(st.zoom_level);
             }
             show_left = st.show_left;
@@ -1867,7 +1867,7 @@ impl CraneShellView {
             // Tab lists: prefer the path-keyed field (stable across project
             // reordering); fall back to the legacy index-keyed one for state
             // files written before `worktree_tabs_by_path` existed.
-            let effective_tabs: Vec<((usize, usize), Vec<crate::warpui::persist::STab>)> =
+            let effective_tabs: Vec<((usize, usize), Vec<crate::app::persist::STab>)> =
                 if !st.worktree_tabs_by_path.is_empty() {
                     st.worktree_tabs_by_path
                         .iter()
@@ -1902,7 +1902,7 @@ impl CraneShellView {
             // project add/remove/reorder, exactly like `worktree_tabs_by_path`);
             // resolving each entry through `wt_index` drops Workspaces whose
             // checkout no longer exists.
-            let mut ws_file_tabs: HashMap<(usize, usize), crate::warpui::persist::SFileTabs> = st
+            let mut ws_file_tabs: HashMap<(usize, usize), crate::app::persist::SFileTabs> = st
                 .file_tabs_by_path
                 .iter()
                 .filter_map(|(path, ft)| wt_index.get(path.as_str()).map(|k| (*k, ft.clone())))
@@ -1986,7 +1986,7 @@ impl CraneShellView {
                 if let Some(key) = owner.or_else(path_owner).or(default_ws) {
                     ws_file_tabs.insert(
                         key,
-                        crate::warpui::persist::SFileTabs {
+                        crate::app::persist::SFileTabs {
                             pane: st.files_pane,
                             paths: st.file_pane_paths.clone(),
                             active: st.file_pane_active,
@@ -2061,7 +2061,7 @@ impl CraneShellView {
             for p in &md_paths {
                 let pc = p.clone();
                 let h = ctx.add_typed_action_view(move |ctx| {
-                    crate::warpui::markdown_view::WarpMarkdownView::new(ctx, pc)
+                    crate::app::markdown_view::WarpMarkdownView::new(ctx, pc)
                 });
                 restored_markdown_views.insert(p.clone(), h);
             }
@@ -2076,7 +2076,7 @@ impl CraneShellView {
             for p in &img_paths {
                 let pc = p.clone();
                 let h = ctx.add_typed_action_view(move |ctx| {
-                    crate::warpui::image_view::WarpImageView::new(ctx, pc)
+                    crate::app::image_view::WarpImageView::new(ctx, pc)
                 });
                 restored_image_views.insert(p.clone(), h);
             }
@@ -2095,7 +2095,7 @@ impl CraneShellView {
                 let uf = ui_font;
                 let icf = icon_font;
                 let h = ctx.add_typed_action_view(move |ctx| {
-                    crate::warpui::pdf_view::WarpPdfView::new(ctx, pc, uf, icf)
+                    crate::app::pdf_view::WarpPdfView::new(ctx, pc, uf, icf)
                 });
                 restored_pdf_views.insert(p.clone(), h);
             }
@@ -2121,7 +2121,7 @@ impl CraneShellView {
             };
             if !editor_source_paths.is_empty() {
                 let mono = warpui::fonts::Cache::handle(ctx)
-                    .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
+                    .update(ctx, |cache, _| crate::app::bundled_fonts::mono(cache));
                 for p in
                     editor_paths_for_restore(&editor_source_paths, &md_paths, &img_paths, &pdf_paths)
                 {
@@ -2144,7 +2144,7 @@ impl CraneShellView {
                     let pc = p.clone();
                     let goto = Self::lsp_goto_cb(p.clone());
                     let h = ctx.add_typed_action_view(move |ctx| {
-                        crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, pc)
+                        crate::app::editor_view::WarpEditorView::new(ctx, content, mono, pc)
                             .with_goto(goto)
                     });
                     h.update(ctx, |v, vctx| {
@@ -2302,7 +2302,7 @@ impl CraneShellView {
                                 let tabs = sb.tabs;
                                 let active = sb.active;
                                 let h = ctx.add_typed_action_view(move |_ctx| {
-                                    crate::warpui::browser_view::WarpBrowserView::new(
+                                    crate::app::browser_view::WarpBrowserView::new(
                                         pid, ui_font, icon_font, tabs, active,
                                     )
                                 });
@@ -2331,7 +2331,7 @@ impl CraneShellView {
                                 };
                                 let history = st.history;
                                 let h = ctx.add_view(move |ctx| {
-                                    crate::warpui::view::TerminalView::new_restore(
+                                    crate::app::view::TerminalView::new_restore(
                                         ctx, cwd, history,
                                     )
                                 });
@@ -2512,7 +2512,7 @@ impl CraneShellView {
         );
         // Filesystem watcher for external / agent edits. Roots are registered
         // below (`view.sync_watches()`); its receiver is drained on the fast tick.
-        let (file_watcher, fs_events) = crate::warpui::file_watcher::FileWatcher::new();
+        let (file_watcher, fs_events) = crate::app::file_watcher::FileWatcher::new();
         // Fast (250ms) tick: sweep expired toasts (so they self-dismiss without
         // user input) and drain filesystem change events (so external edits
         // refresh the active repo promptly). Both are cheap no-ops when idle.
@@ -2607,7 +2607,7 @@ impl CraneShellView {
             // `new`) — never shelled out synchronously here, so startup paints
             // without waiting on `git`.
             branch: String::new(),
-            commit_msg: crate::warpui::line_edit::LineEdit::default(),
+            commit_msg: crate::app::line_edit::LineEdit::default(),
             commit_focused: false,
             show_git_log: false,
             git_log_ratio: Rc::new(Cell::new(0.7)),
@@ -2623,7 +2623,7 @@ impl CraneShellView {
             git_log_selected: None,
             git_log_scroll: Rc::new(Cell::new(0.0)),
             git_log_ref_filter: None,
-            git_log_filter: crate::warpui::line_edit::LineEdit::default(),
+            git_log_filter: crate::app::line_edit::LineEdit::default(),
             git_log_filter_active: false,
             git_log_filtered: std::cell::RefCell::new(None),
             git_log_menu: None,
@@ -2685,7 +2685,7 @@ impl CraneShellView {
             ahead_behind: None,
             file_status: HashMap::new(),
             dirty_dirs: HashSet::new(),
-            git_op: Arc::new(Mutex::new(crate::warpui::git::OpStatus::default())),
+            git_op: Arc::new(Mutex::new(crate::app::git::OpStatus::default())),
             git_wake,
             _git_repaint: git_repaint,
             ui_wake: ui_wake.clone(),
@@ -2741,7 +2741,7 @@ impl CraneShellView {
             _fast_tick: fast_tick,
             _browser_tick: browser_tick,
             _anim_tick: anim_tick,
-            browser_host: crate::warpui::browser::BrowserHost::new(),
+            browser_host: crate::app::browser::BrowserHost::new(),
         };
         // Register every restored Project + Workspace root with the watcher so
         // external / agent edits refresh the active repo from first paint.
@@ -2749,7 +2749,7 @@ impl CraneShellView {
         // Backfill branch labels + diff/dirty badges for the whole (shallow-
         // loaded) tree off the UI thread. The sidebar is already visible; badges
         // stream in as this returns. ZERO synchronous `git` ran on this path.
-        let scan_paths = crate::warpui::projects::scan_paths(&view.projects);
+        let scan_paths = crate::app::projects::scan_paths(&view.projects);
         view.spawn_git_scan(ctx, "tree".to_string(), scan_paths);
         view
     }
@@ -2797,7 +2797,7 @@ impl CraneShellView {
     pub(crate) fn term_snapshot_for_test(
         &self,
         pid: PaneId,
-    ) -> Option<crate::warpui::persist::STerminal> {
+    ) -> Option<crate::app::persist::STerminal> {
         self.term_cache.borrow().get(&pid).cloned()
     }
 
@@ -2877,7 +2877,7 @@ impl CraneShellView {
         shell_wake: Arc<dyn Fn() + Send + Sync>,
     ) -> ViewHandle<TerminalView> {
         let (tx, rx) = async_channel::bounded::<()>(1);
-        let wake: crate::warpui::controller::Wake = std::sync::Arc::new(move || {
+        let wake: crate::app::controller::Wake = std::sync::Arc::new(move || {
             let _ = tx.try_send(());
             // Also repaint the shell so the tab label tracks the terminal's live
             // OSC-0/2 title (the shell renders the label, and its own view is a
@@ -2927,7 +2927,7 @@ impl CraneShellView {
                 } else {
                     hist
                 };
-                cache.insert(*id, crate::warpui::persist::STerminal { cwd, history });
+                cache.insert(*id, crate::app::persist::STerminal { cwd, history });
             }
         }
         self.term_cleared.borrow_mut().clear();
@@ -2938,7 +2938,7 @@ impl CraneShellView {
         // Always attempt a terminal refresh; it self-debounces (400ms) so this
         // is cheap even when called on every keystroke.
         self.refresh_term_cache(app);
-        crate::warpui::persist::save(&self.build_state(app));
+        crate::app::persist::save(&self.build_state(app));
     }
 
     /// Terminate-path save: force a FRESH terminal snapshot (bypass the 400ms
@@ -2949,25 +2949,25 @@ impl CraneShellView {
     fn save_state_now(&self, app: &AppContext) {
         self.last_term_snapshot.set(None);
         self.refresh_term_cache(app);
-        crate::warpui::persist::save_sync(&self.build_state(app));
+        crate::app::persist::save_sync(&self.build_state(app));
     }
 
     /// Build the persistable UI state snapshot from the live shell.
-    fn build_state(&self, app: &AppContext) -> crate::warpui::persist::WarpuiState {
-        use crate::warpui::persist::{SNode, STab, WarpuiState};
-        let terminals: Vec<(PaneId, crate::warpui::persist::STerminal)> = self
+    fn build_state(&self, app: &AppContext) -> crate::app::persist::WarpuiState {
+        use crate::app::persist::{SNode, STab, WarpuiState};
+        let terminals: Vec<(PaneId, crate::app::persist::STerminal)> = self
             .term_cache
             .borrow()
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
-        let browsers: Vec<(PaneId, crate::warpui::persist::SBrowser)> = self
+        let browsers: Vec<(PaneId, crate::app::persist::SBrowser)> = self
             .panes
             .iter()
             .filter_map(|(id, pc)| match pc {
                 PaneContent::Browser(h) => {
                     let (tabs, active) = h.as_ref(app).persist_tabs();
-                    Some((*id, crate::warpui::persist::SBrowser { tabs, active }))
+                    Some((*id, crate::app::persist::SBrowser { tabs, active }))
                 }
                 _ => None,
             })
@@ -2987,7 +2987,7 @@ impl CraneShellView {
         // edit mode BY CONSTRUCTION, so it pins `true` regardless: the record
         // must describe the pane that actually exists, never a mode that would
         // restore it as something else.
-        let markdowns: Vec<(PaneId, crate::warpui::persist::SMarkdown)> = self
+        let markdowns: Vec<(PaneId, crate::app::persist::SMarkdown)> = self
             .panes
             .iter()
             .filter_map(|(id, pc)| {
@@ -3006,28 +3006,28 @@ impl CraneShellView {
                     }
                     _ => return None,
                 };
-                Some((*id, crate::warpui::persist::SMarkdown { path, editing }))
+                Some((*id, crate::app::persist::SMarkdown { path, editing }))
             })
             .collect();
-        let images: Vec<(PaneId, crate::warpui::persist::SImage)> = self
+        let images: Vec<(PaneId, crate::app::persist::SImage)> = self
             .panes
             .iter()
             .filter_map(|(id, pc)| match pc {
                 PaneContent::Image(h) => h
                     .as_ref(app)
                     .path()
-                    .map(|p| (*id, crate::warpui::persist::SImage { path: p.to_path_buf() })),
+                    .map(|p| (*id, crate::app::persist::SImage { path: p.to_path_buf() })),
                 _ => None,
             })
             .collect();
-        let pdfs: Vec<(PaneId, crate::warpui::persist::SPdf)> = self
+        let pdfs: Vec<(PaneId, crate::app::persist::SPdf)> = self
             .panes
             .iter()
             .filter_map(|(id, pc)| match pc {
                 PaneContent::Pdf(h) => h
                     .as_ref(app)
                     .path()
-                    .map(|p| (*id, crate::warpui::persist::SPdf { path: p.to_path_buf() })),
+                    .map(|p| (*id, crate::app::persist::SPdf { path: p.to_path_buf() })),
                 _ => None,
             })
             .collect();
@@ -3084,7 +3084,7 @@ impl CraneShellView {
         // point being that Workspace B's open files come back in B and nowhere
         // else. Sorted so the written file is stable between saves that only
         // differ by HashMap iteration order.
-        let mut file_tabs_by_path: Vec<(String, crate::warpui::persist::SFileTabs)> = self
+        let mut file_tabs_by_path: Vec<(String, crate::app::persist::SFileTabs)> = self
             .file_pane_paths
             .iter()
             .filter(|(_, paths)| !paths.is_empty())
@@ -3092,7 +3092,7 @@ impl CraneShellView {
                 wt_path(k.0, k.1).map(|p| {
                     (
                         p,
-                        crate::warpui::persist::SFileTabs {
+                        crate::app::persist::SFileTabs {
                             pane: self.files_pane.get(k).copied(),
                             paths: paths.clone(),
                             active: self.ws_file_active(*k),
@@ -3146,7 +3146,7 @@ impl CraneShellView {
             window_w,
             window_h,
             theme_name: crate::theme::current().name.clone(),
-            zoom_level: crate::warpui::fontsize::zoom_level(),
+            zoom_level: crate::app::fontsize::zoom_level(),
             added_projects: self.added_projects.clone(),
             removed_project_paths: self.removed_project_paths.clone(),
             project_tints: self.project_tints.iter().map(|(k, v)| (k.clone(), *v)).collect(),
@@ -3172,8 +3172,8 @@ impl CraneShellView {
                 .collect(),
             lsp_enabled: self.lsp_enabled,
             format_on_save: self.format_on_save,
-            terminal_font: crate::warpui::fontsize::base(),
-            editor_font: crate::warpui::fontsize::editor(),
+            terminal_font: crate::app::fontsize::base(),
+            editor_font: crate::app::fontsize::editor(),
             word_wrap: self.word_wrap_default,
             trim_on_save: self.trim_on_save,
             syntax_override: self.syntax_override.clone().unwrap_or_default(),
@@ -3470,7 +3470,7 @@ impl CraneShellView {
         order.insert(insert_at, item);
         let n = self.projects.len();
         let old = std::mem::take(&mut self.projects);
-        let mut taken: Vec<Option<crate::warpui::projects::ProjectNode>> =
+        let mut taken: Vec<Option<crate::app::projects::ProjectNode>> =
             old.into_iter().map(Some).collect();
         let mut new_projects = Vec::with_capacity(n);
         for &b_idx in &order {
@@ -3510,7 +3510,7 @@ impl CraneShellView {
         if order.len() != n {
             return;
         }
-        let mut slots: Vec<Option<crate::warpui::projects::ProjectNode>> =
+        let mut slots: Vec<Option<crate::app::projects::ProjectNode>> =
             std::mem::take(&mut self.projects).into_iter().map(Some).collect();
         let mut reordered = Vec::with_capacity(n);
         for idx in order {
@@ -3992,7 +3992,7 @@ impl CraneShellView {
 
     /// Wrap a sidebar row in a `ZoneProbe` recording its rect + drop scope.
     fn tree_zone(&self, scope: TreeScope, child: Box<dyn Element>) -> Box<dyn Element> {
-        Box::new(crate::warpui::rect_probe::ZoneProbe::new(
+        Box::new(crate::app::rect_probe::ZoneProbe::new(
             child,
             self.tree_zones.clone(),
             scope,
@@ -4541,7 +4541,7 @@ impl CraneShellView {
         // Popover clamps on-screen: pulled left of the right edge, flipped
         // ABOVE the click when the menu would cross the window bottom.
         let positioned =
-            Box::new(crate::warpui::rect_probe::Popover::new(menu_box, x, y));
+            Box::new(crate::app::rect_probe::Popover::new(menu_box, x, y));
         self.menu_dismiss(positioned)
     }
 
@@ -5664,7 +5664,7 @@ impl CraneShellView {
     /// waker fed to `spawn_check` / `start_download`), so the lifecycle —
     /// available → downloading → ready → restart — surfaces live here.
     fn update_row(&self) -> Box<dyn Element> {
-        use crate::warpui::update::{self, UpdateState};
+        use crate::app::update::{self, UpdateState};
         match update::update_state() {
             UpdateState::UpdateAvailable { version } => Flex::column()
                 .with_child(
@@ -5985,7 +5985,7 @@ impl CraneShellView {
         );
 
         col = col.with_child(self.settings_heading("Fonts"));
-        let zoom_pct = (crate::warpui::fontsize::zoom_level() * 100.0).round() as i32;
+        let zoom_pct = (crate::app::fontsize::zoom_level() * 100.0).round() as i32;
         col = col.with_child(
             Text::new(
                 format!("Zoom: {zoom_pct}%   (Cmd+= / Cmd+- / Cmd+0)"),
@@ -5997,12 +5997,12 @@ impl CraneShellView {
         );
         col = col.with_child(Self::spacer(8.0)).with_child(self.settings_font_row(
             "Terminal font size",
-            crate::warpui::fontsize::base(),
+            crate::app::fontsize::base(),
             false,
         ));
         col = col.with_child(Self::spacer(6.0)).with_child(self.settings_font_row(
             "Editor font size",
-            crate::warpui::fontsize::editor(),
+            crate::app::fontsize::editor(),
             true,
         ));
 
@@ -6438,7 +6438,7 @@ impl CraneShellView {
             return self.modal_card(640.0, Flex::column().finish());
         };
         // Query field — a real LineEdit (caret, selection, click-to-place).
-        let query_input = crate::warpui::line_edit::LineEditField::new(
+        let query_input = crate::app::line_edit::LineEditField::new(
             &st.query,
             true,
             self.ui_font,
@@ -6666,7 +6666,7 @@ impl CraneShellView {
     /// git data is loaded once on open — never per frame.
     fn switch_branch_popover(&self, x: f32, y: f32) -> Box<dyn Element> {
         let Some(st) = self.switch_branch.as_ref() else {
-            return self.menu_dismiss(Box::new(crate::warpui::rect_probe::Popover::new(
+            return self.menu_dismiss(Box::new(crate::app::rect_probe::Popover::new(
                 Rect::new().finish(),
                 x,
                 y,
@@ -6684,7 +6684,7 @@ impl CraneShellView {
         let pi = st.project_idx;
 
         // ── Search field (28px, rounded 6, sidebar_bg, magnifier) ──
-        let query_input = crate::warpui::line_edit::LineEditField::new(
+        let query_input = crate::app::line_edit::LineEditField::new(
             &st.query,
             true,
             self.ui_font,
@@ -6840,7 +6840,7 @@ impl CraneShellView {
         )
         .with_width(380.0)
         .finish();
-        let positioned = Box::new(crate::warpui::rect_probe::Popover::new(card, x, y));
+        let positioned = Box::new(crate::app::rect_probe::Popover::new(card, x, y));
         self.menu_dismiss(positioned)
     }
 
@@ -7010,12 +7010,12 @@ impl CraneShellView {
     /// branch prompt.
     fn switch_branch_footer(
         &self,
-        input: Option<&crate::warpui::line_edit::LineEdit>,
+        input: Option<&crate::app::line_edit::LineEdit>,
     ) -> Box<dyn Element> {
         let ui_font = self.ui_font;
         let icon_font = self.icon_font;
         if let Some(buf) = input {
-            let name_input = crate::warpui::line_edit::LineEditField::new(buf, true, ui_font, 12.0)
+            let name_input = crate::app::line_edit::LineEditField::new(buf, true, ui_font, 12.0)
                 .with_placeholder("new branch name…")
                 .on_click_index(|ctx, idx| {
                     ctx.dispatch_typed_action(CraneShellAction::SwitchBranchNewCaret(idx));
@@ -7156,7 +7156,7 @@ impl CraneShellView {
         // Branch field — ~28px, rounded-6, sidebar_bg fill, GIT_BRANCH glyph, a 1px
         // border that lights to accent ONLY while the field owns typing.
         let branch_focused = !st.path_focused && !st.branch_locked;
-        let branch_input = crate::warpui::line_edit::LineEditField::new(
+        let branch_input = crate::app::line_edit::LineEditField::new(
             &st.branch,
             branch_focused,
             ui_font,
@@ -7275,7 +7275,7 @@ impl CraneShellView {
 
         // Custom mode: editable parent-path field + Browse… (OS folder picker).
         let custom_row: Option<Box<dyn Element>> = (st.mode == LocationMode::Custom).then(|| {
-            let path_input = crate::warpui::line_edit::LineEditField::new(
+            let path_input = crate::app::line_edit::LineEditField::new(
                 &st.custom_path,
                 st.path_focused,
                 ui_font,
@@ -7695,11 +7695,11 @@ impl CraneShellView {
     /// against the locals (so `git checkout <short>` DWIMs to a tracking branch).
     /// Returns `(all_candidates, locals_set)`.
     fn branch_candidates(root: &std::path::Path) -> (Vec<String>, HashSet<String>) {
-        let locals = crate::warpui::git::list_local_branches(root);
+        let locals = crate::app::git::list_local_branches(root);
         let locals_set: HashSet<String> = locals.iter().cloned().collect();
         let mut seen = locals_set.clone();
         let mut all = locals;
-        for r in crate::warpui::git::list_remote_branches(root) {
+        for r in crate::app::git::list_remote_branches(root) {
             let short = r.splitn(2, '/').nth(1).unwrap_or(r.as_str()).to_string();
             if short.is_empty() || short == "HEAD" {
                 continue;
@@ -7712,7 +7712,7 @@ impl CraneShellView {
         // (the popup gives it the check glyph + "current" hint). Keeping it in
         // `all` order means the keyboard model (which navigates the filtered
         // `all`) and the rendered order stay in lockstep.
-        let current = crate::warpui::git::current_branch(root);
+        let current = crate::app::git::current_branch(root);
         if let Some(pos) = all.iter().position(|b| *b == current) {
             let c = all.remove(pos);
             all.insert(0, c);
@@ -7734,7 +7734,7 @@ impl CraneShellView {
         let pi = self.active_tab.map(|(p, _, _)| p).unwrap_or(0);
         let generation = self.bump_scan_gen("switchbranch");
         self.switch_branch = Some(SwitchBranchState {
-            query: crate::warpui::line_edit::LineEdit::default(),
+            query: crate::app::line_edit::LineEdit::default(),
             project_idx: pi,
             all: Vec::new(),
             locals: HashSet::new(),
@@ -7749,8 +7749,8 @@ impl CraneShellView {
         // OFF the UI thread, so opening never stalls. All three land at once.
         let fut = async move {
             let (all, locals) = Self::branch_candidates(&root);
-            let recent = crate::warpui::git::recent_branches(&root, 4);
-            let track = crate::warpui::git::branches_track(&root);
+            let recent = crate::app::git::recent_branches(&root, 4);
+            let track = crate::app::git::branches_track(&root);
             (all, locals, recent, track)
         };
         ctx.spawn(fut, move |this, (all, locals, recent, track), vctx| {
@@ -7884,11 +7884,11 @@ impl CraneShellView {
     /// key isn't an editing key (enter / escape / up / down …) — the caller
     /// keeps its own semantics for those.
     fn line_edit_key(
-        le: &mut crate::warpui::line_edit::LineEdit,
+        le: &mut crate::app::line_edit::LineEdit,
         ks: &warpui::keymap::Keystroke,
         ctx: &mut ViewContext<Self>,
     ) -> Option<bool> {
-        use crate::warpui::line_edit::Outcome;
+        use crate::app::line_edit::Outcome;
         match le.handle_key(ks) {
             Outcome::Changed => Some(true),
             Outcome::CaretMoved => Some(false),
@@ -8016,7 +8016,7 @@ impl CraneShellView {
         // without that spinner would look frozen and let a second Enter fire a
         // duplicate `git worktree add`.
         // `git worktree add` (shell-out). Never libgit2, per project rules.
-        if let Err(e) = crate::warpui::git::add_worktree(&main, &branch, &path, create_branch) {
+        if let Err(e) = crate::app::git::add_worktree(&main, &branch, &path, create_branch) {
             if let Some(st) = self.new_workspace.as_mut() {
                 st.error = Some(e);
             }
@@ -8026,8 +8026,8 @@ impl CraneShellView {
         self.modal = None;
         self.new_workspace = None;
         let wpath = path.to_string_lossy().to_string();
-        let diff_stat = crate::warpui::git::diff_numstat(&path);
-        let dirty = crate::warpui::git::is_dirty(&path);
+        let diff_stat = crate::app::git::diff_numstat(&path);
+        let dirty = crate::app::git::is_dirty(&path);
         let wi = {
             let Some(project) = self.projects.get_mut(pi) else {
                 return;
@@ -8036,7 +8036,7 @@ impl CraneShellView {
             if let Some(existing) = project.worktrees.iter().position(|w| w.path == wpath) {
                 existing
             } else {
-                project.worktrees.push(crate::warpui::projects::WorktreeNode {
+                project.worktrees.push(crate::app::projects::WorktreeNode {
                     name: branch.clone(),
                     path: wpath.clone(),
                     tabs: Vec::new(),
@@ -8090,7 +8090,7 @@ impl CraneShellView {
         }
         // Bridge starts from the queued nav actions (views push those on
         // click); alive/inactive slots are pulled from the views here.
-        let mut bridge = crate::warpui::browser::take_bridge();
+        let mut bridge = crate::app::browser::take_bridge();
         // Visible = leaves of the active Tab's layout, narrowed to just the
         // maximized pane when one is maximized.
         let visible: HashSet<PaneId> = match self.maximized {
@@ -8105,8 +8105,8 @@ impl CraneShellView {
                 })
                 .unwrap_or_default(),
         };
-        let mut all_keys: HashSet<crate::warpui::browser::SlotKey> = HashSet::new();
-        let handles: Vec<(PaneId, ViewHandle<crate::warpui::browser_view::WarpBrowserView>)> =
+        let mut all_keys: HashSet<crate::app::browser::SlotKey> = HashSet::new();
+        let handles: Vec<(PaneId, ViewHandle<crate::app::browser_view::WarpBrowserView>)> =
             self.panes
                 .iter()
                 .filter_map(|(id, pc)| match pc {
@@ -8126,7 +8126,7 @@ impl CraneShellView {
                 // WKWebView is positioned in real window points — so it must be
                 // given the layout rect scaled UP by the zoom, or it renders
                 // shifted + undersized by exactly the zoom factor.
-                let zoom = crate::warpui::fontsize::zoom_level();
+                let zoom = crate::app::fontsize::zoom_level();
                 let rect = if zoom != 1.0 {
                     warpui::geometry::rect::RectF::new(
                         rect.origin() * zoom,
@@ -8155,7 +8155,7 @@ impl CraneShellView {
             || self.branch_picker.is_some()
             || self.new_pane_menu_open
             || self.drop_preview.borrow().is_some();
-        let Some(win) = crate::warpui::browser::HostWindow::current() else {
+        let Some(win) = crate::app::browser::HostWindow::current() else {
             return;
         };
         let wake = self.ui_wake.clone();
@@ -8177,9 +8177,9 @@ impl CraneShellView {
                 });
             }
         }
-        crate::warpui::browser::set_loading_snapshot(self.browser_host.loading_set());
+        crate::app::browser::set_loading_snapshot(self.browser_host.loading_set());
         if has_browser {
-            crate::warpui::browser::set_memory_snapshot(self.browser_host.memory.snapshot());
+            crate::app::browser::set_memory_snapshot(self.browser_host.memory.snapshot());
         }
         // Keep the tab-chip spinners animating / footer fresh while loading.
         if !self.browser_host.loading_set().is_empty() {
@@ -8199,14 +8199,14 @@ impl CraneShellView {
         if self.last_update_check.elapsed() >= RECHECK {
             self.last_update_check = std::time::Instant::now();
             let wake = self.ui_wake.clone();
-            crate::warpui::update::spawn_recheck(move || wake());
+            crate::app::update::spawn_recheck(move || wake());
         }
         // The banner overlay (update_banner) is render-driven off
         // update_state() + the prompt decisions; just repaint when a discovery
         // could have landed so it appears without user input.
         if matches!(
-            crate::warpui::update::update_state(),
-            crate::warpui::update::UpdateState::UpdateAvailable { .. }
+            crate::app::update::update_state(),
+            crate::app::update::UpdateState::UpdateAvailable { .. }
         ) {
             ctx.notify();
         }
@@ -8218,9 +8218,9 @@ impl CraneShellView {
     /// ready / failed), the banner persists through those states unless
     /// closed this session.
     fn update_banner_should_show(&self) -> bool {
-        use crate::warpui::update::UpdateState;
+        use crate::app::update::UpdateState;
         let session_dismissed = |v: &str| self.update_dismissed_session.as_deref() == Some(v);
-        match crate::warpui::update::update_state() {
+        match crate::app::update::update_state() {
             UpdateState::UpdateAvailable { version } => {
                 if session_dismissed(&version) {
                     return false;
@@ -8233,7 +8233,7 @@ impl CraneShellView {
             }
             UpdateState::Downloading { .. } | UpdateState::Ready { .. }
             | UpdateState::Failed { .. } => {
-                let v = crate::warpui::update::latest_available().unwrap_or_default();
+                let v = crate::app::update::latest_available().unwrap_or_default();
                 !session_dismissed(&v)
             }
             // A routine background check that finds nothing stays silent, but
@@ -8251,7 +8251,7 @@ impl CraneShellView {
     /// progress while downloading, Restart-now / Later when staged, error +
     /// Retry on failure. Backed by the same lifecycle Settings > About shows.
     fn update_banner(&self) -> Box<dyn Element> {
-        use crate::warpui::update::{self, UpdateState};
+        use crate::app::update::{self, UpdateState};
         let small = |label: &str, action: CraneShellAction| -> Box<dyn Element> {
             EventHandler::new(
                 Container::new(
@@ -8462,7 +8462,7 @@ impl CraneShellView {
                 .into_iter()
                 .filter_map(|main_path| {
                     let main = std::path::Path::new(&main_path);
-                    let listed = crate::warpui::git::list_worktrees(main);
+                    let listed = crate::app::git::list_worktrees(main);
                     // Signature = the git output; unchanged projects are
                     // dropped here so the callback touches nothing for them.
                     let sig: String = listed
@@ -8476,8 +8476,8 @@ impl CraneShellView {
                     let entries: Vec<WorktreePollEntry> = listed
                         .into_iter()
                         .map(|(wpath, wbranch)| {
-                            let diff_stat = crate::warpui::git::diff_numstat(&wpath);
-                            let dirty = crate::warpui::git::is_dirty(&wpath);
+                            let diff_stat = crate::app::git::diff_numstat(&wpath);
+                            let dirty = crate::app::git::is_dirty(&wpath);
                             WorktreePollEntry { path: wpath, branch: wbranch, diff_stat, dirty }
                         })
                         .collect();
@@ -8523,7 +8523,7 @@ impl CraneShellView {
                 let wbranch = &entry.branch;
                 let wps = wpath.to_string_lossy().to_string();
                 let name = if wbranch == "(detached)" || wbranch.is_empty() {
-                    crate::warpui::projects::basename_of(wpath)
+                    crate::app::projects::basename_of(wpath)
                 } else {
                     wbranch.clone()
                 };
@@ -8541,7 +8541,7 @@ impl CraneShellView {
                         changed = true;
                     }
                 } else {
-                    p.worktrees.push(crate::warpui::projects::WorktreeNode {
+                    p.worktrees.push(crate::app::projects::WorktreeNode {
                         name,
                         path: wps,
                         tabs: Vec::new(),
@@ -8613,10 +8613,10 @@ impl CraneShellView {
             paths
                 .into_iter()
                 .map(|p| {
-                    let info = crate::warpui::projects::scan_repo_git(&p);
+                    let info = crate::app::projects::scan_repo_git(&p);
                     (p, info)
                 })
-                .collect::<Vec<(PathBuf, crate::warpui::projects::RepoGitInfo)>>()
+                .collect::<Vec<(PathBuf, crate::app::projects::RepoGitInfo)>>()
         };
         ctx.spawn(fut, move |this, results, vctx| {
             this.apply_git_scan(&scope, generation, results, vctx);
@@ -8632,7 +8632,7 @@ impl CraneShellView {
         &mut self,
         scope: &str,
         generation: u64,
-        results: Vec<(PathBuf, crate::warpui::projects::RepoGitInfo)>,
+        results: Vec<(PathBuf, crate::app::projects::RepoGitInfo)>,
         vctx: &mut ViewContext<Self>,
     ) {
         if self.git_scan_gen.get(scope).copied() != Some(generation) {
@@ -8666,7 +8666,7 @@ impl CraneShellView {
     /// Re-scan git fields for the whole current tree under the `"tree"` scope.
     /// Called after a structural reload (which resets all badges to shallow).
     fn rescan_all_git(&mut self, ctx: &mut ViewContext<Self>) {
-        let paths = crate::warpui::projects::scan_paths(&self.projects);
+        let paths = crate::app::projects::scan_paths(&self.projects);
         self.spawn_git_scan(ctx, "tree".to_string(), paths);
     }
 
@@ -8675,7 +8675,7 @@ impl CraneShellView {
     /// diff/dirty badges reset to their shallow defaults. Callers that want the
     /// badges back must follow with `rescan_all_git`.
     fn reload_projects(&mut self) {
-        self.projects = crate::warpui::projects::load_projects_shallow(
+        self.projects = crate::app::projects::load_projects_shallow(
             &self.added_projects,
             &self.removed_project_paths,
             &self.project_tints,
@@ -8945,7 +8945,7 @@ impl CraneShellView {
     /// without this the row keeps the OLD branch name until restart. Skips rows the
     /// user has explicitly renamed (their per-path override wins over the branch name).
     fn sync_worktree_branch_label(&mut self, root: &std::path::Path) {
-        let new_branch = crate::warpui::git::current_branch(root);
+        let new_branch = crate::app::git::current_branch(root);
         if new_branch.is_empty() {
             return;
         }
@@ -8993,9 +8993,9 @@ impl CraneShellView {
         let generation = self.bump_scan_gen(&scope);
         let root_for_fut = root.clone();
         let fut = async move {
-            let branch = crate::warpui::git::current_branch(&root_for_fut);
-            let changes = crate::warpui::git::changes(&root_for_fut);
-            let ahead_behind = crate::warpui::git::ahead_behind(&root_for_fut);
+            let branch = crate::app::git::current_branch(&root_for_fut);
+            let changes = crate::app::git::changes(&root_for_fut);
+            let ahead_behind = crate::app::git::ahead_behind(&root_for_fut);
             (branch, changes, ahead_behind)
         };
         ctx.spawn(fut, move |this, (branch, changes, ahead_behind), vctx| {
@@ -9207,7 +9207,7 @@ impl CraneShellView {
         diff_stat: (u32, u32),
         dirty: bool,
         indent: f32,
-        rename_buf: Option<crate::warpui::line_edit::LineEdit>,
+        rename_buf: Option<crate::app::line_edit::LineEdit>,
         action: CraneShellAction,
         plus_action: Option<CraneShellAction>,
     ) -> Box<dyn Element> {
@@ -9246,7 +9246,7 @@ impl CraneShellView {
                     // commit box's text rendering.
                     if let Some(buf) = &rename_buf {
                         Container::new(
-                            crate::warpui::line_edit::LineEditField::new(
+                            crate::app::line_edit::LineEditField::new(
                                 buf,
                                 true,
                                 self.ui_font,
@@ -9448,7 +9448,7 @@ impl CraneShellView {
         .with_padding_top(3.0)
         .with_padding_bottom(3.0)
         .finish();
-        Box::new(crate::warpui::rect_probe::Popover::new(label, x + 14.0, y + 18.0))
+        Box::new(crate::app::rect_probe::Popover::new(label, x + 14.0, y + 18.0))
     }
 
     /// A tab row with a trailing close button. The close button's EventHandler returns
@@ -9501,7 +9501,7 @@ impl CraneShellView {
         icon_color: ColorU,
         name: &str,
         indent: f32,
-        rename_buf: Option<crate::warpui::line_edit::LineEdit>,
+        rename_buf: Option<crate::app::line_edit::LineEdit>,
         select_action: CraneShellAction,
         close_action: CraneShellAction,
     ) -> Box<dyn Element> {
@@ -9515,7 +9515,7 @@ impl CraneShellView {
         // becomes an editable field (buffer + caret) on a highlighted bg.
         let label_text: Box<dyn Element> = if let Some(buf) = &rename_buf {
             Container::new(
-                crate::warpui::line_edit::LineEditField::new(buf, true, self.ui_font, size)
+                crate::app::line_edit::LineEditField::new(buf, true, self.ui_font, size)
                     .on_click_index(|ctx, idx| {
                         ctx.dispatch_typed_action(CraneShellAction::RenameCaret(idx));
                     })
@@ -10374,7 +10374,7 @@ impl CraneShellView {
         // also drop zones (rects recorded per paint).
         let dragged = self.fs_draggable(r.path.clone(), clickable);
         if r.is_dir {
-            Box::new(crate::warpui::rect_probe::ZoneProbe::new(
+            Box::new(crate::app::rect_probe::ZoneProbe::new(
                 dragged,
                 self.fs_zones.clone(),
                 r.path.clone(),
@@ -10504,12 +10504,12 @@ impl CraneShellView {
                 // The whole list is (a) the root drop zone for internal drags
                 // that miss every dir row and (b) the sink for OS file drops
                 // (Finder → Crane), which copy into the dir under the cursor.
-                body = Box::new(crate::warpui::rect_probe::ZoneProbe::new(
+                body = Box::new(crate::app::rect_probe::ZoneProbe::new(
                     body,
                     self.fs_zones.clone(),
                     root.clone(),
                 ));
-                body = Box::new(crate::warpui::rect_probe::FileDropSink::new(
+                body = Box::new(crate::app::rect_probe::FileDropSink::new(
                     body,
                     Rc::new(|paths: &[String], loc, ectx| {
                         ectx.dispatch_typed_action(CraneShellAction::FsExternalDrop {
@@ -10575,11 +10575,11 @@ impl CraneShellView {
     /// the user switches projects. Compare `op.repo` against the active cwd and
     /// hand back a fresh Idle default when they differ, so each project's
     /// Changes tab only reflects its OWN op.
-    fn active_op_status(&self) -> crate::warpui::git::OpStatus {
+    fn active_op_status(&self) -> crate::app::git::OpStatus {
         let op = self.git_op.lock().clone();
         match &self.active_cwd {
             Some(cwd) if op.repo == *cwd => op,
-            _ => crate::warpui::git::OpStatus::default(),
+            _ => crate::app::git::OpStatus::default(),
         }
     }
 
@@ -10650,11 +10650,11 @@ impl CraneShellView {
         // Push / Pull / Fetch buttons. The running op shows a spinner glyph; all
         // buttons disable while any op is in flight (guarded in the handler too).
         let buttons = Flex::row()
-            .with_child(self.git_op_button(icons::ARROW_UP, crate::warpui::git::OpKind::Push, run_kind, running))
+            .with_child(self.git_op_button(icons::ARROW_UP, crate::app::git::OpKind::Push, run_kind, running))
             .with_child(Self::spacer(4.0))
-            .with_child(self.git_op_button(icons::ARROW_DOWN, crate::warpui::git::OpKind::Pull, run_kind, running))
+            .with_child(self.git_op_button(icons::ARROW_DOWN, crate::app::git::OpKind::Pull, run_kind, running))
             .with_child(Self::spacer(4.0))
-            .with_child(self.git_op_button(icons::ARROW_COUNTER_CLOCKWISE, crate::warpui::git::OpKind::Fetch, run_kind, running))
+            .with_child(self.git_op_button(icons::ARROW_COUNTER_CLOCKWISE, crate::app::git::OpKind::Fetch, run_kind, running))
             .finish();
 
         let row = Flex::row()
@@ -10674,8 +10674,8 @@ impl CraneShellView {
     fn git_op_button(
         &self,
         glyph: &str,
-        kind: crate::warpui::git::OpKind,
-        run_kind: Option<crate::warpui::git::OpKind>,
+        kind: crate::app::git::OpKind,
+        run_kind: Option<crate::app::git::OpKind>,
         any_running: bool,
     ) -> Box<dyn Element> {
         let this_running = run_kind == Some(kind);
@@ -10687,10 +10687,10 @@ impl CraneShellView {
             (glyph, theme::text_muted())
         };
         let action = match kind {
-            crate::warpui::git::OpKind::Push => CraneShellAction::GitPush,
-            crate::warpui::git::OpKind::Pull => CraneShellAction::GitPull,
-            crate::warpui::git::OpKind::Fetch => CraneShellAction::GitFetch,
-            crate::warpui::git::OpKind::Commit => CraneShellAction::Noop,
+            crate::app::git::OpKind::Push => CraneShellAction::GitPush,
+            crate::app::git::OpKind::Pull => CraneShellAction::GitPull,
+            crate::app::git::OpKind::Fetch => CraneShellAction::GitFetch,
+            crate::app::git::OpKind::Commit => CraneShellAction::Noop,
         };
         let content = ConstrainedBox::new(
             Container::new(self.icon(g, 13.0, color))
@@ -10956,7 +10956,7 @@ impl CraneShellView {
         let any_running = op.is_running();
         let can_commit = staged > 0 && has_message && !any_running;
 
-        let msg_input = crate::warpui::line_edit::LineEditField::new(
+        let msg_input = crate::app::line_edit::LineEditField::new(
             &self.commit_msg,
             self.commit_focused,
             self.ui_font,
@@ -10988,7 +10988,7 @@ impl CraneShellView {
 
         // Primary Commit button — accent fill when enabled, dim when not. Label
         // shows the target branch + staged count so the user sees where it lands.
-        let commit_running = any_running && op.kind == Some(crate::warpui::git::OpKind::Commit);
+        let commit_running = any_running && op.kind == Some(crate::app::git::OpKind::Commit);
         let btn_label = if commit_running {
             format!("{}  Committing…", icons::ARROW_COUNTER_CLOCKWISE)
         } else {
@@ -11024,17 +11024,17 @@ impl CraneShellView {
 
         // Status pill: in-flight op / last success / failure, else legacy error.
         let pill: Option<(String, ColorU)> = match &op.state {
-            crate::warpui::git::OpState::Idle => self
+            crate::app::git::OpState::Idle => self
                 .commit_error
                 .as_ref()
                 .map(|e| (e.clone(), theme::error())),
-            crate::warpui::git::OpState::Running => op
+            crate::app::git::OpState::Running => op
                 .kind
                 .map(|k| (format!("{}…", k.label()), theme::text_muted())),
-            crate::warpui::git::OpState::Done(msg) => op
+            crate::app::git::OpState::Done(msg) => op
                 .kind
                 .map(|k| (format!("{}: {}", k.label(), msg), theme::success())),
-            crate::warpui::git::OpState::Failed(err) => op.kind.map(|k| {
+            crate::app::git::OpState::Failed(err) => op.kind.map(|k| {
                 let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or(err);
                 (format!("{} failed: {}", k.label(), first.trim()), theme::error())
             }),
@@ -11060,7 +11060,7 @@ impl CraneShellView {
         let glyph = if p.is_folder { icons::FOLDER } else { icons::FILE };
         let hint = if p.is_folder { "folder-name" } else { "filename.ext" };
         let name_input =
-            crate::warpui::line_edit::LineEditField::new(&p.name, true, self.ui_font, 12.0)
+            crate::app::line_edit::LineEditField::new(&p.name, true, self.ui_font, 12.0)
                 .with_placeholder(hint)
                 .on_click_index(|ctx, idx| {
                     ctx.dispatch_typed_action(CraneShellAction::PendingEntryCaret(idx));
@@ -11377,7 +11377,7 @@ impl CraneShellView {
     /// badges; it is deliberately NOT keyed off `active_cwd`, which can point
     /// at a different worktree than `selected` (e.g. after a session restore).
     fn selected_diff_stat(
-        projects: &[crate::warpui::projects::ProjectNode],
+        projects: &[crate::app::projects::ProjectNode],
         selected: (usize, usize, usize),
     ) -> (u32, u32) {
         let (pi, wi, _) = selected;
@@ -12339,7 +12339,7 @@ impl CraneShellView {
             } else {
                 let p = path.clone();
                 let h = ctx.add_typed_action_view(move |ctx| {
-                    crate::warpui::markdown_view::WarpMarkdownView::new(ctx, p)
+                    crate::app::markdown_view::WarpMarkdownView::new(ctx, p)
                 });
                 self.markdown_views.insert(path.clone(), h.clone());
                 h
@@ -12369,7 +12369,7 @@ impl CraneShellView {
             } else {
                 let p = path.clone();
                 let h = ctx.add_typed_action_view(move |ctx| {
-                    crate::warpui::image_view::WarpImageView::new(ctx, p)
+                    crate::app::image_view::WarpImageView::new(ctx, p)
                 });
                 self.image_views.insert(path.clone(), h.clone());
                 h
@@ -12399,7 +12399,7 @@ impl CraneShellView {
                 let uf = self.ui_font;
                 let icf = self.icon_font;
                 let h = ctx.add_typed_action_view(move |ctx| {
-                    crate::warpui::pdf_view::WarpPdfView::new(ctx, p, uf, icf)
+                    crate::app::pdf_view::WarpPdfView::new(ctx, p, uf, icf)
                 });
                 self.pdf_views.insert(path.clone(), h.clone());
                 h
@@ -12457,11 +12457,11 @@ impl CraneShellView {
                 }
             };
             let mono = warpui::fonts::Cache::handle(ctx)
-                .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
+                .update(ctx, |cache, _| crate::app::bundled_fonts::mono(cache));
             let p = path.clone();
             let goto = Self::lsp_goto_cb(path.clone());
             let h = ctx.add_typed_action_view(move |ctx| {
-                crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, p)
+                crate::app::editor_view::WarpEditorView::new(ctx, content, mono, p)
                     .with_goto(goto)
             });
             // Apply the persisted editor prefs (Settings > Editor) to the fresh
@@ -12512,7 +12512,7 @@ impl CraneShellView {
     }
 
     /// The warp editor view handle for a pane, if it is an Editor pane.
-    fn editor_at(&self, id: PaneId) -> Option<ViewHandle<crate::warpui::editor_view::WarpEditorView>> {
+    fn editor_at(&self, id: PaneId) -> Option<ViewHandle<crate::app::editor_view::WarpEditorView>> {
         match self.panes.get(&id) {
             Some(PaneContent::Editor(h)) => Some(h.clone()),
             _ => None,
@@ -12522,7 +12522,7 @@ impl CraneShellView {
     fn browser_at(
         &self,
         id: PaneId,
-    ) -> Option<ViewHandle<crate::warpui::browser_view::WarpBrowserView>> {
+    ) -> Option<ViewHandle<crate::app::browser_view::WarpBrowserView>> {
         match self.panes.get(&id) {
             Some(PaneContent::Browser(h)) => Some(h.clone()),
             _ => None,
@@ -12579,7 +12579,7 @@ impl CraneShellView {
     /// the editor's own update settles) that starts the LSP request.
     fn lsp_goto_cb(
         path: PathBuf,
-    ) -> Rc<dyn Fn(u32, u32, &mut ViewContext<crate::warpui::editor_view::WarpEditorView>)> {
+    ) -> Rc<dyn Fn(u32, u32, &mut ViewContext<crate::app::editor_view::WarpEditorView>)> {
         Rc::new(move |line, character, ctx| {
             ctx.dispatch_typed_action_deferred(CraneShellAction::LspGoto {
                 path: path.clone(),
@@ -12756,7 +12756,7 @@ impl CraneShellView {
         let load_gen = self.git_log_gen;
         let ref_filter = self.git_log_ref_filter.clone();
         let fut = async move {
-            crate::warpui::git_log::load_graph_for(&repo, ref_filter.as_deref())
+            crate::app::git_log::load_graph_for(&repo, ref_filter.as_deref())
         };
         ctx.spawn(fut, move |this, frame, vctx| {
             // Ignore a result from a superseded reload (newer gen already ran).
@@ -12829,7 +12829,7 @@ impl CraneShellView {
                     return;
                 };
                 let fut =
-                    async move { crate::warpui::git::branch_from(&repo, &name, &sha) };
+                    async move { crate::app::git::branch_from(&repo, &name, &sha) };
                 ctx.spawn(fut, move |this, res, vctx| {
                     if let Err(e) = res {
                         this.commit_error = Some(e);
@@ -12852,7 +12852,7 @@ impl CraneShellView {
     /// or — when the text filter is non-empty — the cached filtered frame
     /// (recomputed only when the needle or the load generation changes; the
     /// lane relayout over up to 10k commits must not run per paint).
-    fn git_log_shown_frame(&self) -> Option<Rc<crate::warpui::git_log::GraphFrame>> {
+    fn git_log_shown_frame(&self) -> Option<Rc<crate::app::git_log::GraphFrame>> {
         let frame = self.git_log_frame.clone()?;
         let needle = self.git_log_filter.text().trim().to_string();
         if needle.is_empty() {
@@ -12864,7 +12864,7 @@ impl CraneShellView {
                 return Some(cached.clone());
             }
         }
-        let filtered = Rc::new(crate::warpui::git_log::filtered_frame(&frame, &needle));
+        let filtered = Rc::new(crate::app::git_log::filtered_frame(&frame, &needle));
         *cache = Some((needle, self.git_log_gen, filtered.clone()));
         Some(filtered)
     }
@@ -12878,9 +12878,9 @@ impl CraneShellView {
         };
         let fut = async move {
             match op {
-                GitLogOp::Checkout => crate::warpui::git::checkout_commit(&repo, &sha),
-                GitLogOp::CherryPick => crate::warpui::git::cherry_pick(&repo, &sha),
-                GitLogOp::Revert => crate::warpui::git::revert(&repo, &sha),
+                GitLogOp::Checkout => crate::app::git::checkout_commit(&repo, &sha),
+                GitLogOp::CherryPick => crate::app::git::cherry_pick(&repo, &sha),
+                GitLogOp::Revert => crate::app::git::revert(&repo, &sha),
             }
         };
         ctx.spawn(fut, move |this, res, vctx| {
@@ -12908,7 +12908,7 @@ impl CraneShellView {
             return;
         };
         let sha_for_fut = sha.clone();
-        let fut = async move { crate::warpui::git_log::load_detail(&repo, &sha_for_fut) };
+        let fut = async move { crate::app::git_log::load_detail(&repo, &sha_for_fut) };
         ctx.spawn(fut, move |this, detail, vctx| {
             if this.git_log_selected.as_deref() != Some(sha.as_str()) {
                 return;
@@ -13001,7 +13001,7 @@ impl CraneShellView {
         let list: Box<dyn Element> = match &shown {
             Some(frame) if !frame.commits.is_empty() => {
                 Box::new(
-                    crate::warpui::git_log_element::GitLogListElement::new(
+                    crate::app::git_log_element::GitLogListElement::new(
                         frame.clone(),
                         self.mono_font,
                         12.0,
@@ -13076,7 +13076,7 @@ impl CraneShellView {
                 .with_padding_top(4.0)
                 .finish(),
         );
-        let filter_input = crate::warpui::line_edit::LineEditField::new(
+        let filter_input = crate::app::line_edit::LineEditField::new(
             &self.git_log_filter,
             self.git_log_filter_active,
             self.ui_font,
@@ -13161,7 +13161,7 @@ impl CraneShellView {
     fn git_log_refs_column(&self) -> Box<dyn Element> {
         let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
         if let Some(frame) = &self.git_log_frame {
-            for group in crate::warpui::git_log::ref_groups(&frame.refs) {
+            for group in crate::app::git_log::ref_groups(&frame.refs) {
                 // Section header: caps label over a hairline divider.
                 col = col.with_child(
                     Container::new(
@@ -13326,11 +13326,11 @@ impl CraneShellView {
     fn git_log_branch_prompt_overlay(
         &self,
         sha: &str,
-        buf: &crate::warpui::line_edit::LineEdit,
+        buf: &crate::app::line_edit::LineEdit,
     ) -> Box<dyn Element> {
         let short: String = sha.chars().take(7).collect();
         let name_input =
-            crate::warpui::line_edit::LineEditField::new(buf, true, self.ui_font, 12.0)
+            crate::app::line_edit::LineEditField::new(buf, true, self.ui_font, 12.0)
                 .with_placeholder("branch name…")
                 .on_click_index(|ctx, idx| {
                     ctx.dispatch_typed_action(CraneShellAction::GitLogBranchPromptCaret(idx));
@@ -13533,8 +13533,8 @@ impl CraneShellView {
                 // Selected file's patch, windowed by the detail scroll offset.
                 // (Falls back to the whole diff when the split found no files —
                 // e.g. a merge commit rendered without -m.)
-                use crate::warpui::git_log::DiffLineKind;
-                let lines: &[crate::warpui::git_log::DiffLine] =
+                use crate::app::git_log::DiffLineKind;
+                let lines: &[crate::app::git_log::DiffLine] =
                     match detail.files.get(sel_file) {
                         Some(f) => &f.lines,
                         None => &detail.diff,
@@ -13604,7 +13604,7 @@ impl CraneShellView {
         let ui_font = self.ui_font;
         let icon_font = self.icon_font;
         let handle = ctx.add_typed_action_view(move |_ctx| {
-            crate::warpui::browser_view::WarpBrowserView::new(
+            crate::app::browser_view::WarpBrowserView::new(
                 pane_id, ui_font, icon_font, tabs, active,
             )
         });
@@ -13618,7 +13618,7 @@ impl CraneShellView {
         self.ensure_active_tab(ctx);
         let repo_root = self.active_cwd.clone();
         let handle = ctx.add_typed_action_view(move |ctx| {
-            crate::warpui::diff_view::WarpDiffView::new(ctx, repo_root, path)
+            crate::app::diff_view::WarpDiffView::new(ctx, repo_root, path)
         });
         self.split_with(PaneContent::Diff(handle));
         ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
@@ -13652,7 +13652,7 @@ impl CraneShellView {
         &self,
         pi: usize,
         wi: usize,
-    ) -> Option<crate::warpui::line_edit::LineEdit> {
+    ) -> Option<crate::app::line_edit::LineEdit> {
         self.renaming.as_ref().and_then(|r| match &r.target {
             RenameTarget::Worktree { pi: rp, wi: rw } if *rp == pi && *rw == wi => {
                 Some(r.buffer.clone())
@@ -13666,7 +13666,7 @@ impl CraneShellView {
     fn tab_rename_buf(
         &self,
         key: (usize, usize, usize),
-    ) -> Option<crate::warpui::line_edit::LineEdit> {
+    ) -> Option<crate::app::line_edit::LineEdit> {
         self.renaming.as_ref().and_then(|r| match &r.target {
             RenameTarget::Tab { key: k } if *k == key => Some(r.buffer.clone()),
             _ => None,
@@ -13741,18 +13741,18 @@ impl CraneShellView {
             self.commit_error = None;
             let status = self.git_op.clone();
             let wake = self.git_wake.clone();
-            crate::warpui::git::spawn_git_commit(root, msg, status, move || wake());
+            crate::app::git::spawn_git_commit(root, msg, status, move || wake());
             self.commit_msg.set_text("");
             self.commit_focused = false;
         }
     }
 
     /// Dispatch an async network git op (Push / Pull / Fetch) on the active repo.
-    fn spawn_op(&mut self, kind: crate::warpui::git::OpKind) {
+    fn spawn_op(&mut self, kind: crate::app::git::OpKind) {
         if let Some(root) = self.active_cwd.clone() {
             let status = self.git_op.clone();
             let wake = self.git_wake.clone();
-            crate::warpui::git::spawn_git_op(kind, root, status, move || wake());
+            crate::app::git::spawn_git_op(kind, root, status, move || wake());
         }
     }
 
@@ -15324,11 +15324,11 @@ impl CraneShellView {
                             }
                         };
                         let mono = warpui::fonts::Cache::handle(ctx)
-                            .update(ctx, |cache, _| crate::warpui::bundled_fonts::mono(cache));
+                            .update(ctx, |cache, _| crate::app::bundled_fonts::mono(cache));
                         let p = path.clone();
                         let goto = Self::lsp_goto_cb(path.clone());
                         let h = ctx.add_typed_action_view(move |ctx| {
-                            crate::warpui::editor_view::WarpEditorView::new(ctx, content, mono, p)
+                            crate::app::editor_view::WarpEditorView::new(ctx, content, mono, p)
                                 .with_goto(goto)
                         });
                         let wrap = self.word_wrap_default;
@@ -15348,7 +15348,7 @@ impl CraneShellView {
                     // `self.panes` borrow before the `insert`.
                     let candidates: Vec<(
                         PaneId,
-                        ViewHandle<crate::warpui::markdown_view::WarpMarkdownView>,
+                        ViewHandle<crate::app::markdown_view::WarpMarkdownView>,
                     )> = self
                         .panes
                         .iter()
@@ -15377,14 +15377,14 @@ impl CraneShellView {
                         .unwrap_or_else(|| std::fs::read_to_string(&path).unwrap_or_default());
                     let p = path.clone();
                     let handle = ctx.add_typed_action_view(move |ctx| {
-                        crate::warpui::markdown_view::WarpMarkdownView::from_file_source(
+                        crate::app::markdown_view::WarpMarkdownView::from_file_source(
                             ctx, p, text,
                         )
                     });
                     self.markdown_views.insert(path.clone(), handle.clone());
                     let candidates: Vec<(
                         PaneId,
-                        ViewHandle<crate::warpui::editor_view::WarpEditorView>,
+                        ViewHandle<crate::app::editor_view::WarpEditorView>,
                     )> = self
                         .panes
                         .iter()
@@ -15605,7 +15605,7 @@ impl CraneShellView {
                 if let Some(root) = self.active_cwd.clone() {
                     self.commit_error = None;
                     for p in paths {
-                        if let Err(e) = crate::warpui::git::stage(&root, p) {
+                        if let Err(e) = crate::app::git::stage(&root, p) {
                             self.commit_error = Some(e);
                             break;
                         }
@@ -15618,7 +15618,7 @@ impl CraneShellView {
                 if let Some(root) = self.active_cwd.clone() {
                     self.commit_error = None;
                     for p in paths {
-                        if let Err(e) = crate::warpui::git::unstage(&root, p) {
+                        if let Err(e) = crate::app::git::unstage(&root, p) {
                             self.commit_error = Some(e);
                             break;
                         }
@@ -15632,9 +15632,9 @@ impl CraneShellView {
                     self.collapsed_change_dirs.insert(key.clone());
                 }
             }
-            CraneShellAction::GitPush => self.spawn_op(crate::warpui::git::OpKind::Push),
-            CraneShellAction::GitPull => self.spawn_op(crate::warpui::git::OpKind::Pull),
-            CraneShellAction::GitFetch => self.spawn_op(crate::warpui::git::OpKind::Fetch),
+            CraneShellAction::GitPush => self.spawn_op(crate::app::git::OpKind::Push),
+            CraneShellAction::GitPull => self.spawn_op(crate::app::git::OpKind::Pull),
+            CraneShellAction::GitFetch => self.spawn_op(crate::app::git::OpKind::Fetch),
             CraneShellAction::ShowChangeMenu { path, staged, has_unstaged, x, y } => {
                 self.row_menu = Some(RowMenu::Change {
                     path: path.clone(),
@@ -15769,7 +15769,7 @@ impl CraneShellView {
                 self.pending_new_entry = Some(PendingNewEntry {
                     parent: parent.clone(),
                     is_folder: *is_folder,
-                    name: crate::warpui::line_edit::LineEdit::default(),
+                    name: crate::app::line_edit::LineEdit::default(),
                     error: None,
                 });
                 self.refresh_panel(ctx);
@@ -15832,7 +15832,7 @@ impl CraneShellView {
             CraneShellAction::CheckoutBranch(branch) => {
                 self.branch_picker = None;
                 if let Some(root) = self.active_cwd.clone() {
-                    match crate::warpui::git::checkout_branch(&root, branch) {
+                    match crate::app::git::checkout_branch(&root, branch) {
                         Ok(()) => {
                             self.sync_worktree_branch_label(&root);
                             self.refresh_panel(ctx);
@@ -15908,7 +15908,7 @@ impl CraneShellView {
                 // there; the menu itself stops rendering while the prompt is
                 // open (render gates on branch_prompt.is_none()).
                 self.git_log_branch_prompt =
-                    Some((sha.clone(), crate::warpui::line_edit::LineEdit::default()));
+                    Some((sha.clone(), crate::app::line_edit::LineEdit::default()));
             }
             CraneShellAction::GitLogSetRefFilter(r) => {
                 // Clicking the already-active ref clears the scope (toggle).
@@ -15925,7 +15925,7 @@ impl CraneShellView {
             CraneShellAction::GitLogStepSelection(down) => {
                 let shown = self.git_log_shown_frame();
                 if let Some(frame) = shown {
-                    if let Some(sha) = crate::warpui::git_log::step_selection(
+                    if let Some(sha) = crate::app::git_log::step_selection(
                         &frame.commits,
                         self.git_log_selected.as_deref(),
                         *down,
@@ -15939,7 +15939,7 @@ impl CraneShellView {
                         // Reveal with a conservative viewport estimate — the
                         // element owns the real row math; 15 rows keeps the
                         // selection comfortably in view for any dock height.
-                        self.git_log_scroll.set(crate::warpui::git_log::reveal_offset(
+                        self.git_log_scroll.set(crate::app::git_log::reveal_offset(
                             self.git_log_scroll.get(),
                             row,
                             15,
@@ -15951,7 +15951,7 @@ impl CraneShellView {
                 if !self.git_log_fetching {
                     if let Some(repo) = self.active_cwd.clone() {
                         self.git_log_fetching = true;
-                        let fut = async move { crate::warpui::git::fetch_all(&repo) };
+                        let fut = async move { crate::app::git::fetch_all(&repo) };
                         ctx.spawn(fut, move |this, res, vctx| {
                             this.git_log_fetching = false;
                             if let Err(e) = res {
@@ -16002,7 +16002,7 @@ impl CraneShellView {
                 if let Some(h) = self.focused.and_then(|id| self.browser_at(id)) {
                     h.update(ctx, |view, vctx| {
                         view.handle_action(
-                            &crate::warpui::browser_view::BrowserAction::NewTab,
+                            &crate::app::browser_view::BrowserAction::NewTab,
                             vctx,
                         )
                     });
@@ -16015,11 +16015,11 @@ impl CraneShellView {
             CraneShellAction::FontZoomIn
             | CraneShellAction::FontZoomOut
             | CraneShellAction::FontZoomReset => {
-                let step = crate::warpui::fontsize::step();
+                let step = crate::app::fontsize::step();
                 let level = match action {
-                    CraneShellAction::FontZoomIn => crate::warpui::fontsize::zoom(step),
-                    CraneShellAction::FontZoomOut => crate::warpui::fontsize::zoom(-step),
-                    _ => crate::warpui::fontsize::reset(),
+                    CraneShellAction::FontZoomIn => crate::app::fontsize::zoom(step),
+                    CraneShellAction::FontZoomOut => crate::app::fontsize::zoom(-step),
+                    _ => crate::app::fontsize::reset(),
                 };
                 // Global magnification: scales EVERY rendered element (panels,
                 // tabs, breadcrumb, status bar, menus, terminal, editor) and
@@ -16107,7 +16107,7 @@ impl CraneShellView {
                 // back to the Right Panel toggle (Cmd+/'s legacy behavior).
                 if let Some(h) = self.active_input_pane().and_then(|id| self.editor_at(id)) {
                     h.update(ctx, |v, vctx| {
-                        v.apply(&crate::warpui::editor_view::EditAction::ToggleComment, vctx)
+                        v.apply(&crate::app::editor_view::EditAction::ToggleComment, vctx)
                     });
                 } else {
                     self.handle_action(&CraneShellAction::ToggleRight, ctx);
@@ -16194,7 +16194,7 @@ impl CraneShellView {
                         if !this.projects.iter().any(|p| p.path == path_str)
                             && !this.added_projects.iter().any(|a| a.path == path_str)
                         {
-                            let ap = crate::warpui::persist::AddedProject {
+                            let ap = crate::app::persist::AddedProject {
                                 name,
                                 path: path_str.clone(),
                             };
@@ -16209,7 +16209,7 @@ impl CraneShellView {
                             // instantly; its branch/diff/dirty fill in via the scan
                             // below.
                             let start = this.projects.len();
-                            let new_nodes = crate::warpui::projects::load_one_shallow(
+                            let new_nodes = crate::app::projects::load_one_shallow(
                                 &ap,
                                 &this.removed_project_paths,
                                 &this.project_tints,
@@ -16218,7 +16218,7 @@ impl CraneShellView {
                             // Watch the newly added Project(s) + their Workspaces so
                             // external / agent edits refresh the active repo.
                             this.sync_watches();
-                            let new_paths = crate::warpui::projects::scan_paths(
+                            let new_paths = crate::app::projects::scan_paths(
                                 &this.projects[start..],
                             );
                             this.spawn_git_scan(vctx, format!("add:{path_str}"), new_paths);
@@ -16348,7 +16348,7 @@ impl CraneShellView {
                         .unwrap_or_else(|| w.name.clone());
                     self.renaming = Some(RenameState {
                         target: RenameTarget::Worktree { pi: *pi, wi: *wi },
-                        buffer: crate::warpui::line_edit::LineEdit::new(cur),
+                        buffer: crate::app::line_edit::LineEdit::new(cur),
                     });
                 }
             }
@@ -16362,7 +16362,7 @@ impl CraneShellView {
                     .unwrap_or_default();
                 self.renaming = Some(RenameState {
                     target: RenameTarget::Tab { key: *key },
-                    buffer: crate::warpui::line_edit::LineEdit::new(cur),
+                    buffer: crate::app::line_edit::LineEdit::new(cur),
                 });
             }
             CraneShellAction::RemoveWorktree { pi, wi } => {
@@ -16398,8 +16398,8 @@ impl CraneShellView {
                     .cloned()
                     .unwrap_or(wt_name);
                 let wt_pathbuf = std::path::PathBuf::from(&wt_path);
-                let dirty = wt_dirty || crate::warpui::git::is_dirty(&wt_pathbuf);
-                let ahead = crate::warpui::git::ahead_behind(&wt_pathbuf)
+                let dirty = wt_dirty || crate::app::git::is_dirty(&wt_pathbuf);
+                let ahead = crate::app::git::ahead_behind(&wt_pathbuf)
                     .map(|(a, _)| a)
                     .unwrap_or(0);
                 self.remove_wt_info = Some(RemoveWtInfo {
@@ -16435,7 +16435,7 @@ impl CraneShellView {
                 }
                 // Detach the worktree from git (local op; `--force` so dirty trees
                 // still remove). Ignore failure — we still drop it from the UI.
-                let _ = crate::warpui::git::remove_worktree(
+                let _ = crate::app::git::remove_worktree(
                     std::path::Path::new(&main_path),
                     std::path::Path::new(&wt_path),
                 );
@@ -16689,13 +16689,13 @@ impl CraneShellView {
                 if let Some(p) = self.projects.get(*i) {
                     let dir = std::path::PathBuf::from(&p.path);
                     // Shell out `git init` — never libgit2, per project rules.
-                    let _ = crate::warpui::git::init(&dir);
+                    let _ = crate::app::git::init(&dir);
                     // The path was cached as a loose (branch-less, clean) folder;
                     // `git init` just changed that, so drop its cached git status
                     // before the reload re-reads it — otherwise the TTL would
                     // serve the pre-init values and the branch row would be blank
                     // until it expires.
-                    crate::warpui::projects::invalidate_git_cache(&p.path);
+                    crate::app::projects::invalidate_git_cache(&p.path);
                 }
                 // Reload (SHALLOW — zero git on the UI thread) so `is_loose` is
                 // recomputed and the CUBE icon / branch rows appear, then refill
@@ -16739,7 +16739,7 @@ impl CraneShellView {
             }
             CraneShellAction::OpenFindInFiles => {
                 self.find_in_files = Some(FindInFilesState {
-                    query: crate::warpui::line_edit::LineEdit::default(),
+                    query: crate::app::line_edit::LineEdit::default(),
                     results: Vec::new(),
                     truncated: false,
                     selected: 0,
@@ -16781,11 +16781,11 @@ impl CraneShellView {
             }
             CraneShellAction::FontBaseStep { editor, delta } => {
                 if *editor {
-                    crate::warpui::fontsize::set_editor(
-                        crate::warpui::fontsize::editor() + delta,
+                    crate::app::fontsize::set_editor(
+                        crate::app::fontsize::editor() + delta,
                     );
                 } else {
-                    crate::warpui::fontsize::set_base(crate::warpui::fontsize::base() + delta);
+                    crate::app::fontsize::set_base(crate::app::fontsize::base() + delta);
                 }
             }
             CraneShellAction::ToggleWordWrapDefault => {
@@ -16834,10 +16834,10 @@ impl CraneShellView {
                 self.update_dismissed_session = None;
                 self.manual_update_check = true;
                 let wake = self.ui_wake.clone();
-                crate::warpui::update::spawn_recheck(move || wake());
+                crate::app::update::spawn_recheck(move || wake());
             }
             CraneShellAction::UpdateRemindLater => {
-                if let Some(v) = crate::warpui::update::latest_available() {
+                if let Some(v) = crate::app::update::latest_available() {
                     self.update_prompts.insert(
                         v.clone(),
                         UpdatePrompt::RemindAt(now_epoch_secs() + UPDATE_REMIND_SECS),
@@ -16846,14 +16846,14 @@ impl CraneShellView {
                 }
             }
             CraneShellAction::UpdateSkipVersion => {
-                if let Some(v) = crate::warpui::update::latest_available() {
+                if let Some(v) = crate::app::update::latest_available() {
                     self.update_prompts.insert(v.clone(), UpdatePrompt::Dismissed);
                     self.update_dismissed_session = Some(v);
                 }
             }
             CraneShellAction::UpdateDismissSession => {
                 self.update_dismissed_session =
-                    Some(crate::warpui::update::latest_available().unwrap_or_default());
+                    Some(crate::app::update::latest_available().unwrap_or_default());
                 // Also closes the manual "you're up to date" banner so it
                 // can't reappear on some later unrelated repaint.
                 self.manual_update_check = false;
@@ -16903,12 +16903,12 @@ impl CraneShellView {
                 // Ready / Failed transitions surface in Settings > About without
                 // waiting for an incidental repaint. Idempotent + non-blocking.
                 let wake = self.ui_wake.clone();
-                crate::warpui::update::start_download(move || wake());
+                crate::app::update::start_download(move || wake());
             }
             CraneShellAction::ApplyUpdate(path) => {
                 // Swaps the running install for the staged bundle and relaunches
                 // (exits this process on success; macOS only).
-                crate::warpui::update::apply_and_restart(path);
+                crate::app::update::apply_and_restart(path);
             }
             CraneShellAction::OpenSwitchBranch => {
                 self.open_switch_branch(ctx);
@@ -16918,7 +16918,7 @@ impl CraneShellView {
             }
             CraneShellAction::SwitchBranchStartNewBranch => {
                 if let Some(st) = self.switch_branch.as_mut() {
-                    st.new_branch_input = Some(crate::warpui::line_edit::LineEdit::default());
+                    st.new_branch_input = Some(crate::app::line_edit::LineEdit::default());
                 }
             }
             CraneShellAction::CreateBranchCheckout(name) => {
@@ -16927,7 +16927,7 @@ impl CraneShellView {
                 let name = name.trim().to_string();
                 if !name.is_empty() {
                     if let Some(root) = self.active_cwd.clone() {
-                        match crate::warpui::git::create_branch(&root, &name, true) {
+                        match crate::app::git::create_branch(&root, &name, true) {
                             Ok(()) => {
                                 self.sync_worktree_branch_label(&root);
                                 self.refresh_panel(ctx);
@@ -16951,25 +16951,25 @@ impl CraneShellView {
                     .map(|p| {
                         let root = std::path::Path::new(&p.path);
                         let locals: std::collections::HashSet<String> =
-                            crate::warpui::git::list_local_branches(root)
+                            crate::app::git::list_local_branches(root)
                                 .into_iter()
                                 .collect();
                         // Short name → full remote-tracking name, first remote
                         // wins on a clash (same dedup order as the popup).
                         let mut remotes = std::collections::HashMap::new();
-                        for r in crate::warpui::git::list_remote_branches(root) {
+                        for r in crate::app::git::list_remote_branches(root) {
                             let short = r.splitn(2, '/').nth(1).unwrap_or(r.as_str());
                             if short.is_empty() || short == "HEAD" {
                                 continue;
                             }
                             remotes.entry(short.to_string()).or_insert(r);
                         }
-                        (crate::warpui::git::current_branch(root), locals, remotes)
+                        (crate::app::git::current_branch(root), locals, remotes)
                     })
                     .unwrap_or_default();
                 self.new_workspace = Some(NewWorkspaceState {
                     project_idx: *pi,
-                    branch: crate::warpui::line_edit::LineEdit::new(
+                    branch: crate::app::line_edit::LineEdit::new(
                         branch.clone().unwrap_or_default(),
                     ),
                     // An existing branch from the picker locks the field —
@@ -16979,7 +16979,7 @@ impl CraneShellView {
                     existing_branches,
                     remote_branches,
                     mode: LocationMode::Global,
-                    custom_path: crate::warpui::line_edit::LineEdit::default(),
+                    custom_path: crate::app::line_edit::LineEdit::default(),
                     path_focused: false,
                     error: None,
                 });
@@ -17286,7 +17286,7 @@ mod title_debounce_tests {
 #[cfg(test)]
 mod diff_chip_tests {
     use super::CraneShellView;
-    use crate::warpui::projects::{ProjectNode, WorktreeNode};
+    use crate::app::projects::{ProjectNode, WorktreeNode};
 
     fn wt(name: &str, path: &str, diff_stat: (u32, u32)) -> WorktreeNode {
         WorktreeNode {
@@ -17407,7 +17407,7 @@ mod cycle_project_tests {
 #[cfg(test)]
 mod markdown_mode_tests {
     use super::{markdown_edit_path_set, markdown_preview_path_set};
-    use crate::warpui::persist::SMarkdown;
+    use crate::app::persist::SMarkdown;
     use std::collections::HashSet;
     use std::path::PathBuf;
 
@@ -18030,7 +18030,7 @@ mod restore_pane_kind_tests {
 #[cfg(test)]
 mod restore_wiring_integration_tests {
     use super::{CraneShellAction, CraneShellView, PaneId};
-    use crate::warpui::persist::{AddedProject, SImage, SMarkdown, SNode, STab, WarpuiState};
+    use crate::app::persist::{AddedProject, SImage, SMarkdown, SNode, STab, WarpuiState};
 
     /// Overrides `HOME` for the scope of one test. `new_with_state` still
     /// reaches several HOME-derived paths that have nothing to do with the
@@ -18638,7 +18638,7 @@ mod restore_wiring_integration_tests {
     /// created by the live `open_file` path, which is what the bug reports.
     #[test]
     fn file_tabs_do_not_leak_between_workspaces() {
-        use crate::warpui::shell::CraneShellAction;
+        use crate::app::shell::CraneShellAction;
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -18812,7 +18812,7 @@ mod restore_wiring_integration_tests {
     /// `deleting_a_file_closes_its_tab_in_every_workspace`.
     #[test]
     fn deleting_a_directory_closes_the_file_tabs_beneath_it() {
-        use crate::warpui::shell::CraneShellAction;
+        use crate::app::shell::CraneShellAction;
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -19016,7 +19016,7 @@ mod restore_wiring_integration_tests {
     /// the single-Workspace subtree case.
     #[test]
     fn deleting_a_file_closes_its_tab_in_every_workspace() {
-        use crate::warpui::shell::CraneShellAction;
+        use crate::app::shell::CraneShellAction;
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -19182,7 +19182,7 @@ mod restore_wiring_integration_tests {
     /// at all.
     #[test]
     fn a_failed_delete_leaves_the_file_tab_and_its_buffer_intact() {
-        use crate::warpui::shell::CraneShellAction;
+        use crate::app::shell::CraneShellAction;
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -19288,7 +19288,7 @@ mod restore_wiring_integration_tests {
     /// clean.
     #[test]
     fn closing_the_files_pane_releases_its_workspace_tab_list() {
-        use crate::warpui::shell::CraneShellAction;
+        use crate::app::shell::CraneShellAction;
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -19387,7 +19387,7 @@ mod restore_wiring_integration_tests {
     /// same rekey shape, without needing to fabricate drop-zone rects.
     #[test]
     fn reordering_projects_rekeys_files_pane_by_path_not_index() {
-        use crate::warpui::shell::CraneShellAction;
+        use crate::app::shell::CraneShellAction;
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -19551,7 +19551,7 @@ mod restore_wiring_integration_tests {
     /// discovered) and confirms the maps keep `wi = 0` and `wi = 1` apart.
     #[test]
     fn files_pane_state_distinguishes_worktrees_within_one_project() {
-        use crate::warpui::projects::WorktreeNode;
+        use crate::app::projects::WorktreeNode;
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -19628,7 +19628,7 @@ mod restore_wiring_integration_tests {
     /// through the migration untouched.
     #[test]
     fn a_legacy_flat_file_list_migrates_without_losing_any_pane() {
-        use crate::warpui::persist::{SBrowser, STerminal};
+        use crate::app::persist::{SBrowser, STerminal};
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -19768,7 +19768,7 @@ mod restore_wiring_integration_tests {
     /// opened other projects' open files too".
     #[test]
     fn each_workspace_restores_only_its_own_file_tabs() {
-        use crate::warpui::shell::CraneShellAction;
+        use crate::app::shell::CraneShellAction;
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -19905,7 +19905,7 @@ mod restore_wiring_integration_tests {
     /// this whole change exists to prevent.
     #[test]
     fn restored_file_tabs_follow_the_worktree_path_not_the_index() {
-        use crate::warpui::shell::CraneShellAction;
+        use crate::app::shell::CraneShellAction;
         use warpui::platform::WindowStyle;
         use warpui::App;
 
@@ -20059,7 +20059,7 @@ mod restore_wiring_integration_tests {
     /// another Project's file).
     #[test]
     fn a_new_format_state_with_unresolvable_workspaces_does_not_migrate_onto_a_stranger() {
-        use crate::warpui::persist::SFileTabs;
+        use crate::app::persist::SFileTabs;
         use std::path::PathBuf;
         use warpui::platform::WindowStyle;
         use warpui::App;
@@ -20280,7 +20280,7 @@ mod restore_wiring_integration_tests {
     /// catch exactly that.
     #[test]
     fn a_file_tabs_list_whose_pane_no_longer_resolves_still_preserves_its_paths() {
-        use crate::warpui::persist::SFileTabs;
+        use crate::app::persist::SFileTabs;
         use warpui::platform::WindowStyle;
         use warpui::App;
 

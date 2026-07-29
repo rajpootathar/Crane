@@ -1,7 +1,7 @@
 //! Hunk-level git staging helpers used by the Diff Pane
-//! (`src/warpui/diff_view.rs`). Everything else that used to live here —
+//! (`src/app/diff_view.rs`). Everything else that used to live here —
 //! status, commit/push/pull, worktree management, branch listing, etc. —
-//! has been superseded by `src/warpui/git.rs` and was removed as dead code.
+//! has been superseded by `src/app/git.rs` and was removed as dead code.
 //!
 //! `parse_hunks` is kept despite having no production caller: it's pinned
 //! by two regression tests below that guard a specific historical patch-

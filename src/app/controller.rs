@@ -14,7 +14,7 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 
 use crane_term::{Processor, ShellIntegrationEvent, Term, TermNotification};
 
-use crate::warpui::history_store::{now_ms, HistoryEntry};
+use crate::app::history_store::{now_ms, HistoryEntry};
 
 /// Called from the reader thread when the grid changes and the UI should
 /// repaint. Must be cheap and thread-safe (e.g. send on a channel).
@@ -157,7 +157,7 @@ pub struct TerminalController {
 
 impl TerminalController {
     pub fn new(cols: usize, rows: usize, cwd: Option<&Path>, wake: Wake) -> std::io::Result<Self> {
-        crate::warpui::shell_init::ensure_installed();
+        crate::app::shell_init::ensure_installed();
 
         // Warm the history store HERE, on the spawning (UI) thread, before the
         // reader thread below exists. `store()` is a OnceLock whose initializer
@@ -171,7 +171,7 @@ impl TerminalController {
         // thread. Paying the cost at spawn makes it invisible. Do not remove
         // as "unused": the return value is deliberately discarded, the
         // initialization is the point.
-        let _ = crate::warpui::history_store::store();
+        let _ = crate::app::history_store::store();
 
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -223,7 +223,7 @@ impl TerminalController {
         let session_id = {
             use std::sync::atomic::AtomicU64;
             static SEQ: AtomicU64 = AtomicU64::new(0);
-            crate::warpui::history_store::now_ms().wrapping_shl(16)
+            crate::app::history_store::now_ms().wrapping_shl(16)
                 | (SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff)
         };
 
@@ -256,15 +256,15 @@ impl TerminalController {
                 .and_then(|n| n.to_str())
             {
                 Some("zsh") => {
-                    if let Some(zdotdir) = crate::warpui::shell_init::installed_zsh_zdotdir() {
-                        if let Some(old) = crate::warpui::shell_init::inherited_user_zdotdir() {
+                    if let Some(zdotdir) = crate::app::shell_init::installed_zsh_zdotdir() {
+                        if let Some(old) = crate::app::shell_init::inherited_user_zdotdir() {
                             cmd.env("CRANE_OLD_ZDOTDIR", old);
                         }
                         cmd.env("ZDOTDIR", zdotdir);
                     }
                 }
                 Some("bash") => {
-                    if let Some(rcfile) = crate::warpui::shell_init::installed_bash_rcfile() {
+                    if let Some(rcfile) = crate::app::shell_init::installed_bash_rcfile() {
                         cmd.arg("--rcfile");
                         cmd.arg(rcfile);
                     }
@@ -409,7 +409,7 @@ impl TerminalController {
                                     keymap_is_vi.store(k == "vi", Ordering::Relaxed);
                                 }
                                 if let Some(entry) = recorder.feed(ev) {
-                                    crate::warpui::history_store::store().lock().append(entry);
+                                    crate::app::history_store::store().lock().append(entry);
                                 }
                             }
                         }

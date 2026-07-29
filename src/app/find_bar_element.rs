@@ -19,7 +19,7 @@ use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::{vec2f, Vector2F};
 use warpui::{AfterLayoutContext, AppContext, EventContext, LayoutContext, PaintContext, SizeConstraint};
 
-use crate::warpui::{icons, theme};
+use crate::app::{icons, theme};
 
 /// Height of one bar row in pixels.
 const ROW_H: f32 = 32.0;
@@ -86,8 +86,8 @@ impl FindBarElement {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mode: BarMode,
-        find_query: &crate::warpui::line_edit::LineEdit,
-        replace_query: &crate::warpui::line_edit::LineEdit,
+        find_query: &crate::app::line_edit::LineEdit,
+        replace_query: &crate::app::line_edit::LineEdit,
         match_count: usize,
         current_match: Option<usize>,
         find_field_active: bool,

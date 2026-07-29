@@ -11,7 +11,7 @@
 ## Execution Order (amended 2026-07-20)
 
 Run **Tasks 1 → 2 → 3 → 4 → 6, then Task 5 last.** Task 5 is the only task that must
-edit `src/warpui/shell.rs`, which currently carries unrelated uncommitted work; it is
+edit `src/app/shell.rs`, which currently carries unrelated uncommitted work; it is
 deferred until that file is free. Task 4 adds a `restored_session_ids()` accessor
 returning empty so Task 6 does not depend on Task 5 — until Task 5 lands, ranked
 history works within the live session, and only the survives-a-restart behaviour waits.
@@ -40,19 +40,19 @@ history works within the live session, and only the survives-a-restart behaviour
 - `crates/crane_term/src/handler.rs` (modify) — add `ShellIntegrationEvent` enum + `shell_integration(&mut self, ShellIntegrationEvent)` default no-op handler method.
 - `crates/crane_term/src/perform.rs` (modify) — add `b"633"` arm to `OscWatcher::osc_dispatch`; decode sub-commands; unit tests.
 - `crates/crane_term/src/term.rs` (modify) — `shell_events` queue field, `take_shell_events()`, `shell_integration` impl; unit tests.
-- `src/warpui/history_store.rs` (create) — `HistoryEntry`, `HistoryStore` (load/append/rank), process-wide singleton accessor. Owns ranking.
+- `src/app/history_store.rs` (create) — `HistoryEntry`, `HistoryStore` (load/append/rank), process-wide singleton accessor. Owns ranking.
 - `assets/shell/crane-init.zsh` (create) — zsh hooks emitting OSC 633.
 - `assets/shell/zshrc` (create) — the `ZDOTDIR` shim `.zshrc` that sources the user's real rc then `crane-init.zsh`.
 - `assets/shell/crane-init.bash` (create) — bash `PROMPT_COMMAND`/`trap DEBUG` hooks emitting OSC 633.
-- `src/warpui/shell_init.rs` (create) — writes the bundled shell scripts to `~/.crane/shell/` at startup (idempotent) and computes the env vars a PTY needs.
-- `src/warpui/controller.rs` (modify) — set `ZDOTDIR` (zsh) / rcfile env at spawn; mint a `session_id`; drain `take_shell_events()` in the reader thread; assemble + append `HistoryEntry`s.
-- `src/warpui/mod.rs` (modify) — `mod history_store; mod shell_init;`.
+- `src/app/shell_init.rs` (create) — writes the bundled shell scripts to `~/.crane/shell/` at startup (idempotent) and computes the env vars a PTY needs.
+- `src/app/controller.rs` (modify) — set `ZDOTDIR` (zsh) / rcfile env at spawn; mint a `session_id`; drain `take_shell_events()` in the reader thread; assemble + append `HistoryEntry`s.
+- `src/app/mod.rs` (modify) — `mod history_store; mod shell_init;`.
 
 **Sub-project 2 — Ranked up-arrow**
-- `src/warpui/persist.rs` (modify) — add `session_id` + `restored_session_ids` to `STerminal` (both `#[serde(default)]`).
-- `src/warpui/controller.rs` (modify) — expose `session_id()`, `restored_session_ids()`, `cwd()`; accept restored ids on construction.
-- `src/warpui/view.rs` (modify) — Up/Down interception + guards + line replacement + per-terminal history-cursor state.
-- `src/warpui/history_store.rs` (modify) — `rank()` already lives here from Task 4; add the history-cursor helper if needed.
+- `src/app/persist.rs` (modify) — add `session_id` + `restored_session_ids` to `STerminal` (both `#[serde(default)]`).
+- `src/app/controller.rs` (modify) — expose `session_id()`, `restored_session_ids()`, `cwd()`; accept restored ids on construction.
+- `src/app/view.rs` (modify) — Up/Down interception + guards + line replacement + per-terminal history-cursor state.
+- `src/app/history_store.rs` (modify) — `rank()` already lives here from Task 4; add the history-cursor helper if needed.
 
 ---
 
@@ -317,8 +317,8 @@ git commit -m "feat(crane_term): decode OSC 633 shell-integration events"
 ### Task 2: History store module
 
 **Files:**
-- Create: `src/warpui/history_store.rs`
-- Modify: `src/warpui/mod.rs` (add `mod history_store;`)
+- Create: `src/app/history_store.rs`
+- Modify: `src/app/mod.rs` (add `mod history_store;`)
 - Test: inline `#[cfg(test)]` in `history_store.rs`.
 
 **Interfaces:**
@@ -332,7 +332,7 @@ git commit -m "feat(crane_term): decode OSC 633 shell-integration events"
   - `pub fn store() -> &'static Mutex<HistoryStore>` — process-wide singleton at `~/.crane/history/history.jsonl`.
   - `pub fn now_ms() -> u64` — `SystemTime` unix-millis helper.
 
-- [ ] **Step 1: Write the failing ranking + roundtrip tests** (create `src/warpui/history_store.rs` with just this test module first)
+- [ ] **Step 1: Write the failing ranking + roundtrip tests** (create `src/app/history_store.rs` with just this test module first)
 
 ```rust
 #[cfg(test)]
@@ -555,7 +555,7 @@ pub fn store() -> &'static Mutex<HistoryStore> {
 }
 ```
 
-- [ ] **Step 4: Register the module** (in `src/warpui/mod.rs`, alongside the other `mod` lines)
+- [ ] **Step 4: Register the module** (in `src/app/mod.rs`, alongside the other `mod` lines)
 
 ```rust
 mod history_store;
@@ -569,7 +569,7 @@ Expected: PASS — all 5 store tests.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/warpui/history_store.rs src/warpui/mod.rs
+git add src/app/history_store.rs src/app/mod.rs
 git commit -m "feat(warpui): add ranked command-history store"
 ```
 
@@ -581,8 +581,8 @@ git commit -m "feat(warpui): add ranked command-history store"
 - Create: `assets/shell/crane-init.zsh`
 - Create: `assets/shell/zshrc`
 - Create: `assets/shell/crane-init.bash`
-- Create: `src/warpui/shell_init.rs`
-- Modify: `src/warpui/mod.rs` (add `pub mod shell_init;`)
+- Create: `src/app/shell_init.rs`
+- Modify: `src/app/mod.rs` (add `pub mod shell_init;`)
 - Test: inline `#[cfg(test)]` in `shell_init.rs`.
 
 **Interfaces:**
@@ -691,7 +691,7 @@ PROMPT_COMMAND="__crane_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 trap '__crane_debug' DEBUG
 ```
 
-- [ ] **Step 4: Write the failing `shell_init` test** (create `src/warpui/shell_init.rs` with the test first)
+- [ ] **Step 4: Write the failing `shell_init` test** (create `src/app/shell_init.rs` with the test first)
 
 ```rust
 #[cfg(test)]
@@ -778,7 +778,7 @@ pub fn install_shell_scripts() {
 
 - [ ] **Step 7: Register the module + install lazily on first PTY spawn**
 
-In `src/warpui/mod.rs`:
+In `src/app/mod.rs`:
 
 ```rust
 pub mod shell_init;
@@ -811,7 +811,7 @@ Expected: test PASS; build Finished.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add assets/shell src/warpui/shell_init.rs src/warpui/mod.rs src/warpui/shell.rs
+git add assets/shell src/app/shell_init.rs src/app/mod.rs src/app/shell.rs
 git commit -m "feat(warpui): install OSC 633 shell-integration scripts at startup"
 ```
 
@@ -820,7 +820,7 @@ git commit -m "feat(warpui): install OSC 633 shell-integration scripts at startu
 ### Task 4: Spawn with integration + record entries
 
 **Files:**
-- Modify: `src/warpui/controller.rs`
+- Modify: `src/app/controller.rs`
 - Test: manual + a small unit test for entry assembly (extract the correlation logic into a testable helper).
 
 **Interfaces:**
@@ -1016,7 +1016,7 @@ Expected: three JSON lines with the commands, `pwd`, `exit_code`, a `session_id`
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/warpui/controller.rs
+git add src/app/controller.rs
 git commit -m "feat(warpui): record terminal command history via OSC 633"
 ```
 
@@ -1027,9 +1027,9 @@ git commit -m "feat(warpui): record terminal command history via OSC 633"
 ### Task 5: Session identity persistence
 
 **Files:**
-- Modify: `src/warpui/persist.rs` (extend `STerminal`)
-- Modify: `src/warpui/controller.rs` (accept + expose restored ids)
-- Modify: `src/warpui/shell.rs` (thread `session_id` into the saved `STerminal`; feed restored id back on restore)
+- Modify: `src/app/persist.rs` (extend `STerminal`)
+- Modify: `src/app/controller.rs` (accept + expose restored ids)
+- Modify: `src/app/shell.rs` (thread `session_id` into the saved `STerminal`; feed restored id back on restore)
 - Test: inline serde default test in `persist.rs`.
 
 **Interfaces:**
@@ -1112,7 +1112,7 @@ Expected: build Finished; persist tests PASS.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/warpui/persist.rs src/warpui/controller.rs src/warpui/shell.rs
+git add src/app/persist.rs src/app/controller.rs src/app/shell.rs
 git commit -m "feat(warpui): persist terminal session identity for restored history"
 ```
 
@@ -1121,7 +1121,7 @@ git commit -m "feat(warpui): persist terminal session identity for restored hist
 ### Task 6: Up/Down interception + line replacement
 
 **Files:**
-- Modify: `src/warpui/view.rs` (`TerminalView::write_keystroke` + new per-terminal history-cursor state)
+- Modify: `src/app/view.rs` (`TerminalView::write_keystroke` + new per-terminal history-cursor state)
 - Test: inline unit test for the guard predicate + the history-cursor walk (extract both into pure helpers).
 
 **Interfaces:**
@@ -1280,7 +1280,7 @@ Expected: current-session commands appear newest-first; commands typed in the cu
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/warpui/view.rs src/warpui/controller.rs
+git add src/app/view.rs src/app/controller.rs
 git commit -m "feat(warpui): rank terminal history on up/down arrow"
 ```
 

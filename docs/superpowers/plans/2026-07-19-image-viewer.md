@@ -26,7 +26,7 @@
 
 ## Global Constraints
 
-- Never use Unicode glyph icons — bundled fonts render them as tofu. Only constants that exist in `src/warpui/icons.rs` (there is **no** `EYE`).
+- Never use Unicode glyph icons — bundled fonts render them as tofu. Only constants that exist in `src/app/icons.rs` (there is **no** `EYE`).
 - Do NOT modify anything under `vendor/warp/`.
 - **Do NOT run `cargo fmt` in any form** — it reformats the entire workspace including vendored code regardless of the path argument. Hand-format.
 - Every persisted field carries `#[serde(default)]`. Never break deserialization of an existing `~/.crane/warpui-state.json`.
@@ -41,8 +41,8 @@
 ### Task 1: The image view
 
 **Files:**
-- Create: `src/warpui/image_view.rs`
-- Modify: `src/warpui/mod.rs` (register the module)
+- Create: `src/app/image_view.rs`
+- Modify: `src/app/mod.rs` (register the module)
 - Test: in `image_view.rs`
 
 **Interfaces:**
@@ -50,7 +50,7 @@
 
 - [ ] **Step 1: Read the precedent first**
 
-Read `src/warpui/markdown_view.rs` end to end — struct shape, `Entity`/`TypedActionView` impls, how it stores `path`/`title`, and the `App::test` layout tests at the bottom. Mirror that structure. Do not invent a different view shape.
+Read `src/app/markdown_view.rs` end to end — struct shape, `Entity`/`TypedActionView` impls, how it stores `path`/`title`, and the `App::test` layout tests at the bottom. Mirror that structure. Do not invent a different view shape.
 
 - [ ] **Step 2: Write the failing layout test**
 
@@ -105,7 +105,7 @@ Confirm by reading your own render function that `LocalFileContentVersion::for_p
 ### Task 2: Route image files to the pane
 
 **Files:**
-- Modify: `src/warpui/shell.rs` (`PaneContent` enum, view cache, extension routing, render arm, pane header)
+- Modify: `src/app/shell.rs` (`PaneContent` enum, view cache, extension routing, render arm, pane header)
 
 **Interfaces:**
 - Consumes Task 1's `WarpImageView`. Produces `PaneContent::Image(ViewHandle<WarpImageView>)` and an `image_views: HashMap<PathBuf, ViewHandle<_>>` cache.
@@ -134,7 +134,7 @@ Assert an image path routes to `PaneContent::Image` and a `.rs` path still route
 Without this, an image pane restores as a **fresh terminal** — the exact bug just fixed for markdown panes. Do not skip.
 
 **Files:**
-- Modify: `src/warpui/persist.rs`, `src/warpui/shell.rs`
+- Modify: `src/app/persist.rs`, `src/app/shell.rs`
 
 - [ ] **Step 1: Study how markdown panes persist**
 

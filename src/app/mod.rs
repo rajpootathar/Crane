@@ -1,4 +1,7 @@
-//! warpui frontend for Crane — the GPU-rendered UI and Crane's sole frontend.
+//! Crane's frontend — the GPU-rendered UI and Crane's sole frontend, built on
+//! Warp's `warpui` crate (vendored under `vendor/warp/crates/warpui`). The
+//! module is `crate::app` and the framework is `warpui`: two names, because
+//! they are two things.
 //! It reuses the rest of the `crane` crate's logic (`crate::git`,
 //! `crate::lsp`, `crate::theme`, `crate::format`, `crate::syntax`, …) and owns
 //! its own NSApplication / event loop. Launched unconditionally from `main()`;
@@ -53,7 +56,7 @@ pub mod welcome_view;
 use shell::CraneShellView;
 
 #[derive(Clone, Copy, RustEmbed)]
-#[folder = "src/warpui/assets"]
+#[folder = "src/app/assets"]
 pub struct Assets;
 
 pub static ASSETS: Assets = Assets;
@@ -90,7 +93,7 @@ fn set_app_icon() {
 #[cfg(not(target_os = "macos"))]
 fn set_app_icon() {}
 
-/// Run the warpui frontend (owns its own NSApplication/event loop).
+/// Run the frontend (owns its own NSApplication/event loop).
 pub fn run() {
     use std::cell::RefCell;
     use std::rc::Rc;

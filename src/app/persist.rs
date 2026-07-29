@@ -1,8 +1,14 @@
-//! warpui-frontend state persistence. During egui↔warpui coexistence this
-//! writes to a SEPARATE `~/.crane/warpui-state.json` so it can never corrupt
-//! the egui app's rich `session.json`. Restores panels, the tab list per
-//! worktree, the active tab, expand state, and each tab's split layout
-//! (terminals are respawned in the worktree cwd).
+//! Frontend state persistence. Restores panels, the tab list per worktree, the
+//! active tab, expand state, and each tab's split layout (terminals are
+//! respawned in the worktree cwd).
+//!
+//! The on-disk name is still `~/.crane/warpui-state.json`, dating from the
+//! egui↔warpui coexistence period when it was deliberately SEPARATE from the
+//! egui app's `session.json` so neither could corrupt the other. It keeps that
+//! name even though the module is now `crate::app`: the file exists in every
+//! existing user's home, and renaming it without a migration silently drops
+//! their projects, tabs and layouts on first launch. Rename it only together
+//! with a read-old-then-write-new migration step.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -10,7 +16,7 @@ use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::warpui::layout::{Dir, Node, PaneId};
+use crate::app::layout::{Dir, Node, PaneId};
 
 /// Serializable mirror of `layout::Node` (drops the live Rc<Cell> handles).
 #[derive(Serialize, Deserialize, Clone)]

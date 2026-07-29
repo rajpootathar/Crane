@@ -48,9 +48,9 @@ use warpui::{
     SingletonEntity as _, SizeConstraint, TypedActionView, View, ViewContext,
 };
 
-use crate::warpui::icons;
-use crate::warpui::scrollbar_element::LineScrollbar;
-use crate::warpui::theme;
+use crate::app::icons;
+use crate::app::scrollbar_element::LineScrollbar;
+use crate::app::theme;
 
 /// Body font size (matches v1 / the Files Pane).
 const FONT_SIZE: f32 = 12.0;
@@ -143,7 +143,7 @@ impl DiffComputed {
 /// syntax-highlighted text diff here instead of this binary-guard row. This
 /// wrapper exists only to take a `&str` (git gives paths as strings here).
 fn is_image_path_str(path: &str) -> bool {
-    crate::warpui::shell::is_raster_image_path(Path::new(path))
+    crate::app::shell::is_raster_image_path(Path::new(path))
 }
 
 /// Content-sniff for binary data: a NUL in the first 8 KB (the classic git
@@ -396,7 +396,7 @@ fn compute(repo_root: Option<PathBuf>, rel: String, abs: PathBuf) -> DiffCompute
     // diff against empty. `Err` = real git failure, surfaced instead of the
     // old behavior of silently diffing empty text.
     let old_bytes: Option<Vec<u8>> = match &repo_root {
-        Some(root) => match crate::warpui::git::head_bytes(root, &rel) {
+        Some(root) => match crate::app::git::head_bytes(root, &rel) {
             Ok(b) => b,
             Err(e) => {
                 return DiffComputed::with_error(format!("git show HEAD:{rel} failed: {e}"));
@@ -554,7 +554,7 @@ impl WarpDiffView {
     /// rule; never libgit2).
     pub fn new(ctx: &mut ViewContext<Self>, repo_root: Option<PathBuf>, path: PathBuf) -> Self {
         let font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            crate::warpui::bundled_fonts::mono(cache)
+            crate::app::bundled_fonts::mono(cache)
         });
         // The shell registers "phosphor" at startup; re-use it if present so we
         // don't grow the font cache per diff pane.

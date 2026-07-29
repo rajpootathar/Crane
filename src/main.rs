@@ -5,24 +5,30 @@ mod startup;
 mod syntax;
 mod theme;
 mod util;
-mod warpui;
+// Crane's own frontend module. Deliberately NOT named `warpui` any more: that
+// is the name of Warp's UI crate this module is written against
+// (`vendor/warp/crates/warpui`), and having both meanings share one identifier
+// made every `warpui::` read ambiguous. `crate::app` is Crane; `warpui` is the
+// framework. Note this `mod` shadows the extern crate name inside `main.rs`
+// only — hence `app::run()` below, not `warpui::run()`.
+mod app;
 
-/// Crane entry point. warpui (GPU-rendered, `src/warpui/`) is the sole
-/// frontend — it owns its own NSApplication / event loop. The legacy egui
-/// frontend has been removed. `main` performs the shared startup (PATH
-/// rehydration for GUI launches, config-dir migration) then hands control to
-/// warpui.
+/// Crane entry point. The `app` frontend (GPU-rendered on `warpui`, `src/app/`)
+/// is the sole frontend — it owns its own NSApplication / event loop. The
+/// legacy egui frontend has been removed. `main` performs the shared startup
+/// (PATH rehydration for GUI launches, config-dir migration) then hands control
+/// to it.
 fn main() {
     env_logger::init();
     install_crash_logger();
     // Login-shells aren't sourced by Finder / Dock when launching a GUI app,
     // so PATH ends up stripped down to the system defaults. Rehydrate it
-    // before warpui spawns any PTY.
+    // before the frontend spawns any PTY.
     startup::fix_path_for_gui_launch();
     // One-shot migration of the old `~/.config/crane` config directory to
     // `~/.crane`. Cheap no-op after the first run.
     startup::migrate_config_dir();
-    warpui::run();
+    app::run();
 }
 
 /// Install a panic hook that writes the message + location + a full

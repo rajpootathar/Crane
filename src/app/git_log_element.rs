@@ -27,8 +27,8 @@ use warpui::{
     AfterLayoutContext, AppContext, EventContext, LayoutContext, PaintContext, SizeConstraint,
 };
 
-use crate::warpui::git_log::{self, GraphFrame, RefKind};
-use crate::warpui::theme;
+use crate::app::git_log::{self, GraphFrame, RefKind};
+use crate::app::theme;
 
 /// 8-slot lane palette (matches old Crane) — legible on light + dark.
 const LANE_PALETTE: [ColorU; 8] = [
@@ -479,7 +479,7 @@ impl Element for GitLogListElement {
                 if let Some(idx) = row_at(position) {
                     let sha = self.frame.commits[idx].sha.clone();
                     ctx.dispatch_typed_action(
-                        crate::warpui::shell::CraneShellAction::GitLogSelect(sha),
+                        crate::app::shell::CraneShellAction::GitLogSelect(sha),
                     );
                     return true;
                 }

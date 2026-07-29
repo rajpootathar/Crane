@@ -113,7 +113,7 @@ Left → right:
 
 - All new colors derive from existing theme tokens or white/black alpha washes —
   no hardcoded hex, works across every theme. New helpers in
-  `src/warpui/theme.rs`: `hover_wash()`, `selection_wash()`, `context_wash()`
+  `src/app/theme.rs`: `hover_wash()`, `selection_wash()`, `context_wash()`
   (white overlays at 3.5% / 7% / 2.5%), `shadow()`.
 - Hover behavior uses the existing `Hoverable` element (`hover_handle` pattern
   already in shell.rs).

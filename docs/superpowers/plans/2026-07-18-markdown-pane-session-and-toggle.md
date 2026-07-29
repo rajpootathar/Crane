@@ -41,10 +41,10 @@
 Today a markdown pane is not saved, and on restore falls through to `PaneContent::Terminal` — the user loses the document and gets a shell.
 
 **Files:**
-- Modify: `src/warpui/markdown_view.rs` (struct + `new` + new accessor)
-- Modify: `src/warpui/persist.rs` (new `SMarkdown` + state field)
-- Modify: `src/warpui/shell.rs` (save collection ~`:1897`, restore arm ~`:1351-1385`)
-- Test: `src/warpui/markdown_view.rs` and/or `persist.rs` test modules
+- Modify: `src/app/markdown_view.rs` (struct + `new` + new accessor)
+- Modify: `src/app/persist.rs` (new `SMarkdown` + state field)
+- Modify: `src/app/shell.rs` (save collection ~`:1897`, restore arm ~`:1351-1385`)
+- Test: `src/app/markdown_view.rs` and/or `persist.rs` test modules
 
 **Interfaces:**
 - Produces: `WarpMarkdownView::path() -> Option<&Path>`; `persist::SMarkdown { path: PathBuf, editing: bool }`; `WarpuiState.markdowns: Vec<(PaneId, SMarkdown)>`. Task 2 consumes `SMarkdown.editing`.
@@ -196,7 +196,7 @@ If you cannot drive the GUI, say so explicitly and mark DONE_WITH_CONCERNS. Do n
 Run: `make test` — all 117 plus your new tests must pass.
 
 ```bash
-git add src/warpui/markdown_view.rs src/warpui/persist.rs src/warpui/shell.rs
+git add src/app/markdown_view.rs src/app/persist.rs src/app/shell.rs
 git commit -m "fix(warpui): restore markdown panes instead of replacing them with terminals
 
 A markdown pane was never persisted, so the restore chain fell through to
@@ -212,9 +212,9 @@ markdowns entry, and the restore loop rebuilds the pane on its file."
 `.md` currently routes read-only and returns before the editor path, so markdown cannot be edited at all.
 
 **Files:**
-- Modify: `src/warpui/shell.rs` (routing ~`:10794`, pane header ~`:10642`, a new action)
-- Modify: `src/warpui/persist.rs` (write real `editing` values)
-- Test: `src/warpui/shell.rs` test module if one exists; otherwise cover the mode-persistence logic where testable
+- Modify: `src/app/shell.rs` (routing ~`:10794`, pane header ~`:10642`, a new action)
+- Modify: `src/app/persist.rs` (write real `editing` values)
+- Test: `src/app/shell.rs` test module if one exists; otherwise cover the mode-persistence logic where testable
 
 **Interfaces:**
 - Consumes: `SMarkdown.editing` and `WarpMarkdownView::path()` from Task 1.

@@ -16,7 +16,7 @@ use warpui::{
     AfterLayoutContext, AppContext, EventContext, LayoutContext, PaintContext, SizeConstraint,
 };
 
-use crate::warpui::layout::Dir;
+use crate::app::layout::Dir;
 
 const SPLIT_W: f32 = 5.0;
 
@@ -181,7 +181,7 @@ impl Element for SplitBox {
                     // shell's RelayoutPanes nudges every child view (terminal
                     // PTYs get their SIGWINCH mid-drag).
                     ctx.dispatch_typed_action(
-                        crate::warpui::shell::CraneShellAction::RelayoutPanes,
+                        crate::app::shell::CraneShellAction::RelayoutPanes,
                     );
                     return true;
                 }
@@ -190,7 +190,7 @@ impl Element for SplitBox {
                 if self.dragging.get() {
                     self.dragging.set(false);
                     ctx.dispatch_typed_action(
-                        crate::warpui::shell::CraneShellAction::RelayoutPanes,
+                        crate::app::shell::CraneShellAction::RelayoutPanes,
                     );
                     return true;
                 }

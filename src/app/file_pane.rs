@@ -12,7 +12,7 @@ use warpui::elements::{
 use warpui::fonts::FamilyId;
 use warpui::{AppContext, Entity, TypedActionView, View, ViewContext};
 
-use crate::warpui::theme;
+use crate::app::theme;
 
 /// Render cap (NOT a storage cap — the full file is kept; only a window is
 /// drawn until real scroll/virtualization lands, so a huge file can't blow up
