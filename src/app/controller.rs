@@ -99,6 +99,23 @@ fn empty_to_none(raw: String) -> Option<String> {
     }
 }
 
+/// Folds one OSC 633 event into the "a foreground command owns this terminal"
+/// flag the reader thread publishes for [`TerminalController::command_running`].
+///
+/// `C` (pre-exec) opens the window; `D` (exit reported) closes it, and so does
+/// a prompt start — `A` is the belt-and-braces path for a shell that never
+/// emits `D` (the very first prompt, or an rc file that resets the hooks
+/// mid-session), which would otherwise latch the flag on forever. Every other
+/// event leaves the flag alone. Free function so the transition is unit-testable
+/// without spawning a PTY.
+fn command_running_after(prev: bool, ev: &ShellIntegrationEvent) -> bool {
+    match ev {
+        ShellIntegrationEvent::PreExec => true,
+        ShellIntegrationEvent::CommandFinished { .. } | ShellIntegrationEvent::PromptStart => false,
+        _ => prev,
+    }
+}
+
 pub struct TerminalController {
     pub term: Arc<Mutex<Term>>,
     pub parser: Arc<Mutex<Processor>>,
@@ -153,6 +170,14 @@ pub struct TerminalController {
     /// line-clear it sends is an emacs-keymap sequence, so in vi we leave the
     /// arrows alone and the shell's own native vi history takes over.
     keymap_is_vi: Arc<AtomicBool>,
+    /// True between OSC 633 `C` (pre-exec) and the next `D` / prompt start,
+    /// i.e. while a foreground program owns the terminal. Gates OUT the
+    /// ranked-history up/down interception: those arrows belong to whatever is
+    /// running (Claude Code's option list, a REPL, `fzf`), not to the shell's
+    /// line editor, and the `^E^U` line-clear would be typed straight into it.
+    /// The alt-screen check alone was not enough — inline TUIs (ink, prompt
+    /// toolkit) render on the primary screen with no DECCKM.
+    command_running: Arc<AtomicBool>,
 }
 
 impl TerminalController {
@@ -315,6 +340,7 @@ impl TerminalController {
         let notif_queue: Arc<Mutex<Vec<TermNotification>>> = Arc::new(Mutex::new(Vec::new()));
         let live_cwd = Arc::new(Mutex::new(String::new()));
         let keymap_is_vi = Arc::new(AtomicBool::new(false));
+        let command_running = Arc::new(AtomicBool::new(false));
 
         // Reader thread: PTY -> crane_term, write back replies, wake the UI.
         // Lock order is ALWAYS parser-then-term (deadlock-critical).
@@ -329,6 +355,7 @@ impl TerminalController {
             let notif_queue = notif_queue.clone();
             let live_cwd = live_cwd.clone();
             let keymap_is_vi = keymap_is_vi.clone();
+            let command_running = command_running.clone();
             Some(thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -408,6 +435,17 @@ impl TerminalController {
                                 if let ShellIntegrationEvent::Keymap(k) = &ev {
                                     keymap_is_vi.store(k == "vi", Ordering::Relaxed);
                                 }
+                                // Foreground-command tracking for the UI
+                                // thread's up/down interception gate. Same
+                                // by-reference, single-atomic pattern as the
+                                // keymap above — no term or store lock held.
+                                command_running.store(
+                                    command_running_after(
+                                        command_running.load(Ordering::Relaxed),
+                                        &ev,
+                                    ),
+                                    Ordering::Relaxed,
+                                );
                                 if let Some(entry) = recorder.feed(ev) {
                                     crate::app::history_store::store().lock().append(entry);
                                 }
@@ -443,6 +481,7 @@ impl TerminalController {
             shell_integration_active,
             live_cwd,
             keymap_is_vi,
+            command_running,
         })
     }
 
@@ -472,6 +511,16 @@ impl TerminalController {
     /// a vi user keeps the shell's own native arrow-key history.
     pub fn keymap_is_vi(&self) -> bool {
         self.keymap_is_vi.load(Ordering::Relaxed)
+    }
+
+    /// True while a foreground command started from this shell is still
+    /// running (OSC 633 `C` seen, no `D` / prompt start since). Gates OUT the
+    /// ranked-history up/down interception so an inline TUI — Claude Code's
+    /// numbered option list, a REPL, `fzf` — receives the raw cursor keys it
+    /// draws its own selection with, instead of Crane typing a recalled
+    /// command into it.
+    pub fn command_running(&self) -> bool {
+        self.command_running.load(Ordering::Relaxed)
     }
 
     /// The shell's live cwd as of the most recent OSC 633 `P;Cwd=` event, or
@@ -661,6 +710,42 @@ mod live_cwd_tests {
             empty_to_none("/tmp/project".to_string()),
             Some("/tmp/project".to_string())
         );
+    }
+
+    #[test]
+    fn pre_exec_marks_a_foreground_command_running() {
+        // `claude` / a REPL / fzf now owns the arrows — the ranked-history
+        // interception must stand down until the prompt comes back.
+        assert!(command_running_after(false, &ShellIntegrationEvent::PreExec));
+    }
+
+    #[test]
+    fn command_finish_and_prompt_start_both_release_the_flag() {
+        assert!(!command_running_after(
+            true,
+            &ShellIntegrationEvent::CommandFinished { exit: Some(0) }
+        ));
+        // A shell that never emits `D` (first prompt) still releases here,
+        // so the flag can't latch on forever and kill history for the session.
+        assert!(!command_running_after(
+            true,
+            &ShellIntegrationEvent::PromptStart
+        ));
+    }
+
+    #[test]
+    fn unrelated_events_leave_the_flag_alone() {
+        // Cwd / Keymap / CommandLine arrive both at a prompt and mid-command;
+        // neither edge is theirs to move.
+        for ev in [
+            ShellIntegrationEvent::Cwd("/tmp".into()),
+            ShellIntegrationEvent::Keymap("emacs".into()),
+            ShellIntegrationEvent::CommandLine("claude".into()),
+            ShellIntegrationEvent::CommandStart,
+        ] {
+            assert!(command_running_after(true, &ev), "{ev:?} cleared the flag");
+            assert!(!command_running_after(false, &ev), "{ev:?} set the flag");
+        }
     }
 }
 

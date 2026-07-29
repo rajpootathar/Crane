@@ -1189,6 +1189,14 @@ impl TerminalView {
             // screen WITHOUT app-cursor mode, and intercepting there typed
             // ^E^U + a shell command into its input (broke /resume arrows).
             && !alt_now
+            // …and neither is the alt screen: Claude Code's numbered option
+            // prompts render INLINE on the primary screen, so the alt-screen
+            // guard above never fires for them and Up/Down was still being
+            // stolen — a recalled command got typed into the agent's input
+            // instead of moving the 1/2/3 selection. OSC 633 `C`..`D` is the
+            // reliable tell: while a foreground command runs, the arrows are
+            // its business, not the shell line editor's.
+            && !ctrl.command_running()
         {
             let pwd = ctrl
                 .live_cwd()
