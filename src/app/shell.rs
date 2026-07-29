@@ -11908,6 +11908,54 @@ impl CraneShellView {
     /// already needs `ws_of_pane(id)` for the tab strip) rather than
     /// re-resolved here — avoids a second `O(layouts)` scan per pane per
     /// frame.
+    /// "N hidden" pill for the maximized pane's header.
+    ///
+    /// Expanding a pane to full hides its siblings completely — with nothing on
+    /// screen saying so, a Tab that still holds three Panes looks exactly like a
+    /// Tab that only ever held one, and the split is easy to forget. The pill
+    /// counts the leaves of the active Tab's Layout that this pane is standing
+    /// in front of, and clicking it collapses back to the split (same action as
+    /// the header button). `None` when this pane is not maximized, or when it is
+    /// the Layout's only leaf — nothing is hidden, so nothing to say.
+    fn hidden_panes_chip(&self, id: PaneId) -> Option<Box<dyn Element>> {
+        if self.maximized != Some(id) {
+            return None;
+        }
+        let mut leaves = Vec::new();
+        self.active_tab
+            .and_then(|k| self.layouts.get(&k))?
+            .leaves(&mut leaves);
+        let hidden = leaves.iter().filter(|l| **l != id).count();
+        if hidden == 0 {
+            return None;
+        }
+        let chip = ConstrainedBox::new(
+            Container::new(
+                Align::new(
+                    Text::new(format!("{hidden} hidden"), self.ui_font, 10.0)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .finish(),
+            )
+            .with_background_color(theme::surface())
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.0)))
+            .with_padding_left(7.0)
+            .with_padding_right(7.0)
+            .finish(),
+        )
+        .with_height(16.0)
+        .finish();
+        Some(
+            EventHandler::new(chip)
+                .on_left_mouse_down(move |ctx, _app, _pos| {
+                    ctx.dispatch_typed_action(CraneShellAction::ToggleMaximize(id));
+                    DispatchEventResult::StopPropagation
+                })
+                .finish(),
+        )
+    }
+
     fn pane_header(&self, id: PaneId, app: &AppContext, is_file_pane: bool) -> Box<dyn Element> {
         let focused = self.focused == Some(id);
         let bg = if focused { theme::surface() } else { theme::topbar_bg() };
@@ -12003,14 +12051,23 @@ impl CraneShellView {
             _ => None,
         };
 
+        // Expanded-to-full state. The button glyph must show what pressing it
+        // DOES: ARROWS_OUT (expand) while tiled, ARROWS_IN (collapse back to
+        // the split) while this pane is the maximized one.
+        let is_max = self.maximized == Some(id);
+        let max_glyph = if is_max { icons::ARROWS_IN } else { icons::ARROWS_OUT };
+
         // The Expanded title fills the row, pushing these to the right edge.
         let mut btn_row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        if let Some(chip) = self.hidden_panes_chip(id) {
+            btn_row = btn_row.with_child(chip).with_child(Self::spacer(4.0));
+        }
         if let Some(tb) = md_toggle {
             btn_row = btn_row.with_child(tb).with_child(Self::spacer(2.0));
         }
         let buttons = Container::new(
             btn_row
-                .with_child(self.icon_button(&format!("pane-max:{id}"), icons::ARROWS_OUT, CraneShellAction::ToggleMaximize(id)))
+                .with_child(self.icon_button(&format!("pane-max:{id}"), max_glyph, CraneShellAction::ToggleMaximize(id)))
                 .with_child(Self::spacer(2.0))
                 .with_child(self.icon_button(&format!("pane-close:{id}"), icons::X, CraneShellAction::ClosePane(id)))
                 .finish(),

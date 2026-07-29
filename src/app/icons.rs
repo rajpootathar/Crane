@@ -25,6 +25,9 @@ pub const ARROW_CLOCKWISE: &str = "\u{E036}";
 pub const ARROW_SQUARE_OUT: &str = "\u{E5DE}";
 pub const ARROW_COUNTER_CLOCKWISE: &str = "\u{E038}";
 pub const ARROWS_OUT: &str = "\u{E0A2}";
+/// Collapse counterpart of [`ARROWS_OUT`] — the maximized pane's header swaps
+/// to this so the button reads as "restore", not "expand again".
+pub const ARROWS_IN: &str = "\u{E09A}";
 // Not wired into any pane yet, but CLAUDE.md names these four as part of
 // the sanctioned icon palette for future UI work (Crane bans raw Unicode
 // glyph icons — see "Icons" in the project ruleset). Kept, not deleted.
