@@ -15,6 +15,27 @@ fn blink_epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
+/// The mouse buttons macOS itself currently considers held, as a bitmask
+/// (bit 0 = left). Diagnostic only, read under `CRANE_SCROLL_TRACE=1`.
+///
+/// Our own `mouse_dragging` flag is derived from events we received; this asks
+/// the window server what is ACTUALLY held right now. When a wheel event
+/// re-issues a selection drag, the two together say which of two very different
+/// bugs we are looking at: flag says down + OS says up = we missed a
+/// LeftMouseUp and the fix is ours; both say down while the user's finger is
+/// off the trackpad = macOS drag-lock is holding the button and no Crane change
+/// will alter it.
+#[cfg(target_os = "macos")]
+fn os_buttons_down() -> u64 {
+    use objc2::{class, msg_send};
+    unsafe { msg_send![class!(NSEvent), pressedMouseButtons] }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn os_buttons_down() -> u64 {
+    0
+}
+
 /// True when `CRANE_SCROLL_TRACE=1`: scroll-feel debugging probes print
 /// event- and paint-side timings to stderr. Cached once per process.
 pub fn scroll_trace() -> bool {
@@ -127,7 +148,9 @@ pub struct GridElement {
     cell_h: f32,
     /// Scroll-wheel callback: `(delta_y_points, precise)`. `precise` = trackpad
     /// (pixel-smooth), else mouse wheel (line steps). `None` = no scrolling.
-    scroll_cb: Option<Rc<dyn Fn(f32, bool)>>,
+    /// `(delta_y, precise, shift_held)`. Shift decides whether the gesture is
+    /// the app's or Crane's — see the wheel policy in `view.rs`.
+    scroll_cb: Option<Rc<dyn Fn(f32, bool, bool)>>,
     /// Active selection range to highlight, plus the display_offset used to
     /// convert viewport rows to terminal line numbers.
     selection: Option<SelectionRange>,
@@ -250,7 +273,9 @@ impl GridElement {
     }
 
     /// Attach a scroll-wheel handler that receives `(delta_y_points, precise)`.
-    pub fn on_scroll(mut self, cb: Rc<dyn Fn(f32, bool)>) -> Self {
+    pub fn on_scroll(
+        mut self,
+        cb: Rc<dyn Fn(f32, bool, bool)>) -> Self {
         self.scroll_cb = Some(cb);
         self
     }
@@ -639,7 +664,7 @@ impl Element for GridElement {
         // git-log dock / other scrollables) on screen, an ungated arm here
         // would consume wheel events destined for siblings.
         if let Some(cb) = self.scroll_cb.as_ref() {
-            if let Event::ScrollWheel { delta, precise, position, .. } = event.raw_event() {
+            if let Event::ScrollWheel { delta, precise, position, modifiers } = event.raw_event() {
                 let inside = in_bounds(position);
                 if scroll_trace() {
                     eprintln!(
@@ -649,7 +674,7 @@ impl Element for GridElement {
                     );
                 }
                 if inside {
-                    cb(delta.y(), *precise);
+                    cb(delta.y(), *precise, modifiers.shift);
                     // Wheel/trackpad DURING a selection drag: the viewport just
                     // moved under a pointer that never moved, so re-issue the
                     // drag at the same pixel. Without this the selection stays
@@ -658,6 +683,24 @@ impl Element for GridElement {
                     if self.mouse_dragging.get() {
                         if let Some(sel_cb) = self.mouse_sel_cb.as_ref() {
                             let (row, col, side) = pos_to_cell(position);
+                            // CRANE_SCROLL_TRACE=1: this re-issue is CORRECT while
+                            // the button is genuinely held, and a bug if the drag
+                            // flag was stranded by a LeftMouseUp this element never
+                            // saw — the selection then follows every scroll with no
+                            // button down. The probe distinguishes the two.
+                            if scroll_trace() {
+                                let os = os_buttons_down();
+                                eprintln!(
+                                    "[sel-wheel] t={:.1}ms reissue row={row} col={col} \
+                                     os_buttons={os:#04b} verdict={}",
+                                    trace_epoch().elapsed().as_secs_f64() * 1e3,
+                                    if os & 1 != 0 {
+                                        "OS-says-held (expected while extending a selection)"
+                                    } else {
+                                        "STRANDED-FLAG (OS says no button down — this is the bug)"
+                                    },
+                                );
+                            }
                             sel_cb(MouseSelPhase::Drag, row, col, side, false);
                         }
                     }
@@ -761,6 +804,12 @@ impl Element for GridElement {
                     *self.link_pressed.borrow_mut() = pressed_link;
                     self.url_did_drag.set(false);
                     self.mouse_dragging.set(true);
+                    if scroll_trace() {
+                        eprintln!(
+                            "[sel-down]  t={:.1}ms row={row} col={col} dragging=true",
+                            trace_epoch().elapsed().as_secs_f64() * 1e3,
+                        );
+                    }
                     cb(MouseSelPhase::Down, row, col, side, modifiers.shift);
                     return true;
                 }
@@ -790,6 +839,12 @@ impl Element for GridElement {
                 Event::LeftMouseUp { position, .. } if self.mouse_dragging.get() => {
                     // Autoscroll was already cleared by the unconditional arm above.
                     self.mouse_dragging.set(false);
+                    if scroll_trace() {
+                        eprintln!(
+                            "[sel-up]    t={:.1}ms dragging=false",
+                            trace_epoch().elapsed().as_secs_f64() * 1e3,
+                        );
+                    }
                     cb(MouseSelPhase::Up, 0, 0, Side::Left, false);
                     // Link click: only when no drag happened and the release is on
                     // the same target that was pressed. This keeps text selection

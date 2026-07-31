@@ -861,6 +861,27 @@ impl View for TerminalView {
                         if let Some(ref mut sel) = t.selection {
                             sel.update(pt, side);
                         }
+                        // CRANE_SCROLL_TRACE=1: the selection ITSELF, not just
+                        // the pointer. `anchor` must stay put while `active`
+                        // moves — an anchor whose line changes between events is
+                        // the reported "selection slides onto new text" bug,
+                        // and the delta says how far per event.
+                        if crate::app::grid_element::scroll_trace() {
+                            if let Some(sel) = t.selection.as_ref() {
+                                eprintln!(
+                                    "[sel-state] t={:.1}ms disp={disp} vrow={vrow} \
+                                     anchor_line={} active_line={} scrollback={} alt={}",
+                                    crate::app::grid_element::trace_epoch()
+                                        .elapsed()
+                                        .as_secs_f64()
+                                        * 1e3,
+                                    sel.anchor.point.line.0,
+                                    sel.active.point.line.0,
+                                    t.scrollback_len(),
+                                    t.is_alt_screen(),
+                                );
+                            }
+                        }
                         drop(t);
                         (sel_wake)();
                     }
@@ -998,7 +1019,8 @@ impl View for TerminalView {
         // fractional lines across events; we mirror that by keeping `scroll_pos`
         // (fractional display_offset) and truncating to integer rows on apply.
         let cell_h = crate::app::fontsize::base() * 1.2;
-        let scroll_cb: std::rc::Rc<dyn Fn(f32, bool)> = std::rc::Rc::new(move |dy: f32, precise: bool| {
+        let scroll_cb: std::rc::Rc<dyn Fn(f32, bool, bool)> =
+            std::rc::Rc::new(move |dy: f32, precise: bool, _shift: bool| {
             let delta_lines = if precise { dy / cell_h } else { dy };
             // Soft-knee on fast flicks: deltas under ~3 lines/event pass 1:1
             // (micro-scroll fidelity untouched); above that, the excess is
@@ -1020,6 +1042,37 @@ impl View for TerminalView {
                     || t.mode_contains(TermMode::MOUSE_MOTION);
                 (t.is_alt_screen(), mouse, t.scrollback_len(), t.display_offset())
             };
+            // CRANE_SCROLL_TRACE=1: which branch consumes the wheel. When a
+            // selection drag is stuck against an unmoving viewport, this says
+            // whether the app claimed the wheel (mouse), owns the screen (alt),
+            // or whether we simply had nothing to scroll into.
+            if crate::app::grid_element::scroll_trace() {
+                eprintln!(
+                    "[sel-scroll] t={:.1}ms alt={alt} mouse={mouse} disp={cur} scrollback_max={max} \
+                     branch={}",
+                    crate::app::grid_element::trace_epoch().elapsed().as_secs_f64() * 1e3,
+                    if mouse {
+                        "FORWARD-SGR-to-app (viewport will NOT move)"
+                    } else if alt {
+                        "FORWARD-arrows-to-app (viewport will NOT move)"
+                    } else {
+                        "local-scroll"
+                    },
+                );
+            }
+            // Wheel policy: forward to the app whenever it asked for mouse
+            // reporting. This matches Warp's shipped default
+            // (`scroll_reporting_enabled: true`, vendor/warp
+            // app/src/terminal/alt_screen/mod.rs) and it is the default for a
+            // reason — the alternative was tried here and is worse.
+            //
+            // Intercepting a plain wheel and sending SS3 arrows instead (the
+            // path Warp takes only when the user turns scroll reporting OFF)
+            // looks right for `less`/`vim`, but in an app that binds arrows to
+            // something else it is destructive: in Claude Code the wheel then
+            // rotates the prompt through previous messages. Forwarding to an
+            // app that ignores the wheel merely does nothing, which is the
+            // better failure. Revisit only as an opt-in setting, per Warp.
             if mouse {
                 // Mouse-aware app: forward SGR wheel events, one per whole line.
                 let acc = page_accum.get() + delta_lines;
