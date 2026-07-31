@@ -498,6 +498,7 @@ impl Term {
         }
     }
 
+
     /// True when `line` auto-wrapped into `line + 1` — its last cell
     /// carries WRAPLINE, so the two visual rows are one logical line.
     fn wraps_into_next(&self, line: i32) -> bool {
@@ -742,6 +743,52 @@ impl Term {
     /// (Claude splash) is mutated by the redraw → equal gen → drop;
     /// static line from a previous frame scrolling off (Ink) →
     /// untouched this sync → unequal gen → keep.
+    /// Keep a live selection on its own text across one program-driven scroll
+    /// up. Called by [`Self::scroll_up_one`] after the rows have moved.
+    ///
+    /// Selection points live in `row_at` space: `line >= 0` indexes the live
+    /// grid, `line < 0` counts back through scrollback. When the top row is
+    /// evicted, BOTH spaces shift by exactly one — grid content `L -> L-1`, and
+    /// every scrollback row moves one further from the back (`-k -> -k-1`) —
+    /// so a uniform `-1` keeps every point on its text.
+    ///
+    /// Two cases break that uniformity:
+    /// * Nothing was evicted (alt screen, or a `?2026` sync-frame redraw whose
+    ///   eviction is suppressed). Scrollback did not move, so only grid points
+    ///   shift, and the row that fell off the top is gone for good — a point
+    ///   landing above the grid no longer has any text and the selection dies.
+    /// * A partial scroll region. Only some rows moved; no single shift is
+    ///   correct, so the selection is dropped rather than left pointing at text
+    ///   the user never selected.
+    ///
+    /// Dropping beats drifting: a selection that silently covers different text
+    /// is worse than one that visibly went away.
+    fn shift_selection_up_one(&mut self, full_region: bool, evicted_to_scrollback: bool) {
+        if self.selection.is_none() {
+            return;
+        }
+        if !full_region {
+            self.selection = None;
+            return;
+        }
+        // Oldest line still backed by real text.
+        let oldest = if evicted_to_scrollback {
+            -(self.scrollback.len() as i32)
+        } else {
+            0
+        };
+        let Some(sel) = self.selection.as_mut() else {
+            return;
+        };
+        sel.anchor.point.line.0 -= 1;
+        sel.active.point.line.0 -= 1;
+        let newest = sel.anchor.point.line.0.max(sel.active.point.line.0);
+        // Entirely scrolled off the far end of history — nothing left to show.
+        if newest < oldest {
+            self.selection = None;
+        }
+    }
+
     fn scroll_up_one(&mut self) {
         let region = self.grid.scroll_region.clone();
         if region.is_empty() {
@@ -767,16 +814,24 @@ impl Term {
         // data-destructive. Proper fix is the Warp-style Block model
         // (memory: project_warp_style_rewrite) where scrollback only
         // exists at block boundaries; tracked as a follow-up.
+        let mut evicted_to_scrollback = false;
         if !self.mode.contains(TermMode::ALT_SCREEN) {
             let preserve = !self.in_sync_frame
                 || evicted.written_in_gen != self.current_sync_gen;
             if preserve {
                 self.scrollback.push(evicted);
+                evicted_to_scrollback = true;
             }
         }
         for r in region.start..region.end.saturating_sub(1) {
             self.grid.rows.swap(r, r + 1);
         }
+        // A live selection must ride along with the text that just moved.
+        // Whole-screen region only: a scroll region set by a TUI moves a subset
+        // of rows, and there is no single shift that keeps a selection honest
+        // across it.
+        let full_region = region.start == 0 && region.end == self.grid.rows.len();
+        self.shift_selection_up_one(full_region, evicted_to_scrollback);
         let bottom = region.end.saturating_sub(1);
         let sync_gen = self.current_sync_gen;
         if let Some(row) = self.grid.rows.get_mut(bottom) {
@@ -805,6 +860,16 @@ impl Term {
         }
         if let Some(row) = self.grid.rows.get_mut(region.start) {
             row.reset_at(&self.grid.cursor.template, sync_gen);
+        }
+        // Same drift as scroll-up (see `shift_selection_up_one`), but there is
+        // no uniform shift to undo it here: grid content moves DOWN one row
+        // while scrollback stays put, and the bottom row is destroyed rather
+        // than evicted. A selection spanning the grid/scrollback boundary would
+        // need its two ends moved by different amounts. Reverse-index is rare
+        // (TUI redraws, backward paging) so the selection is simply dropped —
+        // visibly gone beats silently covering the wrong text.
+        if self.selection.is_some() {
+            self.selection = None;
         }
     }
 
@@ -1402,6 +1467,10 @@ impl Handler for Term {
                 }
                 vte::ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
                     self.mode |= TermMode::ALT_SCREEN | TermMode::ALT_SCREEN_1049;
+                    // A selection made on the primary screen must not survive
+                    // onto the alt screen: its `line < 0` points resolve into
+                    // the primary scrollback, which is not what is on display.
+                    self.selection = None;
                     self.save_cursor();
                 }
                 vte::ansi::NamedPrivateMode::SyncUpdate => {
@@ -1454,6 +1523,7 @@ impl Handler for Term {
                 }
                 vte::ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
                     self.mode -= TermMode::ALT_SCREEN | TermMode::ALT_SCREEN_1049;
+                    self.selection = None;
                     self.restore_cursor();
                 }
                 vte::ansi::NamedPrivateMode::SyncUpdate => {
@@ -2707,6 +2777,111 @@ mod tests {
                 exit: Some((SHELL_EVENT_QUEUE_MAX + overflow - 1) as i32)
             }),
             "the newest event must survive"
+        );
+    }
+
+    /// User-reported: extending a text selection inside a Claude Code pane is
+    /// unusable — the highlight walks onto whatever text has scrolled under it
+    /// instead of staying on what was selected, so a passage longer than one
+    /// screen can never be captured.
+    ///
+    /// Root cause reproduced here with no GUI: a selection's points live in the
+    /// `line = viewport_row - display_offset` space, which is stable while the
+    /// USER scrolls (content and `display_offset` move together) but NOT when
+    /// the PROGRAM emits a line. `scroll_up_one` shifts every row up and evicts
+    /// the top row to scrollback while the stored selection stays where it was,
+    /// so the selection slips one row relative to its text per line of output.
+    /// A quiet shell never shows it; Claude repaints continuously, so the
+    /// selection walks away as you drag.
+    ///
+    /// The invariant: text that was selected stays selected across program
+    /// output, until it is evicted past the scrollback limit.
+    #[test]
+    fn selection_follows_its_text_across_program_output() {
+        let mut t = Term::new(5, 20);
+        let mut p = crate::Processor::new();
+        // Put a known marker on the first row, then fill the rest.
+        p.parse_bytes(&mut t, b"SELECTME\r\n");
+        p.parse_bytes(&mut t, b"second\r\n");
+
+        // Select the marker where it currently sits: viewport row 0.
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(0), Column(7)), Side::Right);
+        t.selection = Some(sel);
+        assert_eq!(
+            t.selection_to_string().as_deref(),
+            Some("SELECTME"),
+            "fixture broken: selection should start on the marker"
+        );
+
+        // Claude emits output. Each line scrolls the grid up by one; the marker
+        // moves with it (eventually into scrollback), and the selection must
+        // follow the marker rather than staying on a fixed row.
+        p.parse_bytes(&mut t, b"out1\r\nout2\r\nout3\r\n");
+
+        assert_eq!(
+            t.selection_to_string().as_deref(),
+            Some("SELECTME"),
+            "selection drifted onto different text after program output — this \
+             is the Claude-pane bug: it should still cover the marker it was \
+             anchored to"
+        );
+    }
+
+    /// The selection must survive being pushed off the live grid into
+    /// scrollback — that is the whole point of dragging past the top edge to
+    /// select more than one screen of Claude output.
+    #[test]
+    fn selection_survives_into_scrollback() {
+        let mut t = Term::new(3, 20);
+        let mut p = crate::Processor::new();
+        p.parse_bytes(&mut t, b"MARKER\r\n");
+
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(0), Column(5)), Side::Right);
+        t.selection = Some(sel);
+
+        // Enough output to evict the marker well past the live grid.
+        for _ in 0..6 {
+            p.parse_bytes(&mut t, b"filler\r\n");
+        }
+        assert_eq!(
+            t.selection_to_string().as_deref(),
+            Some("MARKER"),
+            "selection must follow its text down into scrollback"
+        );
+    }
+
+    /// Reverse-index has no uniform shift that keeps a selection honest (grid
+    /// moves, scrollback does not), so it drops the selection instead of
+    /// leaving it over text the user never picked.
+    #[test]
+    fn reverse_index_drops_the_selection_rather_than_drifting_it() {
+        let mut t = Term::new(4, 20);
+        let mut p = crate::Processor::new();
+        p.parse_bytes(&mut t, b"one\r\ntwo\r\n");
+
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(0), Column(2)), Side::Right);
+        t.selection = Some(sel);
+
+        // ESC M at the top of the region scrolls the grid down.
+        p.parse_bytes(&mut t, b"\x1b[H\x1bM");
+        assert!(
+            t.selection.is_none(),
+            "reverse-index must drop the selection, not drift it"
         );
     }
 }
