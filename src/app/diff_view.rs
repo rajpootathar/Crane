@@ -364,6 +364,85 @@ fn build_rows(old_text: &str, new_text: &str, ext: &str) -> (Vec<Row>, usize, us
     (rows, ldigits, rdigits)
 }
 
+/// Commit-scoped counterpart of [`compute`]: both sides come out of git
+/// (`<sha>^` and `<sha>`), so nothing touches the working copy and nothing is
+/// stageable. Runs off the UI thread, same as [`compute`].
+///
+/// A missing side is meaningful rather than an error — absent from `<sha>^`
+/// means the commit added the file (everything renders as an add), absent from
+/// `<sha>` means it deleted it (everything renders as a delete). A root commit
+/// has no `^` at all, which lands in the same "added" branch.
+fn compute_commit(repo_root: Option<PathBuf>, rel: String, sha: String) -> DiffComputed {
+    if is_image_path_str(&rel) {
+        return DiffComputed::with_binary("Image file — no text diff".to_string());
+    }
+    let Some(root) = repo_root else {
+        return DiffComputed::with_error("No repository for this commit".to_string());
+    };
+
+    let old_bytes = match crate::app::git::rev_bytes(&root, &format!("{sha}^"), &rel) {
+        Ok(b) => b,
+        Err(e) => return DiffComputed::with_error(format!("git show {sha}^:{rel} failed: {e}")),
+    };
+    let new_bytes = match crate::app::git::rev_bytes(&root, &sha, &rel) {
+        Ok(b) => b,
+        Err(e) => return DiffComputed::with_error(format!("git show {sha}:{rel} failed: {e}")),
+    };
+    if old_bytes.is_none() && new_bytes.is_none() {
+        return DiffComputed::with_error(format!(
+            "{rel} is in neither {sha} nor its parent"
+        ));
+    }
+
+    if new_bytes.as_deref().map(looks_binary).unwrap_or(false)
+        || old_bytes.as_deref().map(looks_binary).unwrap_or(false)
+    {
+        return DiffComputed::with_binary("Binary file — no text diff".to_string());
+    }
+
+    let old_text = old_bytes
+        .map(|b| String::from_utf8(b).unwrap_or_default())
+        .unwrap_or_default();
+    let new_text = new_bytes
+        .map(|b| String::from_utf8(b).unwrap_or_default())
+        .unwrap_or_default();
+
+    let ext = Path::new(&rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let (rows, ldigits, rdigits) = build_rows(&old_text, &new_text, &ext);
+
+    let tags: Vec<ChangeTag> = rows.iter().map(|r| r.tag).collect();
+    let total_rows = tags.len();
+    let hunk_starts = visual_hunk_starts(&tags);
+
+    let mut row_to_hunk: Vec<Option<usize>> = vec![None; total_rows];
+    for (hi, &start) in hunk_starts.iter().enumerate() {
+        let end = hunk_starts.get(hi + 1).copied().unwrap_or(total_rows);
+        for r in start..end.min(total_rows) {
+            row_to_hunk[r] = Some(hi);
+        }
+    }
+
+    // No patches → the gutter draws no stage affordances, and no row can join
+    // a shared-patch group.
+    let n = hunk_starts.len();
+    DiffComputed {
+        rows,
+        hunk_starts,
+        hunk_patches: vec![None; n],
+        hunk_staged: vec![false; n],
+        row_to_hunk,
+        row_in_shared_group: vec![false; total_rows],
+        ldigits,
+        rdigits,
+        binary: None,
+        error: None,
+    }
+}
+
 /// The expensive bit — runs inside the spawned future, OFF the UI thread:
 /// `git show HEAD:` (subprocess), the working-copy read, both-side syntect
 /// highlighting, `TextDiff`, `git diff` hunk parsing, and the per-hunk
@@ -507,6 +586,12 @@ pub struct WarpDiffView {
     /// Repo-relative path (git side) and absolute path (disk side).
     rel: String,
     abs: PathBuf,
+    /// `Some(sha)` puts the pane in COMMIT mode: it diffs `<sha>^` vs `<sha>`
+    /// for `rel` (what that one commit did to that one file) instead of HEAD
+    /// vs the working copy. Opened from the Git Log's changed-files list.
+    /// History can't be staged, so commit mode computes no hunk patches and
+    /// the stage gutter stays empty.
+    commit: Option<String>,
     /// Latest compute result. `None` until the first off-thread compute lands;
     /// kept (and re-rendered) while a recompute is in flight so a hunk stage
     /// doesn't flash the pane back to the spinner.
@@ -553,6 +638,29 @@ impl WarpDiffView {
     /// disk and (b) shell out `git show HEAD:<relpath>` (Crane's git-binary
     /// rule; never libgit2).
     pub fn new(ctx: &mut ViewContext<Self>, repo_root: Option<PathBuf>, path: PathBuf) -> Self {
+        Self::build(ctx, repo_root, path, None)
+    }
+
+    /// Diff what commit `sha` did to `path` — `<sha>^` on the left, `<sha>` on
+    /// the right. This is what the Git Log's changed-files list opens, so a
+    /// historical change gets the same real diff viewer (syntax highlighting,
+    /// hunk nav, minimap) as a working-copy change, rather than a flat patch
+    /// dump. See the `commit` field for why the stage gutter goes quiet.
+    pub fn new_for_commit(
+        ctx: &mut ViewContext<Self>,
+        repo_root: Option<PathBuf>,
+        path: PathBuf,
+        sha: String,
+    ) -> Self {
+        Self::build(ctx, repo_root, path, Some(sha))
+    }
+
+    fn build(
+        ctx: &mut ViewContext<Self>,
+        repo_root: Option<PathBuf>,
+        path: PathBuf,
+        commit: Option<String>,
+    ) -> Self {
         let font = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
             crate::app::bundled_fonts::mono(cache)
         });
@@ -594,15 +702,25 @@ impl WarpDiffView {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
+        // Header sides: commit mode names both revisions by short SHA so it's
+        // unambiguous which two trees are on screen.
+        let (left_path, right_path) = match &commit {
+            Some(sha) => {
+                let short: String = sha.chars().take(8).collect();
+                (format!("{short}^:{rel}"), format!("{short}:{rel}"))
+            }
+            None => (format!("HEAD:{rel}"), rel.clone()),
+        };
         let mut this = Self {
             font,
             icon_font,
             title,
-            left_path: format!("HEAD:{rel}"),
-            right_path: rel.clone(),
+            left_path,
+            right_path,
             repo_root,
             rel,
             abs,
+            commit,
             computed: None,
             loading: false,
             error: None,
@@ -631,7 +749,13 @@ impl WarpDiffView {
         let repo_root = self.repo_root.clone();
         let rel = self.rel.clone();
         let abs = self.abs.clone();
-        let fut = async move { compute(repo_root, rel, abs) };
+        let commit = self.commit.clone();
+        let fut = async move {
+            match commit {
+                Some(sha) => compute_commit(repo_root, rel, sha),
+                None => compute(repo_root, rel, abs),
+            }
+        };
         ctx.spawn(fut, |this, computed, vctx| {
             this.computed = Some(Rc::new(computed));
             this.loading = false;

@@ -20,6 +20,10 @@ pub const ARROW_LEFT: &str = "\u{E058}";
 pub const ARROW_UP: &str = "\u{E08E}";
 pub const ARROW_DOWN: &str = "\u{E03E}";
 pub const ARROW_RIGHT: &str = "\u{E06C}";
+/// Collapse-to-edge arrows (a shaft into a wall) — the Git Log column
+/// collapse toggles. Direction = the way the column moves.
+pub const ARROW_LINE_LEFT: &str = "\u{E062}";
+pub const ARROW_LINE_RIGHT: &str = "\u{E064}";
 pub const CHECK: &str = "\u{E182}";
 pub const ARROW_CLOCKWISE: &str = "\u{E036}";
 pub const ARROW_SQUARE_OUT: &str = "\u{E5DE}";

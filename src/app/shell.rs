@@ -16,6 +16,7 @@ use crate::app::file_pane::FileView;
 use crate::app::file_tree;
 use crate::app::icons;
 use crate::app::layout::{Dir, Node, PaneId};
+use crate::app::tab_key::{DiffSpec, TabKey};
 use crate::app::rect_probe::{pane_under, DockEdge, PaneRect, RectProbe};
 use crate::app::split::SplitBox;
 use warpui::color::ColorU;
@@ -31,6 +32,7 @@ use warpui::platform::Cursor;
 use warpui::geometry::rect::RectF;
 use warpui::geometry::vector::vec2f;
 use warpui::fonts::FamilyId;
+use warpui::units::Pixels;
 use warpui::{
     AppContext, Element, Entity, SingletonEntity as _, TypedActionView, View, ViewContext,
     ViewHandle,
@@ -283,11 +285,16 @@ pub struct CraneShellView {
     /// a single `Option<PaneId>` until it turned out one Project's Files Pane
     /// was being reused for every other Project's files.
     files_pane: HashMap<(usize, usize), PaneId>,
-    /// Open file paths in each Workspace's File pane (shell-side mirror, drives
+    /// Open File Tabs in each Workspace's File pane (shell-side mirror, drives
     /// the header tab strip + persistence). Per Workspace for the same reason
     /// as `files_pane`: File Tabs opened in one Project must never appear in
     /// another's Files Pane.
-    file_pane_paths: HashMap<(usize, usize), Vec<PathBuf>>,
+    ///
+    /// Entries are [`TabKey`]s, not paths: an editable document and a read-only
+    /// diff of the same file are two tabs in one strip, and two diffs of one
+    /// file over different ranges are two more. Anything filesystem-facing
+    /// (delete sweeps, buffer refcounts) must compare `TabKey::path()`.
+    file_pane_paths: HashMap<(usize, usize), Vec<TabKey>>,
     /// Active file tab index within that Workspace's own `file_pane_paths`.
     file_pane_active: HashMap<(usize, usize), usize>,
     /// Live warp editor per open file path — kept alive across tab switches so
@@ -309,6 +316,10 @@ pub struct CraneShellView {
     /// Per-path PDF view cache — peer of `image_views`, so every pane showing
     /// the same PDF shares one decoded view.
     pdf_views: HashMap<PathBuf, ViewHandle<crate::app::pdf_view::WarpPdfView>>,
+    /// Live diff views, keyed by the FULL [`TabKey`] rather than by path —
+    /// peer of `editor_views` / `markdown_views`, but two ranges of one file
+    /// are two distinct live views, so the path alone can't key this.
+    diff_views: HashMap<TabKey, ViewHandle<crate::app::diff_view::WarpDiffView>>,
     /// `.md` paths the user switched into EDIT mode via the pane header's
     /// toggle. Absent = the rendered preview (the default for every `.md`
     /// file); present = the raw source in a `WarpEditorView`.
@@ -349,6 +360,18 @@ pub struct CraneShellView {
     show_git_log: bool,
     git_log_ratio: Rc<Cell<f32>>,
     git_log_drag: Rc<Cell<bool>>,
+    /// Refs column collapsed to zero width (old `col_refs_collapsed`). The
+    /// header's left-edge arrow toggles it.
+    git_log_refs_collapsed: bool,
+    /// Detail column collapsed to zero width (old `col_details_collapsed`).
+    git_log_details_collapsed: bool,
+    /// Refs ↔ (log | detail) split ratio + drag latch (old `col_refs_width`,
+    /// expressed as a fraction so the columns track dock resizes).
+    git_log_refs_ratio: Rc<Cell<f32>>,
+    git_log_refs_drag: Rc<Cell<bool>>,
+    /// Log ↔ detail split ratio + drag latch (old `col_details_width`).
+    git_log_detail_ratio: Rc<Cell<f32>>,
+    git_log_detail_drag: Rc<Cell<bool>>,
     /// Loaded lane-graph snapshot (commits + refs + lanes). `None` until the
     /// first off-thread [`git_log::load`] lands. Shared behind `Rc` so the
     /// custom list element can borrow it without a data clone.
@@ -388,11 +411,31 @@ pub struct CraneShellView {
     git_log_ref_filter: Option<String>,
     /// Case-insensitive text filter over subject / hash / author; "" = off.
     git_log_filter: crate::app::line_edit::LineEdit,
+    /// User filter — an exact author name from the loaded graph; None = all.
+    git_log_author_filter: Option<String>,
+    /// Date-window filter over the commit list.
+    git_log_date_filter: crate::app::git_log::DateFilter,
+    /// Which filter dropdown is open, if any.
+    git_log_open_menu: Option<GitLogMenu>,
+    /// On-screen rects of the three filter chips, written each paint by a
+    /// `RectProbe`. The dropdown anchors under its OWN chip — computing that
+    /// position from the dock ratio instead would drift the moment anything
+    /// above the bar changes height.
+    git_log_menu_anchors: [crate::app::rect_probe::PaneRect; 3],
+    /// Scroll state for the open filter dropdown — a repo with many branches
+    /// or many authors overflows the menu's fixed height.
+    git_log_menu_scroll: ClippedScrollStateHandle,
+    /// Directories collapsed in the commit-detail changed-files TREE, keyed by
+    /// the node's full path.
+    git_log_tree_collapsed: std::collections::HashSet<String>,
     /// True while the git-log filter field owns typing (`SendKeys` routes here).
     git_log_filter_active: bool,
     /// Filtered-frame cache keyed by (needle, generation) — `filtered_frame`
     /// re-runs lane layout over up to 10k commits, which must not happen per
     /// paint. RefCell: filled lazily from `render` (which is `&self`).
+    /// Cache key is the FULL filter set (text, author, date window) plus the
+    /// load generation — narrowing by author must invalidate it just as a new
+    /// needle does.
     git_log_filtered:
         std::cell::RefCell<Option<(String, u64, Rc<crate::app::git_log::GraphFrame>)>>,
     /// Open commit context menu: (sha, window x, window y).
@@ -470,8 +513,19 @@ pub struct CraneShellView {
     git_log_detail: Option<crate::app::git_log::CommitDetail>,
     /// True while the selected commit's `git show` is computing.
     git_log_detail_loading: bool,
-    /// Row scroll offset for the detail/diff panel.
-    git_log_detail_scroll: usize,
+    /// Scroll state for the detail column's changed-files section. A real
+    /// scroll container (same as every other panel) rather than a hand-rolled
+    /// row window — the window only scrolled the patch, so a long commit
+    /// message pushed the changed-files list off the bottom with no way to
+    /// reach it.
+    git_log_detail_scroll: ClippedScrollStateHandle,
+    /// Scroll state for the detail column's commit-message section. The files
+    /// list and the message are separate scroll regions (JetBrains layout), so
+    /// a 70-file commit can't bury the message.
+    git_log_message_scroll: ClippedScrollStateHandle,
+    /// Files ↔ message split inside the detail column + its drag latch.
+    git_log_detail_split: Rc<Cell<f32>>,
+    git_log_detail_split_drag: Rc<Cell<bool>>,
     /// Selected index in the commit detail's changed-files list.
     git_log_detail_file: usize,
     /// Commit message buffer + whether the commit box has keyboard focus
@@ -2585,12 +2639,18 @@ impl CraneShellView {
             focused,
             maximized: None,
             files_pane: restored_files_pane,
-            file_pane_paths: restored_file_paths,
+            // Restored state carries editable documents only — a diff tab is a
+            // derived view, so it is neither saved nor resurrected.
+            file_pane_paths: restored_file_paths
+                .into_iter()
+                .map(|(k, paths)| (k, paths.into_iter().map(TabKey::File).collect()))
+                .collect(),
             file_pane_active: restored_active,
             editor_views: restored_editor_views,
             markdown_views: restored_markdown_views,
             image_views: restored_image_views,
             pdf_views: restored_pdf_views,
+            diff_views: HashMap::new(),
             md_edit_mode: restored_md_edit,
             term_cache: RefCell::new(restored_term_cache),
             last_term_snapshot: std::cell::Cell::new(None),
@@ -2612,6 +2672,12 @@ impl CraneShellView {
             show_git_log: false,
             git_log_ratio: Rc::new(Cell::new(0.7)),
             git_log_drag: Rc::new(Cell::new(false)),
+            git_log_refs_collapsed: false,
+            git_log_details_collapsed: false,
+            git_log_refs_ratio: Rc::new(Cell::new(0.16)),
+            git_log_refs_drag: Rc::new(Cell::new(false)),
+            git_log_detail_ratio: Rc::new(Cell::new(0.58)),
+            git_log_detail_drag: Rc::new(Cell::new(false)),
             git_log_frame: None,
             git_log_repo: None,
             git_log_loading: false,
@@ -2624,6 +2690,16 @@ impl CraneShellView {
             git_log_scroll: Rc::new(Cell::new(0.0)),
             git_log_ref_filter: None,
             git_log_filter: crate::app::line_edit::LineEdit::default(),
+            git_log_author_filter: None,
+            git_log_date_filter: crate::app::git_log::DateFilter::All,
+            git_log_open_menu: None,
+            git_log_menu_scroll: ClippedScrollStateHandle::new(),
+            git_log_menu_anchors: [
+                Rc::new(Cell::new(RectF::default())),
+                Rc::new(Cell::new(RectF::default())),
+                Rc::new(Cell::new(RectF::default())),
+            ],
+            git_log_tree_collapsed: std::collections::HashSet::new(),
             git_log_filter_active: false,
             git_log_filtered: std::cell::RefCell::new(None),
             git_log_menu: None,
@@ -2655,7 +2731,10 @@ impl CraneShellView {
             git_log_hover: Rc::new(Cell::new(None)),
             git_log_detail: None,
             git_log_detail_loading: false,
-            git_log_detail_scroll: 0,
+            git_log_detail_scroll: ClippedScrollStateHandle::new(),
+            git_log_message_scroll: ClippedScrollStateHandle::new(),
+            git_log_detail_split: Rc::new(Cell::new(0.55)),
+            git_log_detail_split_drag: Rc::new(Cell::new(false)),
             git_log_detail_file: 0,
             active_cwd,
             left_ratio: Rc::new(Cell::new(0.18)),
@@ -2780,12 +2859,22 @@ impl CraneShellView {
     pub(crate) fn files_pane_state_for_test(
         &self,
         key: (usize, usize),
-    ) -> (Option<PaneId>, &[PathBuf], usize) {
+    ) -> (Option<PaneId>, Vec<PathBuf>, usize) {
         (
             self.files_pane.get(&key).copied(),
-            self.ws_file_paths(key),
+            // Paths, so the restore/delete tests that predate diff tabs read
+            // unchanged. Tests that care which KIND of tab it is use
+            // `file_tabs_for_test`.
+            self.ws_file_paths(key).iter().map(|t| t.path().to_path_buf()).collect(),
             self.ws_file_active(key),
         )
+    }
+
+    /// Test-only peek at a Workspace's tab strip with tab IDENTITY intact —
+    /// what distinguishes a document tab from a diff tab of the same file.
+    #[cfg(test)]
+    pub(crate) fn file_tabs_for_test(&self, key: (usize, usize)) -> &[TabKey] {
+        self.ws_file_paths(key)
     }
 
     /// Test-only peek at a restored terminal's persisted snapshot. Lets a
@@ -3087,15 +3176,27 @@ impl CraneShellView {
         let mut file_tabs_by_path: Vec<(String, crate::app::persist::SFileTabs)> = self
             .file_pane_paths
             .iter()
-            .filter(|(_, paths)| !paths.is_empty())
-            .filter_map(|(k, paths)| {
+            // Diff tabs are DERIVED views, not open documents: they are not
+            // saved, so a Workspace whose strip holds nothing else contributes
+            // no entry at all (hence filtering on the doc paths, not the tabs).
+            .filter_map(|(k, _)| {
+                let docs = self.ws_file_doc_paths(*k);
+                if docs.is_empty() {
+                    return None;
+                }
                 wt_path(k.0, k.1).map(|p| {
                     (
                         p,
                         crate::app::persist::SFileTabs {
                             pane: self.files_pane.get(k).copied(),
-                            paths: paths.clone(),
-                            active: self.ws_file_active(*k),
+                            paths: docs,
+                            active: self.ws_file_active(*k).min(
+                                // `active` indexes the SAVED list, which may be
+                                // shorter than the live strip once diff tabs
+                                // are dropped — clamp so restore can't land on
+                                // a tab that isn't there.
+                                self.ws_file_doc_paths(*k).len().saturating_sub(1),
+                            ),
                         },
                     )
                 })
@@ -3139,7 +3240,7 @@ impl CraneShellView {
             // a build that predates the path-keyed field still finds a sane
             // session rather than no open files at all.
             files_pane: self.files_pane.get(&self.ws_key()).copied(),
-            file_pane_paths: self.ws_file_paths(self.ws_key()).to_vec(),
+            file_pane_paths: self.ws_file_doc_paths(self.ws_key()),
             file_pane_active: self.ws_file_active(self.ws_key()),
             file_tabs_by_path,
             terminals,
@@ -3834,8 +3935,8 @@ impl CraneShellView {
                 // and each stale entry would break re-clicks there too.
                 for paths in self.file_pane_paths.values_mut() {
                     for p in paths.iter_mut() {
-                        if *p == src {
-                            *p = target.clone();
+                        if p.path() == src {
+                            *p = p.clone().with_path(target.clone());
                         }
                     }
                 }
@@ -3922,8 +4023,8 @@ impl CraneShellView {
                     // Every Workspace's list — mirror of the Move path above.
                     for paths in self.file_pane_paths.values_mut() {
                         for p in paths.iter_mut() {
-                            if *p == to {
-                                *p = from.clone();
+                            if p.path() == to {
+                                *p = p.clone().with_path(from.clone());
                             }
                         }
                     }
@@ -5375,8 +5476,7 @@ impl CraneShellView {
         let name = self
             .ws_file_paths(self.ws_key())
             .get(index)
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|t| t.file_name())
             .unwrap_or_else(|| "this file".to_string());
         let col = Flex::column()
             .with_child(
@@ -11702,27 +11802,38 @@ impl CraneShellView {
     fn file_tab_strip(&self, ws: (usize, usize), app: &AppContext) -> Box<dyn Element> {
         let mut strip = Flex::row();
         let ws_active = self.ws_file_active(ws);
-        for (i, path) in self.ws_file_paths(ws).iter().enumerate() {
+        for (i, tab) in self.ws_file_paths(ws).iter().enumerate() {
             let active = i == ws_active;
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let dirty = self
-                .editor_views
-                .get(path)
-                .map(|h| h.as_ref(app).is_dirty(app))
-                .unwrap_or(false);
+            let path = &tab.path().to_path_buf();
+            // A diff tab carries its range so two diffs of one file are
+            // distinguishable in the strip (`view.rs HEAD-WT` / `view.rs c3a1`).
+            let name = match tab {
+                TabKey::File(_) => tab.file_name(),
+                TabKey::Diff { spec, .. } => format!("{} {}", tab.file_name(), spec.label()),
+            };
+            // Only editable documents can be dirty; a diff is read-only.
+            let dirty = tab.is_file()
+                && self
+                    .editor_views
+                    .get(path)
+                    .map(|h| h.as_ref(app).is_dirty(app))
+                    .unwrap_or(false);
             // Key hover state by the tab's path, not its index — otherwise a
             // close/reorder shifts indices and hover state migrates onto whatever
             // tab now sits at that index for a frame (same reason `lrow:` keys use
             // the row's path string).
-            let path_key = path.to_string_lossy();
+            let path_key = match tab {
+                TabKey::File(p) => p.to_string_lossy().into_owned(),
+                TabKey::Diff { path, spec } => {
+                    format!("diff:{}:{}", path.to_string_lossy(), spec.label())
+                }
+            };
             let state = self.hover_handle(&format!("ftab:{path_key}"));
             let xstate = self.hover_handle(&format!("ftabx:{path_key}"));
             let ui_font = self.ui_font;
             let icon_font = self.icon_font;
             let label_color = if active { theme::text() } else { theme::text_muted() };
+            let is_diff = !tab.is_file();
             let name_cl = name.clone();
             // The whole chip is one visual unit: label (+ dirty dot) and the ✕
             // share the chip's background, hover wash, and active underline. The
@@ -11769,6 +11880,20 @@ impl CraneShellView {
                 })
                 .finish();
                 let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+                // Leading GIT_DIFF glyph marks a read-only diff tab apart from
+                // an editable document tab. Icon font, never a Unicode arrow —
+                // the bundled text faces don't cover those and would tofu.
+                if is_diff {
+                    row = row.with_child(
+                        Container::new(
+                            Text::new(icons::GIT_DIFF.to_string(), icon_font, 10.0)
+                                .with_color(label_color)
+                                .finish(),
+                        )
+                        .with_padding_right(4.0)
+                        .finish(),
+                    );
+                }
                 if dirty {
                     row = row.with_child(
                         Container::new(
@@ -11842,7 +11967,8 @@ impl CraneShellView {
         if let Some((ln, col, sel)) = self
             .ws_file_paths(ws)
             .get(ws_active)
-            .and_then(|p| self.editor_views.get(p))
+            .filter(|t| t.is_file())
+            .and_then(|t| self.editor_views.get(t.path()))
             .map(|h| {
                 h.read(app, |v, a| {
                     let (l, c) = v.cursor_line_col(a);
@@ -12177,9 +12303,20 @@ impl CraneShellView {
             == Some(id)
     }
 
-    /// The open File Tab paths of Workspace `key` (empty when it has none).
-    fn ws_file_paths(&self, key: (usize, usize)) -> &[PathBuf] {
+    /// The open File Tabs of Workspace `key` (empty when it has none).
+    fn ws_file_paths(&self, key: (usize, usize)) -> &[TabKey] {
         self.file_pane_paths.get(&key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Just the editable-document tabs of Workspace `key`, as paths — what
+    /// persistence writes and what "the open files" means to callers that
+    /// predate diff tabs. Diff tabs are derived views, not open documents.
+    fn ws_file_doc_paths(&self, key: (usize, usize)) -> Vec<PathBuf> {
+        self.ws_file_paths(key)
+            .iter()
+            .filter(|t| t.is_file())
+            .map(|t| t.path().to_path_buf())
+            .collect()
     }
 
     /// The active File Tab index within Workspace `key`'s own tab list.
@@ -12285,17 +12422,25 @@ impl CraneShellView {
     /// holding a buffer that could re-write it on its own Cmd+S, even one
     /// that isn't the currently selected Workspace.
     fn purge_path_everywhere(&mut self, path: &PathBuf, ctx: &mut ViewContext<Self>) {
+        // Matches on `TabKey::path()`, so deleting a file (or a directory above
+        // it) closes its DIFF tabs too — keying this off the whole TabKey would
+        // leave a live diff tab open over a file that no longer exists.
         let affected_ws: Vec<(usize, usize)> = self
             .file_pane_paths
             .iter()
-            .filter(|(_, paths)| paths.iter().any(|p| p.starts_with(path)))
+            .filter(|(_, tabs)| tabs.iter().any(|t| t.path().starts_with(path)))
             .map(|(k, _)| *k)
             .collect();
         for ws in affected_ws {
-            while let Some(idx) = self.ws_file_paths(ws).iter().position(|p| p.starts_with(path)) {
+            while let Some(idx) = self
+                .ws_file_paths(ws)
+                .iter()
+                .position(|t| t.path().starts_with(path))
+            {
                 self.close_file_tab_in_ws(ws, idx, ctx);
             }
         }
+        self.diff_views.retain(|k, _| !k.path().starts_with(path));
         // Belt-and-suspenders: the sweep above should already have dropped
         // every reference, but a trashed path must never leave a cached
         // buffer alive regardless.
@@ -12342,6 +12487,9 @@ impl CraneShellView {
     /// None in those cases so the caller splits a fresh pane instead.
     fn reusable_files_pane(&self) -> Option<PaneId> {
         let fp = *self.files_pane.get(&self.ws_key())?;
+        // `Diff` counts as a document pane: a Files Pane showing a diff tab is
+        // still the Files Pane, and the next tab opened must reuse it rather
+        // than split beside it — that split-per-click was the whole bug.
         let is_doc = matches!(
             self.panes.get(&fp),
             Some(PaneContent::Editor(_))
@@ -12349,6 +12497,7 @@ impl CraneShellView {
                 | Some(PaneContent::Markdown(_))
                 | Some(PaneContent::Image(_))
                 | Some(PaneContent::Pdf(_))
+                | Some(PaneContent::Diff(_))
         );
         let in_active = self
             .active_tab
@@ -12369,10 +12518,11 @@ impl CraneShellView {
         let ws = self.ws_key();
         // Track the tab order + active index.
         let paths = self.file_pane_paths.entry(ws).or_default();
-        let active = if let Some(i) = paths.iter().position(|p| p == &path) {
+        let key = TabKey::File(path.clone());
+        let active = if let Some(i) = paths.iter().position(|t| *t == key) {
             i
         } else {
-            paths.push(path.clone());
+            paths.push(key);
             paths.len() - 1
         };
         self.file_pane_active.insert(ws, active);
@@ -12487,7 +12637,7 @@ impl CraneShellView {
                 Ok(Ok(s)) => s,
                 _ => {
                     let paths = self.file_pane_paths.entry(ws).or_default();
-                    paths.retain(|p| p != &path);
+                    paths.retain(|t| *t != TabKey::File(path.clone()));
                     let last = paths.len().saturating_sub(1);
                     if self.ws_file_active(ws) >= self.ws_file_paths(ws).len() {
                         self.file_pane_active.insert(ws, last);
@@ -12556,7 +12706,7 @@ impl CraneShellView {
         }
         if self.files_pane.contains_key(&ws) {
             self.files_pane.remove(&ws); // stale (closed or on another tab)
-            self.file_pane_paths.insert(ws, vec![path.clone()]);
+            self.file_pane_paths.insert(ws, vec![TabKey::File(path.clone())]);
             self.file_pane_active.insert(ws, 0);
         }
         // First open: File pane goes on the RIGHT and takes ~65% width (the
@@ -12608,7 +12758,16 @@ impl CraneShellView {
     /// Tab must not silently flip it back to the rendered preview. The trailing
     /// `markdown_views` fallback keeps the pre-edit-mode behaviour for the case
     /// where the mode is set but no editor buffer exists yet.
-    fn file_tab_pane(&self, path: &PathBuf) -> Option<PaneContent> {
+    fn file_tab_pane(&self, tab: &TabKey) -> Option<PaneContent> {
+        // A diff tab resolves to its own cached view — never to the editable
+        // document of the same path.
+        if let TabKey::Diff { .. } = tab {
+            return self
+                .diff_views
+                .get(tab)
+                .map(|h| PaneContent::Diff(h.clone()));
+        }
+        let path = &tab.path().to_path_buf();
         if let Some(h) = self.image_views.get(path) {
             return Some(PaneContent::Image(h.clone()));
         }
@@ -12650,7 +12809,10 @@ impl CraneShellView {
     /// tab), if that tab is a real editor (not a Markdown preview).
     fn active_editor_path(&self) -> Option<PathBuf> {
         let ws = self.ws_key();
-        let path = self.ws_file_paths(ws).get(self.ws_file_active(ws))?.clone();
+        let tab = self.ws_file_paths(ws).get(self.ws_file_active(ws))?;
+        // A diff tab is read-only and has no editor buffer, so it is never
+        // "the active editor" even while it is the active tab.
+        let path = tab.is_file().then(|| tab.path().to_path_buf())?;
         self.editor_views.contains_key(&path).then_some(path)
     }
 
@@ -12804,7 +12966,7 @@ impl CraneShellView {
             self.git_log_detail = None;
             self.git_log_detail_loading = false;
             self.git_log_scroll.set(0.0);
-            self.git_log_detail_scroll = 0;
+            self.git_log_detail_scroll.scroll_to(Pixels::zero());
         }
         self.git_log_repo = Some(repo.clone());
         self.git_log_loading = true;
@@ -12912,17 +13074,33 @@ impl CraneShellView {
     fn git_log_shown_frame(&self) -> Option<Rc<crate::app::git_log::GraphFrame>> {
         let frame = self.git_log_frame.clone()?;
         let needle = self.git_log_filter.text().trim().to_string();
-        if needle.is_empty() {
+        let author = self.git_log_author_filter.clone();
+        let date = self.git_log_date_filter;
+        if needle.is_empty() && author.is_none() && date == crate::app::git_log::DateFilter::All {
             return Some(frame);
         }
+        // One string covers every filter, so any of them changing misses the
+        // cache. `\u{1f}` separates them because it cannot occur in a needle
+        // or an author name (it is git's own field separator above).
+        let key = format!(
+            "{needle}\u{1f}{}\u{1f}{:?}",
+            author.as_deref().unwrap_or(""),
+            date
+        );
         let mut cache = self.git_log_filtered.borrow_mut();
-        if let Some((n, g, cached)) = cache.as_ref() {
-            if *n == needle && *g == self.git_log_gen {
+        if let Some((k, g, cached)) = cache.as_ref() {
+            if *k == key && *g == self.git_log_gen {
                 return Some(cached.clone());
             }
         }
-        let filtered = Rc::new(crate::app::git_log::filtered_frame(&frame, &needle));
-        *cache = Some((needle, self.git_log_gen, filtered.clone()));
+        let filtered = Rc::new(crate::app::git_log::filtered_frame(
+            &frame,
+            &needle,
+            author.as_deref(),
+            date,
+            crate::app::git_log::now_unix(),
+        ));
+        *cache = Some((key, self.git_log_gen, filtered.clone()));
         Some(filtered)
     }
 
@@ -12958,7 +13136,7 @@ impl CraneShellView {
         self.git_log_selected = Some(sha.clone());
         self.git_log_detail = None;
         self.git_log_detail_loading = true;
-        self.git_log_detail_scroll = 0;
+        self.git_log_detail_scroll.scroll_to(Pixels::zero());
         self.git_log_detail_file = 0;
         let Some(repo) = self.active_cwd.clone() else {
             self.git_log_detail_loading = false;
@@ -13003,9 +13181,28 @@ impl CraneShellView {
                 .with_child(Rect::new().with_background_color(theme::topbar_bg()).finish())
                 .with_child(
                     Flex::row()
+                        // Refs-column toggle, pinned to the LEFT edge so its
+                        // screen position matches the column it controls (old
+                        // Crane `view/mod.rs`). The arrow points the way the
+                        // column moves: open → |← collapse left, collapsed →
+                        // →| bring it back.
+                        .with_child(
+                            Container::new(self.icon_button(
+                                "gitlog-toggle-refs",
+                                if self.git_log_refs_collapsed {
+                                    icons::ARROW_LINE_RIGHT
+                                } else {
+                                    icons::ARROW_LINE_LEFT
+                                },
+                                CraneShellAction::GitLogToggleRefs,
+                            ))
+                            .with_padding_left(6.0)
+                            .with_padding_top(3.0)
+                            .finish(),
+                        )
                         .with_child(
                             Container::new(self.icon(icons::GIT_BRANCH, 12.0, theme::text_muted()))
-                                .with_padding_left(10.0)
+                                .with_padding_left(6.0)
                                 .with_padding_right(6.0)
                                 .with_padding_top(6.0)
                                 .finish(),
@@ -13043,6 +13240,18 @@ impl CraneShellView {
                                 CraneShellAction::GitLogFetchAll,
                             ),
                         )
+                        // Detail-column toggle, pinned next to the × on the
+                        // RIGHT edge — the two collapse controls sit on the
+                        // sides they control and can never be confused.
+                        .with_child(self.icon_button(
+                            "gitlog-toggle-details",
+                            if self.git_log_details_collapsed {
+                                icons::ARROW_LINE_LEFT
+                            } else {
+                                icons::ARROW_LINE_RIGHT
+                            },
+                            CraneShellAction::GitLogToggleDetails,
+                        ))
                         .with_child(self.icon_button("gitlog-close", icons::X, CraneShellAction::OpenGitLog))
                         .finish(),
                 )
@@ -13098,21 +13307,33 @@ impl CraneShellView {
         // ── Detail / diff panel ───────────────────────────────────────────
         let detail = self.git_log_detail_panel();
 
-        let body = Flex::row()
-            .with_child(self.git_log_refs_column())
-            .with_child(
-                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
-                    .with_width(1.0)
-                    .finish(),
+        // Three columns, each side one collapsible to zero width and separated
+        // by a draggable splitter (old Crane `col_refs_collapsed` /
+        // `col_details_collapsed` + the two splitter strips). A collapsed
+        // column drops out of the tree entirely, so the log claims its space.
+        let mut body = list;
+        if !self.git_log_details_collapsed {
+            body = SplitBox::new(
+                Dir::Horizontal,
+                body,
+                detail,
+                self.git_log_detail_ratio.clone(),
+                self.git_log_detail_drag.clone(),
+                theme::divider(),
             )
-            .with_child(Expanded::new(1.4, list).finish())
-            .with_child(
-                ConstrainedBox::new(Rect::new().with_background_color(theme::divider()).finish())
-                    .with_width(1.0)
-                    .finish(),
-            )
-            .with_child(Expanded::new(1.0, detail).finish())
             .finish();
+        }
+        if !self.git_log_refs_collapsed {
+            body = SplitBox::new(
+                Dir::Horizontal,
+                self.git_log_refs_column(),
+                body,
+                self.git_log_refs_ratio.clone(),
+                self.git_log_refs_drag.clone(),
+                theme::divider(),
+            )
+            .finish();
+        }
 
         Flex::column()
             .with_child(header)
@@ -13167,6 +13388,25 @@ impl CraneShellView {
         })
         .finish();
         row = row.with_child(Expanded::new(1.0, field).finish());
+        // Branch / User / Date dropdown chips, mirroring the reference's filter
+        // row. Each is a RectProbe so its menu can anchor under it.
+        row = row.with_child(
+            self.git_log_filter_chip(
+                GitLogMenu::Branch,
+                self.git_log_ref_filter.as_deref().unwrap_or("Branch"),
+                self.git_log_ref_filter.is_some(),
+            ),
+        );
+        row = row.with_child(self.git_log_filter_chip(
+            GitLogMenu::User,
+            self.git_log_author_filter.as_deref().unwrap_or("User"),
+            self.git_log_author_filter.is_some(),
+        ));
+        row = row.with_child(self.git_log_filter_chip(
+            GitLogMenu::Date,
+            self.git_log_date_filter.label(),
+            self.git_log_date_filter != crate::app::git_log::DateFilter::All,
+        ));
         if let Some(r) = &self.git_log_ref_filter {
             let label = r.clone();
             let pill = EventHandler::new(
@@ -13212,6 +13452,156 @@ impl CraneShellView {
         .finish()
     }
 
+    /// One filter-bar dropdown chip (`Branch ⌄` / `User ⌄` / `Date ⌄`).
+    /// Wrapped in a `RectProbe` so [`Self::git_log_filter_menu_overlay`] can
+    /// anchor the menu under this exact chip rather than a guessed position.
+    fn git_log_filter_chip(
+        &self,
+        menu: GitLogMenu,
+        label: &str,
+        set: bool,
+    ) -> Box<dyn Element> {
+        // A chip whose filter is ACTIVE reads in the accent color, so a
+        // narrowed log never looks like an unfiltered one.
+        let color = if set { theme::accent() } else { theme::text_muted() };
+        let open = self.git_log_open_menu == Some(menu);
+        // Long branch names would otherwise stretch the chip across the bar.
+        let shown: String = if label.chars().count() > 18 {
+            format!("{}…", label.chars().take(17).collect::<String>())
+        } else {
+            label.to_string()
+        };
+        let inner = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(Text::new(shown, self.ui_font, 10.5).with_color(color).finish())
+            .with_child(
+                Container::new(self.icon(icons::CARET_DOWN, 9.0, color))
+                    .with_padding_left(3.0)
+                    .finish(),
+            );
+        let base = Container::new(inner.finish())
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.0)))
+            .with_padding_left(7.0)
+            .with_padding_right(5.0)
+            .with_padding_top(1.0)
+            .with_padding_bottom(1.0);
+        let state = self.hover_handle(&format!("glchip:{menu:?}"));
+        let chip = Hoverable::new(state, move |ms| {
+            base.with_background_color(if open || ms.is_hovered() {
+                theme::selection_wash()
+            } else {
+                ColorU::new(0, 0, 0, 0)
+            })
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_mouse_down(move |ctx, _app, _pos| {
+            ctx.dispatch_typed_action(CraneShellAction::GitLogOpenMenu(Some(menu)));
+        })
+        .finish();
+        let anchor = self.git_log_menu_anchors[match menu {
+            GitLogMenu::Branch => 0,
+            GitLogMenu::User => 1,
+            GitLogMenu::Date => 2,
+        }]
+        .clone();
+        Container::new(Box::new(crate::app::rect_probe::RectProbe::new(chip, anchor))
+            as Box<dyn Element>)
+            .with_padding_left(6.0)
+            .finish()
+    }
+
+    /// The open filter dropdown, anchored under its chip. Branch lists the
+    /// repo's refs (same scope strings the refs column uses), User the authors
+    /// present in the loaded graph, Date the fixed windows.
+    fn git_log_filter_menu_overlay(&self, menu: GitLogMenu) -> Box<dyn Element> {
+        let idx = match menu {
+            GitLogMenu::Branch => 0,
+            GitLogMenu::User => 1,
+            GitLogMenu::Date => 2,
+        };
+        let r = self.git_log_menu_anchors[idx].get();
+        let (x, y) = (r.origin().x(), r.origin().y() + r.size().y() + 2.0);
+
+        let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        match menu {
+            GitLogMenu::Branch => {
+                col = col.with_child(self.menu_item(
+                    icons::X,
+                    "All branches",
+                    CraneShellAction::GitLogSetRefFilter(None),
+                ));
+                if let Some(frame) = &self.git_log_frame {
+                    for group in crate::app::git_log::ref_groups(&frame.refs) {
+                        let glyph = match group.title {
+                            "REMOTE" => icons::CLOUD,
+                            "TAGS" => icons::TAG,
+                            _ => icons::GIT_BRANCH,
+                        };
+                        for item in group.items {
+                            col = col.with_child(self.menu_item(
+                                glyph,
+                                &item.display,
+                                CraneShellAction::GitLogSetRefFilter(Some(item.display.clone())),
+                            ));
+                        }
+                    }
+                }
+            }
+            GitLogMenu::User => {
+                col = col.with_child(self.menu_item(
+                    icons::X,
+                    "All users",
+                    CraneShellAction::GitLogSetAuthorFilter(None),
+                ));
+                // Authors come from the LOADED graph, so the menu can never
+                // offer a name the list can't show.
+                let authors = self
+                    .git_log_frame
+                    .as_ref()
+                    .map(|f| crate::app::git_log::distinct_authors(&f.commits))
+                    .unwrap_or_default();
+                for a in authors {
+                    col = col.with_child(self.menu_item(
+                        icons::CIRCLE,
+                        &a,
+                        CraneShellAction::GitLogSetAuthorFilter(Some(a.clone())),
+                    ));
+                }
+            }
+            GitLogMenu::Date => {
+                for d in crate::app::git_log::DateFilter::all() {
+                    let label = if d == crate::app::git_log::DateFilter::All {
+                        "All time"
+                    } else {
+                        d.label()
+                    };
+                    col = col.with_child(self.menu_item(
+                        if d == self.git_log_date_filter { icons::CHECK } else { icons::CIRCLE },
+                        label,
+                        CraneShellAction::GitLogSetDateFilter(d),
+                    ));
+                }
+            }
+        }
+        // `menu_popover` supplies its own click-away backdrop (via
+        // `menu_dismiss`), which closes through `CloseContextMenu` — the same
+        // path every other overlay uses, and why that handler has to clear
+        // `git_log_open_menu`. Wrapping this in a SECOND backdrop is what kept
+        // the menu stuck open: the inner one consumed the click first.
+        self.menu_popover(
+            ConstrainedBox::new(Self::vscroll(
+                self.git_log_menu_scroll.clone(),
+                col.finish(),
+            ))
+            .with_width(230.0)
+            .with_height(320.0)
+            .finish(),
+            x,
+            y,
+        )
+    }
+
     /// The refs column (old view/refs.rs): LOCAL / REMOTE / TAGS groups, each
     /// ref a click-to-scope row; the active scope row is accent-highlighted
     /// and clicking it again clears the scope.
@@ -13251,7 +13641,7 @@ impl CraneShellView {
                 for item in group.items {
                     let active =
                         self.git_log_ref_filter.as_deref() == Some(item.display.as_str());
-                    // Truncate long ref names so the 170px column never
+                    // Truncate long ref names so a narrowed column never
                     // clips mid-glyph (full name still shows in the pill).
                     let shown = if item.display.chars().count() > 22 {
                         let cut: String = item.display.chars().take(21).collect();
@@ -13325,21 +13715,14 @@ impl CraneShellView {
                 }
             }
         }
-        ConstrainedBox::new(
-            ClippedScrollable::vertical(
-                self.git_log_refs_scroll.clone(),
-                Container::new(col.finish())
-                    .with_background_color(theme::bg())
-                    .finish(),
-                ScrollbarWidth::Auto,
-                Fill::Solid(theme::border()),
-                Fill::Solid(theme::text_muted()),
-                Fill::None,
-            )
-            .finish(),
+        // No fixed width — the enclosing SplitBox sizes it (draggable), the
+        // same rule the Right Panel follows.
+        Self::vscroll(
+            self.git_log_refs_scroll.clone(),
+            Container::new(col.finish())
+                .with_background_color(theme::bg())
+                .finish(),
         )
-        .with_width(170.0)
-        .finish()
     }
 
     /// The commit context menu (right-click on a lane row): checkout /
@@ -13440,106 +13823,212 @@ impl CraneShellView {
         )
     }
 
-    /// The right-hand detail panel: the selected commit's message header then
-    /// its patch, add/delete-tinted, manually scrolled via `GitLogDetailScroll`.
+    /// The right-hand detail column, split the way JetBrains splits it: the
+    /// commit's CHANGED FILES on top, the COMMIT MESSAGE underneath, each its
+    /// own scroll region behind a draggable splitter. Clicking a file opens a
+    /// real Diff Pane for that commit (see [`Self::open_commit_diff`]) rather
+    /// than dumping a flat patch here — the patch has no syntax highlighting,
+    /// hunk nav or minimap, and the diff viewer has all three.
     fn git_log_detail_panel(&self) -> Box<dyn Element> {
-        let tint = |c: warpui::color::ColorU, a: u8| warpui::color::ColorU {
-            r: c.r,
-            g: c.g,
-            b: c.b,
-            a,
-        };
-        let mut col = Flex::column();
-
-        match &self.git_log_detail {
-            _ if self.git_log_selected.is_none() => {
-                col = col.with_child(
-                    Container::new(
-                        Text::new(
-                            "Select a commit to view its changes".to_string(),
-                            self.ui_font,
-                            12.0,
-                        )
+        // Nothing selected / still loading — one centred note, no split.
+        let placeholder = |this: &Self, msg: &str| -> Box<dyn Element> {
+            this.panel(
+                theme::bg(),
+                Container::new(
+                    Text::new(msg.to_string(), this.ui_font, 12.0)
                         .with_color(theme::text_muted())
                         .finish(),
-                    )
-                    .with_padding_left(12.0)
-                    .with_padding_top(10.0)
-                    .finish(),
-                );
-            }
-            None => {
-                let msg = if self.git_log_detail_loading {
-                    "Loading commit…"
-                } else {
-                    "(no changes)"
-                };
-                col = col.with_child(
-                    Container::new(
-                        Text::new(msg.to_string(), self.ui_font, 12.0)
-                            .with_color(theme::text_muted())
+                )
+                .with_padding_left(12.0)
+                .with_padding_top(10.0)
+                .finish(),
+            )
+        };
+        if self.git_log_selected.is_none() {
+            return placeholder(self, "Select a commit to view its changes");
+        }
+        let Some(detail) = &self.git_log_detail else {
+            return placeholder(
+                self,
+                if self.git_log_detail_loading { "Loading commit…" } else { "(no changes)" },
+            );
+        };
+
+        self.panel(
+            theme::bg(),
+            SplitBox::new(
+                Dir::Vertical,
+                self.git_log_files_section(detail),
+                self.git_log_message_section(detail),
+                self.git_log_detail_split.clone(),
+                self.git_log_detail_split_drag.clone(),
+                theme::divider(),
+            )
+            .finish(),
+        )
+    }
+
+    /// The changed-files section: a `N files` count, then the commit's files as
+    /// a real nested TREE — single-child directory chains collapsed into one
+    /// row (`crates/crane_term/src`), each node collapsible — with file names
+    /// colored by what the commit did to them: GREEN added, RED deleted, BLUE
+    /// modified, matching the reference JetBrains layout.
+    fn git_log_files_section(
+        &self,
+        detail: &crate::app::git_log::CommitDetail,
+    ) -> Box<dyn Element> {
+        use crate::app::git_log::FileTreeRow;
+
+        let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+        if detail.files.is_empty() {
+            col = col.with_child(
+                Container::new(
+                    Text::new("(no files)".to_string(), self.ui_font, 11.5)
+                        .with_color(theme::text_muted())
+                        .finish(),
+                )
+                .with_padding_left(12.0)
+                .with_padding_top(8.0)
+                .finish(),
+            );
+            return Self::vscroll(self.git_log_detail_scroll.clone(), col.finish());
+        }
+
+        // Root count row.
+        col = col.with_child(
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Container::new(self.icon(icons::FOLDER_OPEN, 11.0, theme::text_muted()))
+                            .with_padding_right(6.0)
                             .finish(),
                     )
-                    .with_padding_left(12.0)
-                    .with_padding_top(10.0)
+                    .with_child(
+                        Text::new(
+                            format!(
+                                "{} file{}",
+                                detail.files.len(),
+                                if detail.files.len() == 1 { "" } else { "s" }
+                            ),
+                            self.ui_font,
+                            11.5,
+                        )
+                        .with_color(theme::text())
+                        .finish(),
+                    )
                     .finish(),
-                );
-            }
-            Some(detail) => {
-                // Commit message header (mono, first line emphasized).
-                for (i, line) in detail.header.iter().enumerate() {
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let color = if i == 0 { theme::text() } else { theme::text_muted() };
-                    col = col.with_child(
-                        Container::new(
-                            Text::new(line.clone(), self.mono_font, 11.5)
-                                .with_color(color)
-                                .finish(),
-                        )
-                        .with_padding_left(12.0)
-                        .with_padding_right(8.0)
-                        .with_padding_top(1.0)
-                        .finish(),
-                    );
-                }
-                if !detail.diff.is_empty() {
-                    col = col.with_child(
-                        ConstrainedBox::new(
-                            Rect::new().with_background_color(theme::divider()).finish(),
-                        )
-                        .with_height(1.0)
-                        .finish(),
-                    );
-                }
-                // Changed-files list (JetBrains style): one clickable row per
-                // file with +/- counts; the selected file's patch renders
-                // below instead of one monolithic dump.
-                let sel_file = self.git_log_detail_file.min(detail.files.len().saturating_sub(1));
-                for (fi, f) in detail.files.iter().enumerate() {
-                    let active = fi == sel_file;
-                    let mut frow = Flex::row()
+            )
+            .with_padding_left(10.0)
+            .with_padding_top(6.0)
+            .with_padding_bottom(3.0)
+            .finish(),
+        );
+
+        let sel_file = self.git_log_detail_file.min(detail.files.len().saturating_sub(1));
+        let sha = self.git_log_selected.clone().unwrap_or_default();
+        // Indent per tree level, on top of the root row's own inset.
+        const INDENT: f32 = 13.0;
+
+        for row in
+            crate::app::git_log::file_tree_rows(&detail.files, &self.git_log_tree_collapsed)
+        {
+            match row {
+                FileTreeRow::Dir { key, label, depth, files } => {
+                    let collapsed = self.git_log_tree_collapsed.contains(&key);
+                    let caret = if collapsed { icons::CARET_RIGHT } else { icons::CARET_DOWN };
+                    let inner = Flex::row()
                         .with_cross_axis_alignment(CrossAxisAlignment::Center)
                         .with_child(
-                            Container::new(self.icon(icons::FILE, 10.0, theme::text_muted()))
+                            Container::new(self.icon(caret, 10.0, theme::text_muted()))
+                                .with_padding_right(3.0)
+                                .finish(),
+                        )
+                        .with_child(
+                            Container::new(self.icon(icons::FOLDER, 10.0, theme::text_muted()))
                                 .with_padding_right(6.0)
                                 .finish(),
                         )
                         .with_child(
-                            Text::new(f.path.clone(), self.ui_font, 11.5)
-                                .with_color(if active { theme::text() } else { theme::text_muted() })
+                            Text::new(label, self.ui_font, 11.5)
+                                .with_color(theme::text_muted())
                                 .finish(),
                         )
-                        .with_child(Expanded::new(
-                            1.0,
-                            ConstrainedBox::new(Rect::new().finish()).with_height(1.0).finish(),
+                        .with_child(
+                            Container::new(
+                                Text::new(
+                                    format!(
+                                        "{files} file{}",
+                                        if files == 1 { "" } else { "s" }
+                                    ),
+                                    self.ui_font,
+                                    10.0,
+                                )
+                                .with_color(theme::pane_dim())
+                                .finish(),
+                            )
+                            .with_padding_left(8.0)
+                            .finish(),
+                        );
+                    let base = Container::new(inner.finish())
+                        .with_padding_left(14.0 + depth as f32 * INDENT)
+                        .with_padding_top(2.0)
+                        .with_padding_bottom(2.0);
+                    let state = self.hover_handle(&format!("gldgroup:{key}"));
+                    let toggle_key = key.clone();
+                    col = col.with_child(
+                        Hoverable::new(state, move |ms| {
+                            base.with_background_color(if ms.is_hovered() {
+                                theme::row_hover()
+                            } else {
+                                ColorU::new(0, 0, 0, 0)
+                            })
+                            .finish()
+                        })
+                        .with_cursor(Cursor::PointingHand)
+                        .on_mouse_down(move |ctx, _app, _pos| {
+                            ctx.dispatch_typed_action(CraneShellAction::GitLogToggleDir(
+                                toggle_key.clone(),
+                            ));
+                        })
+                        .finish(),
+                    );
+                }
+                FileTreeRow::File { index, label, depth } => {
+                    let f = &detail.files[index];
+                    let active = index == sel_file;
+                    // File-name color IS the status (JetBrains convention):
+                    // green added, red deleted, blue modified/renamed.
+                    let name_color = match f.status {
+                        'A' => theme::success(),
+                        'D' => theme::error(),
+                        _ => theme::accent(),
+                    };
+                    let mut frow = Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Container::new(self.icon(icons::FILE_TEXT, 10.0, name_color))
+                                .with_padding_right(6.0)
+                                .finish(),
                         )
-                        .finish());
+                        .with_child(
+                            Text::new(label, self.ui_font, 11.5)
+                                .with_color(name_color)
+                                .finish(),
+                        )
+                        .with_child(
+                            Expanded::new(
+                                1.0,
+                                ConstrainedBox::new(Rect::new().finish())
+                                    .with_height(1.0)
+                                    .finish(),
+                            )
+                            .finish(),
+                        );
                     if f.added > 0 {
                         frow = frow.with_child(
                             Container::new(
-                                Text::new(format!("+{}", f.added), self.ui_font, 10.5)
+                                Text::new(format!("+{}", f.added), self.ui_font, 10.0)
                                     .with_color(theme::success())
                                     .finish(),
                             )
@@ -13550,95 +14039,140 @@ impl CraneShellView {
                     if f.deleted > 0 {
                         frow = frow.with_child(
                             Container::new(
-                                Text::new(format!("-{}", f.deleted), self.ui_font, 10.5)
+                                Text::new(format!("-{}", f.deleted), self.ui_font, 10.0)
                                     .with_color(theme::error())
                                     .finish(),
                             )
-                            .with_padding_right(4.0)
+                            .with_padding_right(6.0)
                             .finish(),
                         );
                     }
-                    let row = EventHandler::new(
-                        Container::new(frow.finish())
-                            .with_background_color(if active {
+                    let base = Container::new(frow.finish())
+                        .with_padding_left(27.0 + depth as f32 * INDENT)
+                        .with_padding_right(8.0)
+                        .with_padding_top(2.0)
+                        .with_padding_bottom(2.0);
+                    let state = self.hover_handle(&format!("gldfile:{index}:{}", f.path));
+                    let path = f.path.clone();
+                    let sha_for_row = sha.clone();
+                    col = col.with_child(
+                        Hoverable::new(state, move |ms| {
+                            base.with_background_color(if active {
                                 theme::row_active()
+                            } else if ms.is_hovered() {
+                                theme::row_hover()
                             } else {
                                 ColorU::new(0, 0, 0, 0)
                             })
-                            .with_padding_left(12.0)
-                            .with_padding_right(8.0)
-                            .with_padding_top(2.0)
-                            .with_padding_bottom(2.0)
-                            .finish(),
-                    )
-                    .on_left_mouse_down(move |ctx, _app, _pos| {
-                        ctx.dispatch_typed_action(CraneShellAction::GitLogDetailFile(fi));
-                        DispatchEventResult::StopPropagation
-                    })
-                    .finish();
-                    col = col.with_child(row);
-                }
-                if !detail.files.is_empty() {
-                    col = col.with_child(
-                        ConstrainedBox::new(
-                            Rect::new().with_background_color(theme::divider()).finish(),
-                        )
-                        .with_height(1.0)
-                        .finish(),
-                    );
-                }
-                // Selected file's patch, windowed by the detail scroll offset.
-                // (Falls back to the whole diff when the split found no files —
-                // e.g. a merge commit rendered without -m.)
-                use crate::app::git_log::DiffLineKind;
-                let lines: &[crate::app::git_log::DiffLine] =
-                    match detail.files.get(sel_file) {
-                        Some(f) => &f.lines,
-                        None => &detail.diff,
-                    };
-                let start = self
-                    .git_log_detail_scroll
-                    .min(lines.len().saturating_sub(1));
-                for dl in lines.iter().skip(start).take(1500) {
-                    let (fg, bg) = match dl.kind {
-                        DiffLineKind::Add => (theme::success(), tint(theme::success(), 38)),
-                        DiffLineKind::Del => (theme::error(), tint(theme::error(), 38)),
-                        DiffLineKind::Hunk => (theme::accent(), tint(theme::accent(), 22)),
-                        DiffLineKind::FileHeader => (theme::text_muted(), tint(theme::bg(), 0)),
-                        DiffLineKind::Context => (theme::text(), tint(theme::bg(), 0)),
-                    };
-                    col = col.with_child(
-                        Container::new(
-                            Text::new(dl.text.clone(), self.mono_font, 11.0)
-                                .with_color(fg)
-                                .finish(),
-                        )
-                        .with_background_color(bg)
-                        .with_padding_left(12.0)
-                        .with_padding_right(8.0)
+                            .finish()
+                        })
+                        .with_cursor(Cursor::PointingHand)
+                        .on_mouse_down(move |ctx, _app, _pos| {
+                            ctx.dispatch_typed_action(CraneShellAction::GitLogOpenFileDiff {
+                                sha: sha_for_row.clone(),
+                                path: path.clone(),
+                                index,
+                            });
+                        })
                         .finish(),
                     );
                 }
             }
         }
+        Self::vscroll(self.git_log_detail_scroll.clone(), col.finish())
+    }
+    /// The commit-message section under the files list: the message body, then
+    /// the `<sha> <author> <email> on <date>` attribution line, then the
+    /// `In N branches: …` footer — the same three blocks the reference shows.
+    fn git_log_message_section(
+        &self,
+        detail: &crate::app::git_log::CommitDetail,
+    ) -> Box<dyn Element> {
+        let mut col = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
-        // Scroll wheel adjusts the detail row window (same manual-scroll feel as
-        // WarpDiffView).
-        let scroll_body = EventHandler::new(Expanded::new(1.0, col.finish()).finish())
-            .on_scroll_wheel(move |ctx, _app, delta, _mods| {
-                let lines = (-delta.y() / 8.0).round() as i32;
-                if lines != 0 {
-                    ctx.dispatch_typed_action(CraneShellAction::GitLogDetailScroll(lines));
-                }
-                DispatchEventResult::StopPropagation
-            })
-            .finish();
-        self.panel(
-            theme::bg(),
-            Flex::column()
-                .with_child(Expanded::new(1.0, scroll_body).finish())
+        // Message only — the `commit …` / `Author:` / `Date:` meta lines come
+        // off in the core (which owns `git show`'s output shape), and the
+        // attribution below renders from the graph's own record instead.
+        let body = crate::app::git_log::message_body(&detail.header);
+        for (i, line) in body.iter().enumerate() {
+            col = col.with_child(
+                Container::new(
+                    Text::new(
+                        // An empty Text lays out to zero height, which would
+                        // swallow the paragraph break; a space keeps the row.
+                        if line.is_empty() { " ".to_string() } else { line.clone() },
+                        self.mono_font,
+                        11.5,
+                    )
+                    // Subject line first, body muted — the same emphasis the
+                    // commit list gives the subject.
+                    .with_color(if i == 0 { theme::text() } else { theme::text_muted() })
+                    .finish(),
+                )
+                .with_padding_left(12.0)
+                .with_padding_right(8.0)
+                .with_padding_top(if i == 0 { 8.0 } else { 1.0 })
                 .finish(),
-        )
+            );
+        }
+
+        // Attribution — short sha, author, relative + absolute date, taken from
+        // the loaded graph so it needs no extra parse of `git show`'s header.
+        if let Some(record) = self.git_log_shown_frame().and_then(|f| {
+            self.git_log_selected
+                .as_deref()
+                .and_then(|sha| f.commits.iter().find(|c| c.sha == sha).cloned())
+        }) {
+            let short: String = record.sha.chars().take(8).collect();
+            col = col.with_child(
+                Container::new(
+                    Text::new(
+                        // Reads like the reference: who, where to reach them,
+                        // and WHEN in absolute local time — the raw ISO string
+                        // this used to print (`2026-07-28T13:20:11+05:00`) is
+                        // not something anyone reads at a glance.
+                        format!(
+                            "{short}  {} <{}> on {}  ({})",
+                            record.author, record.email, record.display_date, record.relative
+                        ),
+                        self.ui_font,
+                        10.5,
+                    )
+                    .with_color(theme::text_muted())
+                    .finish(),
+                )
+                .with_padding_left(12.0)
+                .with_padding_right(8.0)
+                .with_padding_top(10.0)
+                .finish(),
+            );
+        }
+
+        if !detail.branches.is_empty() {
+            col = col.with_child(
+                Container::new(
+                    Text::new(
+                        format!(
+                            "In {} branch{}: {}",
+                            detail.branches.len(),
+                            if detail.branches.len() == 1 { "" } else { "es" },
+                            detail.branches.join(", ")
+                        ),
+                        self.ui_font,
+                        10.5,
+                    )
+                    .with_color(theme::text_muted())
+                    .finish(),
+                )
+                .with_padding_left(12.0)
+                .with_padding_right(8.0)
+                .with_padding_top(4.0)
+                .with_padding_bottom(8.0)
+                .finish(),
+            );
+        }
+
+        Self::vscroll(self.git_log_message_scroll.clone(), col.finish())
     }
 
     /// Open a placeholder Browser pane (WKWebView embed pending).
@@ -13669,15 +14203,101 @@ impl CraneShellView {
         ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
     }
 
-    /// Open a read-only unified Diff pane (HEAD vs working copy) for `path` in a
-    /// fresh pane beside the focused one (same placement as `open_browser`).
+    /// Open a read-only diff of `path`, HEAD vs the working copy — what the
+    /// Right Panel's Changes rows open.
     fn open_diff(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        self.open_diff_tab(
+            TabKey::Diff { path, spec: DiffSpec::WorkingTree },
+            self.active_cwd.clone(),
+            ctx,
+        );
+    }
+
+    /// Open a read-only diff of what commit `sha` did to `rel` (`<sha>^` vs
+    /// `<sha>`) — what the Git Log's changed-files list opens. `rel` is
+    /// repo-relative, resolved against the LOG's repo root rather than
+    /// `active_cwd` so the diff follows the Workspace the log is showing.
+    ///
+    /// The path need not exist on disk: a file the commit deleted, or one
+    /// later renamed away, still diffs fine because both sides come out of
+    /// git's object store.
+    fn open_commit_diff(&mut self, sha: String, rel: String, ctx: &mut ViewContext<Self>) {
+        let repo_root = self.git_log_repo.clone().or_else(|| self.active_cwd.clone());
+        // ABSOLUTE path in the TabKey. Every path-keyed sweep in the shell
+        // (delete, rename, buffer refcount) compares absolute paths, so a tab
+        // stored under the repo-RELATIVE path git handed us would be invisible
+        // to all of them — deleting the file would leave its diff tab open.
+        // `WarpDiffView` re-derives the relative path it needs from the root.
+        let path = repo_root
+            .as_ref()
+            .map(|r| r.join(&rel))
+            .unwrap_or_else(|| PathBuf::from(&rel));
+        self.open_diff_tab(
+            TabKey::Diff { path, spec: DiffSpec::Commit(sha) },
+            repo_root,
+            ctx,
+        );
+    }
+
+    /// Open `key` as a File Tab in this Workspace's Files Pane — the diff
+    /// counterpart of [`Self::open_file`], and the reason clicking five changed
+    /// files no longer leaves five Panes fighting for space.
+    ///
+    /// Re-opening a diff that is already a tab FOCUSES it (the `TabKey` dedup)
+    /// rather than appending a duplicate. Diffs over different ranges of one
+    /// file are distinct keys, so they coexist as separate tabs.
+    fn open_diff_tab(
+        &mut self,
+        key: TabKey,
+        repo_root: Option<PathBuf>,
+        ctx: &mut ViewContext<Self>,
+    ) {
         self.ensure_active_tab(ctx);
-        let repo_root = self.active_cwd.clone();
-        let handle = ctx.add_typed_action_view(move |ctx| {
-            crate::app::diff_view::WarpDiffView::new(ctx, repo_root, path)
-        });
-        self.split_with(PaneContent::Diff(handle));
+        let ws = self.ws_key();
+        let tabs = self.file_pane_paths.entry(ws).or_default();
+        let active = match tabs.iter().position(|t| *t == key) {
+            Some(i) => i,
+            None => {
+                tabs.push(key.clone());
+                tabs.len() - 1
+            }
+        };
+        self.file_pane_active.insert(ws, active);
+
+        // One live view per (path, range) — a second click on the same tab
+        // reuses its view, keeping that diff's scroll position.
+        let handle = if let Some(h) = self.diff_views.get(&key) {
+            h.clone()
+        } else {
+            let path = key.path().to_path_buf();
+            let TabKey::Diff { spec, .. } = &key else {
+                return; // unreachable: callers only pass Diff keys
+            };
+            let spec = spec.clone();
+            let h = ctx.add_typed_action_view(move |ctx| match spec {
+                DiffSpec::WorkingTree => {
+                    crate::app::diff_view::WarpDiffView::new(ctx, repo_root, path)
+                }
+                DiffSpec::Commit(sha) => crate::app::diff_view::WarpDiffView::new_for_commit(
+                    ctx, repo_root, path, sha,
+                ),
+            });
+            self.diff_views.insert(key.clone(), h.clone());
+            h
+        };
+
+        // Same placement / reuse logic as `open_file`'s Markdown branch: swap
+        // the live Files Pane's content when it's a document leaf in the ACTIVE
+        // Tab, else split ONE fresh pane on the right.
+        if let Some(fp) = self.reusable_files_pane() {
+            self.panes.insert(fp, PaneContent::Diff(handle));
+            self.focused = Some(fp);
+            return;
+        }
+        self.files_pane.remove(&ws); // stale (closed or on another tab)
+        if let Some(fp) = self.split_with_at(PaneContent::Diff(handle), false, 0.35) {
+            self.files_pane.insert(ws, fp);
+        }
         ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
     }
 
@@ -14281,6 +14901,11 @@ impl View for CraneShellView {
         if let Some(line) = self.tree_drop_line_overlay() {
             root_stack = root_stack.with_child(line);
         }
+        if self.show_git_log {
+            if let Some(m) = self.git_log_open_menu {
+                root_stack = root_stack.with_child(self.git_log_filter_menu_overlay(m));
+            }
+        }
         if let Some((sha, x, y)) = &self.git_log_menu {
             if self.git_log_branch_prompt.is_none() {
                 root_stack = root_stack.with_child(self.git_log_menu_overlay(sha, *x, *y));
@@ -14673,6 +15298,15 @@ impl View for CraneShellView {
     }
 }
 
+/// Which Git Log filter-bar dropdown is open. The bar's chips are mutually
+/// exclusive: opening one closes any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitLogMenu {
+    Branch,
+    User,
+    Date,
+}
+
 #[derive(Debug, Clone)]
 pub enum CraneShellAction {
     Select {
@@ -14849,8 +15483,23 @@ pub enum CraneShellAction {
     GitLogRevert(String),
     /// Open the inline "create branch from commit" prompt.
     GitLogBranchPrompt(String),
-    /// Select a file in the commit detail's changed-files list.
-    GitLogDetailFile(usize),
+    /// Select a file in the commit detail's changed-files list AND open a Diff
+    /// Pane for what that commit did to it (`<sha>^` vs `<sha>`).
+    GitLogOpenFileDiff {
+        sha: String,
+        /// Repo-relative path, as the patch header reported it.
+        path: String,
+        /// Index into the detail's file list (drives the row highlight).
+        index: usize,
+    },
+    /// Collapse / expand one directory group in the changed-files tree.
+    GitLogToggleDir(String),
+    /// Open (or, when already open, dismiss) one filter-bar dropdown.
+    GitLogOpenMenu(Option<GitLogMenu>),
+    /// Pick a User-filter entry; None clears it.
+    GitLogSetAuthorFilter(Option<String>),
+    /// Pick a Date-filter window.
+    GitLogSetDateFilter(crate::app::git_log::DateFilter),
     /// Scope the log to one ref (`git log <ref>`), or None for `--all`.
     GitLogSetRefFilter(Option<String>),
     /// Click into the git-log text-filter field — take typing focus.
@@ -14860,8 +15509,10 @@ pub enum CraneShellAction {
     GitLogStepSelection(bool),
     /// `git fetch --all --prune --tags` off-thread, then reload the graph.
     GitLogFetchAll,
-    /// Scroll the Git Log detail/diff panel by N rows (positive = down).
-    GitLogDetailScroll(i32),
+    /// Collapse / restore the Git Log refs column (left).
+    GitLogToggleRefs,
+    /// Collapse / restore the Git Log detail column (right).
+    GitLogToggleDetails,
     /// Open a Browser pane (placeholder).
     OpenBrowser,
     /// Cmd+Opt+T — new tab in the focused Browser pane; opens a Browser pane
@@ -15553,7 +16204,8 @@ impl CraneShellView {
                 let dirty = self
                     .ws_file_paths(self.ws_key())
                     .get(*i)
-                    .and_then(|p| self.editor_views.get(p))
+                    .filter(|t| t.is_file())
+                    .and_then(|t| self.editor_views.get(t.path()))
                     .map(|h| h.as_ref(&*ctx).is_dirty(&*ctx))
                     .unwrap_or(false);
                 if dirty {
@@ -15570,20 +16222,32 @@ impl CraneShellView {
                     if *i < self.ws_file_paths(ws).len() {
                         let removed =
                             self.file_pane_paths.entry(ws).or_default().remove(*i);
-                        // `editor_views` / `markdown_views` are GLOBAL caches
-                        // shared by every Workspace, so only drop the live
-                        // buffer once no other Workspace still has this path
-                        // open as a File Tab — otherwise closing a tab here
-                        // would discard another Project's unsaved edits.
-                        let still_open = self
-                            .file_pane_paths
-                            .values()
-                            .any(|paths| paths.contains(&removed));
-                        if !still_open {
-                            self.editor_views.remove(&removed);
-                            self.markdown_views.remove(&removed);
-                            self.image_views.remove(&removed);
-                            self.pdf_views.remove(&removed);
+                        // A closed DIFF tab drops only its own view; it never
+                        // owned a document buffer.
+                        if let TabKey::Diff { .. } = removed {
+                            self.diff_views.remove(&removed);
+                        } else {
+                            // `editor_views` / `markdown_views` are GLOBAL
+                            // caches shared by every Workspace, so only drop
+                            // the live buffer once no other Workspace still has
+                            // this path open — otherwise closing a tab here
+                            // would discard another Project's unsaved edits.
+                            //
+                            // The refcount compares PATHS, not whole TabKeys: a
+                            // diff tab of this same file still pins the path, so
+                            // whole-key comparison would free a buffer that is
+                            // still on screen.
+                            let path = removed.path().to_path_buf();
+                            let still_open = self
+                                .file_pane_paths
+                                .values()
+                                .any(|tabs| tabs.iter().any(|t| t.path() == path));
+                            if !still_open {
+                                self.editor_views.remove(&path);
+                                self.markdown_views.remove(&path);
+                                self.image_views.remove(&path);
+                                self.pdf_views.remove(&path);
+                            }
                         }
                         if self.ws_file_paths(ws).is_empty() {
                             // Last tab closed — close the whole editor pane.
@@ -15941,24 +16605,30 @@ impl CraneShellView {
                 self.git_log_menu = None;
                 self.run_git_log_op(ctx, sha.clone(), GitLogOp::Revert);
             }
-            CraneShellAction::GitLogDetailFile(fi) => {
-                self.git_log_detail_file = *fi;
-                self.git_log_detail_scroll = 0;
-                // Also open the file's CURRENT working-tree copy in the File
-                // Edit pane (the inline patch above already shows the
-                // commit's historical diff). Repo-relative path from the
-                // commit detail, joined against the log's own repo root —
-                // silently skipped if the file no longer exists on disk
-                // (deleted / renamed since that commit).
-                if let (Some(repo), Some(rel)) = (
-                    self.git_log_repo.clone(),
-                    self.git_log_detail.as_ref().and_then(|d| d.files.get(*fi)).map(|f| f.path.clone()),
-                ) {
-                    let abs = repo.join(&rel);
-                    if abs.is_file() {
-                        self.open_file(abs, ctx);
-                    }
+            CraneShellAction::GitLogOpenFileDiff { sha, path, index } => {
+                self.git_log_detail_file = *index;
+                self.open_commit_diff(sha.clone(), path.clone(), ctx);
+            }
+            CraneShellAction::GitLogOpenMenu(m) => {
+                // Clicking the open menu's own chip closes it (toggle).
+                self.git_log_open_menu = if self.git_log_open_menu == *m { None } else { *m };
+                ctx.notify();
+            }
+            CraneShellAction::GitLogSetAuthorFilter(a) => {
+                self.git_log_author_filter = a.clone();
+                self.git_log_open_menu = None;
+                ctx.notify();
+            }
+            CraneShellAction::GitLogSetDateFilter(d) => {
+                self.git_log_date_filter = *d;
+                self.git_log_open_menu = None;
+                ctx.notify();
+            }
+            CraneShellAction::GitLogToggleDir(dir) => {
+                if !self.git_log_tree_collapsed.remove(dir) {
+                    self.git_log_tree_collapsed.insert(dir.clone());
                 }
+                ctx.notify();
             }
             CraneShellAction::GitLogBranchPrompt(sha) => {
                 // Keep git_log_menu's (x, y) — the prompt overlay anchors
@@ -16023,14 +16693,12 @@ impl CraneShellView {
                     }
                 }
             }
-            CraneShellAction::GitLogDetailScroll(delta) => {
-                let max = self
-                    .git_log_detail
-                    .as_ref()
-                    .map(|d| d.diff.len().saturating_sub(1))
-                    .unwrap_or(0);
-                let next = self.git_log_detail_scroll as i64 + *delta as i64;
-                self.git_log_detail_scroll = next.clamp(0, max as i64) as usize;
+            CraneShellAction::GitLogToggleRefs => {
+                self.git_log_refs_collapsed = !self.git_log_refs_collapsed;
+                ctx.notify();
+            }
+            CraneShellAction::GitLogToggleDetails => {
+                self.git_log_details_collapsed = !self.git_log_details_collapsed;
                 ctx.notify();
             }
             CraneShellAction::OpenBrowser => self.open_browser(ctx),
@@ -16694,6 +17362,7 @@ impl CraneShellView {
                 self.folder_menu = None;
                 self.git_log_menu = None;
                 self.git_log_branch_prompt = None;
+                self.git_log_open_menu = None;
                 self.new_pane_menu_open = false;
                 // The Switch Branch popup is a menu-style overlay too — Escape /
                 // outside-click clear it through the same path.
@@ -18088,6 +18757,7 @@ mod restore_pane_kind_tests {
 mod restore_wiring_integration_tests {
     use super::{CraneShellAction, CraneShellView, PaneId};
     use crate::app::persist::{AddedProject, SImage, SMarkdown, SNode, STab, WarpuiState};
+    use crate::app::tab_key::{DiffSpec, TabKey};
 
     /// Overrides `HOME` for the scope of one test. `new_with_state` still
     /// reaches several HOME-derived paths that have nothing to do with the
@@ -19333,6 +20003,327 @@ mod restore_wiring_integration_tests {
         });
     }
 
+
+    /// Every overlay in the shell dismisses through `CloseContextMenu` — the
+    /// click-away backdrop `menu_popover` wraps itself in dispatches exactly
+    /// that. A menu whose state field the handler forgets therefore cannot be
+    /// closed by clicking outside it, which is how the Git Log's filter
+    /// dropdown shipped stuck-open.
+    #[test]
+    fn close_context_menu_dismisses_the_git_log_filter_dropdown() {
+        use crate::app::shell::{CraneShellAction, GitLogMenu};
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(WarpuiState::default()))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    v.handle_action_impl(
+                        &CraneShellAction::GitLogOpenMenu(Some(GitLogMenu::Branch)),
+                        vctx,
+                    );
+                    assert_eq!(
+                        v.git_log_open_menu,
+                        Some(GitLogMenu::Branch),
+                        "the chip must open its dropdown"
+                    );
+
+                    // What a click on the backdrop dispatches.
+                    v.handle_action_impl(&CraneShellAction::CloseContextMenu, vctx);
+                    assert_eq!(
+                        v.git_log_open_menu, None,
+                        "clicking outside must close the filter dropdown — CloseContextMenu \
+                         is the single path every overlay dismisses through"
+                    );
+                });
+            });
+        });
+    }
+
+    /// Diffs used to spawn a brand-new Pane on EVERY click, so reviewing five
+    /// files left five Panes fighting for space (the `open_diff` →
+    /// `split_with` path). They are now File Tabs in the one Files Pane, which
+    /// means: the pane count stays at one, a re-click FOCUSES the existing tab
+    /// instead of appending a duplicate, and a diff tab coexists with the
+    /// document tab of the same file rather than replacing it.
+    #[test]
+    fn diffs_open_as_tabs_in_one_files_pane_not_a_pane_per_click() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let path = proj.path().to_string_lossy().into_owned();
+
+        let seed = proj.path().join("seed.md");
+        let a = proj.path().join("a.md");
+        let b = proj.path().join("b.md");
+        for p in [&seed, &a, &b] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID_SEED: PaneId = 60;
+
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 61;
+        st.added_projects = vec![AddedProject { name: "proj".to_string(), path: path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID_SEED),
+                focus: Some(PID_SEED),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((path.clone(), 0));
+        st.markdowns = vec![(PID_SEED, SMarkdown { path: seed, editing: false })];
+
+        let path2 = path.clone();
+        let (a2, b2) = (a.clone(), b.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws = v
+                        .ws_key_for_path_for_test(&path2)
+                        .expect("project must resolve to a Workspace");
+
+                    v.open_diff(a2.clone(), vctx);
+                    let panes_after_first = v.panes.len();
+                    let fp = v.files_pane_state_for_test(ws).0;
+                    assert!(fp.is_some(), "the first diff creates the Files Pane");
+
+                    // Second DIFFERENT file: a new tab, but NOT a new pane.
+                    v.open_diff(b2.clone(), vctx);
+                    assert_eq!(
+                        v.panes.len(),
+                        panes_after_first,
+                        "a second diff must reuse the Files Pane, not split another one — \
+                         a pane per click was the whole bug"
+                    );
+                    assert_eq!(
+                        v.file_tabs_for_test(ws),
+                        [
+                            TabKey::Diff { path: a2.clone(), spec: DiffSpec::WorkingTree },
+                            TabKey::Diff { path: b2.clone(), spec: DiffSpec::WorkingTree },
+                        ],
+                        "both diffs sit in one strip"
+                    );
+
+                    // Re-clicking the FIRST file focuses its tab; no duplicate.
+                    v.open_diff(a2.clone(), vctx);
+                    assert_eq!(
+                        v.file_tabs_for_test(ws).len(),
+                        2,
+                        "re-opening a diff must FOCUS its tab, never append a duplicate"
+                    );
+                    let (_, _, active) = v.files_pane_state_for_test(ws);
+                    assert_eq!(active, 0, "the re-clicked diff becomes the active tab");
+                    assert_eq!(
+                        v.panes.len(),
+                        panes_after_first,
+                        "re-clicking must not split a pane either"
+                    );
+
+                    // A DOCUMENT tab of the same file is a separate tab.
+                    v.open_file(a2.clone(), vctx);
+                    assert_eq!(
+                        v.file_tabs_for_test(ws),
+                        [
+                            TabKey::Diff { path: a2.clone(), spec: DiffSpec::WorkingTree },
+                            TabKey::Diff { path: b2.clone(), spec: DiffSpec::WorkingTree },
+                            TabKey::File(a2.clone()),
+                        ],
+                        "a file tab and a diff tab of ONE path coexist — opening the document \
+                         must not swallow or replace its diff tab"
+                    );
+                });
+            });
+        });
+    }
+
+    /// A commit diff and a working-tree diff of one file are different tabs,
+    /// and two commits of one file are different tabs again — the Git Log's
+    /// changed-files list depends on it (clicking the same file across two
+    /// commits must show two diffs, not silently reuse one).
+    #[test]
+    fn commit_diffs_and_working_tree_diffs_of_one_file_are_separate_tabs() {
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let path = proj.path().to_string_lossy().into_owned();
+        let seed = proj.path().join("seed.md");
+        let a = proj.path().join("a.md");
+        for p in [&seed, &a] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID_SEED: PaneId = 70;
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 71;
+        st.added_projects = vec![AddedProject { name: "proj".to_string(), path: path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID_SEED),
+                focus: Some(PID_SEED),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((path.clone(), 0));
+        st.markdowns = vec![(PID_SEED, SMarkdown { path: seed, editing: false })];
+
+        let path2 = path.clone();
+        let a2 = a.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws = v.ws_key_for_path_for_test(&path2).expect("Workspace");
+                    let rel = "a.md".to_string();
+
+                    v.open_diff(a2.clone(), vctx);
+                    // Pane count AFTER the Files Pane exists — the fixture also
+                    // has the seed pane, so the invariant is "no further
+                    // splits", not "exactly one pane".
+                    let panes_after_first = v.panes.len();
+                    v.open_commit_diff("aaaa1111".to_string(), rel.clone(), vctx);
+                    v.open_commit_diff("bbbb2222".to_string(), rel.clone(), vctx);
+                    assert_eq!(
+                        v.file_tabs_for_test(ws).len(),
+                        3,
+                        "working-tree + two commit ranges of one file are three tabs: {:?}",
+                        v.file_tabs_for_test(ws)
+                    );
+
+                    // Re-opening one of the commits focuses it, no duplicate.
+                    v.open_commit_diff("aaaa1111".to_string(), rel, vctx);
+                    assert_eq!(
+                        v.file_tabs_for_test(ws).len(),
+                        3,
+                        "re-opening one range must focus its tab, not append a fourth"
+                    );
+                    assert_eq!(
+                        v.panes.len(),
+                        panes_after_first,
+                        "all three diffs live in ONE Files Pane — no split per click"
+                    );
+                });
+            });
+        });
+    }
+
+    /// Deleting a file must close its DIFF tabs too, not just its file tab —
+    /// otherwise a live diff tab is left open over a file that no longer
+    /// exists. This is why every filesystem-facing sweep keys off
+    /// `TabKey::path()` rather than the whole key.
+    #[test]
+    fn deleting_a_file_closes_its_diff_tabs_and_drops_their_views() {
+        use crate::app::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let path = proj.path().to_string_lossy().into_owned();
+        let seed = proj.path().join("seed.md");
+        let doomed = proj.path().join("doomed.md");
+        let keep = proj.path().join("keep.md");
+        for p in [&seed, &doomed, &keep] {
+            std::fs::write(p, "# doc\n").expect("write temp md file");
+        }
+
+        const PID_SEED: PaneId = 80;
+        let mut st = WarpuiState::default();
+        st.next_pane_id = 81;
+        st.added_projects = vec![AddedProject { name: "proj".to_string(), path: path.clone() }];
+        st.worktree_tabs_by_path = vec![(
+            path.clone(),
+            vec![STab {
+                id: 0,
+                name: "Tab".to_string(),
+                layout: SNode::Leaf(PID_SEED),
+                focus: Some(PID_SEED),
+                renamed: false,
+            }],
+        )];
+        st.active_tab_path = Some((path.clone(), 0));
+        st.markdowns = vec![(PID_SEED, SMarkdown { path: seed, editing: false })];
+
+        let path2 = path.clone();
+        let (doomed2, keep2) = (doomed.clone(), keep.clone());
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws = v.ws_key_for_path_for_test(&path2).expect("Workspace");
+
+                    // Both a document tab and TWO diff tabs of the doomed file.
+                    v.open_file(doomed2.clone(), vctx);
+                    v.open_diff(doomed2.clone(), vctx);
+                    v.open_commit_diff(
+                        "cccc3333".to_string(),
+                        "doomed.md".to_string(),
+                        vctx,
+                    );
+                    v.open_diff(keep2.clone(), vctx);
+                    assert_eq!(v.file_tabs_for_test(ws).len(), 4, "four tabs before the delete");
+                    assert_eq!(v.diff_views.len(), 3, "three live diff views");
+
+                    // Never the real system Trash — see the `trash_delete`
+                    // field doc; a real call escapes the tempdir.
+                    v.trash_delete = |p| std::fs::remove_file(p).map_err(|e| e.to_string());
+                    v.handle_action_impl(
+                        &CraneShellAction::RequestDelete(doomed2.clone()),
+                        vctx,
+                    );
+                    v.handle_action_impl(&CraneShellAction::ConfirmDelete, vctx);
+                    assert!(!doomed2.exists(), "the file must actually be gone from disk");
+
+                    assert_eq!(
+                        v.file_tabs_for_test(ws),
+                        [TabKey::Diff { path: keep2.clone(), spec: DiffSpec::WorkingTree }],
+                        "deleting a file must close its file tab AND both of its diff tabs, \
+                         leaving only the untouched file's tab"
+                    );
+                    assert_eq!(
+                        v.diff_views.len(),
+                        1,
+                        "the deleted file's diff VIEWS must be dropped too, not just its tabs"
+                    );
+                });
+            });
+        });
+    }
+
     /// `close_focused`'s pre-fix cleanup only forgot `files_pane`, leaving
     /// `file_pane_paths` / `file_pane_active` for that Workspace populated.
     /// With File Tab state scoped per Workspace via a `HashMap` (rather than
@@ -19649,10 +20640,10 @@ mod restore_wiring_integration_tests {
                     // File-Tab state directly under wi=0 and wi=1.
                     let doc0 = std::path::PathBuf::from(format!("{path2}/wi0.md"));
                     let doc1 = std::path::PathBuf::from(format!("{path2}/wi1.md"));
-                    v.file_pane_paths.insert(ws0, vec![doc0.clone()]);
+                    v.file_pane_paths.insert(ws0, vec![TabKey::File(doc0.clone())]);
                     v.file_pane_active.insert(ws0, 0);
                     v.files_pane.insert(ws0, 100);
-                    v.file_pane_paths.insert(ws1, vec![doc1.clone()]);
+                    v.file_pane_paths.insert(ws1, vec![TabKey::File(doc1.clone())]);
                     v.file_pane_active.insert(ws1, 0);
                     v.files_pane.insert(ws1, 101);
 

@@ -126,10 +126,23 @@ pub fn push(repo: &Path) -> Result<String, String> {
 /// - `Err(msg)` — a real git failure (git missing, not a repository, corrupt
 ///   object store). The caller surfaces `msg` as an error row.
 pub fn head_bytes(repo: &Path, rel_path: &str) -> Result<Option<Vec<u8>>, String> {
+    rev_bytes(repo, "HEAD", rel_path)
+}
+
+/// [`head_bytes`] against an arbitrary revision — `rev` is any git revision
+/// (`HEAD`, a SHA, `abc123^` for a commit's parent). The Git Log's commit-vs-
+/// parent diff reads both of its sides through this.
+///
+/// The `Ok(None)` case carries real meaning per side: absent from `<sha>^`
+/// means the commit ADDED the file, absent from `<sha>` means it DELETED it.
+/// A commit's first parent doesn't exist for a root commit, so `<sha>^`
+/// legitimately fails to resolve — that's the "everything is an add" outcome,
+/// not an error.
+pub fn rev_bytes(repo: &Path, rev: &str, rel_path: &str) -> Result<Option<Vec<u8>>, String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["show", &format!("HEAD:{rel_path}")])
+        .args(["show", &format!("{rev}:{rel_path}")])
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
@@ -137,14 +150,43 @@ pub fn head_bytes(repo: &Path, rel_path: &str) -> Result<Option<Vec<u8>>, String
         return Ok(Some(out.stdout));
     }
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    // Expected "not in HEAD" shapes (per `git show` messages):
+    // Expected "not in <rev>" shapes (per `git show` messages):
     //   "fatal: path 'x' does not exist in 'HEAD'"
     //   "fatal: path 'x' exists on disk, but not in 'HEAD'"
     //   "fatal: invalid object name 'HEAD'"   (unborn HEAD, fresh repo)
+    //   "fatal: ambiguous argument 'abc^'"    (root commit has no parent)
     let absent = err.contains("does not exist in")
         || err.contains("exists on disk, but not in")
-        || err.contains("invalid object name");
+        || err.contains("invalid object name")
+        || err.contains("unknown revision")
+        || err.contains("ambiguous argument");
     if absent { Ok(None) } else { Err(err) }
+}
+
+/// Branch names (local AND remote-tracking) whose tip contains `sha`, for the
+/// commit-detail footer's "In N branches: …" line. Empty on any error.
+pub fn branches_containing(repo: &Path, sha: &str) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["branch", "-a", "--contains", sha, "--format=%(refname:short)"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        // `git branch -a` emits a detached-HEAD pseudo-entry; drop it so the
+        // list is real branches only.
+        .filter(|l| !l.starts_with("(HEAD detached"))
+        .map(String::from)
+        .collect()
 }
 
 /// Current branch name in `root` (or a short SHA when detached), empty on error.

@@ -48,6 +48,7 @@ pub mod rect_probe;
 pub mod shell;
 pub mod shell_init;
 pub mod split;
+pub mod tab_key;
 pub mod theme;
 pub mod update;
 pub mod view;

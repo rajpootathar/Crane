@@ -60,6 +60,15 @@ fn pill_colors(kind: RefKind) -> (ColorU, ColorU) {
     }
 }
 
+/// Author column width, in monospace character cells. Wide enough for a
+/// typical `first last`; longer names truncate rather than push the date
+/// column out of alignment.
+const AUTHOR_COLS: f32 = 18.0;
+/// Date column width in cells — fits `31/07/2026, 12:07 pm`.
+const DATE_COLS: f32 = 21.0;
+/// Gap between the author and date columns.
+const COL_GAP: f32 = 8.0;
+
 // Lane-graph geometry.
 const COL_W: f32 = 15.0;
 const DOT_R: f32 = 4.0;
@@ -394,18 +403,41 @@ impl Element for GitLogListElement {
             cx = draw_text(ctx, cx, base_y, &short, text_muted, hash_w, font);
             cx += self.cell_w;
 
-            // Meta (author + relative age) reserved on the right.
-            let meta = format!("{}  {}", commit.author, commit.relative);
-            let meta_w = meta.chars().count() as f32 * self.cell_w;
-            let meta_x = origin.x() + size.x() - meta_w - 10.0;
+            // AUTHOR and DATE are fixed-width columns pinned to the right
+            // edge, so they line up down the whole list — a single
+            // right-aligned "author  age" string (what this used to draw) left
+            // every row's author starting at a different x.
+            let date_w = DATE_COLS * self.cell_w;
+            let author_w = AUTHOR_COLS * self.cell_w;
+            let date_x = origin.x() + size.x() - date_w - 10.0;
+            let author_x = date_x - author_w - COL_GAP;
 
-            // Subject fills the gap between hash and meta.
-            let subj_max = (meta_x - cx - 8.0).max(0.0);
+            // Subject fills the gap between the hash and the author column.
+            let subj_max = (author_x - cx - 8.0).max(0.0);
             let subj_col = if is_sel { accent } else { text_col };
             draw_text(ctx, cx, base_y, &commit.subject, subj_col, subj_max, if is_sel { bold } else { font });
 
-            if meta_x > cx {
-                draw_text(ctx, meta_x, base_y, &meta, text_muted, meta_w + self.cell_w, font);
+            // Columns are dropped rather than overlapped when the pane is too
+            // narrow to hold them beside the subject.
+            if author_x > cx {
+                draw_text(
+                    ctx,
+                    author_x,
+                    base_y,
+                    &commit.author,
+                    text_muted,
+                    author_w,
+                    font,
+                );
+                draw_text(
+                    ctx,
+                    date_x,
+                    base_y,
+                    &commit.display_date,
+                    text_muted,
+                    date_w,
+                    font,
+                );
             }
         }
     }
