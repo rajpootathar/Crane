@@ -278,8 +278,12 @@ pub struct CraneShellView {
     layouts: HashMap<(usize, usize, usize), Node>,
     /// The focused pane — target for split / close / scroll.
     focused: Option<PaneId>,
-    /// When set, only this pane renders (expand-to-full / maximize).
-    maximized: Option<PaneId>,
+    /// The maximized (expand-to-full) pane of each Tab, keyed exactly like
+    /// `layouts`. PER TAB, not global: a single `Option<PaneId>` kept
+    /// rendering Tab A's maximized pane after switching to Tab B, so the
+    /// expanded pane hovered over every other Tab's content. Each Tab now
+    /// remembers its own, so switching away and back restores what you left.
+    maximized: HashMap<(usize, usize, usize), PaneId>,
     /// The dedicated File pane (files open as TABS inside it), PER WORKSPACE.
     /// Keyed `(project_idx, worktree_idx)`, matching `worktree_tabs`. This was
     /// a single `Option<PaneId>` until it turned out one Project's Files Pane
@@ -2637,7 +2641,7 @@ impl CraneShellView {
             panes,
             layouts,
             focused,
-            maximized: None,
+            maximized: HashMap::new(),
             files_pane: restored_files_pane,
             // Restored state carries editable documents only — a diff tab is a
             // derived view, so it is neither saved nor resurrected.
@@ -8193,7 +8197,7 @@ impl CraneShellView {
         let mut bridge = crate::app::browser::take_bridge();
         // Visible = leaves of the active Tab's layout, narrowed to just the
         // maximized pane when one is maximized.
-        let visible: HashSet<PaneId> = match self.maximized {
+        let visible: HashSet<PaneId> = match self.maximized_pane() {
             Some(m) => std::iter::once(m).collect(),
             None => self
                 .active_tab
@@ -11549,9 +11553,23 @@ impl CraneShellView {
         Some(chip)
     }
 
+    /// Drop `id` from whichever Tab has it maximized. Keyed by the PANE, not
+    /// the active Tab: a pane can be closed from a Tab that isn't on screen
+    /// (a delete sweep, a Workspace teardown), and leaving a stale entry would
+    /// make that Tab render an expanded pane that no longer exists.
+    fn clear_maximized(&mut self, id: PaneId) {
+        self.maximized.retain(|_, m| *m != id);
+    }
+
+    /// The ACTIVE Tab's maximized pane, if it has one. Every read site goes
+    /// through here so a maximized pane can never leak across Tabs.
+    fn maximized_pane(&self) -> Option<PaneId> {
+        self.active_tab.and_then(|t| self.maximized.get(&t).copied())
+    }
+
     fn center(&self, app: &AppContext) -> Box<dyn Element> {
         // Expand-to-full: render only the maximized pane.
-        if let Some(id) = self.maximized {
+        if let Some(id) = self.maximized_pane() {
             if self.panes.contains_key(&id) {
                 return self.panel(theme::bg(), self.render_pane(id, app));
             }
@@ -12044,7 +12062,7 @@ impl CraneShellView {
     /// the header button). `None` when this pane is not maximized, or when it is
     /// the Layout's only leaf — nothing is hidden, so nothing to say.
     fn hidden_panes_chip(&self, id: PaneId) -> Option<Box<dyn Element>> {
-        if self.maximized != Some(id) {
+        if self.maximized_pane() != Some(id) {
             return None;
         }
         let mut leaves = Vec::new();
@@ -12180,7 +12198,7 @@ impl CraneShellView {
         // Expanded-to-full state. The button glyph must show what pressing it
         // DOES: ARROWS_OUT (expand) while tiled, ARROWS_IN (collapse back to
         // the split) while this pane is the maximized one.
-        let is_max = self.maximized == Some(id);
+        let is_max = self.maximized_pane() == Some(id);
         let max_glyph = if is_max { icons::ARROWS_IN } else { icons::ARROWS_OUT };
 
         // The Expanded title fills the row, pushing these to the right edge.
@@ -12363,6 +12381,10 @@ impl CraneShellView {
         }
         self.panes.remove(&pane);
         self.drag_states.remove(&pane);
+        // Every leaf removal funnels through here (Cmd+W, delete sweeps,
+        // Workspace teardown), so this is the one place that guarantees no Tab
+        // is left maximizing a pane that no longer exists.
+        self.clear_maximized(pane);
         self.pane_rects.borrow_mut().remove(&pane);
         ctx.dispatch_typed_action(&CraneShellAction::RelayoutPanes);
     }
@@ -15901,17 +15923,19 @@ impl CraneShellView {
             }
             CraneShellAction::ClosePane(id) => {
                 self.focused = Some(*id);
-                if self.maximized == Some(*id) {
-                    self.maximized = None;
-                }
+                self.clear_maximized(*id);
                 self.close_focused(ctx);
             }
             CraneShellAction::ToggleMaximize(id) => {
-                self.maximized = if self.maximized == Some(*id) {
-                    None
-                } else {
-                    Some(*id)
-                };
+                // Recorded against the pane's own Tab, so maximizing in one Tab
+                // leaves every other Tab's layout alone.
+                if let Some(tab) = self.tab_of_pane(*id) {
+                    if self.maximized.get(&tab) == Some(id) {
+                        self.maximized.remove(&tab);
+                    } else {
+                        self.maximized.insert(tab, *id);
+                    }
+                }
             }
             CraneShellAction::SplitPane(id, dir) => {
                 self.focused = Some(*id);
@@ -17458,9 +17482,7 @@ impl CraneShellView {
             CraneShellAction::ConfirmClosePane(id) => {
                 self.modal = None;
                 self.focused = Some(*id);
-                if self.maximized == Some(*id) {
-                    self.maximized = None;
-                }
+                self.clear_maximized(*id);
                 self.close_focused(ctx);
             }
             CraneShellAction::OpenFindInFiles => {
@@ -20003,6 +20025,102 @@ mod restore_wiring_integration_tests {
         });
     }
 
+
+    /// Maximizing a pane used to be recorded in ONE global field, and
+    /// `center()` honored it whatever Tab was on screen — so an expanded pane
+    /// in Tab A went on rendering over Tab B's layout. Maximization belongs to
+    /// the Tab that owns the pane: switching away shows the other Tab's real
+    /// layout, and switching back restores the expanded pane.
+    #[test]
+    fn a_maximized_pane_stays_scoped_to_its_own_tab() {
+        use crate::app::shell::CraneShellAction;
+        use warpui::platform::WindowStyle;
+        use warpui::App;
+
+        let home_dir = tempfile::tempdir().expect("home tempdir");
+        let _home = HomeOverride::scoped(home_dir.path());
+
+        let proj = tempfile::tempdir().expect("project tempdir");
+        let path = proj.path().to_string_lossy().into_owned();
+
+        let mut st = WarpuiState::default();
+        st.added_projects = vec![AddedProject { name: "proj".to_string(), path: path.clone() }];
+
+        let path2 = path.clone();
+        App::test((), move |mut app| async move {
+            let app = &mut app;
+            let (_window_id, view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                CraneShellView::new_with_state(ctx, Some(st))
+            });
+            app.update(move |ctx| {
+                view.update(ctx, |v, vctx| {
+                    let ws = v.ws_key_for_path_for_test(&path2).expect("Workspace");
+                    let tab_a = (ws.0, ws.1, 0);
+                    let tab_b = (ws.0, ws.1, 1);
+                    let p = std::path::PathBuf::from(&path2);
+
+                    // Two Tabs, each opened with its own terminal leaf.
+                    v.handle_action_impl(
+                        &CraneShellAction::Select { sel: tab_a, path: p.clone() },
+                        vctx,
+                    );
+                    let pane_a = v.focused.expect("Tab A has a pane");
+                    v.handle_action_impl(
+                        &CraneShellAction::Select { sel: tab_b, path: p.clone() },
+                        vctx,
+                    );
+                    let pane_b = v.focused.expect("Tab B has a pane");
+                    assert_ne!(pane_a, pane_b, "the two Tabs must own distinct panes");
+
+                    // Maximize inside Tab A.
+                    v.handle_action_impl(
+                        &CraneShellAction::Select { sel: tab_a, path: p.clone() },
+                        vctx,
+                    );
+                    v.handle_action_impl(&CraneShellAction::ToggleMaximize(pane_a), vctx);
+                    assert_eq!(
+                        v.maximized_pane(),
+                        Some(pane_a),
+                        "Tab A shows its own maximized pane"
+                    );
+
+                    // Switching to Tab B must show B's layout, NOT A's pane.
+                    v.handle_action_impl(
+                        &CraneShellAction::Select { sel: tab_b, path: p.clone() },
+                        vctx,
+                    );
+                    assert_eq!(
+                        v.maximized_pane(),
+                        None,
+                        "a pane maximized in Tab A must not hover over Tab B"
+                    );
+
+                    // Maximizing in B is independent of A.
+                    v.handle_action_impl(&CraneShellAction::ToggleMaximize(pane_b), vctx);
+                    assert_eq!(v.maximized_pane(), Some(pane_b));
+                    v.handle_action_impl(
+                        &CraneShellAction::Select { sel: tab_a, path: p.clone() },
+                        vctx,
+                    );
+                    assert_eq!(
+                        v.maximized_pane(),
+                        Some(pane_a),
+                        "switching back must RESTORE the Tab's own maximized pane, not \
+                         forget it and not adopt the other Tab's"
+                    );
+
+                    // Closing the maximized pane must not leave its Tab
+                    // expanding a pane that no longer exists.
+                    v.handle_action_impl(&CraneShellAction::ClosePane(pane_a), vctx);
+                    assert_eq!(
+                        v.maximized.values().copied().collect::<Vec<_>>(),
+                        vec![pane_b],
+                        "a closed pane must be dropped from the maximized map"
+                    );
+                });
+            });
+        });
+    }
 
     /// Every overlay in the shell dismisses through `CloseContextMenu` — the
     /// click-away backdrop `menu_popover` wraps itself in dispatches exactly
