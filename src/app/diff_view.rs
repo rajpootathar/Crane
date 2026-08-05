@@ -35,8 +35,8 @@ use similar::{ChangeTag, TextDiff};
 use syntect::easy::HighlightLines;
 use warpui::color::ColorU;
 use warpui::elements::{
-    ConstrainedBox, Container, CrossAxisAlignment, Element, Expanded, Fill, Flex, Hoverable,
-    MouseStateHandle, ParentElement, Point, Rect, Stack, Text,
+    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Expanded, Fill, Flex,
+    Hoverable, MouseStateHandle, ParentElement, Point, Radius, Rect, Stack, Text,
 };
 use warpui::event::{DispatchedEvent, Event};
 use warpui::fonts::{FamilyId, Properties};
@@ -56,6 +56,8 @@ use crate::app::theme;
 const FONT_SIZE: f32 = 12.0;
 /// Stage-hunk control gutter width (1:1 old egui `stage_btn_w`).
 const STAGE_W: f32 = 28.0;
+/// Horizontal scrollbar height at the bottom of the content column.
+const H_BAR_H: f32 = 7.0;
 /// Minimap strip width (1:1 old egui `MINIMAP_W`).
 const MINIMAP_W: f32 = 10.0;
 
@@ -603,6 +605,12 @@ pub struct WarpDiffView {
     /// Fractional scroll offset in ROWS (shared with the body element, which
     /// clamps it to the content each paint).
     scroll: Rc<Cell<f32>>,
+    /// Horizontal scroll offset in PIXELS over the content column. Long lines
+    /// used to be truncated at the minimap edge with nothing to say so — on a
+    /// wide change you simply could not see the end of the line.
+    h_scroll: Rc<Cell<f32>>,
+    /// Horizontal thumb drag latch (same persistence contract as `scroll`).
+    h_drag: Rc<Cell<bool>>,
     /// Hovered hunk index (stage-gutter affordance highlight).
     hover_hunk: Rc<Cell<Option<usize>>>,
     /// Viewport height in rows, written by the body element each layout — the
@@ -725,6 +733,8 @@ impl WarpDiffView {
             loading: false,
             error: None,
             scroll: Rc::new(Cell::new(0.0)),
+            h_scroll: Rc::new(Cell::new(0.0)),
+            h_drag: Rc::new(Cell::new(false)),
             hover_hunk: Rc::new(Cell::new(None)),
             viewport_rows: Rc::new(Cell::new(0.0)),
             minimap_drag: Rc::new(Cell::new(false)),
@@ -1064,6 +1074,8 @@ impl View for WarpDiffView {
                         self.font,
                         self.icon_font,
                         self.scroll.clone(),
+                        self.h_scroll.clone(),
+                        self.h_drag.clone(),
                         self.hover_hunk.clone(),
                         self.viewport_rows.clone(),
                         self.minimap_drag.clone(),
@@ -1103,6 +1115,13 @@ struct DiffBodyElement {
     font_size: f32,
     /// Fractional scroll offset in ROWS (shared, persisted by the view).
     scroll: Rc<Cell<f32>>,
+    /// Horizontal offset in PIXELS over the content column (shared, persisted).
+    h_scroll: Rc<Cell<f32>>,
+    /// Horizontal thumb drag latch (persisted across per-frame rebuilds).
+    h_drag: Rc<Cell<bool>>,
+    /// `(track_x, track_w, content_w, full_w)` written by paint, read when a
+    /// drag hit-tests the thumb — only paint knows the column geometry.
+    h_track: Cell<(f32, f32, f32, f32)>,
     /// Hovered hunk index (shared so the highlight survives rebuilds).
     hover_hunk: Rc<Cell<Option<usize>>>,
     /// Written each layout: viewport height in rows (view reads for scrollbar).
@@ -1119,11 +1138,36 @@ struct DiffBodyElement {
 }
 
 impl DiffBodyElement {
+    /// Widest row in the diff, in characters — the horizontal scroll extent.
+    /// Computed over the WHOLE file rather than the visible window so the
+    /// scrollbar thumb doesn't resize as you scroll vertically.
+    fn max_line_chars(&self) -> usize {
+        self.computed
+            .rows
+            .iter()
+            .map(|r| r.spans.iter().map(|(_, t)| t.chars().count()).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Clamp the shared horizontal offset to `[0, content_width - viewport]`.
+    /// `content_w` is the width of the text column (gutters and minimap
+    /// excluded — those never scroll).
+    fn clamp_h_scroll(&self, content_w: f32) -> f32 {
+        let full = self.max_line_chars() as f32 * self.cell_w;
+        let max = (full - content_w).max(0.0);
+        let clamped = self.h_scroll.get().clamp(0.0, max);
+        self.h_scroll.set(clamped);
+        clamped
+    }
+
     fn new(
         computed: Rc<DiffComputed>,
         font: FamilyId,
         icon_font: FamilyId,
         scroll: Rc<Cell<f32>>,
+        h_scroll: Rc<Cell<f32>>,
+        h_drag: Rc<Cell<bool>>,
         hover_hunk: Rc<Cell<Option<usize>>>,
         viewport_rows: Rc<Cell<f32>>,
         minimap_drag: Rc<Cell<bool>>,
@@ -1132,6 +1176,9 @@ impl DiffBodyElement {
             computed,
             font,
             icon_font,
+            h_scroll,
+            h_drag,
+            h_track: Cell::new((0.0, 0.0, 0.0, 0.0)),
             font_size: FONT_SIZE,
             scroll,
             hover_hunk,
@@ -1272,6 +1319,13 @@ impl Element for DiffBodyElement {
         let sign_w = self.cell_w * 2.0 + 8.0;
         let text_x = sign_x + sign_w;
         let minimap_x = x0 + size.x() - MINIMAP_W;
+        // Only the CONTENT column scrolls horizontally; the stage gutter, the
+        // two line-number columns and the +/- sign stay pinned, so you can
+        // always tell which line you are reading.
+        let content_w = (minimap_x - 2.0 - text_x).max(0.0);
+        let h_off = self.clamp_h_scroll(content_w);
+        let full_w = self.max_line_chars() as f32 * self.cell_w;
+        self.h_track.set((text_x, content_w, content_w, full_w));
 
         let text_col = theme::text();
         let text_muted = theme::text_muted();
@@ -1419,15 +1473,17 @@ impl Element for DiffBodyElement {
             };
             draw_text(ctx, sign_x + (sign_w - self.cell_w) * 0.5, base_y, sign, sign_fg, text_x);
 
-            // Syntax-colored content spans (truncated at the minimap edge).
-            let mut cx = text_x;
+            // Syntax-colored content spans, shifted by the horizontal offset.
+            // Clipped at BOTH edges: glyphs scrolled off the left would
+            // otherwise be drawn over the pinned line-number gutter.
+            let mut cx = text_x - h_off;
             'spans: for (color, text) in &r.spans {
                 let fg = if color.a == 0 { text_col } else { *color };
                 for ch in text.chars() {
                     if cx + self.cell_w > minimap_x - 2.0 {
                         break 'spans;
                     }
-                    if ch != ' ' {
+                    if cx >= text_x - 0.5 && ch != ' ' {
                         if let Some((gid, rf)) = fc.glyph_for_char(font, ch, true) {
                             ctx.scene
                                 .draw_glyph(vec2f(cx, base_y), gid, rf, self.font_size, fg);
@@ -1436,6 +1492,32 @@ impl Element for DiffBodyElement {
                     cx += self.cell_w;
                 }
             }
+        }
+
+        // Horizontal scrollbar: a thumb over the content column, drawn only
+        // when the widest line actually overflows. Without it the sideways
+        // scroll is gesture-only and undiscoverable — you cannot tell a
+        // truncated line from a short one.
+        if full_w > content_w && content_w > 0.0 {
+            let frac = (content_w / full_w).clamp(0.05, 1.0);
+            let thumb_w = (content_w * frac).max(24.0);
+            let travel = content_w - thumb_w;
+            let pos = if full_w > content_w {
+                (h_off / (full_w - content_w)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let thumb_x = text_x + travel * pos;
+            let thumb_y = origin.y() + size.y() - H_BAR_H;
+            ctx.scene
+                .draw_rect_without_hit_recording(RectF::new(
+                    vec2f(thumb_x, thumb_y),
+                    vec2f(thumb_w, H_BAR_H - 2.0),
+                ))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                    (H_BAR_H - 2.0) * 0.5,
+                )))
+                .with_background(Fill::Solid(theme::text_muted()));
         }
 
         // Minimap: add/del markers scaled to the whole file (old egui 748-790).
@@ -1486,13 +1568,52 @@ impl Element for DiffBodyElement {
             // Bounds-gated so an open Diff pane can't eat wheel events meant
             // for other panes/panels (events dispatch tree-wide).
             Event::ScrollWheel { delta, precise, position, .. } if in_bounds(position) => {
-                // Same feel as the Git Log list: precise (trackpad) deltas are
-                // pixels → rows; line deltas map 1:1 to rows.
-                let dy = delta.y();
-                let delta_rows = if *precise { dy / self.row_h } else { dy };
-                self.scroll.set((self.scroll.get() - delta_rows).max(0.0));
-                let _ = self.clamp_scroll();
+                // Dominant axis wins, same rule the editor uses — a mostly
+                // vertical gesture must not jitter the line sideways.
+                let (dx, dy) = (delta.x(), delta.y());
+                if dx.abs() > dy.abs() {
+                    // Pixels either way: line deltas get the same nominal cell
+                    // step the vertical branch gives a row.
+                    let step = if *precise { dx } else { dx * self.cell_w };
+                    self.h_scroll.set((self.h_scroll.get() - step).max(0.0));
+                } else {
+                    // Same feel as the Git Log list: precise (trackpad) deltas
+                    // are pixels → rows; line deltas map 1:1 to rows.
+                    let delta_rows = if *precise { dy / self.row_h } else { dy };
+                    self.scroll.set((self.scroll.get() - delta_rows).max(0.0));
+                    let _ = self.clamp_scroll();
+                }
+                // The horizontal clamp needs the content width, which only
+                // paint knows; it re-clamps there. Repaint either way.
                 ctx.notify();
+                return true;
+            }
+            // Horizontal thumb: press anywhere in the bottom bar band jumps
+            // there, then drags. Checked BEFORE the hunk-gutter hit test since
+            // the bar overlays the bottom row.
+            Event::LeftMouseDown { position, .. }
+                if in_bounds(position) && position.y() >= o.y() + s.y() - H_BAR_H =>
+            {
+                let (track_x, track_w, content_w, full_w) = self.h_track.get();
+                if full_w > content_w && track_w > 0.0 {
+                    self.h_drag.set(true);
+                    let frac = ((position.x() - track_x) / track_w).clamp(0.0, 1.0);
+                    self.h_scroll.set(frac * (full_w - content_w));
+                    ctx.notify();
+                    return true;
+                }
+            }
+            Event::LeftMouseDragged { position, .. } if self.h_drag.get() => {
+                let (track_x, track_w, content_w, full_w) = self.h_track.get();
+                if full_w > content_w && track_w > 0.0 {
+                    let frac = ((position.x() - track_x) / track_w).clamp(0.0, 1.0);
+                    self.h_scroll.set(frac * (full_w - content_w));
+                    ctx.notify();
+                }
+                return true;
+            }
+            Event::LeftMouseUp { .. } if self.h_drag.get() => {
+                self.h_drag.set(false);
                 return true;
             }
             Event::MouseMoved { position, .. } if in_bounds(position) => {
@@ -1544,6 +1665,87 @@ impl Element for DiffBodyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── horizontal scroll ────────────────────────────────────────────────
+
+    /// Build a body element over rows whose content spans are `widths` chars.
+    fn body_with_widths(widths: &[usize]) -> DiffBodyElement {
+        let rows: Vec<Row> = widths
+            .iter()
+            .map(|w| Row {
+                tag: ChangeTag::Equal,
+                old_ln: String::new(),
+                new_ln: String::new(),
+                spans: vec![(NO_COLOR, "x".repeat(*w))],
+                old_lno: None,
+                new_lno: None,
+            })
+            .collect();
+        let computed = Rc::new(DiffComputed {
+            rows,
+            hunk_starts: Vec::new(),
+            hunk_patches: Vec::new(),
+            hunk_staged: Vec::new(),
+            row_to_hunk: Vec::new(),
+            row_in_shared_group: Vec::new(),
+            ldigits: 3,
+            rdigits: 3,
+            binary: None,
+            error: None,
+        });
+        let mut b = DiffBodyElement::new(
+            computed,
+            // The scroll math never touches the font cache; any id will do.
+            FamilyId(0),
+            FamilyId(0),
+            Rc::new(Cell::new(0.0)),
+            Rc::new(Cell::new(0.0)),
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(None)),
+            Rc::new(Cell::new(0.0)),
+            Rc::new(Cell::new(false)),
+        );
+        b.cell_w = 10.0;
+        b
+    }
+
+    /// The scroll extent is the WIDEST line in the whole file, not the widest
+    /// currently on screen — otherwise the thumb would resize as you scroll
+    /// vertically past a long line.
+    #[test]
+    fn horizontal_extent_is_the_widest_line_in_the_file() {
+        let b = body_with_widths(&[10, 240, 30]);
+        assert_eq!(b.max_line_chars(), 240);
+        assert_eq!(body_with_widths(&[]).max_line_chars(), 0);
+    }
+
+    /// Clamping is against `content_width`, so a diff that fits never scrolls
+    /// and one that overflows stops exactly at the last column.
+    #[test]
+    fn horizontal_scroll_clamps_to_the_overflow() {
+        let b = body_with_widths(&[100]); // 100 chars * 10px = 1000px of content
+        // Viewport wider than the content: no scrolling at all.
+        b.h_scroll.set(500.0);
+        assert_eq!(b.clamp_h_scroll(1200.0), 0.0);
+        // Viewport narrower: clamp to (1000 - 400) = 600.
+        b.h_scroll.set(5_000.0);
+        assert_eq!(b.clamp_h_scroll(400.0), 600.0);
+        // A negative offset can never survive.
+        b.h_scroll.set(-50.0);
+        assert_eq!(b.clamp_h_scroll(400.0), 0.0);
+        // An in-range offset is left alone.
+        b.h_scroll.set(250.0);
+        assert_eq!(b.clamp_h_scroll(400.0), 250.0);
+    }
+
+    /// An empty diff must not divide by zero or admit an offset.
+    #[test]
+    fn horizontal_scroll_on_an_empty_diff_is_inert() {
+        let b = body_with_widths(&[]);
+        b.h_scroll.set(100.0);
+        assert_eq!(b.clamp_h_scroll(0.0), 0.0);
+        assert_eq!(b.clamp_h_scroll(500.0), 0.0);
+    }
 
     // ── visual hunk detection ────────────────────────────────────────────
 
