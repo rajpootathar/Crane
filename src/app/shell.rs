@@ -16940,30 +16940,48 @@ impl CraneShellView {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| path_str.clone());
-                        if !this.projects.iter().any(|p| p.path == path_str)
-                            && !this.added_projects.iter().any(|a| a.path == path_str)
-                        {
-                            let ap = crate::app::persist::AddedProject {
-                                name,
-                                path: path_str.clone(),
-                            };
+                        // Un-suppress the picked folder AND everything nested
+                        // under it. "Remove Project" on a grouped CHILD repo
+                        // records the CHILD's own path, and `expand_folder`
+                        // skips any child still listed — so clearing only the
+                        // exact picked path brought a container back
+                        // permanently empty of the repos inside it.
+                        crate::app::projects::unsuppress_tree(
+                            &mut this.removed_project_paths,
+                            &path_str,
+                        );
+                        let ap = crate::app::persist::AddedProject {
+                            name,
+                            path: path_str.clone(),
+                        };
+                        // A stale `added_projects` entry must NOT short-circuit
+                        // the re-add: removing a container's child repos drops
+                        // the children by their own paths and leaves the
+                        // container's entry behind, so gating on it turned
+                        // re-picking that folder into a silent no-op. Presence
+                        // in `self.projects` is the only real "already here".
+                        if !this.added_projects.iter().any(|a| a.path == path_str) {
                             this.added_projects.push(ap.clone());
-                            // Re-add in case the user had previously removed it.
-                            this.removed_project_paths.retain(|r| r != &path_str);
-                            // Shallow-expand ONLY the picked folder and APPEND it —
-                            // no whole-tree reload and ZERO synchronous `git` on the
-                            // UI thread. Appending (vs a full rebuild) keeps every
-                            // existing project's (pi, *)-keyed state + already-filled
-                            // badges intact. The new project appears + is usable
-                            // instantly; its branch/diff/dirty fill in via the scan
-                            // below.
+                        }
+                        // Shallow-expand ONLY the picked folder and APPEND what
+                        // is not already on screen — no whole-tree reload and
+                        // ZERO synchronous `git` on the UI thread. Appending
+                        // (vs a full rebuild, or splicing mid-vector) keeps every
+                        // existing project's (pi, *)-keyed state + already-filled
+                        // badges intact. The new project appears + is usable
+                        // instantly; its branch/diff/dirty fill in via the scan
+                        // below.
+                        let fresh: Vec<_> = crate::app::projects::load_one_shallow(
+                            &ap,
+                            &this.removed_project_paths,
+                            &this.project_tints,
+                        )
+                        .into_iter()
+                        .filter(|n| !this.projects.iter().any(|p| p.path == n.path))
+                        .collect();
+                        if !fresh.is_empty() {
                             let start = this.projects.len();
-                            let new_nodes = crate::app::projects::load_one_shallow(
-                                &ap,
-                                &this.removed_project_paths,
-                                &this.project_tints,
-                            );
-                            this.projects.extend(new_nodes);
+                            this.projects.extend(fresh);
                             // Watch the newly added Project(s) + their Workspaces so
                             // external / agent edits refresh the active repo.
                             this.sync_watches();
@@ -16971,8 +16989,8 @@ impl CraneShellView {
                                 &this.projects[start..],
                             );
                             this.spawn_git_scan(vctx, format!("add:{path_str}"), new_paths);
-                            this.save_state(&*vctx);
                         }
+                        this.save_state(&*vctx);
                         // Open (expand + activate) the picked project so it becomes
                         // usable immediately. A container folder (git children) has
                         // no single project entry — its children just appear.

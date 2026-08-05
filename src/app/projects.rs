@@ -348,6 +348,27 @@ fn expand_folder(
                 is_loose: false,
                 group_path: Some(container.clone()),
             });
+        } else {
+            // Non-git CONTAINER: emit the container ITSELF as a LOOSE group
+            // member (first, above its repos) so everything in it that is NOT a
+            // repo — stray files, plain subfolders — stays reachable. It carries
+            // a worktree, so Tabs / terminals / the Files pane can be rooted at
+            // the folder. Without this the container vanished entirely the
+            // moment it contained one git repo, and its loose content had no
+            // node to hang off.
+            let worktrees = if opened.worktrees.is_empty() {
+                vec![default_worktree(path, &opened.name, with_git)]
+            } else {
+                opened.worktrees
+            };
+            out.push(ProjectNode {
+                name: opened.name,
+                path: container.clone(),
+                worktrees,
+                tint: None,
+                is_loose: true,
+                group_path: Some(container.clone()),
+            });
         }
         for child in &siblings {
             // Suppress a child repo the user explicitly removed. "Remove
@@ -398,6 +419,19 @@ fn expand_folder(
         is_loose: true,
         group_path: None,
     });
+}
+
+/// Drop `path` and everything nested UNDER it from the removal set, so a folder
+/// the user re-picks in "Add Project" comes back whole.
+///
+/// An exact-match retain is not enough: "Remove Project" on a repo discovered
+/// inside a container records the CHILD's own path (see `expand_folder`), which
+/// no container-keyed filter can ever clear. Re-adding the container then
+/// re-emitted it with every previously-removed repo still suppressed — i.e. the
+/// folder came back permanently empty.
+pub fn unsuppress_tree(removed: &mut Vec<String>, path: &str) {
+    let prefix = format!("{path}/");
+    removed.retain(|r| r != path && !r.starts_with(&prefix));
 }
 
 /// Parse the opened folders recorded in `~/.crane/session.json` (unexpanded).
@@ -698,6 +732,98 @@ mod tests {
         // the basename default the fresh child carried).
         let py = projects.iter().find(|p| p.path.ends_with("qck-py-sdk")).unwrap();
         assert_eq!(py.worktrees[0].name, "main", "kept the fresh child, lost real state");
+    }
+
+    /// A non-git CONTAINER holding one git repo plus loose (non-repo) content
+    /// must emit the container itself as a loose group member — otherwise the
+    /// loose files have no node and are unreachable.
+    #[test]
+    fn container_with_loose_content_emits_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("my-folder");
+        std::fs::create_dir_all(root.join("repo-a/.git")).unwrap();
+        std::fs::create_dir_all(root.join("plain-subdir")).unwrap();
+        std::fs::write(root.join("notes.md"), "loose").unwrap();
+
+        let mut out = Vec::new();
+        expand_folder(
+            OpenedFolder {
+                name: "my-folder".into(),
+                path: root.to_string_lossy().into(),
+                worktrees: Vec::new(),
+            },
+            &[],
+            false,
+            &mut out,
+        );
+
+        let group = root.to_string_lossy().to_string();
+        assert_eq!(out.len(), 2, "container + its one repo");
+        assert!(out[0].is_loose, "container must render as a loose folder");
+        assert_eq!(out[0].path, group);
+        assert_eq!(out[0].group_path.as_deref(), Some(group.as_str()));
+        assert_eq!(
+            out[0].worktrees.len(),
+            1,
+            "loose container needs a worktree to hold Tabs / terminals"
+        );
+        assert!(!out[1].is_loose);
+        assert!(out[1].path.ends_with("repo-a"));
+        assert_eq!(out[1].group_path.as_deref(), Some(group.as_str()));
+    }
+
+    /// Re-adding a container must restore the repos inside it. `expand_folder`
+    /// suppresses any child listed in `removed`, and "Remove Project" on a child
+    /// records the CHILD's path — so the un-remove has to clear the whole
+    /// subtree, not just the exact folder the user picked.
+    #[test]
+    fn unsuppress_tree_restores_removed_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("my-folder");
+        std::fs::create_dir_all(root.join("repo-a/.git")).unwrap();
+        std::fs::create_dir_all(root.join("repo-b/.git")).unwrap();
+        let group = root.to_string_lossy().to_string();
+        let opened = || OpenedFolder {
+            name: "my-folder".into(),
+            path: group.clone(),
+            worktrees: Vec::new(),
+        };
+
+        // User removed the whole group: the container plus both child repos,
+        // each keyed by its own path.
+        let mut removed = vec![
+            group.clone(),
+            format!("{group}/repo-a"),
+            format!("{group}/repo-b"),
+        ];
+
+        // Exact-match clearing only (the old behaviour) brings the folder back
+        // with both repos still suppressed.
+        let mut exact = removed.clone();
+        exact.retain(|r| r != &group);
+        let mut out = Vec::new();
+        expand_folder(opened(), &exact, false, &mut out);
+        assert_eq!(out.len(), 1, "exact-match clear leaves the repos suppressed");
+
+        // Subtree clearing restores the container AND both repos.
+        unsuppress_tree(&mut removed, &group);
+        assert!(removed.is_empty(), "subtree entries must all be cleared");
+        let mut out = Vec::new();
+        expand_folder(opened(), &removed, false, &mut out);
+        assert_eq!(out.len(), 3, "container + both repos come back");
+    }
+
+    /// The subtree clear must not touch a sibling folder that merely shares a
+    /// name prefix (`/p/proj` vs `/p/proj-old`).
+    #[test]
+    fn unsuppress_tree_respects_path_boundaries() {
+        let mut removed = vec![
+            "/p/proj".to_string(),
+            "/p/proj/child".to_string(),
+            "/p/proj-old".to_string(),
+        ];
+        unsuppress_tree(&mut removed, "/p/proj");
+        assert_eq!(removed, vec!["/p/proj-old".to_string()]);
     }
 
     // A discovered sibling that was NOT opened on its own (e.g. a gitignored
