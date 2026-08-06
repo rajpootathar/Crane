@@ -415,13 +415,13 @@ fn expand_folder(
     // project row nobody asked for — the user removed what was in it, so the
     // container goes with them.
     //
-    // UNLESS the user explicitly picked this folder in "Add Project". Its repos
-    // may all be independently-opened-and-removed paths that `unsuppress_tree`
-    // deliberately refuses to resurrect (e.g. removing `OneVibe/Android` and
-    // `OneVibe/Backend`, then adding their parent `OneVibe`) — dropping the
-    // container too made "Add Project" a silent no-op with nothing to click.
-    // The pick is an explicit request for THIS folder, so it renders as a loose
-    // folder carrying its non-repo content; the removed repos stay removed.
+    // UNLESS the user explicitly picked this folder in "Add Project" and then
+    // removed the repos inside it one by one. The folder stays in
+    // `added_projects`, so vanishing it leaves a project the user asked for
+    // recorded but unreachable — and re-picking it only re-runs the same
+    // vanishing act. The pick is an explicit request for THIS folder, so it
+    // renders as a loose folder carrying its non-repo content; removing the
+    // container itself is how it goes away.
     if !siblings.is_empty() && !opened.user_added {
         return;
     }
@@ -452,43 +452,23 @@ fn expand_folder(
 /// re-emitted it with every previously-removed repo still suppressed — i.e. the
 /// folder came back permanently empty.
 ///
-/// But a blanket prefix clear over-reaches. A path nested under `path` may be a
-/// folder the user opened INDEPENDENTLY (its own session.json / "Add Project"
-/// entry) and removed as a top-level project in its own right — e.g. removing
+/// The clear covers the WHOLE subtree, including nested folders the user had
+/// also opened INDEPENDENTLY (their own session.json / "Add Project" entry) and
+/// removed as top-level projects in their own right — e.g. removing
 /// `OneVibe/Android` and `OneVibe/Backend`, then later adding their parent
-/// `OneVibe`. Those keep their own identity, so re-adding an ancestor must not
-/// resurrect them; only re-picking that exact path may. `opened` carries every
-/// independently-opened path for exactly this test.
-pub fn unsuppress_tree(
-    removed: &mut Vec<String>,
-    path: &str,
-    opened: &std::collections::HashSet<String>,
-) {
+/// `OneVibe`. Those were previously exempted to preserve their standalone
+/// identity, but the exemption is what made picking the parent produce a
+/// container with none of its repos in it: `expand_folder` suppresses every
+/// still-listed child, and nothing in the UI reveals that children are being
+/// held back or offers a way to release just one. Picking a folder is an
+/// explicit request for that folder AND its contents, so it wins; a child the
+/// user does not want back is one "Remove Project" away.
+///
+/// Only a genuine path boundary limits the clear — a mere name-prefix sibling
+/// (`foo-old` next to `foo`) is untouched.
+pub fn unsuppress_tree(removed: &mut Vec<String>, path: &str) {
     let prefix = format!("{path}/");
-    removed.retain(|r| {
-        // The folder the user just picked always comes back.
-        if r == path {
-            return false;
-        }
-        // Unrelated entry (incl. a mere name-prefix sibling like `foo-old`).
-        if !r.starts_with(&prefix) {
-            return true;
-        }
-        // Descendant: restore it only if it exists SOLELY as a discovered child
-        // of this container. An independently-opened one stays removed.
-        opened.contains(r)
-    });
-}
-
-/// Paths of every folder recorded as independently opened in `session.json`.
-/// Combined with `added_projects`, this is the set that `unsuppress_tree` must
-/// not resurrect when an ancestor folder is re-added.
-pub fn session_folder_paths() -> Vec<String> {
-    session_folders(false)
-        .into_iter()
-        .map(|f| f.path)
-        .filter(|p| !p.is_empty())
-        .collect()
+    removed.retain(|r| r != path && !r.starts_with(&prefix));
 }
 
 /// Parse the opened folders recorded in `~/.crane/session.json` (unexpanded).
@@ -877,7 +857,7 @@ mod tests {
         assert!(out.is_empty(), "every child suppressed => folder contributes nothing");
 
         // Subtree clearing restores the container AND both repos.
-        unsuppress_tree(&mut removed, &group, &Default::default());
+        unsuppress_tree(&mut removed, &group);
         assert!(removed.is_empty(), "subtree entries must all be cleared");
         let mut out = Vec::new();
         expand_folder(opened(), &removed, false, &mut out);
@@ -916,10 +896,9 @@ mod tests {
         );
     }
 
-    /// …but when the user EXPLICITLY picks that same container in "Add
-    /// Project", it must materialise. Its repos may all be
-    /// independently-opened-and-removed paths that `unsuppress_tree` refuses to
-    /// resurrect, which used to make the pick a silent no-op.
+    /// …but a container the user EXPLICITLY added, whose repos they then
+    /// removed one by one, must still render. It stays in `added_projects`, so
+    /// vanishing it strands a recorded project with no row to click.
     #[test]
     fn user_added_container_with_all_children_removed_emits_itself() {
         let tmp = tempfile::tempdir().unwrap();
@@ -952,23 +931,22 @@ mod tests {
         assert_eq!(out[0].worktrees.len(), 1, "needs a worktree to hold tabs");
     }
 
-    /// Re-adding an ancestor must not resurrect a nested folder the user opened
-    /// INDEPENDENTLY and removed as a project in its own right.
+    /// Re-adding an ancestor restores nested folders the user had opened
+    /// INDEPENDENTLY and removed as projects in their own right. Exempting them
+    /// (the earlier rule) made picking the parent yield a container with none of
+    /// its repos and no way to release them one by one.
     #[test]
-    fn unsuppress_tree_leaves_independently_opened_descendants_removed() {
-        let opened: std::collections::HashSet<String> =
-            ["/p/OneVibe/Android".to_string()].into_iter().collect();
+    fn unsuppress_tree_restores_independently_opened_descendants() {
         let mut removed = vec![
             "/p/OneVibe".to_string(),
-            "/p/OneVibe/Android".to_string(), // opened on its own => stays removed
-            "/p/OneVibe/Backend".to_string(), // discovered child only => restored
+            "/p/OneVibe/Android".to_string(), // opened on its own => still restored
+            "/p/OneVibe/Backend".to_string(),
         ];
-        unsuppress_tree(&mut removed, "/p/OneVibe", &opened);
-        assert_eq!(removed, vec!["/p/OneVibe/Android".to_string()]);
-
-        // Re-picking that exact path is the way back.
-        unsuppress_tree(&mut removed, "/p/OneVibe/Android", &opened);
-        assert!(removed.is_empty(), "the exact path always comes back");
+        unsuppress_tree(&mut removed, "/p/OneVibe");
+        assert!(
+            removed.is_empty(),
+            "picking the parent releases the whole subtree; got {removed:?}"
+        );
     }
 
     /// The subtree clear must not touch a sibling folder that merely shares a
@@ -980,7 +958,7 @@ mod tests {
             "/p/proj/child".to_string(),
             "/p/proj-old".to_string(),
         ];
-        unsuppress_tree(&mut removed, "/p/proj", &Default::default());
+        unsuppress_tree(&mut removed, "/p/proj");
         assert_eq!(removed, vec!["/p/proj-old".to_string()]);
     }
 

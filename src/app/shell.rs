@@ -16955,20 +16955,9 @@ impl CraneShellView {
                         // skips any child still listed — so clearing only the
                         // exact picked path brought a container back
                         // permanently empty of the repos inside it.
-                        // Folders that exist as projects in their OWN right —
-                        // re-adding an ancestor must not resurrect one the user
-                        // removed as a top-level project (see `unsuppress_tree`).
-                        let opened: HashSet<String> =
-                            crate::app::projects::session_folder_paths()
-                                .into_iter()
-                                .chain(
-                                    this.added_projects.iter().map(|a| a.path.clone()),
-                                )
-                                .collect();
                         crate::app::projects::unsuppress_tree(
                             &mut this.removed_project_paths,
                             &path_str,
-                            &opened,
                         );
                         let ap = crate::app::persist::AddedProject {
                             name,
