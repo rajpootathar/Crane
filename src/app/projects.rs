@@ -181,6 +181,12 @@ struct OpenedFolder {
     name: String,
     path: String,
     worktrees: Vec<WorktreeNode>,
+    /// True when this folder is in the user's "Add Project" list — i.e. the user
+    /// explicitly picked it, as opposed to it merely surviving in session.json.
+    /// An explicitly-picked folder must always materialise a row (see the
+    /// all-children-removed branch of `expand_folder`); a passive session folder
+    /// whose every repo was removed goes away with them.
+    user_added: bool,
 }
 
 /// Basename of a path as a `String`, falling back to `fallback`.
@@ -408,7 +414,15 @@ fn expand_folder(
     // NOTHING. Falling through would materialise the bare folder as a top-level
     // project row nobody asked for — the user removed what was in it, so the
     // container goes with them.
-    if !siblings.is_empty() {
+    //
+    // UNLESS the user explicitly picked this folder in "Add Project". Its repos
+    // may all be independently-opened-and-removed paths that `unsuppress_tree`
+    // deliberately refuses to resurrect (e.g. removing `OneVibe/Android` and
+    // `OneVibe/Backend`, then adding their parent `OneVibe`) — dropping the
+    // container too made "Add Project" a silent no-op with nothing to click.
+    // The pick is an explicit request for THIS folder, so it renders as a loose
+    // folder carrying its non-repo content; the removed repos stay removed.
+    if !siblings.is_empty() && !opened.user_added {
         return;
     }
 
@@ -546,6 +560,9 @@ fn session_folders(with_git: bool) -> Vec<OpenedFolder> {
                 name,
                 path,
                 worktrees,
+                // Overwritten by `load_projects_core` for folders that are ALSO
+                // in the user's "Add Project" list.
+                user_added: false,
             });
         }
     }
@@ -613,6 +630,8 @@ pub fn load_one_shallow(
             name: added.name.clone(),
             path: added.path.clone(),
             worktrees: Vec::new(),
+            // Only ever called from "Add Project" — an explicit user pick.
+            user_added: true,
         },
         removed,
         false,
@@ -634,12 +653,19 @@ fn load_projects_core(
     //    by the opened path.
     let mut folders: Vec<OpenedFolder> = session_folders(with_git);
     folders.retain(|f| !removed.contains(&f.path));
+    // A session folder the user ALSO picked in "Add Project" is an explicit
+    // pick — the session entry wins (it carries the worktrees/tabs) but it must
+    // still carry the user-added flag.
+    for f in &mut folders {
+        f.user_added = added.iter().any(|a| a.path == f.path);
+    }
     for ap in added {
         if !folders.iter().any(|f| f.path == ap.path) {
             folders.push(OpenedFolder {
                 name: ap.name.clone(),
                 path: ap.path.clone(),
                 worktrees: Vec::new(),
+                user_added: true,
             });
         }
     }
@@ -794,6 +820,7 @@ mod tests {
                 name: "my-folder".into(),
                 path: root.to_string_lossy().into(),
                 worktrees: Vec::new(),
+                user_added: false,
             },
             &[],
             false,
@@ -830,6 +857,7 @@ mod tests {
             name: "my-folder".into(),
             path: group.clone(),
             worktrees: Vec::new(),
+            user_added: false,
         };
 
         // User removed the whole group: the container plus both child repos,
@@ -875,6 +903,7 @@ mod tests {
                 name: "OneVibe".into(),
                 path: group.clone(),
                 worktrees: Vec::new(),
+                user_added: false,
             },
             &removed,
             false,
@@ -885,6 +914,42 @@ mod tests {
             "container must not reappear as a bare row; got {:?}",
             out.iter().map(|p| p.path.clone()).collect::<Vec<_>>()
         );
+    }
+
+    /// …but when the user EXPLICITLY picks that same container in "Add
+    /// Project", it must materialise. Its repos may all be
+    /// independently-opened-and-removed paths that `unsuppress_tree` refuses to
+    /// resurrect, which used to make the pick a silent no-op.
+    #[test]
+    fn user_added_container_with_all_children_removed_emits_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("OneVibe");
+        std::fs::create_dir_all(root.join("Android/.git")).unwrap();
+        std::fs::create_dir_all(root.join("Backend/.git")).unwrap();
+        std::fs::write(root.join("README.md"), "loose").unwrap();
+        let group = root.to_string_lossy().to_string();
+
+        let removed = vec![format!("{group}/Android"), format!("{group}/Backend")];
+        let mut out = Vec::new();
+        expand_folder(
+            OpenedFolder {
+                name: "OneVibe".into(),
+                path: group.clone(),
+                worktrees: Vec::new(),
+                user_added: true,
+            },
+            &removed,
+            false,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "the picked folder must render exactly once");
+        assert_eq!(out[0].path, group);
+        assert!(out[0].is_loose, "non-git container renders as a loose folder");
+        assert!(
+            out[0].group_path.is_none(),
+            "no surviving children => no group header"
+        );
+        assert_eq!(out[0].worktrees.len(), 1, "needs a worktree to hold tabs");
     }
 
     /// Re-adding an ancestor must not resurrect a nested folder the user opened
