@@ -678,6 +678,20 @@ fn load_projects_core(
 /// the child's `group_path` onto it, and drop the fresh child. A genuinely
 /// not-separately-opened sibling (no standalone twin) keeps its fresh child node,
 /// so single-container grouping is unaffected.
+///
+/// Adopting alone is not enough, because the adopted node keeps its ORIGINAL
+/// position. Session folders are expanded before user-added ones, so an
+/// independently-opened `OneVibe/Android` sits early in the list while the
+/// `OneVibe` container that adopts it is expanded near the end — two separate
+/// runs of the same `group_path`, hence two identical FOLDER headers with the
+/// container's own row orphaned under the second. The existing
+/// `qck-cloud` grouping only escaped this because session order happened to put
+/// the parent immediately before its children.
+///
+/// So a final pass COMPACTS each group: every member is gathered at the position
+/// where the group first appears, parent (the node whose path IS the group key)
+/// first, the rest in their existing relative order. Ungrouped projects keep
+/// their positions.
 fn fold_grouped_duplicates(projects: &mut Vec<ProjectNode>) {
     // Paths that have an independently-opened (top-level) node.
     let standalone_paths: std::collections::HashSet<String> = projects
@@ -706,6 +720,39 @@ fn fold_grouped_duplicates(projects: &mut Vec<ProjectNode>) {
             if let Some(g) = child_group.get(&p.path) {
                 p.group_path = Some(g.clone());
             }
+        }
+    }
+    compact_groups(projects);
+}
+
+/// Gather each group's members into one contiguous run so the sidebar draws its
+/// FOLDER header exactly once (see `fold_grouped_duplicates`). A group lands at
+/// the position of its first member; within the run the group PARENT (the node
+/// whose own path is the group key) leads, then the children in their existing
+/// relative order. Nodes outside any group keep their positions.
+fn compact_groups(projects: &mut Vec<ProjectNode>) {
+    // The run a node belongs to: its group key, or its own path when ungrouped
+    // (a unique key, so it stays a run of one, in place).
+    let slot = |p: &ProjectNode| p.group_path.clone().unwrap_or_else(|| p.path.clone());
+    let order: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        projects
+            .iter()
+            .map(slot)
+            .filter(|s| seen.insert(s.clone()))
+            .collect()
+    };
+    if order.len() == projects.len() {
+        return; // every node is its own run — nothing to compact.
+    }
+    let mut rest = std::mem::take(projects);
+    for key in order {
+        // The parent first (path == group key), then the remaining members.
+        if let Some(i) = rest.iter().position(|p| slot(p) == key && p.path == key) {
+            projects.push(rest.remove(i));
+        }
+        while let Some(i) = rest.iter().position(|p| slot(p) == key) {
+            projects.push(rest.remove(i));
         }
     }
 }
@@ -960,6 +1007,48 @@ mod tests {
         ];
         unsuppress_tree(&mut removed, "/p/proj");
         assert_eq!(removed, vec!["/p/proj-old".to_string()]);
+    }
+
+    /// Session folders expand BEFORE user-added ones, so an independently-opened
+    /// child can sit far from the container that adopts it. Both must end up in
+    /// one contiguous run, container first, or the sidebar draws the same FOLDER
+    /// header twice with the container's own row stranded under the second.
+    #[test]
+    fn fold_compacts_a_group_split_across_the_load_order() {
+        let g = "/p/OneVibe";
+        let mut projects = vec![
+            node("crane", "/p/crane", None, "main"),
+            // Independently opened, expanded from session.json — early.
+            node("Android", "/p/OneVibe/Android", None, "main"),
+            node("Backend", "/p/OneVibe/Backend", None, "main"),
+            node("shortIO", "/p/shortIO", None, "main"),
+            // The user-added container + its fresh children — expanded last.
+            node("OneVibe", g, Some(g), "OneVibe"),
+            node("Android", "/p/OneVibe/Android", Some(g), "main"),
+            node("Backend", "/p/OneVibe/Backend", Some(g), "main"),
+        ];
+        fold_grouped_duplicates(&mut projects);
+
+        let paths: Vec<&str> = projects.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/p/crane",
+                // The whole group lands where its first member was, parent first.
+                "/p/OneVibe",
+                "/p/OneVibe/Android",
+                "/p/OneVibe/Backend",
+                "/p/shortIO",
+            ],
+            "group must be one contiguous run, container leading"
+        );
+        assert!(
+            projects[1..4].iter().all(|p| p.group_path.as_deref() == Some(g)),
+            "every member carries the group key"
+        );
+        // The standalones survived (they own the real worktrees/tabs), not the
+        // fresh duplicates.
+        assert_eq!(projects[2].worktrees[0].name, "main");
     }
 
     // A discovered sibling that was NOT opened on its own (e.g. a gitignored
