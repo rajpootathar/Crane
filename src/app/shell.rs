@@ -4306,6 +4306,15 @@ impl CraneShellView {
                 if self.active_tab.is_none() {
                     self.refresh_panel(ctx);
                 }
+                // PERSIST THE REMOVAL. `added_projects` / `removed_project_paths`
+                // are the only record that this Project is gone — the tree is
+                // rebuilt from them on every launch. "Add Project" saves inline,
+                // so without a matching save here adds stick and removes do not:
+                // a removal survives only if some LATER event happens to save
+                // before exit, and is silently lost if the app dies first (the
+                // window-teardown crash does exactly that). The removed Project
+                // then reappears on next launch as if it had re-added itself.
+                self.save_state(&*ctx);
     }
 
     /// A single row inside the context menu (icon + label). Dispatches
@@ -16946,9 +16955,20 @@ impl CraneShellView {
                         // skips any child still listed — so clearing only the
                         // exact picked path brought a container back
                         // permanently empty of the repos inside it.
+                        // Folders that exist as projects in their OWN right —
+                        // re-adding an ancestor must not resurrect one the user
+                        // removed as a top-level project (see `unsuppress_tree`).
+                        let opened: HashSet<String> =
+                            crate::app::projects::session_folder_paths()
+                                .into_iter()
+                                .chain(
+                                    this.added_projects.iter().map(|a| a.path.clone()),
+                                )
+                                .collect();
                         crate::app::projects::unsuppress_tree(
                             &mut this.removed_project_paths,
                             &path_str,
+                            &opened,
                         );
                         let ap = crate::app::persist::AddedProject {
                             name,
