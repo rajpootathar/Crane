@@ -8622,7 +8622,6 @@ impl CraneShellView {
             let Some(pi) = self.projects.iter().position(|p| p.path == main_path) else {
                 continue;
             };
-            self.worktree_poll_sig.insert(main_path.clone(), sig);
             let listed_paths: HashSet<String> =
                 listed.iter().map(|e| e.path.to_string_lossy().to_string()).collect();
             // 2a) Reconcile each worktree git knows about. NEW paths get a row;
@@ -8664,21 +8663,29 @@ impl CraneShellView {
                     changed = true;
                 }
             }
-            // 2b) Detect a worktree whose checkout dir vanished on disk AND is no
-            //     longer in git's list — remove it (never the primary checkout).
+            // 2b) Detect worktrees whose checkout dir vanished on disk AND are no
+            //     longer in git's list — remove them (never the primary checkout).
+            let wt_paths: Vec<String> = self
+                .projects
+                .get(pi)
+                .map(|p| p.worktrees.iter().map(|w| w.path.clone()).collect())
+                .unwrap_or_default();
+            let dead = dead_worktree_rows(&wt_paths, &listed_paths, &main_path, |p| {
+                std::path::Path::new(p).exists()
+            });
+            // Record the signature ONLY once this project is clean. We remove at
+            // most one dead row per tick, so stamping the signature while others
+            // remain would make the background pass skip this project on every
+            // later tick (git's output hasn't changed) and strand rows 2..N in
+            // the Left Panel forever — exactly the reported bug, seen with three
+            // stale rows under one project. Leaving the signature unset re-polls
+            // the project next tick until the last dead row is gone.
+            if dead.is_empty() {
+                self.worktree_poll_sig.insert(main_path.clone(), sig);
+            }
             if dead_remove.is_none() {
-                if let Some(p) = self.projects.get(pi) {
-                    for (wi, w) in p.worktrees.iter().enumerate() {
-                        if w.path == main_path {
-                            continue; // primary working tree — never auto-remove.
-                        }
-                        if !listed_paths.contains(&w.path)
-                            && !std::path::Path::new(&w.path).exists()
-                        {
-                            dead_remove = Some((pi, wi));
-                            break;
-                        }
-                    }
+                if let Some(&wi) = dead.first() {
+                    dead_remove = Some((pi, wi));
                 }
             }
         }
@@ -17957,6 +17964,72 @@ fn git_meta_path(path: &std::path::Path) -> bool {
         }
     }
     false
+}
+
+/// Indices into `worktree_paths` of the rows that git no longer lists AND whose
+/// checkout dir is gone from disk — the auto-removable ("dead") set for one
+/// project. The primary working tree (`main_path`) is never included: it can't
+/// be `git worktree remove`d, and a project whose own folder vanished is the
+/// project-removal flow's business, not this one.
+///
+/// A row git doesn't list whose directory still EXISTS is deliberately NOT dead
+/// — the dir may be a leftover checkout or a temporarily unavailable mount, and
+/// dropping it would be unrecoverable from the sidebar's side.
+fn dead_worktree_rows(
+    worktree_paths: &[String],
+    listed_paths: &HashSet<String>,
+    main_path: &str,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<usize> {
+    worktree_paths
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.as_str() != main_path)
+        .filter(|(_, p)| !listed_paths.contains(p.as_str()) && !exists(p))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[cfg(test)]
+mod dead_worktree_tests {
+    use super::dead_worktree_rows;
+    use std::collections::HashSet;
+
+    fn paths(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unlisted_and_missing_rows_are_dead_but_the_primary_never_is() {
+        let rows = paths(&["/r", "/r/.crane-worktrees/a", "/r/.crane-worktrees/b"]);
+        let listed: HashSet<String> = HashSet::from(["/r".to_string()]);
+        // Nothing but the primary exists on disk.
+        let dead = dead_worktree_rows(&rows, &listed, "/r", |_| false);
+        assert_eq!(dead, vec![1, 2], "both removed worktrees must be reported");
+
+        // Even with the primary's own dir gone it is never auto-removed.
+        let only_primary = paths(&["/r"]);
+        assert!(dead_worktree_rows(&only_primary, &HashSet::new(), "/r", |_| false).is_empty());
+    }
+
+    #[test]
+    fn a_row_git_forgot_but_whose_dir_survives_is_not_dead() {
+        let rows = paths(&["/r", "/r/.crane-worktrees/a"]);
+        let listed: HashSet<String> = HashSet::from(["/r".to_string()]);
+        assert!(
+            dead_worktree_rows(&rows, &listed, "/r", |p| p.ends_with("/a")).is_empty(),
+            "an on-disk checkout must not be dropped from the sidebar"
+        );
+    }
+
+    #[test]
+    fn every_dead_row_is_reported_not_just_the_first() {
+        // Regression: OneVibe/Backend carried THREE stale rows in session.json.
+        // Reporting only the first stranded the other two in the Left Panel.
+        let rows = paths(&["/r", "/r/w1", "/r/w2", "/r/w3"]);
+        let listed: HashSet<String> = HashSet::from(["/r".to_string()]);
+        assert_eq!(dead_worktree_rows(&rows, &listed, "/r", |_| false).len(), 3);
+    }
 }
 
 #[cfg(test)]
