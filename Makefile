@@ -6,6 +6,22 @@ APP_NAME  := Crane
 VERSION   := $(shell awk -F'"' '/^version/ { print $$2; exit }' Cargo.toml)
 BIN_NAME  := crane
 
+# Always invoke cargo with the inherited GNU jobserver neutralized.
+#
+# `ship` recurses (`ship` → `$(MAKE) _ship_post_bump` → `dmg` → `bundle`), and
+# make advertises jobserver tokens to children via MAKEFLAGS; cargo forwards
+# that to rustc as CARGO_MAKEFLAGS (`--jobserver-auth=8,9`). Those recursive
+# recipe lines are NOT marked with `+`, so make closes the jobserver pipe for
+# the child — rustc then blocks forever waiting for a token nobody holds. The
+# symptom is a build that sits at the final crate ("657/658: crane(bin)")
+# burning no CPU, looking like slow codegen but never finishing. GNU Make 3.81,
+# the version Xcode ships as /usr/bin/make, is especially prone to this.
+#
+# Clearing both variables makes cargo schedule its own parallelism, which is
+# what we want here anyway. Use $(CARGO) for EVERY cargo call in this file — a
+# bare `cargo` in any recipe reachable from `ship` reintroduces the hang.
+CARGO     := MAKEFLAGS= CARGO_MAKEFLAGS= cargo
+
 ARCH      := $(shell uname -m)
 TARGET_DIR := target/release
 BUNDLE_DIR := $(TARGET_DIR)/bundle/osx
@@ -64,13 +80,13 @@ help:
 	@echo "  clean              remove bundles and DMGs"
 
 build:
-	cargo build
+	$(CARGO) build
 
 test:
-	cargo test --bin $(BIN_NAME)
+	$(CARGO) test --bin $(BIN_NAME)
 
 run:
-	cargo run
+	$(CARGO) run
 
 icns: icons/crane.icns
 
@@ -78,7 +94,7 @@ icons/crane.icns: crane.png scripts/make-icns.sh
 	./scripts/make-icns.sh
 
 install-cargo-bundle:
-	@command -v cargo-bundle >/dev/null 2>&1 || cargo install cargo-bundle
+	@command -v cargo-bundle >/dev/null 2>&1 || $(CARGO) install cargo-bundle
 
 # Fetch libpdfium.dylib (arm64 + x86_64) into vendor/pdfium/. Idempotent
 # — re-running with the same pinned PDFIUM_TAG is a no-op. Bump the tag
@@ -88,7 +104,7 @@ vendor-pdfium:
 	@./scripts/vendor-pdfium.sh
 
 bundle: icns install-cargo-bundle vendor-pdfium
-	cargo bundle --release
+	$(CARGO) bundle --release
 	@# Drop the host-arch libpdfium.dylib into Contents/Frameworks and
 	@# wire @rpath so the bundled binary finds it. Without this the PDF
 	@# viewer shows the "PDF rendering unavailable" fallback at runtime.
@@ -130,9 +146,9 @@ release: dmg
 bundle-universal: icns install-cargo-bundle vendor-pdfium
 	rustup target add aarch64-apple-darwin >/dev/null 2>&1 || true
 	rustup target add x86_64-apple-darwin >/dev/null 2>&1 || true
-	cargo build --release --target aarch64-apple-darwin
-	cargo build --release --target x86_64-apple-darwin
-	cargo bundle --release --target aarch64-apple-darwin
+	$(CARGO) build --release --target aarch64-apple-darwin
+	$(CARGO) build --release --target x86_64-apple-darwin
+	$(CARGO) bundle --release --target aarch64-apple-darwin
 	mkdir -p "$(dir $(UNIVERSAL_APP))"
 	rm -rf "$(UNIVERSAL_APP)"
 	cp -R "target/aarch64-apple-darwin/release/bundle/osx/$(APP_NAME).app" \
@@ -282,7 +298,7 @@ _bump_%:
 	esac ; \
 	echo "bump: $$cur → $$next" ; \
 	sed -i '' -E "s/^version = \"$$cur\"/version = \"$$next\"/" Cargo.toml ; \
-	cargo build --quiet ; \
+	$(CARGO) build --quiet ; \
 	git add Cargo.toml Cargo.lock 2>/dev/null || git add Cargo.toml ; \
 	git commit -m "chore(crane): v$$next"
 
